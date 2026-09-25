@@ -14,6 +14,8 @@ const CHUNK_CHARS = 3000;
 
 export interface BotDeps {
   model: ChatModel;
+  /** 只在这些群里响应。为空时不响应任何群。 */
+  allowedChatIds: ReadonlySet<string>;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   logger?: Pick<Console, "info" | "error">;
 }
@@ -22,8 +24,13 @@ export interface BotDeps {
  * 处理一条已经过 SDK 安全管线的群消息（已去重、已确认 @ 了机器人、@ 占位符已替换成名字）：
  * 问模型，把回答发到这条消息的话题里。
  */
-export function createMessageHandler({ model, send, logger = console }: BotDeps) {
+export function createMessageHandler({ model, allowedChatIds, send, logger = console }: BotDeps) {
   return async (msg: NormalizedMessage): Promise<void> => {
+    if (!allowedChatIds.has(msg.chatId)) {
+      // 机器人可能也在告警群等业务群里，没加进白名单的群一律不回应，只在日志里打出 chat_id 方便加白
+      logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
+      return;
+    }
     logger.info(`收到提问 chat=${msg.chatId} message=${msg.messageId} sender=${msg.senderId}`);
 
     const question = msg.content.trim();

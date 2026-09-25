@@ -6,6 +6,8 @@ export interface Config {
     appId: string;
     appSecret: string;
     domain: Domain;
+    /** 群白名单（chat_id）。为空时不响应任何群。 */
+    allowedChatIds: ReadonlySet<string>;
   };
   llm: LlmConfig;
 }
@@ -31,6 +33,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       appId: env.FEISHU_APP_ID!,
       appSecret: env.FEISHU_APP_SECRET!,
       domain: domainName === "lark" ? Domain.Lark : Domain.Feishu,
+      allowedChatIds: new Set(
+        (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
+      ),
     },
     llm: {
       baseURL: env.MODEL_BASE_URL || DEFAULT_MODEL_BASE_URL,

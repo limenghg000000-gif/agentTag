@@ -23,6 +23,7 @@ const channel = createLarkChannel({
 
 channel.on("message", createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
+  allowedChatIds: config.feishu.allowedChatIds,
   send: (to, input, opts) => channel.send(to, input, opts),
 }));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
@@ -34,6 +35,11 @@ try {
   process.exit(1);
 }
 console.log(`飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}`);
+if (config.feishu.allowedChatIds.size === 0) {
+  console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");
+} else {
+  console.log(`已启用的群：${[...config.feishu.allowedChatIds].join(", ")}`);
+}
 
 const shutdown = async () => {
   await channel.disconnect();
