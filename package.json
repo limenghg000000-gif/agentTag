@@ -1,0 +1,26 @@
+{
+  "name": "agenttag",
+  "version": "0.1.0",
+  "private": true,
+  "description": "飞书版 Claude Tag：AI 助手作为成员加入飞书群，@ 它即可派活",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.74.0",
+    "openai": "^7.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
