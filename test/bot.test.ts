@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import { type BotDeps, createCardActionHandler, createMessageHandler, type ThreadContextSource } from "../src/bot.js";
 import type { ThreadContext } from "../src/history.js";
 import { type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
+import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION } from "../src/progress.js";
 import { TaskRegistry } from "../src/tasks.js";
 import type { Tool } from "../src/tools/tool.js";
@@ -343,4 +347,83 @@ test("白名单为空时不响应任何群", async () => {
 
   assert.equal(requests.length, 0);
   assert.equal(sent.length, 0);
+});
+
+const memoryDirs: string[] = [];
+after(() => Promise.all(memoryDirs.map((dir) => rm(dir, { recursive: true, force: true }))));
+
+async function memoryStore(): Promise<MemoryStore> {
+  const dir = await mkdtemp(path.join(tmpdir(), "agenttag-bot-memory-"));
+  memoryDirs.push(dir);
+  return new MemoryStore(dir, quiet);
+}
+
+test("把这个群的记忆写进提示词，别的群的记忆不会带进来", async () => {
+  const memory = await memoryStore();
+  await memory.add("oc_1", "decision", "发版固定在每周三", { name: "张三" });
+  await memory.add("oc_other", "background", "别的群的秘密");
+  const { model, requests } = fakeModel(() => ({ text: "周三", finish: "stop" }));
+  const { handle } = setup({ model, memory });
+
+  await handle(message("我们哪天发版？"));
+
+  const system = requests[0].system;
+  assert.match(system, /## 群记忆/);
+  assert.match(system, /【决定】\n- #1 发版固定在每周三（张三，/);
+  assert.doesNotMatch(system, /别的群的秘密/);
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["memory_save", "memory_update", "memory_delete"]);
+});
+
+test("群里还没有记忆时也告诉模型可以记", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, memory: await memoryStore() });
+
+  await handle(message("你好"));
+
+  assert.match(requests[0].system, /（这个群还没有记忆）/);
+  assert.match(requests[0].system, /memory_save/);
+});
+
+test("模型记下的内容带上提问人和来源消息，卡片上显示这一步，换个话题也能用上", async () => {
+  const memory = await memoryStore();
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: "c1", name: "memory_save", arguments: JSON.stringify({ content: "发版固定在每周三", kind: "decision" }) }],
+    },
+    { text: "好的。已记住：发版固定在每周三", finish: "stop" },
+    { text: "每周三", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const context = fakeContext({ askerName: "张三" });
+  const { sent, updates, handle } = setup({ model, memory, context: context.source });
+
+  await handle(message("记住：以后发版固定在每周三", { senderId: "ou_zhang" }));
+  await handle(message("哪天发版？", { messageId: "om_9" }));
+
+  const [saved] = await memory.list("oc_1");
+  assert.equal(saved.content, "发版固定在每周三");
+  assert.equal(saved.author, "张三");
+  assert.equal(saved.authorId, "ou_zhang");
+  assert.equal(saved.sourceMessageId, "om_1");
+  assert.ok(updates.some((u) => /记住：发版固定在每周三/.test(cardText(u.card))));
+  assert.deepEqual(markdowns(sent), ["好的。已记住：发版固定在每周三", "每周三"]);
+  assert.match(requests.at(-1)!.system, /#1 发版固定在每周三（张三，/);
+});
+
+test("读不到群记忆时照常回答，只是不带记忆", async () => {
+  const memory = await memoryStore();
+  memory.list = async () => {
+    throw new Error("disk error");
+  };
+  const errors: string[] = [];
+  const { model, requests } = fakeModel(() => ({ text: "答案", finish: "stop" }));
+  const { sent, handle } = setup({ model, memory, logger: { ...quiet, error: (line: string) => errors.push(line) } });
+
+  await handle(message("你好"));
+
+  assert.deepEqual(markdowns(sent), ["答案"]);
+  assert.doesNotMatch(requests[0].system, /群记忆/);
+  assert.match(errors[0], /读取群记忆失败/);
 });

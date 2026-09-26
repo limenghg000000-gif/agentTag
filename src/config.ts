@@ -1,3 +1,4 @@
+import path from "node:path";
 import { Domain } from "@larksuiteoapi/node-sdk";
 import type { LlmConfig } from "./llm.js";
 
@@ -10,11 +11,15 @@ export interface Config {
     allowedChatIds: ReadonlySet<string>;
   };
   llm: LlmConfig;
+  /** 群记忆的存放目录（每个群一个 JSON 文件） */
+  memoryDir: string;
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
 export const DEFAULT_MODEL_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 export const DEFAULT_MODEL_ID = "qwen3.8-max";
+/** 数据目录，相对路径按启动时的工作目录算 */
+export const DEFAULT_DATA_DIR = "data";
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -42,5 +47,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       apiKey: env.MODEL_API_KEY!,
       model: env.MODEL_ID || DEFAULT_MODEL_ID,
     },
+    memoryDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "memory"),
   };
 }

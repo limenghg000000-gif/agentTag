@@ -119,7 +119,10 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
     },
 
     async getMessage(messageId) {
-      const res = (await client.im.v1.message.get({ path: { message_id: messageId } })) as ApiResponse<{ items?: ApiItem[] }>;
+      const res = (await client.im.v1.message.get({
+        path: { message_id: messageId },
+        params: { with_sender_name: true },
+      })) as ApiResponse<{ items?: ApiItem[] }>;
       check(res);
       const [first] = await convertAll(res.data?.items?.slice(0, 1) ?? []);
       return first;

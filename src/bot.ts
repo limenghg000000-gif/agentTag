@@ -3,6 +3,7 @@ import { type AgentEvent, type AgentResult, runAgent } from "./agent.js";
 import { labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { type ChatModel, LlmError } from "./llm.js";
 import { splitMarkdown } from "./markdown.js";
+import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   CardUpdater,
   type ProgressState,
@@ -12,6 +13,7 @@ import {
 } from "./progress.js";
 import { buildSystemPrompt } from "./prompt.js";
 import type { TaskRegistry } from "./tasks.js";
+import { createMemoryTools } from "./tools/memory.js";
 import type { Tool } from "./tools/tool.js";
 
 /**
@@ -37,6 +39,8 @@ export interface BotDeps {
   /** 机器人在飞书里的名字（连上长连接后才拿得到），写进提示词 */
   botName: () => string | undefined;
   context: ThreadContextSource;
+  /** 按群保存的长期记忆。不传时不带记忆，也没有记忆工具 */
+  memory?: MemoryStore;
   tasks: TaskRegistry;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   updateCard: (messageId: string, card: object) => Promise<void>;
@@ -104,6 +108,7 @@ async function runTask(
   let answer: string | undefined;
   let result: AgentResult | undefined;
   let source = "none";
+  let memoryCount: number | undefined;
   try {
     if (!(await task.waitTurn())) {
       throw new Error("stopped while queued");
@@ -116,16 +121,20 @@ async function runTask(
 
     const context = await deps.context.load(msg);
     source = context.source;
+    const memory = await loadGroupMemory(deps, msg, context.askerName);
+    memoryCount = memory?.count;
+    const taskTools = memory ? [...tools, ...memory.tools] : tools;
     const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
     result = await runAgent({
       model,
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
-        toolNames: tools.map((tool) => tool.spec.name),
+        toolNames: taskTools.map((tool) => tool.spec.name),
+        memory: memory?.prompt,
       }),
       messages: [...context.history, { role: "user", content: prompt }],
-      tools,
+      tools: taskTools,
       signal: task.signal,
       onEvent: (event) => {
         applyEvent(state, event);
@@ -163,8 +172,34 @@ async function runTask(
   }
   logger.info(
     `${state.phase === "stopped" ? "已停止" : "已回复"} message=${msg.messageId} 上下文=${source} ` +
+      `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
+}
+
+/**
+ * 读出这个群的记忆写进提示词，并给这次任务配一套只能读写这个群记忆的工具。
+ * 读失败（比如磁盘出错）时这次任务不带记忆，照常回答。
+ */
+async function loadGroupMemory(deps: BotDeps, msg: NormalizedMessage, askerName: string | undefined) {
+  const { memory: store, logger = console } = deps;
+  if (!store) {
+    return undefined;
+  }
+  try {
+    const entries = await store.list(msg.chatId);
+    const prompt = renderMemoryForPrompt(entries);
+    const tools = createMemoryTools({
+      store,
+      chatId: msg.chatId,
+      author: { name: askerName, openId: msg.senderId, messageId: msg.messageId },
+      includeSearch: prompt.omitted > 0,
+    });
+    return { prompt, tools, count: entries.length };
+  } catch (err) {
+    logger.error(`读取群记忆失败 chat=${msg.chatId}，这次不带记忆`, err);
+    return undefined;
+  }
 }
 
 function applyEvent(state: ProgressState, event: AgentEvent): void {
