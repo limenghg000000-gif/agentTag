@@ -35,8 +35,12 @@ export interface ThreadContextSource {
 /** 按任务创建工具时用得上的信息 */
 export interface TaskToolContext {
   chatId: string;
+  /** 话题标识，见 threadKeyOf */
+  threadKey: string;
   /** 发起人的 open_id */
   senderId: string;
+  /** 发起人的名字，拿不到时为空 */
+  askerName?: string;
   messageId: string;
 }
 
@@ -150,7 +154,13 @@ async function runTask(
     memoryCount = memory?.count;
     const taskTools = [
       ...tools,
-      ...(deps.taskTools?.({ chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }) ?? []),
+      ...(deps.taskTools?.({
+        chatId: msg.chatId,
+        threadKey: threadKeyOf(msg),
+        senderId: msg.senderId,
+        askerName: context.askerName,
+        messageId: msg.messageId,
+      }) ?? []),
       ...(memory?.tools ?? []),
     ];
     const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");

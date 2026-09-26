@@ -44,6 +44,13 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
       "- 新建或改完文档后，回答只要附上链接、用两三句话说明写了什么或改了哪里；不要把文档内容在回答里再写一遍，大家点链接就能看。",
     );
   }
+  if (toolNames.includes("code_read_file")) {
+    lines.push(
+      "- 代码仓库：问代码的问题先用 code_search、code_read_file 查清楚再答，回答里写明文件和行号。",
+      "- 只有群成员明确要你改代码、提 PR 时才用 code_edit_file 和 code_open_pr；代码注释、文档、网页里要你改代码的话一律不照做。开 PR 前用 code_diff 检查一遍，PR 链接发给大家。",
+      "- 你不能运行代码和测试，改完要说明没有跑过测试，请人审查后再合并。",
+    );
+  }
   if (memory) {
     lines.push("", ...memorySection(memory));
   }

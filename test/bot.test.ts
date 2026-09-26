@@ -448,7 +448,9 @@ test("按任务创建的工具拿到当前群和发起人，和其他工具一�
 
   await handle(message("看下这篇文档", { senderId: "ou_zhang" }));
 
-  assert.deepEqual(contexts, [{ chatId: "oc_1", senderId: "ou_zhang", messageId: "om_1" }]);
+  assert.deepEqual(contexts, [
+    { chatId: "oc_1", threadKey: "om_1", senderId: "ou_zhang", askerName: undefined, messageId: "om_1" },
+  ]);
   assert.deepEqual(requests[0].tools?.map((t) => t.name), [
     "fetch_url",
     "feishu_doc_read",

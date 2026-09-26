@@ -23,6 +23,14 @@ export interface Config {
   memoryBackupDays: number;
   /** 联网搜索：百炼原生接口地址和搜索用的模型。关掉或模型服务不是百炼时为空 */
   webSearch?: { url: string; model: string };
+  /** 代码仓库：没配 CODE_REPOS 时为空 */
+  code?: {
+    /** 允许操作的 GitHub 仓库（owner/repo） */
+    repos: string[];
+    githubToken: string;
+    /** 拉代码的工作目录（每个话题一个子目录） */
+    workspaceDir: string;
+  };
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
@@ -60,6 +68,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const model = env.MODEL_ID || DEFAULT_MODEL_ID;
   const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
 
+  const repos = (env.CODE_REPOS ?? "").split(",").map((r) => r.trim()).filter(Boolean);
+  const badRepo = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
+  if (badRepo) {
+    throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${badRepo}`);
+  }
+  if (repos.length > 0 && !env.GITHUB_TOKEN) {
+    throw new Error("配了 CODE_REPOS 就要配 GITHUB_TOKEN（给这些仓库 Contents 和 Pull requests 读写权限的 token）");
+  }
+
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
     throw new Error(`FEISHU_DOMAIN 只能是 feishu 或 lark，当前为 ${env.FEISHU_DOMAIN}`);
@@ -81,6 +98,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
     memoryBackupDays: backupDays,
     webSearch: searchUrl ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || model } : undefined,
+    code:
+      repos.length > 0
+        ? { repos, githubToken: env.GITHUB_TOKEN!, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") }
+        : undefined,
   };
 }
 
