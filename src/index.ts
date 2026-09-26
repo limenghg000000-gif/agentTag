@@ -1,8 +1,12 @@
 import { existsSync } from "node:fs";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
-import { createMessageHandler } from "./bot.js";
+import { createCardActionHandler, createMessageHandler } from "./bot.js";
 import { loadConfig } from "./config.js";
+import { createFeishuApi } from "./feishu.js";
+import { ThreadContextLoader } from "./history.js";
 import { createOpenAICompatibleModel } from "./llm.js";
+import { TaskRegistry } from "./tasks.js";
+import { createFetchUrlTool } from "./tools/fetch-url.js";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -15,17 +19,26 @@ const channel = createLarkChannel({
   appSecret: config.feishu.appSecret,
   domain: config.feishu.domain,
   loggerLevel: LoggerLevel.info,
-  // 群里只响应 @ 机器人的消息，@所有人 不响应；阶段 0 先不开单聊
+  // 群里只响应 @ 机器人的消息，@所有人 不响应；单聊暂不开
   policy: { requireMention: true, dmMode: "disabled" },
-  // 关掉按群排队合并：同一个群里几个人同时 @，各自独立回答，互不等待
+  // 关掉按群排队合并：同一个群里几个人同时 @，各自独立处理。同一话题里的任务由 TaskRegistry 排队
   safety: { chatQueue: { enabled: false } },
 });
 
+const tasks = new TaskRegistry();
+const tools = [createFetchUrlTool()];
+
 channel.on("message", createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
+  tools,
   allowedChatIds: config.feishu.allowedChatIds,
+  botName: () => channel.botIdentity?.name,
+  context: new ThreadContextLoader(createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity)),
+  tasks,
   send: (to, input, opts) => channel.send(to, input, opts),
+  updateCard: (messageId, card) => channel.updateCard(messageId, card),
 }));
+channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds }));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
 
 try {
@@ -34,7 +47,10 @@ try {
   console.error("连接飞书失败：请检查 FEISHU_APP_ID / FEISHU_APP_SECRET，以及应用是否已开启机器人能力并发布版本。", err);
   process.exit(1);
 }
-console.log(`飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}`);
+console.log(
+  `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
+    `工具 ${tools.map((tool) => tool.spec.name).join(", ")}`,
+);
 if (config.feishu.allowedChatIds.size === 0) {
   console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");
 } else {
@@ -42,6 +58,9 @@ if (config.feishu.allowedChatIds.size === 0) {
 }
 
 const shutdown = async () => {
+  // 停掉进行中的任务，让它们把卡片更新成「已停止」再退出
+  tasks.stopAll();
+  await tasks.idle(5000);
   await channel.disconnect();
   process.exit(0);
 };

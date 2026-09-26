@@ -74,3 +74,68 @@ test("Key 无效时抛出 auth 类错误", async () => {
   responses.push({ status: 401, body: { error: { code: "invalid_api_key", message: "Incorrect API key provided." } } });
   await assert.rejects(ask, (err) => err instanceof LlmError && err.kind === "auth");
 });
+
+test("带上工具说明，解析模型返回的工具调用", async () => {
+  responses.push({
+    status: 200,
+    body: {
+      id: "chatcmpl-2",
+      object: "chat.completion",
+      created: 0,
+      model: "qwen3.8-max",
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: "我先看看这个网页",
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "fetch_url", arguments: '{"url":"https://example.com"}' } }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    },
+  });
+  const tool = { name: "fetch_url", description: "读网页", parameters: { type: "object", properties: { url: { type: "string" } } } };
+
+  const result = await model.chat({ system: "你是助手", messages: [{ role: "user", content: "看看 example.com" }], tools: [tool] });
+
+  assert.deepEqual(result, {
+    text: "我先看看这个网页",
+    finish: "tool_calls",
+    toolCalls: [{ id: "call_1", name: "fetch_url", arguments: '{"url":"https://example.com"}' }],
+  });
+  assert.deepEqual(requests.at(-1)!.body.tools, [{ type: "function", function: tool }]);
+});
+
+test("把之前的工具调用和工具结果按 OpenAI 格式发回去", async () => {
+  responses.push(completion("网页讲的是示例域名"));
+  const toolCalls = [{ id: "call_1", name: "fetch_url", arguments: '{"url":"https://example.com"}' }];
+
+  await model.chat({
+    system: "你是助手",
+    messages: [
+      { role: "user", content: "看看 example.com" },
+      { role: "assistant", content: "", toolCalls },
+      { role: "tool", toolCallId: "call_1", content: "Example Domain" },
+    ],
+  });
+
+  const { body } = requests.at(-1)!;
+  assert.equal(body.tools, undefined);
+  assert.deepEqual(body.messages.slice(2), [
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "fetch_url", arguments: '{"url":"https://example.com"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "Example Domain" },
+  ]);
+});
+
+test("中止后请求被取消，抛出的不是 LlmError", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    model.chat({ system: "你是助手", messages: [{ role: "user", content: "你好" }], signal: controller.signal }),
+    (err) => !(err instanceof LlmError),
+  );
+});
