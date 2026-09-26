@@ -14,6 +14,7 @@ import { MemoryStore } from "./memory.js";
 import { TaskRegistry } from "./tasks.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
+import { createWebSearchTool } from "./tools/web-search.js";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -33,7 +34,10 @@ const channel = createLarkChannel({
 });
 
 const tasks = new TaskRegistry();
-const tools = [createFetchUrlTool()];
+const tools = [
+  createFetchUrlTool(),
+  ...(config.webSearch ? [createWebSearchTool({ ...config.webSearch, apiKey: config.llm.apiKey })] : []),
+];
 const memory = new MemoryStore(config.memoryDir);
 try {
   await memory.init();
@@ -108,6 +112,11 @@ if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
     `补漏轮询已开启，每 ${config.catchUpIntervalMs / 1000} 秒检查一次白名单群里有没有漏掉的 @；` +
       `30 分钟内补上 2 条以上会在${config.alertChatId ? `群 ${config.alertChatId}` : "漏消息的群"}里报警`,
   );
+}
+if (config.webSearch) {
+  console.log(`联网搜索已开启，用百炼的 ${config.webSearch.model} 搜索`);
+} else {
+  console.log("联网搜索没开：WEB_SEARCH=off，或者 MODEL_BASE_URL 不是百炼的 OpenAI 兼容接口（web_search 只支持百炼）");
 }
 if (backup) {
   backup.start();

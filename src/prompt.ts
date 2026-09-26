@@ -31,6 +31,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
       "- 不要编造没查到的信息；工具失败或查不到时如实说明。",
     );
   }
+  if (toolNames.includes("web_search")) {
+    lines.push(
+      "- 需要最新信息或你拿不准的事实时用 web_search 搜，不要用 fetch_url 打开搜索引擎；要看某个网页的原文再用 fetch_url。回答里用到搜索结果时附上来源链接。",
+    );
+  }
   if (toolNames.includes("feishu_doc_read")) {
     lines.push(
       "- 飞书文档链接（/docx/、/wiki/ 等）用 feishu_doc_read 读，不要用 fetch_url。读不到时把工具给的原因和解决办法转告大家。",
