@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
+import { MissedEventAlarm } from "./alarm.js";
+import { MemoryBackup } from "./backup.js";
 import { createCardActionHandler, createMessageHandler } from "./bot.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { loadConfig } from "./config.js";
@@ -38,6 +40,11 @@ try {
   process.exit(1);
 }
 
+const backup =
+  config.memoryBackupDays > 0
+    ? new MemoryBackup({ memoryDir: config.memoryDir, backupDir: config.memoryBackupDir, keepDays: config.memoryBackupDays })
+    : undefined;
+
 const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
 const handleMessage = createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
@@ -53,15 +60,25 @@ const handleMessage = createMessageHandler({
 
 // 事件和补漏轮询可能拿到同一条消息，谁先认领谁处理
 const handled = new HandledMessages();
+const alarm = new MissedEventAlarm({
+  notify: (chatId, text) => channel.send(chatId, { markdown: text }),
+  chatId: config.alertChatId,
+});
 const catchUp = new CatchUpPoller({
   api: feishuApi,
   chatIds: config.feishu.allowedChatIds,
   handled,
-  handle: handleMessage,
+  handle: (msg) => {
+    alarm.record(msg);
+    return handleMessage(msg);
+  },
   intervalMs: config.catchUpIntervalMs || undefined,
 });
 channel.on("message", async (msg: NormalizedMessage) => {
   if (!handled.claim(msg.messageId)) {
+    // 轮询已经补上了这条：事件只是晚到，不是被别处分走
+    alarm.arrivedLate(msg.messageId);
+    console.log(`事件晚到，这条已由轮询处理 message=${msg.messageId}`);
     return;
   }
   catchUp.watch(msg);
@@ -82,7 +99,14 @@ console.log(
 );
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();
-  console.log(`补漏轮询已开启，每 ${config.catchUpIntervalMs / 1000} 秒检查一次白名单群里有没有漏掉的 @`);
+  console.log(
+    `补漏轮询已开启，每 ${config.catchUpIntervalMs / 1000} 秒检查一次白名单群里有没有漏掉的 @；` +
+      `30 分钟内补上 2 条以上会在${config.alertChatId ? `群 ${config.alertChatId}` : "漏消息的群"}里报警`,
+  );
+}
+if (backup) {
+  backup.start();
+  console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
 }
 if (config.feishu.allowedChatIds.size === 0) {
   console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");
@@ -93,6 +117,7 @@ if (config.feishu.allowedChatIds.size === 0) {
 const shutdown = async () => {
   // 停掉进行中的任务，让它们把卡片更新成「已停止」再退出
   await catchUp.stop();
+  await backup?.stop();
   tasks.stopAll();
   await tasks.idle(5000);
   await channel.disconnect();
