@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -112,6 +112,19 @@ test("内容为空、太长或记满了时拒绝，并说明原因", async () =>
 
   await Promise.all(Array.from({ length: MAX_ENTRIES }, (_, i) => store.add("oc_a", "background", `第 ${i} 条`)));
   await assert.rejects(store.add("oc_a", "background", "再来一条"), /到上限了/);
+});
+
+test("写盘失败时报错，内存里的记忆和磁盘保持一致，不留临时文件", async () => {
+  const dir = await tempDir();
+  const store = new MemoryStore(dir, quiet);
+  await store.add("oc_a", "background", "第一条");
+  // 用同名目录占住目标文件的位置，让改名失败
+  await rm(path.join(dir, "oc_a.json"));
+  await mkdir(path.join(dir, "oc_a.json"));
+
+  await assert.rejects(store.add("oc_a", "background", "第二条"));
+  assert.deepEqual((await store.list("oc_a")).map((e) => e.content), ["第一条"]);
+  assert.deepEqual(await readdir(dir), ["oc_a.json"]);
 });
 
 test("群 id 里有路径字符时拒绝，不会写到目录外", async () => {

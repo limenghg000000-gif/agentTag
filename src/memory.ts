@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./history.js";
 
@@ -214,8 +214,13 @@ export class MemoryStore {
     await this.init();
     const target = this.fileOf(file.chatId);
     const tmp = `${target}.${randomUUID()}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
-    await rename(tmp, target);
+    try {
+      await writeFile(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+      await rename(tmp, target);
+    } catch (err) {
+      await rm(tmp, { force: true });
+      throw err;
+    }
   }
 
   private fileOf(chatId: string): string {
