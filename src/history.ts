@@ -64,7 +64,9 @@ export class ThreadContextLoader {
         this.warnOnce(err);
       }
     }
-    return { history, source: history.length > 0 ? "local" : "none" };
+    // 不在话题里时拿不到话题列表里的发言人名字，单独读一下这条消息。名字只是锦上添花，读不到就算了
+    const askerName = (await this.api.getMessage(msg.messageId).catch(() => undefined))?.senderName;
+    return { history, ...(askerName ? { askerName } : {}), source: history.length > 0 ? "local" : "none" };
   }
 
   /** 记下一轮问答，读不到飞书话题时用 */

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { test } from "node:test";
 import { Domain } from "@larksuiteoapi/node-sdk";
 import { DEFAULT_MODEL_BASE_URL, DEFAULT_MODEL_ID, loadConfig } from "../src/config.js";
@@ -29,4 +30,9 @@ test("群白名单按逗号分隔，忽略空格和空项", () => {
 
 test("FEISHU_DOMAIN 写错时报错", () => {
   assert.throws(() => loadConfig({ ...base, FEISHU_DOMAIN: "dingtalk" }), /FEISHU_DOMAIN/);
+});
+
+test("群记忆默认存在工作目录下的 data/memory，可以用 DATA_DIR 改", () => {
+  assert.equal(loadConfig(base).memoryDir, path.resolve("data", "memory"));
+  assert.equal(loadConfig({ ...base, DATA_DIR: "/var/lib/agenttag" }).memoryDir, "/var/lib/agenttag/memory");
 });

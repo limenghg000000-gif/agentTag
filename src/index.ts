@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
 import { createOpenAICompatibleModel } from "./llm.js";
+import { MemoryStore } from "./memory.js";
 import { TaskRegistry } from "./tasks.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
 
@@ -27,6 +28,13 @@ const channel = createLarkChannel({
 
 const tasks = new TaskRegistry();
 const tools = [createFetchUrlTool()];
+const memory = new MemoryStore(config.memoryDir);
+try {
+  await memory.init();
+} catch (err) {
+  console.error(`群记忆目录 ${config.memoryDir} 建不了或不可写，请检查 DATA_DIR 和目录权限。`, err);
+  process.exit(1);
+}
 
 channel.on("message", createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
@@ -34,6 +42,7 @@ channel.on("message", createMessageHandler({
   allowedChatIds: config.feishu.allowedChatIds,
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity)),
+  memory,
   tasks,
   send: (to, input, opts) => channel.send(to, input, opts),
   updateCard: (messageId, card) => channel.updateCard(messageId, card),
@@ -49,7 +58,7 @@ try {
 }
 console.log(
   `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
-    `工具 ${tools.map((tool) => tool.spec.name).join(", ")}`,
+    `工具 ${tools.map((tool) => tool.spec.name).join(", ")}，群记忆存放在 ${config.memoryDir}`,
 );
 if (config.feishu.allowedChatIds.size === 0) {
   console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");

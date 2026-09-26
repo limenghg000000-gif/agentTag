@@ -124,6 +124,17 @@ test("读不到飞书话题时退回本地记下的问答，并只提示一次",
   assert.match(warnings[0], /im:message\.group_msg/);
 });
 
+test("在群里直接 @ 时单独读这条消息拿到提问人名字，读不到就不带名字", async () => {
+  const { api, calls } = fakeApi([], { om_3: item("om_3", { senderName: "张三" }) });
+  const context = await new ThreadContextLoader(api, quiet).load(message());
+
+  assert.deepEqual(calls, ["get om_3"]);
+  assert.deepEqual(context, { history: [], askerName: "张三", source: "none" });
+
+  const failing: FeishuApi = { ...api, getMessage: async () => Promise.reject(new Error("no permission")) };
+  assert.deepEqual(await new ThreadContextLoader(failing, quiet).load(message()), { history: [], source: "none" });
+});
+
 test("在群里直接 @ 时没有上文；用「回复」引用消息时带上被引用的消息", async () => {
   const { api } = fakeApi([], { om_quoted: item("om_quoted", { senderName: "张三", content: "明天下午开会" }) });
   const loader = new ThreadContextLoader(api, quiet);
