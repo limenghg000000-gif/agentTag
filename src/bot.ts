@@ -1,60 +1,202 @@
-import type { NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
+import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
+import { type AgentEvent, type AgentResult, runAgent } from "./agent.js";
+import { labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { type ChatModel, LlmError } from "./llm.js";
 import { splitMarkdown } from "./markdown.js";
-
-const SYSTEM_PROMPT = `你是团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @ 你提问或派活，你的回答会发在那条消息的话题里。
-- 用提问者使用的语言回答，先给结论，需要时再展开。
-- 可以用 Markdown：粗体、列表、链接、引用和代码块。飞书消息不渲染表格，需要对比时用列表。`;
+import {
+  CardUpdater,
+  type ProgressState,
+  renderPlainProgressCard,
+  renderProgressCard,
+  STOP_ACTION,
+} from "./progress.js";
+import { buildSystemPrompt } from "./prompt.js";
+import type { TaskRegistry } from "./tasks.js";
+import type { Tool } from "./tools/tool.js";
 
 /**
  * 每条回复的字数上限。SDK 超过 3500 字会自己切分，但切出来的后续片段会发到群主界面而不是话题里，
  * 所以这里先切好，每片都回复到原消息的话题。
  */
 const CHUNK_CHARS = 3000;
+/** 连长连接之前还不知道机器人名字时用这个 */
+const FALLBACK_BOT_NAME = "AI 助手";
+/** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
+const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
+
+export interface ThreadContextSource {
+  load(msg: NormalizedMessage): Promise<ThreadContext>;
+  remember(msg: NormalizedMessage, question: string, answer: string): void;
+}
 
 export interface BotDeps {
   model: ChatModel;
+  tools: readonly Tool[];
   /** 只在这些群里响应。为空时不响应任何群。 */
   allowedChatIds: ReadonlySet<string>;
+  /** 机器人在飞书里的名字（连上长连接后才拿得到），写进提示词 */
+  botName: () => string | undefined;
+  context: ThreadContextSource;
+  tasks: TaskRegistry;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
-  logger?: Pick<Console, "info" | "error">;
+  updateCard: (messageId: string, card: object) => Promise<void>;
+  logger?: Logger;
+  now?: () => number;
+  /** 同一张进度卡片两次更新的最小间隔 */
+  cardIntervalMs?: number;
 }
 
 /**
  * 处理一条已经过 SDK 安全管线的群消息（已去重、已确认 @ 了机器人、@ 占位符已替换成名字）：
- * 问模型，把回答发到这条消息的话题里。
+ * 在话题里发一张进度卡片，带着话题上下文跑工具循环，结束后更新卡片并把回答发到话题里。
  */
-export function createMessageHandler({ model, allowedChatIds, send, logger = console }: BotDeps) {
+export function createMessageHandler(deps: BotDeps) {
+  const { allowedChatIds, tasks, send, logger = console } = deps;
+
   return async (msg: NormalizedMessage): Promise<void> => {
     if (!allowedChatIds.has(msg.chatId)) {
       // 机器人可能也在告警群等业务群里，没加进白名单的群一律不回应，只在日志里打出 chat_id 方便加白
       logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
       return;
     }
-    logger.info(`收到提问 chat=${msg.chatId} message=${msg.messageId} sender=${msg.senderId}`);
+    logger.info(`收到提问 chat=${msg.chatId} message=${msg.messageId} thread=${threadKeyOf(msg)} sender=${msg.senderId}`);
 
     const question = msg.content.trim();
-    let answer: string;
-    if (!question) {
-      answer = "在的，@ 我的时候带上问题或要做的事就行。";
-    } else {
-      try {
-        const result = await model.chat({ system: SYSTEM_PROMPT, messages: [{ role: "user", content: question }] });
-        answer = toReply(result.text, result.finish);
-      } catch (err) {
-        logger.error(`调用模型失败 message=${msg.messageId}`, err);
-        answer = `抱歉，这次没能完成：${describeError(err)}。`;
-      }
+    const reply = (markdown: string) =>
+      send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
+
+    if (STOP_COMMAND.test(question)) {
+      // 在话题里说「停止」停这个话题的任务；在群里直接说则停这个群的所有任务
+      const stopped = msg.rootId ? tasks.stopThread(threadKeyOf(msg)) : tasks.stopChat(msg.chatId);
+      logger.info(`停止指令 message=${msg.messageId} 停止了 ${stopped} 个任务`);
+      await reply(stopped > 0 ? "好的，已停止。" : "现在没有进行中的任务。");
+      return;
+    }
+    if (!question && !msg.rootId) {
+      await reply("在的，@ 我的时候带上问题或要做的事就行。");
+      return;
     }
 
-    for (const chunk of splitMarkdown(answer, CHUNK_CHARS)) {
-      await send(msg.chatId, { markdown: chunk }, { replyTo: msg.messageId, replyInThread: true });
-    }
-    logger.info(`已回复 message=${msg.messageId}`);
+    await runTask(deps, msg, question, reply);
   };
 }
 
-function toReply(text: string, finish: "stop" | "length" | "filtered"): string {
+async function runTask(
+  deps: BotDeps,
+  msg: NormalizedMessage,
+  question: string,
+  reply: (markdown: string) => Promise<SendResult>,
+): Promise<void> {
+  const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
+  const task = tasks.create(msg.chatId, threadKeyOf(msg));
+  const state: ProgressState = { phase: task.queued ? "queued" : "thinking", steps: [], startedAt: now() };
+  const render = () => renderProgressCard(state, task.id, now());
+
+  // 进度卡片发不出去（比如卡片格式被拒）不影响回答，只是看不到进度、不能点停止
+  let card: CardUpdater | undefined;
+  try {
+    const { messageId } = await send(msg.chatId, { card: render() }, { replyTo: msg.messageId, replyInThread: true });
+    card = new CardUpdater((next) => updateCard(messageId, next), logger, cardIntervalMs);
+  } catch (err) {
+    logger.error(`发送进度卡片失败 message=${msg.messageId}`, err);
+  }
+
+  let answer: string | undefined;
+  let result: AgentResult | undefined;
+  let source = "none";
+  try {
+    if (!(await task.waitTurn())) {
+      throw new Error("stopped while queued");
+    }
+    if (state.phase === "queued") {
+      state.phase = "thinking";
+      state.startedAt = now();
+      card?.update(render());
+    }
+
+    const context = await deps.context.load(msg);
+    source = context.source;
+    const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
+    result = await runAgent({
+      model,
+      system: buildSystemPrompt({
+        botName: deps.botName() || FALLBACK_BOT_NAME,
+        now: new Date(now()),
+        toolNames: tools.map((tool) => tool.spec.name),
+      }),
+      messages: [...context.history, { role: "user", content: prompt }],
+      tools,
+      signal: task.signal,
+      onEvent: (event) => {
+        applyEvent(state, event);
+        card?.update(render());
+      },
+    });
+    answer = toReply(result.text, result.finish);
+    state.phase = "done";
+    deps.context.remember(msg, prompt, answer);
+  } catch (err) {
+    if (task.signal.aborted) {
+      state.phase = "stopped";
+    } else {
+      logger.error(`处理失败 message=${msg.messageId}`, err);
+      state.phase = "failed";
+      answer = `抱歉，这次没能完成：${describeError(err)}。`;
+    }
+  }
+
+  state.endedAt = now();
+  for (const step of state.steps) {
+    if (step.status === "running") {
+      step.status = "error";
+    }
+  }
+  try {
+    await card?.finish(render(), renderPlainProgressCard(state, now()));
+    if (answer !== undefined) {
+      for (const chunk of splitMarkdown(answer, CHUNK_CHARS)) {
+        await reply(chunk);
+      }
+    }
+  } finally {
+    tasks.finish(task);
+  }
+  logger.info(
+    `${state.phase === "stopped" ? "已停止" : "已回复"} message=${msg.messageId} 上下文=${source} ` +
+      `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
+  );
+}
+
+function applyEvent(state: ProgressState, event: AgentEvent): void {
+  if (event.type === "tool_start") {
+    state.steps.push({ id: event.id, label: event.label, status: "running" });
+    return;
+  }
+  const step = state.steps.find((s) => s.id === event.id && s.status === "running");
+  if (step) {
+    step.status = event.ok ? "ok" : "error";
+  }
+}
+
+export interface CardActionDeps {
+  tasks: TaskRegistry;
+  allowedChatIds: ReadonlySet<string>;
+  logger?: Logger;
+}
+
+/** 处理进度卡片上的按钮。停止后卡片由任务自己更新成「已停止」。 */
+export function createCardActionHandler({ tasks, allowedChatIds, logger = console }: CardActionDeps) {
+  return async (evt: CardActionEvent): Promise<void> => {
+    const value = evt.action.value as { action?: unknown; task?: unknown } | undefined;
+    if (value?.action !== STOP_ACTION || typeof value.task !== "string" || !allowedChatIds.has(evt.chatId)) {
+      return;
+    }
+    const stopped = tasks.stop(value.task, evt.chatId);
+    logger.info(`停止按钮 task=${value.task} operator=${evt.operator.openId} ${stopped ? "已停止" : "任务已经结束"}`);
+  };
+}
+
+function toReply(text: string, finish: AgentResult["finish"]): string {
   if (finish === "filtered") {
     return "抱歉，这个问题被模型服务的内容审核拦下了，换个说法试试。";
   }

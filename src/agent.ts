@@ -1,0 +1,125 @@
+import type { ChatMessage, ChatModel, ChatResult, ToolCall } from "./llm.js";
+import type { Tool } from "./tools/tool.js";
+
+/** 单次任务最多几轮工具调用。到了上限就让模型用已有信息直接作答。 */
+export const MAX_TOOL_ROUNDS = 8;
+/** 单个工具结果交给模型前的字数上限，防止一个大网页挤掉上下文 */
+export const MAX_TOOL_OUTPUT_CHARS = 16000;
+
+const LAST_ROUND_NOTE = "工具调用次数已经用完了。请根据上面已经拿到的信息直接给出最终回答，不要再调用工具；没查到的部分如实说明。";
+const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限（${MAX_TOOL_ROUNDS} 轮工具调用），我先停在这里。可以把任务拆小一点再交给我。`;
+
+export type AgentEvent =
+  | { type: "tool_start"; id: string; label: string }
+  | { type: "tool_end"; id: string; ok: boolean };
+
+export interface AgentRequest {
+  model: ChatModel;
+  system: string;
+  messages: ChatMessage[];
+  tools: readonly Tool[];
+  signal: AbortSignal;
+  onEvent?: (event: AgentEvent) => void;
+  maxToolRounds?: number;
+}
+
+export interface AgentResult {
+  text: string;
+  finish: Exclude<ChatResult["finish"], "tool_calls">;
+  /** 一共调用了几次工具 */
+  toolCalls: number;
+}
+
+/**
+ * 与具体模型无关的工具循环：问模型 → 模型要调工具就执行并把结果交回 → 直到模型给出最终回答。
+ * 同一轮里的多个工具调用并行执行。signal 中止后抛出中止错误，由调用方按「已停止」处理。
+ */
+export async function runAgent({
+  model,
+  system,
+  messages,
+  tools,
+  signal,
+  onEvent = () => {},
+  maxToolRounds = MAX_TOOL_ROUNDS,
+}: AgentRequest): Promise<AgentResult> {
+  const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
+  const specs = tools.map((tool) => tool.spec);
+  const conversation = [...messages];
+  let toolCalls = 0;
+
+  for (let round = 0; ; round++) {
+    signal.throwIfAborted();
+    const lastRound = round >= maxToolRounds;
+    if (lastRound) {
+      conversation.push({ role: "user", content: LAST_ROUND_NOTE });
+    }
+    const result = await model.chat({ system, messages: conversation, tools: specs, signal });
+    if (result.finish !== "tool_calls" || !result.toolCalls?.length) {
+      return { text: result.text, finish: result.finish === "tool_calls" ? "stop" : result.finish, toolCalls };
+    }
+    if (lastRound) {
+      return { text: result.text || OUT_OF_ROUNDS_ANSWER, finish: "stop", toolCalls };
+    }
+
+    conversation.push({ role: "assistant", content: result.text, toolCalls: result.toolCalls });
+    const outputs = await Promise.all(
+      result.toolCalls.map((call) => runTool(call, byName.get(call.name), signal, onEvent)),
+    );
+    toolCalls += result.toolCalls.length;
+    signal.throwIfAborted();
+    result.toolCalls.forEach((call, i) => {
+      conversation.push({ role: "tool", toolCallId: call.id, content: outputs[i] });
+    });
+  }
+}
+
+async function runTool(
+  call: ToolCall,
+  tool: Tool | undefined,
+  signal: AbortSignal,
+  onEvent: (event: AgentEvent) => void,
+): Promise<string> {
+  if (!tool) {
+    return `没有名为 ${call.name} 的工具。`;
+  }
+  let args: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(call.arguments || "{}");
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("参数必须是 JSON 对象");
+    }
+    args = parsed as Record<string, unknown>;
+  } catch (err) {
+    return `工具参数不是合法的 JSON 对象：${errorMessage(err)}`;
+  }
+
+  onEvent({ type: "tool_start", id: call.id, label: safeDescribe(tool, args) });
+  try {
+    const output = await tool.run(args, { signal });
+    onEvent({ type: "tool_end", id: call.id, ok: true });
+    return truncate(output, MAX_TOOL_OUTPUT_CHARS);
+  } catch (err) {
+    onEvent({ type: "tool_end", id: call.id, ok: false });
+    if (signal.aborted) {
+      throw err;
+    }
+    return `工具执行失败：${errorMessage(err)}`;
+  }
+}
+
+function safeDescribe(tool: Tool, args: Record<string, unknown>): string {
+  try {
+    return tool.describe(args);
+  } catch {
+    return tool.spec.name;
+  }
+}
+
+function truncate(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit)}\n\n（内容过长，后面 ${text.length - limit} 字已省略）`;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
