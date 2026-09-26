@@ -31,9 +31,19 @@ export interface ThreadContextSource {
   remember(msg: NormalizedMessage, question: string, answer: string): void;
 }
 
+/** 按任务创建工具时用得上的信息 */
+export interface TaskToolContext {
+  chatId: string;
+  /** 发起人的 open_id */
+  senderId: string;
+  messageId: string;
+}
+
 export interface BotDeps {
   model: ChatModel;
   tools: readonly Tool[];
+  /** 每个任务单独创建的工具，比如新建文档时要共享给当前群和发起人 */
+  taskTools?: (task: TaskToolContext) => readonly Tool[];
   /** 只在这些群里响应。为空时不响应任何群。 */
   allowedChatIds: ReadonlySet<string>;
   /** 机器人在飞书里的名字（连上长连接后才拿得到），写进提示词 */
@@ -123,7 +133,11 @@ async function runTask(
     source = context.source;
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
-    const taskTools = memory ? [...tools, ...memory.tools] : tools;
+    const taskTools = [
+      ...tools,
+      ...(deps.taskTools?.({ chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }) ?? []),
+      ...(memory?.tools ?? []),
+    ];
     const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
     result = await runAgent({
       model,
