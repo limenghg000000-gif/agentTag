@@ -27,7 +27,7 @@ function item(messageId: string, extra: Partial<ThreadMessage> = {}): ThreadMess
 
 function fakeApi(thread: ThreadMessage[] | Error, single: Record<string, ThreadMessage> = {}) {
   const calls: string[] = [];
-  const api: FeishuApi = {
+  const api: Pick<FeishuApi, "listThreadMessages" | "getMessage"> = {
     async listThreadMessages(threadId) {
       calls.push(`list ${threadId}`);
       if (thread instanceof Error) {
@@ -131,7 +131,7 @@ test("在群里直接 @ 时单独读这条消息拿到提问人名字，读不�
   assert.deepEqual(calls, ["get om_3"]);
   assert.deepEqual(context, { history: [], askerName: "张三", source: "none" });
 
-  const failing: FeishuApi = { ...api, getMessage: async () => Promise.reject(new Error("no permission")) };
+  const failing: typeof api = { ...api, getMessage: async () => Promise.reject(new Error("no permission")) };
   assert.deepEqual(await new ThreadContextLoader(failing, quiet).load(message()), { history: [], source: "none" });
 });
 

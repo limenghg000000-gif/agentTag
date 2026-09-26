@@ -103,3 +103,53 @@ test("读单条消息", async () => {
   const message = await createFeishuApi(client, "cli_app", () => bot).getMessage("om_9");
   assert.equal(message?.content, "明天开会");
 });
+
+test("读群或话题里最近的消息：群按时间过滤，话题不传时间；转成和事件一样的格式，认出 @ 机器人和机器人自己", async () => {
+  const items = [
+    {
+      message_id: "om_2",
+      chat_id: "oc_1",
+      root_id: "om_1",
+      thread_id: "omt_1",
+      msg_type: "text",
+      create_time: "2000",
+      sender: { id: "ou_zhang", id_type: "open_id", sender_type: "user" },
+      body: { content: JSON.stringify({ text: "@_user_1 ping" }) },
+      mentions: [{ key: "@_user_1", id: "ou_bot", id_type: "open_id", name: "飞书 CLI" }],
+    },
+    {
+      message_id: "om_1",
+      chat_id: "oc_1",
+      msg_type: "text",
+      create_time: "1000",
+      sender: { id: "cli_app", id_type: "app_id", sender_type: "app" },
+      body: { content: JSON.stringify({ text: "回答" }) },
+    },
+    { message_id: "om_0", deleted: true, body: { content: "{}" } },
+  ];
+  const { client, listCalls } = fakeClient([
+    { code: 0, data: { items } },
+    { code: 0, data: { items: [] } },
+  ]);
+  const api = createFeishuApi(client, "cli_app", () => bot);
+
+  const recent = await api.listRecentMessages("chat", "oc_1", 30, 1_700_000_000_500);
+  await api.listRecentMessages("thread", "omt_1", 30, 1_700_000_000_500);
+
+  assert.deepEqual(listCalls, [
+    { container_id_type: "chat", container_id: "oc_1", sort_type: "ByCreateTimeDesc", page_size: 30, start_time: "1700000000" },
+    { container_id_type: "thread", container_id: "omt_1", sort_type: "ByCreateTimeDesc", page_size: 30 },
+  ]);
+  assert.equal(recent.length, 2);
+  const [ping, answer] = recent;
+  assert.equal(ping.fromBot, false);
+  assert.equal(ping.message.mentionedBot, true);
+  assert.equal(ping.message.content, "ping");
+  assert.equal(ping.message.senderId, "ou_zhang");
+  assert.equal(ping.message.chatId, "oc_1");
+  assert.equal(ping.message.rootId, "om_1");
+  assert.equal(ping.message.threadId, "omt_1");
+  assert.equal(ping.message.createTime, 2000);
+  assert.equal(answer.fromBot, true);
+  assert.equal(answer.message.mentionedBot, false);
+});

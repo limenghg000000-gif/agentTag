@@ -13,6 +13,8 @@ export interface Config {
   llm: LlmConfig;
   /** 群记忆的存放目录（每个群一个 JSON 文件） */
   memoryDir: string;
+  /** 补漏轮询的间隔，0 表示不轮询 */
+  catchUpIntervalMs: number;
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
@@ -20,12 +22,19 @@ export const DEFAULT_MODEL_BASE_URL = "https://dashscope.aliyuncs.com/compatible
 export const DEFAULT_MODEL_ID = "qwen3.8-max";
 /** 数据目录，相对路径按启动时的工作目录算 */
 export const DEFAULT_DATA_DIR = "data";
+/** 补漏轮询默认每 10 秒一次 */
+export const DEFAULT_CATCHUP_INTERVAL_SECONDS = 10;
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const missing = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "MODEL_API_KEY"].filter((key) => !env[key]);
   if (missing.length > 0) {
     throw new Error(`缺少环境变量：${missing.join(", ")}。请参考 .env.example 配置 .env`);
+  }
+
+  const catchUpSeconds = Number(env.CATCHUP_INTERVAL_SECONDS || DEFAULT_CATCHUP_INTERVAL_SECONDS);
+  if (!Number.isFinite(catchUpSeconds) || catchUpSeconds < 0 || (catchUpSeconds > 0 && catchUpSeconds < 2)) {
+    throw new Error(`CATCHUP_INTERVAL_SECONDS 要么是 0（不轮询），要么不小于 2，当前为 ${env.CATCHUP_INTERVAL_SECONDS}`);
   }
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
@@ -48,5 +57,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       model: env.MODEL_ID || DEFAULT_MODEL_ID,
     },
     memoryDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "memory"),
+    catchUpIntervalMs: catchUpSeconds * 1000,
   };
 }
