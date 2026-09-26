@@ -37,7 +37,7 @@ export class ThreadContextLoader {
   private warned = false;
 
   constructor(
-    private readonly api: FeishuApi,
+    private readonly api: Pick<FeishuApi, "listThreadMessages" | "getMessage">,
     private readonly logger: Logger = console,
     private readonly maxLocalThreads = 500,
   ) {}

@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
+import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { createCardActionHandler, createMessageHandler } from "./bot.js";
+import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { loadConfig } from "./config.js";
 import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
@@ -36,17 +38,35 @@ try {
   process.exit(1);
 }
 
-channel.on("message", createMessageHandler({
+const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
+const handleMessage = createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
   tools,
   allowedChatIds: config.feishu.allowedChatIds,
   botName: () => channel.botIdentity?.name,
-  context: new ThreadContextLoader(createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity)),
+  context: new ThreadContextLoader(feishuApi),
   memory,
   tasks,
   send: (to, input, opts) => channel.send(to, input, opts),
   updateCard: (messageId, card) => channel.updateCard(messageId, card),
-}));
+});
+
+// 事件和补漏轮询可能拿到同一条消息，谁先认领谁处理
+const handled = new HandledMessages();
+const catchUp = new CatchUpPoller({
+  api: feishuApi,
+  chatIds: config.feishu.allowedChatIds,
+  handled,
+  handle: handleMessage,
+  intervalMs: config.catchUpIntervalMs || undefined,
+});
+channel.on("message", async (msg: NormalizedMessage) => {
+  if (!handled.claim(msg.messageId)) {
+    return;
+  }
+  catchUp.watch(msg);
+  await handleMessage(msg);
+});
 channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds }));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
 
@@ -60,6 +80,10 @@ console.log(
   `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
     `工具 ${tools.map((tool) => tool.spec.name).join(", ")}，群记忆存放在 ${config.memoryDir}`,
 );
+if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
+  catchUp.start();
+  console.log(`补漏轮询已开启，每 ${config.catchUpIntervalMs / 1000} 秒检查一次白名单群里有没有漏掉的 @`);
+}
 if (config.feishu.allowedChatIds.size === 0) {
   console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");
 } else {
@@ -68,6 +92,7 @@ if (config.feishu.allowedChatIds.size === 0) {
 
 const shutdown = async () => {
   // 停掉进行中的任务，让它们把卡片更新成「已停止」再退出
+  await catchUp.stop();
   tasks.stopAll();
   await tasks.idle(5000);
   await channel.disconnect();
