@@ -22,6 +22,7 @@ export interface CodeToolsOptions {
 /** 代码仓库工具。每个任务单独创建一套，工作目录按话题复用。 */
 export function createCodeTools({ workspaces, threadKey, askerName, botName }: CodeToolsOptions): Tool[] {
   const repos = workspaces.repos;
+  const { requestName, refOf } = workspaces.host;
   const opened = new Map<string, Promise<Workspace>>();
   // 一个任务里每个仓库只打开（克隆或更新）一次
   const workspace = (args: Record<string, unknown>, { signal }: ToolContext) => {
@@ -42,7 +43,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
   const repoParam = {
     type: "string",
     ...(repos.length > 1 ? { enum: [...repos] } : {}),
-    description: `仓库（owner/repo）${repos.length === 1 ? `，只有 ${repos[0]} 一个，可以不填` : ""}`,
+    description: `仓库的项目路径${repos.length === 1 ? `，只有 ${repos[0]} 一个，可以不填` : ""}`,
   };
   const required = (...keys: string[]) => (repos.length === 1 ? keys : ["repo", ...keys]);
 
@@ -123,7 +124,8 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_edit_file",
       description:
-        "改代码仓库里的文件（改动先留在机器人的工作目录里，用 code_open_pr 才会提交）。只在群成员明确要你改代码时使用，改之前先读相关代码。" +
+        `改代码仓库里的文件（改动先留在机器人的工作目录里，用 code_open_pr 开${requestName}时才会提交）。` +
+        "只在群成员明确要你改代码时使用，改之前先读相关代码。" +
         "把文件里的 old_text 换成 new_text：old_text 要和文件内容一字不差（含缩进），并且在文件里只出现一次，多带几行上下文。" +
         "新建文件或整个重写时不填 old_text，new_text 写完整内容。",
       parameters: {
@@ -164,19 +166,19 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_open_pr",
       description:
-        "把改动提交到机器人新建的分支并开 PR（合并请求）到默认分支，返回 PR 链接。这个话题里已经开过 PR 时，新改动推到同一个 PR。" +
-        "只在群成员要你提交或开 PR 时使用；机器人不会合并 PR，也不会推到默认分支。",
+        `把改动提交到机器人新建的分支，开${requestName}到默认分支，返回链接。这个话题里已经开过${requestName}时，新改动推到同一个。` +
+        `只在群成员要你提交或开${requestName}时使用；机器人不会合并，也不会推到默认分支。`,
       parameters: {
         type: "object",
         properties: {
           repo: repoParam,
-          title: { type: "string", description: "PR 标题，也是提交说明的第一行，一句话说清改了什么" },
-          body: { type: "string", description: "PR 描述：为什么改、改了什么、怎么验证（机器人没有运行代码，要写明）" },
+          title: { type: "string", description: `${requestName}标题，也是提交说明的第一行，一句话说清改了什么` },
+          body: { type: "string", description: `${requestName}描述：为什么改、改了什么、怎么验证（机器人没有运行代码，要写明）` },
         },
         required: required("title", "body"),
       },
     },
-    describe: () => "提交代码并开 PR",
+    describe: () => `提交代码并开${requestName}`,
     async run(args, ctx) {
       const title = requireString(args, "title").split("\n")[0].trim();
       const body = [
@@ -188,7 +190,9 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
       const ws = await workspace(args, ctx);
       const pr = await ws.openPullRequest(title, body, ctx.signal);
       return [
-        pr.created ? `已开 PR #${pr.number}：${pr.url}` : `已把新改动推到这个话题之前开的 PR #${pr.number}：${pr.url}`,
+        pr.created
+          ? `已开${requestName} ${refOf(pr.number)}：${pr.url}`
+          : `已把新改动推到这个话题之前开的${requestName} ${refOf(pr.number)}：${pr.url}`,
         "",
         "改动统计：",
         pr.stat,

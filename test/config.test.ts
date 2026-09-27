@@ -77,3 +77,25 @@ test("联网搜索：百炼的兼容接口换成同域名的原生接口，可�
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).webSearch, undefined);
   assert.throws(() => loadConfig({ ...base, WEB_SEARCH: "yes" }), /WEB_SEARCH 只能是 on 或 off/);
 });
+
+test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层），否则 GITHUB_TOKEN 接 GitHub，缺令牌时报错", () => {
+  assert.equal(loadConfig(base).code, undefined);
+  const gitlab = loadConfig({
+    ...base,
+    CODE_REPOS: "team/backend/api.git, team/web",
+    GITLAB_URL: "https://git.corp.example.com",
+    GITLAB_TOKEN: "glpat-x",
+    DATA_DIR: "/srv/agenttag",
+  }).code;
+  assert.deepEqual(gitlab, {
+    repos: ["team/backend/api", "team/web"],
+    host: { kind: "gitlab", url: "https://git.corp.example.com", token: "glpat-x" },
+    workspaceDir: path.resolve("/srv/agenttag", "workspaces"),
+  });
+  assert.deepEqual(loadConfig({ ...base, CODE_REPOS: "acme/app", GITHUB_TOKEN: "ghp" }).code?.host, { kind: "github", token: "ghp" });
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app" }), /GITLAB_URL 和 GITLAB_TOKEN/);
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app", GITLAB_URL: "https://git.corp" }), /GITLAB_TOKEN/);
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "app", GITLAB_URL: "https://git.corp", GITLAB_TOKEN: "t" }), /项目路径/);
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b/c", GITHUB_TOKEN: "t" }), /owner\/repo/);
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b", GITLAB_URL: "git.corp", GITLAB_TOKEN: "t" }), /GITLAB_URL 要写成/);
+});

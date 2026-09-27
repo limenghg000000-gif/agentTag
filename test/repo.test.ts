@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { type CodeHost, CodeWorkspaces, RepoError, runGit } from "../src/repo.js";
+import { type CodeHost, CodeWorkspaces, createGitLabHost, RepoError, runGit } from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
@@ -40,6 +40,8 @@ function fakeHost(fail = 0) {
   let failures = fail;
   const host: CodeHost = {
     name: "Fake",
+    requestName: "合并请求",
+    refOf: (number) => `!${number}`,
     cloneUrl: () => `file://${remote}`,
     gitEnv: () => ({}),
     async openPullRequest(repo, pr) {
@@ -133,7 +135,7 @@ test("开 PR：提交到机器人建的分支并推上去；同一话题再改�
   assert.deepEqual([second.created, second.number], [false, 1]);
   assert.equal(prs.length, 1);
   assert.equal((await runGit(["log", "-1", "--format=%s", prs[0].head], { cwd: remote })).stdout.trim(), "改 a");
-  await assert.rejects(again.openPullRequest("x", ""), /没有新的改动要推，PR 还是 https:\/\/example.com\/pr\/1/);
+  await assert.rejects(again.openPullRequest("x", ""), /没有新的改动要推，合并请求还是 https:\/\/example.com\/pr\/1/);
 });
 
 test("推上去了但开 PR 失败时，再调一次直接补开，不用新改动", async () => {
@@ -171,6 +173,42 @@ test("只能操作接入的仓库；几天没用的工作目录会被清掉", as
   assert.deepEqual(await readdir(root), ["om_7"]);
 });
 
+test("GitLab：git 用 Basic 认证头（放在环境变量里），开合并请求调 v4 接口，出错时说清原因", async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const replies = [
+    new Response(JSON.stringify({ iid: 7, web_url: "https://git.corp/g/sub/p/-/merge_requests/7" }), { status: 201 }),
+    new Response(JSON.stringify({ message: "403 Forbidden" }), { status: 403 }),
+    new Response(JSON.stringify({ message: ["Another open merge request already exists for this source branch: !7"] }), { status: 409 }),
+  ];
+  const fakeFetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return replies.shift()!;
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://git.corp/", "glpat-x", fakeFetch);
+
+  assert.equal(host.cloneUrl("g/sub/p"), "https://git.corp/g/sub/p.git");
+  assert.deepEqual(host.gitEnv(), {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.https://git.corp/.extraheader",
+    GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from("oauth2:glpat-x").toString("base64")}`,
+  });
+  assert.equal(host.refOf(7), "!7");
+
+  const pr = { head: "agenttag/20260927-abcdef", base: "main", title: "修 bug", body: "说明" };
+  assert.deepEqual(await host.openPullRequest("g/sub/p", pr), { url: "https://git.corp/g/sub/p/-/merge_requests/7", number: 7 });
+  assert.equal(calls[0].url, "https://git.corp/api/v4/projects/g%2Fsub%2Fp/merge_requests");
+  assert.equal((calls[0].init.headers as Record<string, string>)["private-token"], "glpat-x");
+  assert.deepEqual(JSON.parse(String(calls[0].init.body)), {
+    source_branch: "agenttag/20260927-abcdef",
+    target_branch: "main",
+    title: "修 bug",
+    description: "说明",
+    remove_source_branch: true,
+  });
+  await assert.rejects(host.openPullRequest("g/sub/p", pr), /HTTP 403.*api 权限.*Developer/);
+  await assert.rejects(host.openPullRequest("g/sub/p", pr), /HTTP 409.*已经有打开的合并请求.*Another open merge request/);
+});
+
 test("代码工具：只有一个仓库时可以不填 repo，PR 描述带上发起人，一个任务里只打开一次", async () => {
   const { host, prs } = fakeHost();
   const all = workspaces(host);
@@ -187,7 +225,7 @@ test("代码工具：只有一个仓库时可以不填 repo，PR 描述带上发
   assert.match(await tools.code_read_file.run({ path: "src/a.ts" }, { signal }), /1\| export const a = 1;/);
   await tools.code_edit_file.run({ path: "src/a.ts", old_text: "= 1", new_text: "= 3" }, { signal });
   const result = await tools.code_open_pr.run({ title: "a 改成 3\n多余的行", body: "原因" }, { signal });
-  assert.match(result, /^已开 PR #1：https:\/\/example.com\/pr\/1\n\n改动统计：\nsrc\/a.ts/);
+  assert.match(result, /^已开合并请求 !1：https:\/\/example.com\/pr\/1\n\n改动统计：\nsrc\/a.ts/);
   assert.equal(prs[0].title, "a 改成 3");
   assert.equal(prs[0].body, "原因\n\n---\n由 张三 在飞书群里让「飞书 CLI」提交。");
   assert.equal(opens, 1);

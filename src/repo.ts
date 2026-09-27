@@ -17,14 +17,71 @@ const GIT_TIMEOUT_MS = 120_000;
 export const WORKSPACE_KEEP_MS = 3 * 24 * 60 * 60_000;
 const STATE_FILE = ".agenttag.json";
 
-/** 代码平台：怎么拉代码、怎么认证、怎么开合并请求。换平台（GitLab、云效）只需另写一个实现 */
+/** 代码平台：怎么拉代码、怎么认证、怎么开合并请求。换平台（如云效）只需另写一个实现 */
 export interface CodeHost {
-  /** 平台名，写进提示和报错，如 GitHub */
+  /** 平台名，写进提示和报错，如 GitLab */
   readonly name: string;
+  /** 合并请求在这个平台上的叫法：GitLab 叫合并请求（MR），GitHub 叫 PR */
+  readonly requestName: string;
+  /** 合并请求编号的写法：GitLab 是 !12，GitHub 是 #12 */
+  refOf(number: number): string;
   cloneUrl(repo: string): string;
   /** 给 git 进程的环境变量（认证），不能出现在命令行参数里 */
   gitEnv(): Record<string, string>;
   openPullRequest(repo: string, pr: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
+}
+
+/**
+ * 自建 GitLab：用一个访问令牌（项目或群组访问令牌、个人访问令牌都行，要 api 权限，角色至少 Developer）
+ * 拉代码、推分支、开合并请求。repo 是项目路径，如 group/sub/project。
+ */
+export function createGitLabHost(baseUrl: string, token: string, fetchImpl: typeof fetch = fetch): CodeHost {
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  // git 走 HTTP 时用户名随便填，密码是令牌
+  const basic = Buffer.from(`oauth2:${token}`).toString("base64");
+  return {
+    name: "GitLab",
+    requestName: "合并请求",
+    refOf: (number) => `!${number}`,
+    cloneUrl: (repo) => `${base}/${repo}.git`,
+    gitEnv: () => ({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: `http.${base}/.extraheader`,
+      GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
+    }),
+    async openPullRequest(repo, pr) {
+      const res = await fetchImpl(`${base}/api/v4/projects/${encodeURIComponent(repo)}/merge_requests`, {
+        method: "POST",
+        headers: { "private-token": token, "content-type": "application/json" },
+        body: JSON.stringify({
+          source_branch: pr.head,
+          target_branch: pr.base,
+          title: pr.title,
+          description: pr.body,
+          // 合并后删掉机器人建的分支
+          remove_source_branch: true,
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const body = (await res.json().catch(() => ({}))) as { iid?: number; web_url?: string; message?: unknown; error?: unknown };
+      if (!res.ok || !body.web_url || !body.iid) {
+        const raw = body.message ?? body.error;
+        const detail = raw === undefined ? "" : typeof raw === "string" ? raw : JSON.stringify(raw);
+        const hint =
+          res.status === 401
+            ? "令牌无效或过期了"
+            : res.status === 403
+              ? "令牌没有权限，要 api 权限，对应的账号在项目里至少是 Developer"
+              : res.status === 404
+                ? "找不到这个项目，或者令牌访问不了它"
+                : res.status === 409
+                  ? "这个分支已经有打开的合并请求了"
+                  : "";
+        throw new RepoError(`GitLab 开合并请求失败（HTTP ${res.status}）${hint ? `：${hint}` : ""}。${detail}`.trim());
+      }
+      return { url: body.web_url, number: body.iid };
+    },
+  };
 }
 
 /** GitHub：用一个 token（fine-grained，给指定仓库 Contents 和 Pull requests 读写权限）拉代码、推分支、开 PR */
@@ -32,6 +89,8 @@ export function createGitHubHost(token: string, fetchImpl: typeof fetch = fetch)
   const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
   return {
     name: "GitHub",
+    requestName: "PR",
+    refOf: (number) => `#${number}`,
     cloneUrl: (repo) => `https://github.com/${repo}.git`,
     gitEnv: () => ({
       GIT_CONFIG_COUNT: "1",
@@ -131,7 +190,7 @@ export interface CodeWorkspacesOptions {
   /** 工作目录的根，每个话题一个子目录 */
   root: string;
   host: CodeHost;
-  /** 允许操作的仓库（owner/repo） */
+  /** 允许操作的仓库（GitLab 的项目路径 group/project，或 GitHub 的 owner/repo） */
   repos: readonly string[];
   logger?: Logger;
   now?: () => Date;
@@ -376,7 +435,9 @@ export class Workspace {
     const base = this.state.pushedSha ?? `origin/${this.defaultBranch}`;
     const stat = (await this.git(["diff", "--cached", "--stat", base])).trim();
     if (!stat) {
-      return this.pullRequest ? `和已经推到 PR 的内容相比没有新的改动（${this.pullRequest.url}）。` : "还没有任何改动。";
+      return this.pullRequest
+        ? `和已经推到${this.host.requestName}的内容相比没有新的改动（${this.pullRequest.url}）。`
+        : "还没有任何改动。";
     }
     const full = await this.git(["diff", "--cached", base]);
     const cut = full.length > MAX_DIFF_CHARS;
@@ -402,7 +463,11 @@ export class Workspace {
     const base = this.state.pushedSha ?? (await this.git(["rev-parse", `origin/${this.defaultBranch}`], signal)).trim();
     const stat = (await this.git(["diff", "--stat", base, "HEAD"], signal)).trim();
     if (!branch || (head === base && this.pullRequest)) {
-      throw new RepoError(this.pullRequest ? `没有新的改动要推，PR 还是 ${this.pullRequest.url}` : "还没有任何改动，先用 code_edit_file 改代码");
+      throw new RepoError(
+        this.pullRequest
+          ? `没有新的改动要推，${this.host.requestName}还是 ${this.pullRequest.url}`
+          : "还没有任何改动，先用 code_edit_file 改代码",
+      );
     }
     if (head !== this.state.pushedSha) {
       await this.git(["push", "origin", `HEAD:refs/heads/${branch}`], signal);

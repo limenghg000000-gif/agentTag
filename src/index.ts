@@ -11,7 +11,7 @@ import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
 import { createOpenAICompatibleModel } from "./llm.js";
 import { MemoryStore } from "./memory.js";
-import { CodeWorkspaces, createGitHubHost, runGit } from "./repo.js";
+import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { TaskRegistry } from "./tasks.js";
 import { CODE_TOOL_NAMES, createCodeTools } from "./tools/code.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
@@ -128,7 +128,7 @@ if (config.webSearch) {
   console.log("联网搜索没开：WEB_SEARCH=off，或者 MODEL_BASE_URL 不是百炼的 OpenAI 兼容接口（web_search 只支持百炼）");
 }
 if (workspaces) {
-  console.log(`代码仓库已接入：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
+  console.log(`代码仓库已接入（${workspaces.host.name}）：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
 }
 if (backup) {
   backup.start();
@@ -160,7 +160,8 @@ async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promis
     console.error("配了 CODE_REPOS，但服务器上跑不了 git，代码仓库工具先不开", err);
     return undefined;
   }
-  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host: createGitHubHost(code.githubToken), repos: code.repos });
+  const host = code.host.kind === "gitlab" ? createGitLabHost(code.host.url, code.host.token) : createGitHubHost(code.host.token);
+  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos });
   // 几天没用的话题工作目录，启动时和之后每天清一次
   const sweep = () => workspaces.sweep().catch((err) => console.error("清理代码工作目录失败", err));
   void sweep();

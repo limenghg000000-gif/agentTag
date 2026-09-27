@@ -25,9 +25,9 @@ export interface Config {
   webSearch?: { url: string; model: string };
   /** 代码仓库：没配 CODE_REPOS 时为空 */
   code?: {
-    /** 允许操作的 GitHub 仓库（owner/repo） */
+    /** 允许操作的仓库：GitLab 的项目路径（group/project），或 GitHub 的 owner/repo */
     repos: string[];
-    githubToken: string;
+    host: { kind: "gitlab"; url: string; token: string } | { kind: "github"; token: string };
     /** 拉代码的工作目录（每个话题一个子目录） */
     workspaceDir: string;
   };
@@ -68,14 +68,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const model = env.MODEL_ID || DEFAULT_MODEL_ID;
   const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
 
-  const repos = (env.CODE_REPOS ?? "").split(",").map((r) => r.trim()).filter(Boolean);
-  const badRepo = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
-  if (badRepo) {
-    throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${badRepo}`);
-  }
-  if (repos.length > 0 && !env.GITHUB_TOKEN) {
-    throw new Error("配了 CODE_REPOS 就要配 GITHUB_TOKEN（给这些仓库 Contents 和 Pull requests 读写权限的 token）");
-  }
+  const code = loadCodeConfig(env);
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
@@ -98,11 +91,38 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
     memoryBackupDays: backupDays,
     webSearch: searchUrl ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || model } : undefined,
-    code:
-      repos.length > 0
-        ? { repos, githubToken: env.GITHUB_TOKEN!, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") }
-        : undefined,
+    code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
   };
+}
+
+/** 代码仓库：配了 GITLAB_URL 就接 GitLab，否则配了 GITHUB_TOKEN 接 GitHub */
+function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]>, "workspaceDir"> | undefined {
+  const repos = (env.CODE_REPOS ?? "").split(",").map((r) => r.trim().replace(/\.git$/, "")).filter(Boolean);
+  if (repos.length === 0) {
+    return undefined;
+  }
+  const gitlabUrl = env.GITLAB_URL?.trim();
+  if (gitlabUrl) {
+    if (!/^https?:\/\/[^/\s]+/.test(gitlabUrl)) {
+      throw new Error(`GITLAB_URL 要写成 https://gitlab.example.com 这样的地址，当前为 ${gitlabUrl}`);
+    }
+    if (!env.GITLAB_TOKEN) {
+      throw new Error("配了 GITLAB_URL 就要配 GITLAB_TOKEN（要 api 权限的访问令牌）");
+    }
+    const bad = repos.find((r) => !/^[\w.-]+(\/[\w.-]+)+$/.test(r));
+    if (bad) {
+      throw new Error(`CODE_REPOS 要写成 GitLab 的项目路径（如 group/project），多个用逗号分隔，这一项不对：${bad}`);
+    }
+    return { repos, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
+  }
+  if (env.GITHUB_TOKEN) {
+    const bad = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
+    if (bad) {
+      throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${bad}`);
+    }
+    return { repos, host: { kind: "github", token: env.GITHUB_TOKEN } };
+  }
+  throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
 }
 
 /**
