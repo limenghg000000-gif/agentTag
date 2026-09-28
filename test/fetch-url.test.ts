@@ -100,3 +100,20 @@ test("HTML 转文本：解码实体，合并空白", () => {
   assert.equal(title, "A");
   assert.equal(text, "x <y> 你好\n\nz");
 });
+
+test("连接一直建立不起来（TLS 握手没有回应）时几秒内放弃，说明网站可能访问不了", async () => {
+  const { createServer: createTcpServer } = await import("node:net");
+  // 只接受 TCP 连接、从不回 TLS 握手，模拟服务器连境外网站卡在握手上
+  const sockets: import("node:net").Socket[] = [];
+  const silent = createTcpServer((socket) => sockets.push(socket));
+  await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+  const port = (silent.address() as AddressInfo).port;
+  const tool = createFetchUrlTool({ allowPrivateNetwork: true, connectTimeoutMs: 300 });
+
+  const started = Date.now();
+  await assert.rejects(tool.run({ url: `https://127.0.0.1:${port}/` }, { signal: new AbortController().signal }), /连不上 127.0.0.1:\d+/);
+  assert.ok(Date.now() - started < 5_000);
+
+  for (const socket of sockets) socket.destroy();
+  await new Promise((resolve) => silent.close(resolve));
+});

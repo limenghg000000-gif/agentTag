@@ -68,6 +68,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const model = env.MODEL_ID || DEFAULT_MODEL_ID;
   const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
 
+  // 百炼默认关掉思考：同样的回答快一半左右。别家服务不传，用它的默认值
+  const thinkingEnv = env.MODEL_THINKING?.trim().toLowerCase();
+  if (thinkingEnv && thinkingEnv !== "on" && thinkingEnv !== "off") {
+    throw new Error(`MODEL_THINKING 只能是 on 或 off，当前为 ${env.MODEL_THINKING}`);
+  }
+  const thinking = thinkingEnv ? thinkingEnv === "on" : isBailian(baseURL) ? false : undefined;
+
   const code = loadCodeConfig(env);
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
@@ -84,7 +91,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
       ),
     },
-    llm: { baseURL, apiKey: env.MODEL_API_KEY!, model },
+    llm: { baseURL, apiKey: env.MODEL_API_KEY!, model, ...(thinking !== undefined ? { thinking } : {}) },
     memoryDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "memory"),
     catchUpIntervalMs: catchUpSeconds * 1000,
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,
@@ -123,6 +130,14 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     return { repos, host: { kind: "github", token: env.GITHUB_TOKEN } };
   }
   throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
+}
+
+function isBailian(baseURL: string): boolean {
+  try {
+    return /(^|\.)aliyuncs\.com$/.test(new URL(baseURL).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**

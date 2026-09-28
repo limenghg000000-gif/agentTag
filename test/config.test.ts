@@ -14,7 +14,8 @@ test("默认值：国内飞书、百炼接口、默认模型", () => {
   const config = loadConfig(base);
   assert.equal(config.feishu.domain, Domain.Feishu);
   assert.equal(config.feishu.allowedChatIds.size, 0);
-  assert.deepEqual(config.llm, { baseURL: DEFAULT_MODEL_BASE_URL, apiKey: "k", model: DEFAULT_MODEL_ID });
+  // 百炼默认关掉思考
+  assert.deepEqual(config.llm, { baseURL: DEFAULT_MODEL_BASE_URL, apiKey: "k", model: DEFAULT_MODEL_ID, thinking: false });
 });
 
 test("换模型服务只改环境变量", () => {
@@ -98,4 +99,12 @@ test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层）�
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "app", GITLAB_URL: "https://git.corp", GITLAB_TOKEN: "t" }), /项目路径/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b/c", GITHUB_TOKEN: "t" }), /owner\/repo/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b", GITLAB_URL: "git.corp", GITLAB_TOKEN: "t" }), /GITLAB_URL 要写成/);
+});
+
+test("MODEL_THINKING 可以打开或关掉思考；别家服务默认不传；写错时报错", () => {
+  assert.equal(loadConfig({ ...base, MODEL_THINKING: "on" }).llm.thinking, true);
+  assert.equal(loadConfig({ ...base, MODEL_THINKING: "OFF" }).llm.thinking, false);
+  assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).llm.thinking, undefined);
+  assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1", MODEL_THINKING: "off" }).llm.thinking, false);
+  assert.throws(() => loadConfig({ ...base, MODEL_THINKING: "yes" }), /MODEL_THINKING 只能是 on 或 off/);
 });

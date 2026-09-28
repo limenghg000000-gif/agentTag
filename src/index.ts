@@ -115,6 +115,9 @@ console.log(
     `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, ...(workspaces ? CODE_TOOL_NAMES : [])].join(", ")}，` +
     `群记忆存放在 ${config.memoryDir}`,
 );
+if (config.llm.thinking !== undefined) {
+  console.log(`思考模式：${config.llm.thinking ? "开（回答更慢）" : "关（MODEL_THINKING=on 可以打开）"}`);
+}
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();
   console.log(
