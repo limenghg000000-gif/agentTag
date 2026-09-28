@@ -59,3 +59,21 @@ test("群记忆默认每天备份到 data/backup/memory，保留 14 天，可以
   assert.throws(() => loadConfig({ ...base, MEMORY_BACKUP_DAYS: "1.5" }), /MEMORY_BACKUP_DAYS/);
   assert.throws(() => loadConfig({ ...base, MEMORY_BACKUP_DAYS: "-1" }), /MEMORY_BACKUP_DAYS/);
 });
+
+test("联网搜索：百炼的兼容接口换成同域名的原生接口，可以单独指定模型或关掉", () => {
+  assert.deepEqual(loadConfig(base).webSearch, {
+    url: "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+    model: DEFAULT_MODEL_ID,
+  });
+  assert.deepEqual(
+    loadConfig({
+      ...base,
+      MODEL_BASE_URL: "https://ws123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/",
+      WEB_SEARCH_MODEL: "qwen3.8-flash",
+    }).webSearch,
+    { url: "https://ws123.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/text-generation/generation", model: "qwen3.8-flash" },
+  );
+  assert.equal(loadConfig({ ...base, WEB_SEARCH: "off" }).webSearch, undefined);
+  assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).webSearch, undefined);
+  assert.throws(() => loadConfig({ ...base, WEB_SEARCH: "yes" }), /WEB_SEARCH 只能是 on 或 off/);
+});

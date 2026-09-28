@@ -21,6 +21,8 @@ export interface Config {
   memoryBackupDir: string;
   /** 群记忆备份保留几天，0 表示不备份 */
   memoryBackupDays: number;
+  /** 联网搜索：百炼原生接口地址和搜索用的模型。关掉或模型服务不是百炼时为空 */
+  webSearch?: { url: string; model: string };
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
@@ -50,6 +52,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`MEMORY_BACKUP_DAYS 要填不小于 0 的整数（0 表示不备份），当前为 ${env.MEMORY_BACKUP_DAYS}`);
   }
 
+  const webSearch = (env.WEB_SEARCH || "on").toLowerCase();
+  if (webSearch !== "on" && webSearch !== "off") {
+    throw new Error(`WEB_SEARCH 只能是 on 或 off，当前为 ${env.WEB_SEARCH}`);
+  }
+  const baseURL = env.MODEL_BASE_URL || DEFAULT_MODEL_BASE_URL;
+  const model = env.MODEL_ID || DEFAULT_MODEL_ID;
+  const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
+
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
     throw new Error(`FEISHU_DOMAIN 只能是 feishu 或 lark，当前为 ${env.FEISHU_DOMAIN}`);
@@ -64,15 +74,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
       ),
     },
-    llm: {
-      baseURL: env.MODEL_BASE_URL || DEFAULT_MODEL_BASE_URL,
-      apiKey: env.MODEL_API_KEY!,
-      model: env.MODEL_ID || DEFAULT_MODEL_ID,
-    },
+    llm: { baseURL, apiKey: env.MODEL_API_KEY!, model },
     memoryDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "memory"),
     catchUpIntervalMs: catchUpSeconds * 1000,
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
     memoryBackupDays: backupDays,
+    webSearch: searchUrl ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || model } : undefined,
   };
+}
+
+/**
+ * 百炼 OpenAI 兼容接口地址 → 同一域名下的原生文本生成接口（联网搜索要用它才拿得到来源）。
+ * 不是百炼的地址时返回 undefined。
+ */
+export function bailianGenerationUrl(baseURL: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(baseURL);
+  } catch {
+    return undefined;
+  }
+  if (!/(^|\.)aliyuncs\.com$/.test(url.hostname) || !/^\/compatible-mode\/v1\/?$/.test(url.pathname)) {
+    return undefined;
+  }
+  return `${url.origin}/api/v1/services/aigc/text-generation/generation`;
 }
