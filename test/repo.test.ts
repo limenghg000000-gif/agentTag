@@ -391,6 +391,25 @@ test("话题里切过去的分支被删了：下次打开时回到默认分支",
   assert.match(await again.listFiles(), /README.md$/);
 });
 
+test("配置里给仓库指定了默认分支：新话题直接克隆这个分支，旧话题下次打开时换过去", async () => {
+  const { host } = fakeHost();
+  host.cloneUrl = () => `file://${branchRemote}`;
+  const root = path.join(tmp, `ws${rootCount++}`);
+  const plain = new CodeWorkspaces({ root, host, repos: ["ai/aiops-mcp"], logger: quiet });
+  assert.equal((await plain.open("om_c1", "ai/aiops-mcp")).baseBranch, "main");
+
+  const pinned = new CodeWorkspaces({ root, host, repos: ["ai/aiops-mcp"], branches: { "ai/aiops-mcp": "aiops" }, logger: quiet });
+  const fresh = await pinned.open("om_c2", "ai/aiops-mcp");
+  assert.equal(fresh.baseBranch, "aiops");
+  assert.match(await fresh.search("RegisterK8sTools"), /（aiops 分支 @ [0-9a-f]{7}）/);
+  const old = await pinned.open("om_c1", "ai/aiops-mcp");
+  assert.equal(old.baseBranch, "aiops");
+  assert.match(await old.listFiles({ glob: "**/*.go" }), /internal\/tools\/k8s.go/);
+  // 话题里明确切过的分支优先
+  await old.switchBranch("old");
+  assert.equal((await pinned.open("om_c1", "ai/aiops-mcp")).baseBranch, "old");
+});
+
 test("GitLab 列分支：调 v4 接口，按最近更新排，带最近一次提交", async () => {
   const urls: string[] = [];
   const fakeFetch = (async (url: string) => {

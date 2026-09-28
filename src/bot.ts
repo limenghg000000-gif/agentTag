@@ -67,6 +67,8 @@ export interface BotDeps {
   cardIntervalMs?: number;
   /** 配置的代码仓库（CODE_REPOS）。用来检查回答是不是没读代码就说了仓库里的内容 */
   codeRepos?: readonly string[];
+  /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
+  writeAllowed?: ReadonlySet<string>;
 }
 
 /**
@@ -156,7 +158,7 @@ async function runTask(
     source = context.source;
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
-    const taskTools = [
+    const allTools = [
       ...tools,
       ...(deps.taskTools?.({
         chatId: msg.chatId,
@@ -167,6 +169,12 @@ async function runTask(
       }) ?? []),
       ...(memory?.tools ?? []),
     ];
+    // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
+    const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
+    const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
+    if (readOnly) {
+      logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    }
     const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
     if (deep) {
@@ -180,6 +188,7 @@ async function runTask(
         now: new Date(now()),
         toolNames: taskTools.map((tool) => tool.spec.name),
         memory: memory?.prompt,
+        readOnly,
       }),
       messages: [...context.history, { role: "user", content: prompt }],
       tools: taskTools,

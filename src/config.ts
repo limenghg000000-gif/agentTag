@@ -9,6 +9,8 @@ export interface Config {
     domain: Domain;
     /** 群白名单（chat_id）。为空时不响应任何群。 */
     allowedChatIds: ReadonlySet<string>;
+    /** 能让机器人改文档、改代码的人（open_id）。不配时群里所有人都能 */
+    writeAllowedUsers?: ReadonlySet<string>;
   };
   llm: LlmConfig;
   /** 群记忆的存放目录（每个群一个 JSON 文件） */
@@ -27,6 +29,8 @@ export interface Config {
   code?: {
     /** 允许操作的仓库：GitLab 的项目路径（group/project），或 GitHub 的 owner/repo */
     repos: string[];
+    /** 给仓库指定的默认分支（CODE_REPOS 里写成 group/project@分支），没点名分支时先看它 */
+    branches: Record<string, string>;
     host: { kind: "gitlab"; url: string; token: string } | { kind: "github"; token: string };
     /** 拉代码的工作目录（每个话题一个子目录） */
     workspaceDir: string;
@@ -84,6 +88,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const code = loadCodeConfig(env);
+  const writers = (env.WRITE_ALLOWED_USERS ?? "").split(",").map((id) => id.trim()).filter(Boolean);
+  const badWriter = writers.find((id) => !/^ou_[\w-]+$/.test(id));
+  if (badWriter) {
+    throw new Error(`WRITE_ALLOWED_USERS 要填飞书用户的 open_id（ou_ 开头），多个用逗号分隔，这一项不对：${badWriter}`);
+  }
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
@@ -98,6 +107,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       allowedChatIds: new Set(
         (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
       ),
+      ...(writers.length > 0 ? { writeAllowedUsers: new Set(writers) } : {}),
     },
     llm: {
       baseURL,
@@ -121,10 +131,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
 /** 代码仓库：配了 GITLAB_URL 就接 GitLab，否则配了 GITHUB_TOKEN 接 GitHub */
 function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]>, "workspaceDir"> | undefined {
-  const repos = (env.CODE_REPOS ?? "").split(",").map((r) => r.trim().replace(/\.git$/, "")).filter(Boolean);
-  if (repos.length === 0) {
+  const entries = (env.CODE_REPOS ?? "").split(",").map((r) => r.trim()).filter(Boolean);
+  if (entries.length === 0) {
     return undefined;
   }
+  // 每一项可以写成 group/project@分支，给这个仓库指定默认看的分支
+  const branches: Record<string, string> = {};
+  const repos = entries.map((entry) => {
+    const at = entry.lastIndexOf("@");
+    const repo = (at > 0 ? entry.slice(0, at) : entry).trim().replace(/\.git$/, "");
+    if (at > 0) {
+      const branch = entry.slice(at + 1).trim();
+      if (!/^[\p{L}\p{N}_.\/+-]+$/u.test(branch) || branch.startsWith("-") || branch.includes("..")) {
+        throw new Error(`CODE_REPOS 里 ${entry} 的分支名不对，要写成 group/project@分支`);
+      }
+      branches[repo] = branch;
+    }
+    return repo;
+  });
   const gitlabUrl = env.GITLAB_URL?.trim();
   if (gitlabUrl) {
     if (!/^https?:\/\/[^/\s]+/.test(gitlabUrl)) {
@@ -137,14 +161,14 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 GitLab 的项目路径（如 group/project），多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
+    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
   }
   if (env.GITHUB_TOKEN) {
     const bad = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, host: { kind: "github", token: env.GITHUB_TOKEN } };
+    return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN } };
   }
   throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
 }

@@ -556,6 +556,38 @@ test("提问里说「深度思考」时这次任务打开思考，平时不指�
   assert.equal(requests[2].thinking, true);
 });
 
+test("配了写权限名单：名单外的人只拿到读的工具，提示词说明没权限；名单里的人工具齐全；不配时所有人都能写", async () => {
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_edit", true), tool("code_search"), tool("code_open_pr", true)];
+  const logs: string[] = [];
+
+  const guarded = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({
+    model: guarded.model,
+    taskTools,
+    writeAllowed: new Set(["ou_admin"]),
+    logger: { ...quiet, info: (line: string) => logs.push(line) },
+  });
+  await handle(message("把这篇文档改一下", { senderId: "ou_guest" }));
+  assert.deepEqual(guarded.requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "code_search"]);
+  assert.match(guarded.requests[0].system, /这次提问的人没有让你改东西的权限（管理员在 WRITE_ALLOWED_USERS 里配置）/);
+  assert.match(logs.join("\n"), /发起人不在写权限名单里，这次只给读的工具 message=om_1 sender=ou_guest/);
+
+  await handle(message("把这篇文档改一下", { messageId: "om_2", senderId: "ou_admin" }));
+  assert.deepEqual(guarded.requests[1].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit", "code_search", "code_open_pr"]);
+  assert.doesNotMatch(guarded.requests[1].system, /WRITE_ALLOWED_USERS/);
+
+  const open = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: open.model, taskTools }).handle(message("改一下", { senderId: "ou_guest" }));
+  assert.equal(open.requests[0].tools?.length, 4);
+  assert.doesNotMatch(open.requests[0].system, /WRITE_ALLOWED_USERS/);
+});
+
 test("有代码工具时，没读代码就说仓库内容的回答被打回去，查过之后才发出", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },

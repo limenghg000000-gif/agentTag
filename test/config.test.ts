@@ -99,6 +99,7 @@ test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层）�
   }).code;
   assert.deepEqual(gitlab, {
     repos: ["team/backend/api", "team/web"],
+    branches: {},
     host: { kind: "gitlab", url: "https://git.corp.example.com", token: "glpat-x" },
     workspaceDir: path.resolve("/srv/agenttag", "workspaces"),
   });
@@ -108,6 +109,27 @@ test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层）�
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "app", GITLAB_URL: "https://git.corp", GITLAB_TOKEN: "t" }), /项目路径/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b/c", GITHUB_TOKEN: "t" }), /owner\/repo/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b", GITLAB_URL: "git.corp", GITLAB_TOKEN: "t" }), /GITLAB_URL 要写成/);
+});
+
+test("CODE_REPOS 可以给仓库指定默认分支：group/project@分支", () => {
+  const code = loadConfig({
+    ...base,
+    CODE_REPOS: "ai/aiops-mcp@aiops, ai/agent-tag, team/web.git@release/2.0",
+    GITLAB_URL: "https://lab.corp",
+    GITLAB_TOKEN: "t",
+  }).code;
+  assert.deepEqual(code?.repos, ["ai/aiops-mcp", "ai/agent-tag", "team/web"]);
+  assert.deepEqual(code?.branches, { "ai/aiops-mcp": "aiops", "team/web": "release/2.0" });
+  assert.throws(
+    () => loadConfig({ ...base, CODE_REPOS: "ai/aiops-mcp@../x", GITLAB_URL: "https://lab.corp", GITLAB_TOKEN: "t" }),
+    /分支名不对/,
+  );
+});
+
+test("WRITE_ALLOWED_USERS：不配时所有人都能写，配了只有名单里的 open_id 能写，写错时报错", () => {
+  assert.equal(loadConfig(base).feishu.writeAllowedUsers, undefined);
+  assert.deepEqual(loadConfig({ ...base, WRITE_ALLOWED_USERS: " ou_a1, ou_b2 ," }).feishu.writeAllowedUsers, new Set(["ou_a1", "ou_b2"]));
+  assert.throws(() => loadConfig({ ...base, WRITE_ALLOWED_USERS: "赵作武" }), /open_id（ou_ 开头）.*赵作武/);
 });
 
 test("MODEL_THINKING 可以打开或关掉思考；别家服务默认不传；写错时报错", () => {

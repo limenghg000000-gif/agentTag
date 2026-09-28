@@ -68,6 +68,7 @@ const handleMessage = createMessageHandler({
   ],
   allowedChatIds: config.feishu.allowedChatIds,
   ...(workspaces ? { codeRepos: workspaces.repos } : {}),
+  ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
   memory,
@@ -127,6 +128,11 @@ if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
       `30 分钟内补上 2 条以上会在${config.alertChatId ? `群 ${config.alertChatId}` : "漏消息的群"}里报警`,
   );
 }
+console.log(
+  config.feishu.writeAllowedUsers
+    ? `写权限：只有 ${config.feishu.writeAllowedUsers.size} 人能让机器人改文档、改代码（WRITE_ALLOWED_USERS），其他人只能问和读`
+    : "写权限：群里所有人都能让机器人改文档、改代码。要限制就在 WRITE_ALLOWED_USERS 里填允许的人的 open_id",
+);
 if (config.webSearch) {
   console.log(`联网搜索已开启，用百炼的 ${config.webSearch.model} 搜索`);
 } else {
@@ -167,7 +173,8 @@ async function checkRepos(workspaces: CodeWorkspaces): Promise<void> {
   await Promise.all(
     workspaces.repos.map(async (repo) => {
       try {
-        console.log(`代码仓库 ${repo}：${await check(repo)}`);
+        const branch = workspaces.branches[repo];
+        console.log(`代码仓库 ${repo}：${await check(repo)}${branch ? `，机器人默认看 ${branch} 分支` : ""}`);
       } catch (err) {
         console.warn(`代码仓库 ${repo} 访问不了：${err instanceof Error ? err.message : String(err)}`);
       }
@@ -184,7 +191,7 @@ async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promis
     return undefined;
   }
   const host = code.host.kind === "gitlab" ? createGitLabHost(code.host.url, code.host.token) : createGitHubHost(code.host.token);
-  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos });
+  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos, branches: code.branches });
   // 几天没用的话题工作目录，启动时和之后每天清一次
   const sweep = () => workspaces.sweep().catch((err) => console.error("清理代码工作目录失败", err));
   void sweep();
