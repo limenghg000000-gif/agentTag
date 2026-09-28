@@ -290,6 +290,7 @@ async function readState(dir: string): Promise<WorkspaceState> {
 export class Workspace {
   defaultBranch = "main";
   private realDir = "";
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
     readonly repo: string,
@@ -394,7 +395,11 @@ export class Workspace {
    * 改文件。oldText 为空时整个文件写成 newText（新建或覆盖）；
    * 否则把文件里唯一出现的 oldText 换成 newText，出现 0 次或多次都报错，让模型给更准的片段。
    */
-  async editFile(file: string, oldText: string | undefined, newText: string): Promise<string> {
+  editFile(file: string, oldText: string | undefined, newText: string): Promise<string> {
+    return this.serial(() => this.applyEdit(file, oldText, newText));
+  }
+
+  private async applyEdit(file: string, oldText: string | undefined, newText: string): Promise<string> {
     const abs = await this.resolve(file, true);
     const info = await lstat(abs).catch(() => undefined);
     if (info?.isSymbolicLink()) {
@@ -429,7 +434,11 @@ export class Workspace {
   }
 
   /** 当前所有改动（含新建的文件）：先列统计，再给完整 diff */
-  async diff(): Promise<string> {
+  diff(): Promise<string> {
+    return this.serial(() => this.stagedDiff());
+  }
+
+  private async stagedDiff(): Promise<string> {
     await this.git(["add", "-A"]);
     // 和上次推上去的（没推过就是默认分支）比，没推的提交和没提交的改动都算
     const base = this.state.pushedSha ?? `origin/${this.defaultBranch}`;
@@ -448,7 +457,11 @@ export class Workspace {
    * 提交全部改动，推到机器人自己建的分支，开 PR 到默认分支。这个话题已经开过 PR 时推到同一个分支，更新那个 PR。
    * 分支名由程序生成（agenttag/日期-随机），不会推到默认分支或别人的分支。
    */
-  async openPullRequest(title: string, body: string, signal?: AbortSignal): Promise<{ url: string; number: number; created: boolean; stat: string }> {
+  openPullRequest(title: string, body: string, signal?: AbortSignal): Promise<{ url: string; number: number; created: boolean; stat: string }> {
+    return this.serial(() => this.commitAndOpen(title, body, signal));
+  }
+
+  private async commitAndOpen(title: string, body: string, signal?: AbortSignal): Promise<{ url: string; number: number; created: boolean; stat: string }> {
     await this.git(["add", "-A"], signal);
     if (await this.hasStaged(signal)) {
       if (!this.state.branch) {
@@ -483,6 +496,16 @@ export class Workspace {
     this.state = { ...this.state, prUrl: pr.url, prNumber: pr.number };
     await this.saveState();
     return { ...pr, created: true, stat };
+  }
+
+  /**
+   * 模型可能在同一轮里并行调几个工具：改文件、看 diff、提交这些会写文件或 git index 的操作排队执行，
+   * 免得两次修改同一个文件互相覆盖，或者 git 抢 index.lock。
+   */
+  private serial<T>(run: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(run);
+    this.queue = result.catch(() => {});
+    return result;
   }
 
   private async hasChanges(signal?: AbortSignal): Promise<boolean> {

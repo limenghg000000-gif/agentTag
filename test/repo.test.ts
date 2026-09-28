@@ -106,6 +106,18 @@ test("改文件：替换唯一的片段、新建文件，找不到或不唯一�
   assert.match(diff, /-  return 'hi';\n\+  return 'hello';/);
 });
 
+test("同一轮里并行改同一个文件的两处，两处改动都保留", async () => {
+  const ws = await workspaces(fakeHost().host).open("om_par", "acme/demo");
+  await Promise.all([
+    ws.editFile("src/a.ts", "export const a = 1;", "export const a = 2;"),
+    ws.editFile("src/a.ts", "return 'hi';", "return 'hello';"),
+    ws.diff(),
+  ]);
+  const content = await ws.readFile("src/a.ts");
+  assert.match(content, /export const a = 2;/);
+  assert.match(content, /return 'hello';/);
+});
+
 test("开 PR：提交到机器人建的分支并推上去；同一话题再改会推到同一个 PR；没改动时报错", async () => {
   const { host, prs } = fakeHost();
   const all = workspaces(host, () => new Date("2026-09-26T10:00:00Z"));
