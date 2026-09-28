@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { type CodeHost, CodeWorkspaces, createGitLabHost, RepoError, runGit } from "../src/repo.js";
+import { type CodeHost, CodeWorkspaces, createGitHubHost, createGitLabHost, RepoError, runGit } from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
@@ -219,6 +219,47 @@ test("GitLab：git 用 Basic 认证头（放在环境变量里），开合并请
   });
   await assert.rejects(host.openPullRequest("g/sub/p", pr), /HTTP 403.*api 权限.*Developer/);
   await assert.rejects(host.openPullRequest("g/sub/p", pr), /HTTP 409.*已经有打开的合并请求.*Another open merge request/);
+});
+
+test("启动检查：GitLab 按角色和默认分支说明能否访问，404、401、Reporter 时说清原因", async () => {
+  const urls: string[] = [];
+  const replies = [
+    new Response(
+      JSON.stringify({
+        path_with_namespace: "ai/aiops-mcp",
+        default_branch: "main",
+        permissions: { project_access: null, group_access: { access_level: 30 } },
+      }),
+      { status: 200 },
+    ),
+    new Response(JSON.stringify({ message: "404 Project Not Found" }), { status: 404 }),
+    new Response(JSON.stringify({ message: "401 Unauthorized" }), { status: 401 }),
+    new Response(JSON.stringify({ permissions: { project_access: { access_level: 20 }, group_access: null } }), { status: 200 }),
+  ];
+  const fakeFetch = (async (url: string) => {
+    urls.push(url);
+    return replies.shift()!;
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://lab.corp", "glpat-x", fakeFetch);
+
+  assert.equal(await host.checkAccess!("ai/aiops-mcp"), "能访问，角色 Developer，默认分支 main");
+  assert.equal(urls[0], "https://lab.corp/api/v4/projects/ai%2Faiops-mcp");
+  await assert.rejects(host.checkAccess!("ai/agent-tag"), /HTTP 404.*项目成员.*项目访问令牌只能访问建它的那个项目/);
+  await assert.rejects(host.checkAccess!("ai/agent-tag"), /令牌无效或过期/);
+  await assert.rejects(host.checkAccess!("ai/agent-tag"), /角色是 Reporter，推不了分支/);
+});
+
+test("启动检查：GitHub 没有写权限或看不到仓库时说清原因", async () => {
+  const replies = [
+    new Response(JSON.stringify({ default_branch: "main", permissions: { push: true } }), { status: 200 }),
+    new Response(JSON.stringify({ permissions: { push: false } }), { status: 200 }),
+    new Response(JSON.stringify({ message: "Not Found" }), { status: 404 }),
+  ];
+  const fakeFetch = (async () => replies.shift()!) as unknown as typeof fetch;
+  const host = createGitHubHost("ghp", fakeFetch);
+  assert.equal(await host.checkAccess!("acme/app"), "能访问，默认分支 main");
+  await assert.rejects(host.checkAccess!("acme/app"), /没有写权限/);
+  await assert.rejects(host.checkAccess!("acme/app"), /HTTP 404/);
 });
 
 test("代码工具：只有一个仓库时可以不填 repo，PR 描述带上发起人，一个任务里只打开一次", async () => {
