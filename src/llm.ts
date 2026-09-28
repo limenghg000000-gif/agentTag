@@ -65,6 +65,11 @@ export interface LlmConfig {
    * 思考 token 和回答一样按顺序生成，关掉能明显缩短长回答的时间
    */
   thinking?: boolean;
+  /**
+   * 打开思考时最多思考多少 token（百炼的 thinking_budget），超过后模型立刻开始回答。
+   * 不填就不传，用模型自己的上限
+   */
+  thinkingBudget?: number;
 }
 
 export type LlmErrorKind = "auth" | "rate_limit" | "connection" | "api";
@@ -91,21 +96,29 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   // 这两个参数个别服务或模型不认、报 400 时，去掉重试，之后都不再带
   let parallelToolCalls = true;
   let thinkingSupported = true;
-  type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & { enable_thinking?: boolean };
+  let budgetSupported = true;
+  type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & { enable_thinking?: boolean; thinking_budget?: number };
   const create = async (body: Body, thinkingWanted: boolean | undefined, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> => {
     for (let attempt = 0; ; attempt++) {
       const thinking = thinkingSupported ? (thinkingWanted ?? config.thinking) : undefined;
+      const budget = thinking && budgetSupported ? config.thinkingBudget : undefined;
       const request: Body = {
         ...body,
         ...(body.tools && parallelToolCalls ? { parallel_tool_calls: true } : {}),
         ...(thinking !== undefined ? { enable_thinking: thinking } : {}),
+        ...(budget !== undefined ? { thinking_budget: budget } : {}),
       };
       try {
         return await client.chat.completions.create(request, { signal });
       } catch (err) {
-        if (attempt < 2 && err instanceof OpenAI.BadRequestError) {
+        if (attempt < 3 && err instanceof OpenAI.BadRequestError) {
           if (request.parallel_tool_calls && /parallel_tool_calls/i.test(err.message)) {
             parallelToolCalls = false;
+            continue;
+          }
+          if (request.thinking_budget !== undefined && /thinking_budget/i.test(err.message)) {
+            warn(`模型 ${config.model} 不支持限制思考长度（${err.message}），之后不再传 thinking_budget`);
+            budgetSupported = false;
             continue;
           }
           if (request.enable_thinking !== undefined && /thinking/i.test(err.message)) {

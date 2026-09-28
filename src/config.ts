@@ -36,6 +36,8 @@ export interface Config {
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
 export const DEFAULT_MODEL_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 export const DEFAULT_MODEL_ID = "qwen3.8-max";
+/** 用百炼时，打开思考后最多思考多少 token */
+export const DEFAULT_THINKING_BUDGET = 4000;
 /** 数据目录，相对路径按启动时的工作目录算 */
 export const DEFAULT_DATA_DIR = "data";
 /** 补漏轮询默认每 10 秒一次 */
@@ -74,6 +76,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`MODEL_THINKING 只能是 on 或 off，当前为 ${env.MODEL_THINKING}`);
   }
   const thinking = thinkingEnv ? thinkingEnv === "on" : isBailian(baseURL) ? false : undefined;
+  // 打开思考时限制思考长度，免得一个问题想好几分钟。百炼默认 4000 token（按每秒 30～40 个约 2 分钟），0 表示不限
+  const budgetEnv = env.MODEL_THINKING_BUDGET?.trim();
+  const budget = budgetEnv ? Number(budgetEnv) : isBailian(baseURL) ? DEFAULT_THINKING_BUDGET : 0;
+  if (!Number.isInteger(budget) || budget < 0) {
+    throw new Error(`MODEL_THINKING_BUDGET 要填不小于 0 的整数（0 表示不限），当前为 ${env.MODEL_THINKING_BUDGET}`);
+  }
 
   const code = loadCodeConfig(env);
 
@@ -91,7 +99,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
       ),
     },
-    llm: { baseURL, apiKey: env.MODEL_API_KEY!, model, ...(thinking !== undefined ? { thinking } : {}) },
+    llm: {
+      baseURL,
+      apiKey: env.MODEL_API_KEY!,
+      model,
+      ...(thinking !== undefined ? { thinking } : {}),
+      ...(budget > 0 ? { thinkingBudget: budget } : {}),
+    },
     memoryDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "memory"),
     catchUpIntervalMs: catchUpSeconds * 1000,
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,

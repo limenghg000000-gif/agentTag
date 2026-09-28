@@ -75,7 +75,9 @@ test("强制联网搜索并要来源，返回摘要和来源链接", async () =>
       "Node.js 24 于 2025 年 10 月进入 LTS [1]。",
       "",
       "来源：",
-      "[1] Node.js 发布计划 https://nodejs.org/en/about/previous-releases",
+      "[1] [Node.js 发布计划](https://nodejs.org/en/about/previous-releases)",
+      "",
+      "（回答里引用时写成上面的 [标题](网址) 链接，不要只写 [编号]。搜索结果可能滞后几天，版本号、价格等以官方来源为准）",
     ].join("\n"),
   );
   assert.equal(tool.describe({ query: "Node.js 24 什么时候 LTS" }), "搜索：Node.js 24 什么时候 LTS");
@@ -86,6 +88,21 @@ test("deep 时用 max 策略；没返回来源时提醒核实", async () => {
   const result = await tool.run({ query: "对比三家云厂商", deep: true }, { signal });
   assert.equal(requests.splice(0)[0].body.parameters.search_options.search_strategy, "max");
   assert.match(result, /没有返回搜索来源.*核实/);
+});
+
+test("来源标题里的方括号去掉，免得打断 Markdown 链接", async () => {
+  responses.push({
+    status: 200,
+    body: {
+      output: {
+        choices: [{ message: { content: "答案 [1]" } }],
+        search_info: { search_results: [{ index: 1, title: "[公告] Release  v2", url: "https://example.com/r" }] },
+      },
+    },
+  });
+  const result = await tool.run({ query: "x" }, { signal });
+  requests.splice(0);
+  assert.match(result, /^\[1\] \[公告 Release v2\]\(https:\/\/example.com\/r\)$/m);
 });
 
 test("出错时给出能看懂的原因，不带密钥", async () => {
@@ -125,7 +142,7 @@ test("文本接口报 url error 时换多模态接口（content 用数组），�
   assert.deepEqual(second.body.input.messages[1].content, [{ text: "x 最新版本" }]);
   assert.equal(third.url, "/api/v1/services/aigc/multimodal-generation/generation");
   assert.match(result, /最新版是 2.1.283 \[1\]。/);
-  assert.match(result, /\[1\] npm https:\/\/www.npmjs.com\/package\/x/);
+  assert.match(result, /\[1\] \[npm\]\(https:\/\/www.npmjs.com\/package\/x\)/);
 });
 
 test("两个接口都报 url error 时，提示换搜索模型", async () => {

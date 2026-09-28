@@ -116,7 +116,8 @@ console.log(
     `群记忆存放在 ${config.memoryDir}`,
 );
 if (config.llm.thinking !== undefined) {
-  console.log(`思考模式：${config.llm.thinking ? "开（回答更慢）" : "关（MODEL_THINKING=on 可以打开）"}`);
+  const budget = config.llm.thinkingBudget ? `，打开时最多想 ${config.llm.thinkingBudget} token` : "";
+  console.log(`思考模式：${config.llm.thinking ? "开（回答更慢）" : "关（MODEL_THINKING=on 可以打开）"}${budget}`);
 }
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();

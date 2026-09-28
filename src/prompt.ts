@@ -34,7 +34,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
   }
   if (toolNames.includes("web_search")) {
     lines.push(
-      "- 需要最新信息或你拿不准的事实时用 web_search 搜，不要用 fetch_url 打开搜索引擎；要看某个网页的原文再用 fetch_url。回答里用到搜索结果时附上来源链接。",
+      "- 需要最新信息或你拿不准的事实时用 web_search 搜，不要用 fetch_url 打开搜索引擎；要看某个网页的原文再用 fetch_url。回答里用到搜索结果时附上来源，写成 [标题](网址) 的链接，不要只写 [1] 这样的编号。",
+      "- 会随时间变化的事实（版本、价格、新闻、数据、政策、谁在任）只用这次工具查到的内容回答，不凭记忆补；查不到就直说。",
+      "- web_search 返回的是另一个模型读搜索结果写的摘要，搜索引擎收录又会滞后几天。这类事实要用 fetch_url 打开一两个最权威、最新的原网页，按原文回答；来源之间对不上时以官方、最新的为准，并说明。",
+      "- 有官方接口的直接读接口，最准最快：npm 包读 https://registry.npmjs.org/包名/latest，PyPI 读 https://pypi.org/pypi/包名/json，GitHub 项目读 https://api.github.com/repos/所有者/仓库/releases/latest。",
+      "- 回答这类问题时写明查询时间（如「截至 9 月 28 日 16:40」）和来源的发布日期。",
     );
   }
   if (toolNames.includes("feishu_doc_read")) {
