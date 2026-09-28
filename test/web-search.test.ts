@@ -57,6 +57,7 @@ test("强制联网搜索并要来源，返回摘要和来源链接", async () =>
   assert.match(req.body.input.messages[0].content, /2026年9月26日/);
   assert.deepEqual(req.body.parameters, {
     result_format: "message",
+    enable_thinking: false,
     enable_search: true,
     search_options: {
       forced_search: true,
@@ -94,4 +95,63 @@ test("出错时给出能看懂的原因，不带密钥", async () => {
   await assert.rejects(tool.run({ query: "x" }, { signal }), /HTTP 400 InvalidParameter：model not support search/);
   await assert.rejects(tool.run({ query: "  " }, { signal }), /缺少 query/);
   requests.splice(0);
+});
+
+test("文本接口报 url error 时换多模态接口（content 用数组），之后都走多模态", async () => {
+  const mmTool = createWebSearchTool({
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}${PATH}`,
+    apiKey: "sk-test",
+    model: "qwen3.8-max",
+    now: () => new Date("2026-09-26T08:00:00Z"),
+  });
+  const reply = {
+    output: {
+      choices: [{ message: { role: "assistant", content: [{ text: "最新版是 2.1.283 [1]。" }] } }],
+      search_info: { search_results: [{ index: 1, title: "npm", url: "https://www.npmjs.com/package/x" }] },
+    },
+  };
+  responses.push(
+    { status: 400, body: { code: "InvalidParameter", message: "url error, please check url! For details, see: https://help.aliyun.com" } },
+    { status: 200, body: reply },
+    { status: 200, body: reply },
+  );
+
+  const result = await mmTool.run({ query: "x 最新版本" }, { signal });
+  await mmTool.run({ query: "再搜一次" }, { signal });
+
+  const [first, second, third] = requests.splice(0);
+  assert.equal(first.url, PATH);
+  assert.equal(second.url, "/api/v1/services/aigc/multimodal-generation/generation");
+  assert.deepEqual(second.body.input.messages[1].content, [{ text: "x 最新版本" }]);
+  assert.equal(third.url, "/api/v1/services/aigc/multimodal-generation/generation");
+  assert.match(result, /最新版是 2.1.283 \[1\]。/);
+  assert.match(result, /\[1\] npm https:\/\/www.npmjs.com\/package\/x/);
+});
+
+test("两个接口都报 url error 时，提示换搜索模型", async () => {
+  const badTool = createWebSearchTool({
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}${PATH}`,
+    apiKey: "sk-test",
+    model: "some-model",
+  });
+  const urlError = { status: 400, body: { code: "InvalidParameter", message: "url error, please check url!" } };
+  responses.push(urlError, urlError);
+  await assert.rejects(badTool.run({ query: "x" }, { signal }), /两个接口都试过了.*WEB_SEARCH_MODEL=qwen-plus/);
+  requests.splice(0);
+});
+
+test("模型不认 enable_thinking 时去掉重试", async () => {
+  const thinkTool = createWebSearchTool({
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}${PATH}`,
+    apiKey: "sk-test",
+    model: "qwq-plus",
+  });
+  responses.push(
+    { status: 400, body: { code: "InvalidParameter", message: "The value of the enable_thinking parameter is restricted to True." } },
+    { status: 200, body: { output: { choices: [{ message: { content: "答案" } }] } } },
+  );
+  await thinkTool.run({ query: "x" }, { signal });
+  const [first, second] = requests.splice(0);
+  assert.equal(first.body.parameters.enable_thinking, false);
+  assert.equal(second.body.parameters.enable_thinking, undefined);
 });

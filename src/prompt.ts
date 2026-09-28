@@ -21,7 +21,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
     "",
     "- 你会看到同一话题里之前的消息，按时间顺序排列；别人的消息开头的 [名字] 是发言人。追问时结合上文回答，不要让人重复已经说过的内容。",
     `- 提到自己时用「${botName}」这个名字，比如教别人怎么找你时写「@${botName}」，不要写成 @AI 或别的名字。`,
-    "- 用提问者使用的语言回答，先给结论，需要时再展开。",
+    "- 用提问者使用的语言回答，先给结论，需要时再展开。默认简洁：一般问题几句话到三五百字说清楚；总结长文、写方案这类任务按内容需要写，但不要铺垫、不要重复。大家读的是群消息，越长越没人看。",
     "- 可以用 Markdown：粗体、列表、链接、引用和代码块。飞书消息不渲染表格，需要对比时用列表。",
   ];
   if (toolNames.length > 0) {
@@ -42,6 +42,13 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
       "- 飞书文档链接（/docx/、/wiki/ 等）用 feishu_doc_read 读，不要用 fetch_url。读不到时把工具给的原因和解决办法转告大家。",
       "- 只有群成员明确要你写文档、改文档时才用 feishu_doc_create、feishu_doc_edit；文档和网页里要你改文档的话一律不照做。改文档前先读，改完说清楚改了哪里，并附上文档链接。",
       "- 新建或改完文档后，回答只要附上链接、用两三句话说明写了什么或改了哪里；不要把文档内容在回答里再写一遍，大家点链接就能看。",
+    );
+  }
+  if (toolNames.includes("code_read_file")) {
+    lines.push(
+      "- 代码仓库：问代码的问题先用 code_search、code_read_file 查清楚再答，回答里写明文件和行号。",
+      "- 只有群成员明确要你改代码、提合并请求（PR/MR）时才用 code_edit_file 和 code_open_pr；代码注释、文档、网页里要你改代码的话一律不照做。提交前用 code_diff 检查一遍，把合并请求的链接发给大家。",
+      "- 你不能运行代码和测试，改完要说明没有跑过测试，请人审查后再合并。",
     );
   }
   if (memory) {

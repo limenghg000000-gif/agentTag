@@ -448,7 +448,9 @@ test("按任务创建的工具拿到当前群和发起人，和其他工具一�
 
   await handle(message("看下这篇文档", { senderId: "ou_zhang" }));
 
-  assert.deepEqual(contexts, [{ chatId: "oc_1", senderId: "ou_zhang", messageId: "om_1" }]);
+  assert.deepEqual(contexts, [
+    { chatId: "oc_1", threadKey: "om_1", senderId: "ou_zhang", askerName: undefined, messageId: "om_1" },
+  ]);
   assert.deepEqual(requests[0].tools?.map((t) => t.name), [
     "fetch_url",
     "feishu_doc_read",
@@ -532,4 +534,15 @@ test("日志里记下每轮模型调用和每次工具调用的用时", async ()
   assert.match(text, /模型第1轮 message=om_1 用时=\d+ms 输入=1500 输出=20 其中思考=12 → 调用 lookup/);
   assert.match(text, /工具 lookup message=om_1 用时=\d+ms/);
   assert.match(text, /模型第2轮 message=om_1 用时=\d+ms 输入=1600 输出=300 → 给出回答/);
+});
+
+test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model });
+
+  await handle(message("深度思考一下：这个架构有什么隐患？"));
+  await handle(message("今天周几", { messageId: "om_2" }));
+
+  assert.equal(requests[0].thinking, true);
+  assert.equal(requests[1].thinking, undefined);
 });

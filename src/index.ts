@@ -11,7 +11,9 @@ import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
 import { createOpenAICompatibleModel } from "./llm.js";
 import { MemoryStore } from "./memory.js";
+import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { TaskRegistry } from "./tasks.js";
+import { CODE_TOOL_NAMES, createCodeTools } from "./tools/code.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
 import { createWebSearchTool } from "./tools/web-search.js";
@@ -53,11 +55,17 @@ const backup =
 
 const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
 const docs = new FeishuDocs(createDocsApi(channel.rawClient), () => channel.botIdentity?.name ?? "机器人");
+const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefined;
 const handleMessage = createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
   tools,
-  // 文档工具按任务创建：新建的文档要共享给当前群和发起人
-  taskTools: ({ chatId, senderId }) => createDocTools({ docs, chatId, requesterOpenId: senderId }),
+  // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分
+  taskTools: ({ chatId, senderId, threadKey, askerName }) => [
+    ...createDocTools({ docs, chatId, requesterOpenId: senderId }),
+    ...(workspaces
+      ? createCodeTools({ workspaces, threadKey, askerName, botName: () => channel.botIdentity?.name ?? "机器人" })
+      : []),
+  ],
   allowedChatIds: config.feishu.allowedChatIds,
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
@@ -104,8 +112,12 @@ try {
 }
 console.log(
   `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
-    `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES].join(", ")}，群记忆存放在 ${config.memoryDir}`,
+    `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, ...(workspaces ? CODE_TOOL_NAMES : [])].join(", ")}，` +
+    `群记忆存放在 ${config.memoryDir}`,
 );
+if (config.llm.thinking !== undefined) {
+  console.log(`思考模式：${config.llm.thinking ? "开（回答更慢）" : "关（MODEL_THINKING=on 可以打开）"}`);
+}
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();
   console.log(
@@ -117,6 +129,9 @@ if (config.webSearch) {
   console.log(`联网搜索已开启，用百炼的 ${config.webSearch.model} 搜索`);
 } else {
   console.log("联网搜索没开：WEB_SEARCH=off，或者 MODEL_BASE_URL 不是百炼的 OpenAI 兼容接口（web_search 只支持百炼）");
+}
+if (workspaces) {
+  console.log(`代码仓库已接入（${workspaces.host.name}）：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
 }
 if (backup) {
   backup.start();
@@ -139,3 +154,20 @@ const shutdown = async () => {
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+
+/** 代码仓库工具要用 git。没装 git 时不开这些工具，别的照常 */
+async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promise<CodeWorkspaces | undefined> {
+  try {
+    await runGit(["--version"]);
+  } catch (err) {
+    console.error("配了 CODE_REPOS，但服务器上跑不了 git，代码仓库工具先不开", err);
+    return undefined;
+  }
+  const host = code.host.kind === "gitlab" ? createGitLabHost(code.host.url, code.host.token) : createGitHubHost(code.host.token);
+  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos });
+  // 几天没用的话题工作目录，启动时和之后每天清一次
+  const sweep = () => workspaces.sweep().catch((err) => console.error("清理代码工作目录失败", err));
+  void sweep();
+  setInterval(sweep, 24 * 60 * 60_000).unref();
+  return workspaces;
+}

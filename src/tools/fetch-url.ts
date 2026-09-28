@@ -9,6 +9,8 @@ import type { Tool } from "./tool.js";
 const MAX_REDIRECTS = 5;
 const MAX_BYTES = 2 * 1024 * 1024;
 const TIMEOUT_MS = 20_000;
+/** 建立连接（含 TLS 握手）的时限。国内服务器连某些境外网站会卡在握手上十几秒才断，早点放弃 */
+const CONNECT_TIMEOUT_MS = 6_000;
 /** 返回给模型的正文字数上限 */
 const MAX_TEXT_CHARS = 12000;
 const USER_AGENT = "Mozilla/5.0 (compatible; AgentTag/0.1; +https://github.com/limenghg000000-gif/agentTag)";
@@ -81,9 +83,11 @@ function publicOnlyLookup(hostname: string, options: LookupOptions, callback: Lo
 export interface FetchUrlOptions {
   /** 只给测试用：允许访问本机等内网地址 */
   allowPrivateNetwork?: boolean;
+  /** 建立连接的时限（毫秒） */
+  connectTimeoutMs?: number;
 }
 
-export function createFetchUrlTool({ allowPrivateNetwork = false }: FetchUrlOptions = {}): Tool {
+export function createFetchUrlTool({ allowPrivateNetwork = false, connectTimeoutMs = CONNECT_TIMEOUT_MS }: FetchUrlOptions = {}): Tool {
   return {
     spec: {
       name: "fetch_url",
@@ -115,7 +119,7 @@ export function createFetchUrlTool({ allowPrivateNetwork = false }: FetchUrlOpti
       }
       const timeout = AbortSignal.timeout(TIMEOUT_MS);
       try {
-        return formatPage(await fetchPage(url, AbortSignal.any([signal, timeout]), allowPrivateNetwork));
+        return formatPage(await fetchPage(url, AbortSignal.any([signal, timeout]), allowPrivateNetwork, connectTimeoutMs));
       } catch (err) {
         if (timeout.aborted && !signal.aborted) {
           throw new Error(`请求超时（${TIMEOUT_MS / 1000} 秒）`);
@@ -133,7 +137,7 @@ interface FetchedPage {
   truncated: boolean;
 }
 
-async function fetchPage(start: URL, signal: AbortSignal, allowPrivateNetwork: boolean): Promise<FetchedPage> {
+async function fetchPage(start: URL, signal: AbortSignal, allowPrivateNetwork: boolean, connectTimeoutMs: number): Promise<FetchedPage> {
   let url = start;
   for (let redirects = 0; ; redirects++) {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -145,7 +149,7 @@ async function fetchPage(start: URL, signal: AbortSignal, allowPrivateNetwork: b
       throw new BlockedAddressError(host);
     }
 
-    const res = await request(url, signal, allowPrivateNetwork);
+    const res = await request(url, signal, allowPrivateNetwork, connectTimeoutMs);
     const status = res.statusCode ?? 0;
     if (status >= 300 && status < 400 && res.headers.location) {
       res.resume();
@@ -166,7 +170,7 @@ async function fetchPage(start: URL, signal: AbortSignal, allowPrivateNetwork: b
   }
 }
 
-function request(url: URL, signal: AbortSignal, allowPrivateNetwork: boolean): Promise<http.IncomingMessage> {
+function request(url: URL, signal: AbortSignal, allowPrivateNetwork: boolean, connectTimeoutMs: number): Promise<http.IncomingMessage> {
   const client = url.protocol === "https:" ? https : http;
   return new Promise((resolve, reject) => {
     const req = client.request(
@@ -185,6 +189,17 @@ function request(url: URL, signal: AbortSignal, allowPrivateNetwork: boolean): P
       resolve,
     );
     req.on("error", reject);
+    req.on("socket", (socket) => {
+      if (req.reusedSocket) {
+        return;
+      }
+      const timer = setTimeout(
+        () => req.destroy(new Error(`连不上 ${url.host}（${connectTimeoutMs / 1000} 秒内没建立连接），服务器可能访问不了这个网站`)),
+        connectTimeoutMs,
+      );
+      socket.once(url.protocol === "https:" ? "secureConnect" : "connect", () => clearTimeout(timer));
+      socket.once("close", () => clearTimeout(timer));
+    });
     req.end();
   });
 }

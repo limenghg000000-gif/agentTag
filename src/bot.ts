@@ -26,6 +26,8 @@ const CHUNK_CHARS = 3000;
 const FALLBACK_BOT_NAME = "AI 助手";
 /** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
 const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
+/** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
+export const DEEP_THINKING = /深度思考|仔细(想|思考)|认真(想|思考)/;
 
 export interface ThreadContextSource {
   load(msg: NormalizedMessage): Promise<ThreadContext>;
@@ -35,8 +37,12 @@ export interface ThreadContextSource {
 /** 按任务创建工具时用得上的信息 */
 export interface TaskToolContext {
   chatId: string;
+  /** 话题标识，见 threadKeyOf */
+  threadKey: string;
   /** 发起人的 open_id */
   senderId: string;
+  /** 发起人的名字，拿不到时为空 */
+  askerName?: string;
   messageId: string;
 }
 
@@ -150,12 +156,23 @@ async function runTask(
     memoryCount = memory?.count;
     const taskTools = [
       ...tools,
-      ...(deps.taskTools?.({ chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }) ?? []),
+      ...(deps.taskTools?.({
+        chatId: msg.chatId,
+        threadKey: threadKeyOf(msg),
+        senderId: msg.senderId,
+        askerName: context.askerName,
+        messageId: msg.messageId,
+      }) ?? []),
       ...(memory?.tools ?? []),
     ];
     const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
+    const deep = DEEP_THINKING.test(question);
+    if (deep) {
+      logger.info(`这次打开深度思考 message=${msg.messageId}`);
+    }
     result = await runAgent({
       model,
+      ...(deep ? { thinking: true } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),

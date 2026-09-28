@@ -23,6 +23,14 @@ export interface Config {
   memoryBackupDays: number;
   /** 联网搜索：百炼原生接口地址和搜索用的模型。关掉或模型服务不是百炼时为空 */
   webSearch?: { url: string; model: string };
+  /** 代码仓库：没配 CODE_REPOS 时为空 */
+  code?: {
+    /** 允许操作的仓库：GitLab 的项目路径（group/project），或 GitHub 的 owner/repo */
+    repos: string[];
+    host: { kind: "gitlab"; url: string; token: string } | { kind: "github"; token: string };
+    /** 拉代码的工作目录（每个话题一个子目录） */
+    workspaceDir: string;
+  };
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
@@ -60,6 +68,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const model = env.MODEL_ID || DEFAULT_MODEL_ID;
   const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
 
+  // 百炼默认关掉思考：同样的回答快一半左右。别家服务不传，用它的默认值
+  const thinkingEnv = env.MODEL_THINKING?.trim().toLowerCase();
+  if (thinkingEnv && thinkingEnv !== "on" && thinkingEnv !== "off") {
+    throw new Error(`MODEL_THINKING 只能是 on 或 off，当前为 ${env.MODEL_THINKING}`);
+  }
+  const thinking = thinkingEnv ? thinkingEnv === "on" : isBailian(baseURL) ? false : undefined;
+
+  const code = loadCodeConfig(env);
+
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
     throw new Error(`FEISHU_DOMAIN 只能是 feishu 或 lark，当前为 ${env.FEISHU_DOMAIN}`);
@@ -74,14 +91,56 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
       ),
     },
-    llm: { baseURL, apiKey: env.MODEL_API_KEY!, model },
+    llm: { baseURL, apiKey: env.MODEL_API_KEY!, model, ...(thinking !== undefined ? { thinking } : {}) },
     memoryDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "memory"),
     catchUpIntervalMs: catchUpSeconds * 1000,
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
     memoryBackupDays: backupDays,
-    webSearch: searchUrl ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || model } : undefined,
+    // 百炼的联网搜索只有千问模型支持：主模型换成 Kimi、GLM、DeepSeek 等时，搜索仍用千问旗舰
+    webSearch: searchUrl
+      ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || (/^qwen/i.test(model) ? model : DEFAULT_MODEL_ID) }
+      : undefined,
+    code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
   };
+}
+
+/** 代码仓库：配了 GITLAB_URL 就接 GitLab，否则配了 GITHUB_TOKEN 接 GitHub */
+function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]>, "workspaceDir"> | undefined {
+  const repos = (env.CODE_REPOS ?? "").split(",").map((r) => r.trim().replace(/\.git$/, "")).filter(Boolean);
+  if (repos.length === 0) {
+    return undefined;
+  }
+  const gitlabUrl = env.GITLAB_URL?.trim();
+  if (gitlabUrl) {
+    if (!/^https?:\/\/[^/\s]+/.test(gitlabUrl)) {
+      throw new Error(`GITLAB_URL 要写成 https://gitlab.example.com 这样的地址，当前为 ${gitlabUrl}`);
+    }
+    if (!env.GITLAB_TOKEN) {
+      throw new Error("配了 GITLAB_URL 就要配 GITLAB_TOKEN（要 api 权限的访问令牌）");
+    }
+    const bad = repos.find((r) => !/^[\w.-]+(\/[\w.-]+)+$/.test(r));
+    if (bad) {
+      throw new Error(`CODE_REPOS 要写成 GitLab 的项目路径（如 group/project），多个用逗号分隔，这一项不对：${bad}`);
+    }
+    return { repos, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
+  }
+  if (env.GITHUB_TOKEN) {
+    const bad = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
+    if (bad) {
+      throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${bad}`);
+    }
+    return { repos, host: { kind: "github", token: env.GITHUB_TOKEN } };
+  }
+  throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
+}
+
+function isBailian(baseURL: string): boolean {
+  try {
+    return /(^|\.)aliyuncs\.com$/.test(new URL(baseURL).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**
