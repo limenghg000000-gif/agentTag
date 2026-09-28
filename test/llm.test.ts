@@ -218,3 +218,39 @@ test("单次请求可以覆盖配置里的思考模式", async () => {
   await configured.chat({ system: "s", messages: [{ role: "user", content: "简单" }] });
   assert.equal(requests.at(-1)!.body.enable_thinking, false);
 });
+
+test("打开思考时带上思考长度上限；关着时不带；服务不认时去掉重试并提示一次", async () => {
+  const warnings: string[] = [];
+  const budgeted = createOpenAICompatibleModel(
+    {
+      baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+      apiKey: "sk-test",
+      model: "qwen3.8-max",
+      thinking: false,
+      thinkingBudget: 4000,
+    },
+    (message) => warnings.push(message),
+  );
+  const ask = (thinking?: boolean) =>
+    budgeted.chat({ system: "s", messages: [{ role: "user", content: "问" }], ...(thinking ? { thinking } : {}) });
+  responses.push(
+    completion("好"),
+    completion("好"),
+    { status: 400, body: { error: { code: "invalid_parameter_error", message: "thinking_budget is not supported" } } },
+    completion("好"),
+    completion("好"),
+  );
+
+  await ask();
+  assert.equal(requests.at(-1)!.body.thinking_budget, undefined);
+  await ask(true);
+  assert.equal(requests.at(-1)!.body.thinking_budget, 4000);
+  assert.deepEqual(await ask(true), { text: "好", finish: "stop" });
+  await ask(true);
+
+  const bodies = requests.slice(-3).map((r) => [r.body.enable_thinking, r.body.thinking_budget]);
+  // 只去掉上限，思考照样打开
+  assert.deepEqual(bodies, [[true, 4000], [true, undefined], [true, undefined]]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /不支持限制思考长度/);
+});

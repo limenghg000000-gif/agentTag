@@ -542,7 +542,9 @@ test("提问里说「深度思考」时这次任务打开思考，平时不指�
 
   await handle(message("深度思考一下：这个架构有什么隐患？"));
   await handle(message("今天周几", { messageId: "om_2" }));
+  await handle(message("认真分析下这两个方案", { messageId: "om_3" }));
 
   assert.equal(requests[0].thinking, true);
   assert.equal(requests[1].thinking, undefined);
+  assert.equal(requests[2].thinking, true);
 });

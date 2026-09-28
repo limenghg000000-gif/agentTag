@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { test } from "node:test";
 import { Domain } from "@larksuiteoapi/node-sdk";
-import { DEFAULT_MODEL_BASE_URL, DEFAULT_MODEL_ID, loadConfig } from "../src/config.js";
+import { DEFAULT_MODEL_BASE_URL, DEFAULT_MODEL_ID, DEFAULT_THINKING_BUDGET, loadConfig } from "../src/config.js";
 
 const base = { FEISHU_APP_ID: "cli_x", FEISHU_APP_SECRET: "s", MODEL_API_KEY: "k" };
 
@@ -15,7 +15,13 @@ test("默认值：国内飞书、百炼接口、默认模型", () => {
   assert.equal(config.feishu.domain, Domain.Feishu);
   assert.equal(config.feishu.allowedChatIds.size, 0);
   // 百炼默认关掉思考
-  assert.deepEqual(config.llm, { baseURL: DEFAULT_MODEL_BASE_URL, apiKey: "k", model: DEFAULT_MODEL_ID, thinking: false });
+  assert.deepEqual(config.llm, {
+    baseURL: DEFAULT_MODEL_BASE_URL,
+    apiKey: "k",
+    model: DEFAULT_MODEL_ID,
+    thinking: false,
+    thinkingBudget: DEFAULT_THINKING_BUDGET,
+  });
 });
 
 test("换模型服务只改环境变量", () => {
@@ -110,4 +116,13 @@ test("MODEL_THINKING 可以打开或关掉思考；别家服务默认不传；�
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).llm.thinking, undefined);
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1", MODEL_THINKING: "off" }).llm.thinking, false);
   assert.throws(() => loadConfig({ ...base, MODEL_THINKING: "yes" }), /MODEL_THINKING 只能是 on 或 off/);
+});
+
+test("MODEL_THINKING_BUDGET 限制思考长度：百炼默认 4000，0 表示不限，别家服务默认不传，写错时报错", () => {
+  assert.equal(loadConfig(base).llm.thinkingBudget, 4000);
+  assert.equal(loadConfig({ ...base, MODEL_THINKING_BUDGET: "8000" }).llm.thinkingBudget, 8000);
+  assert.equal(loadConfig({ ...base, MODEL_THINKING_BUDGET: "0" }).llm.thinkingBudget, undefined);
+  assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).llm.thinkingBudget, undefined);
+  assert.throws(() => loadConfig({ ...base, MODEL_THINKING_BUDGET: "很多" }), /MODEL_THINKING_BUDGET/);
+  assert.throws(() => loadConfig({ ...base, MODEL_THINKING_BUDGET: "-1" }), /MODEL_THINKING_BUDGET/);
 });
