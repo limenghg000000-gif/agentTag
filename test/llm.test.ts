@@ -104,6 +104,25 @@ test("带上工具说明，解析模型返回的工具调用", async () => {
     toolCalls: [{ id: "call_1", name: "fetch_url", arguments: '{"url":"https://example.com"}' }],
   });
   assert.deepEqual(requests.at(-1)!.body.tools, [{ type: "function", function: tool }]);
+  // 允许一轮调多个工具，少等几轮
+  assert.equal(requests.at(-1)!.body.parallel_tool_calls, true);
+});
+
+test("带回模型服务返回的用量，包括思考用掉的 token", async () => {
+  const reply = completion("好");
+  responses.push({
+    ...reply,
+    body: {
+      ...reply.body,
+      usage: { prompt_tokens: 1200, completion_tokens: 300, total_tokens: 1500, completion_tokens_details: { reasoning_tokens: 250 } },
+    },
+  });
+  assert.deepEqual(await ask(), { text: "好", finish: "stop", usage: { input: 1200, output: 300, reasoning: 250 } });
+
+  responses.push({ ...reply, body: { ...reply.body, usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } } });
+  assert.deepEqual(await ask(), { text: "好", finish: "stop", usage: { input: 10, output: 2 } });
+  // 不带工具时不发 parallel_tool_calls，有的服务会拒绝
+  assert.equal(requests.at(-1)!.body.parallel_tool_calls, undefined);
 });
 
 test("把之前的工具调用和工具结果按 OpenAI 格式发回去", async () => {
@@ -138,4 +157,20 @@ test("中止后请求被取消，抛出的不是 LlmError", async () => {
     model.chat({ system: "你是助手", messages: [{ role: "user", content: "你好" }], signal: controller.signal }),
     (err) => !(err instanceof LlmError),
   );
+});
+
+test("服务不认 parallel_tool_calls 时去掉它重试，之后不再带", async () => {
+  const tool = { name: "fetch_url", description: "读网页", parameters: { type: "object", properties: {} } };
+  const withTools = () => model.chat({ system: "你是助手", messages: [{ role: "user", content: "看看" }], tools: [tool] });
+  responses.push(
+    { status: 400, body: { error: { code: "invalid_parameter", message: "Unrecognized request argument: parallel_tool_calls" } } },
+    completion("好"),
+    completion("好"),
+  );
+
+  assert.deepEqual(await withTools(), { text: "好", finish: "stop" });
+  assert.deepEqual(await withTools(), { text: "好", finish: "stop" });
+
+  const bodies = requests.slice(-3).map((r) => r.body.parallel_tool_calls);
+  assert.deepEqual(bodies, [true, undefined, undefined]);
 });

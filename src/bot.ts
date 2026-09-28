@@ -1,5 +1,6 @@
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { type AgentEvent, type AgentResult, runAgent } from "./agent.js";
+import { DuplicateAsks } from "./duplicates.js";
 import { labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { type ChatModel, LlmError } from "./llm.js";
 import { splitMarkdown } from "./markdown.js";
@@ -66,6 +67,7 @@ export interface BotDeps {
  */
 export function createMessageHandler(deps: BotDeps) {
   const { allowedChatIds, tasks, send, logger = console } = deps;
+  const duplicates = new DuplicateAsks(deps.now);
 
   return async (msg: NormalizedMessage): Promise<void> => {
     if (!allowedChatIds.has(msg.chatId)) {
@@ -74,6 +76,19 @@ export function createMessageHandler(deps: BotDeps) {
       return;
     }
     logger.info(`收到提问 chat=${msg.chatId} message=${msg.messageId} thread=${threadKeyOf(msg)} sender=${msg.senderId}`);
+
+    // 话题里回复时勾了「同时发送到群」会收到两条一样的 @，只处理话题里那条，写操作不做两遍
+    const verdict = duplicates.check(msg);
+    if (verdict.action === "skip") {
+      logger.info(`跳过重复的提问 message=${msg.messageId}：和 ${verdict.duplicateOf} 是同一个人几秒内发的同一句话（多半勾了「同时发送到群」）`);
+      return;
+    }
+    if ("stopThreadKey" in verdict) {
+      const stopped = tasks.stopThread(verdict.stopThreadKey);
+      logger.info(
+        `message=${msg.messageId} 和群里先到的 ${verdict.duplicateOf} 是同一句话，改为处理话题里这条，停掉副本的任务 ${stopped} 个`,
+      );
+    }
 
     const question = msg.content.trim();
     const reply = (markdown: string) =>
@@ -151,8 +166,11 @@ async function runTask(
       tools: taskTools,
       signal: task.signal,
       onEvent: (event) => {
-        applyEvent(state, event);
-        card?.update(render());
+        logEvent(logger, msg.messageId, event);
+        if (event.type !== "model") {
+          applyEvent(state, event);
+          card?.update(render());
+        }
       },
     });
     answer = toReply(result.text, result.finish);
@@ -216,7 +234,24 @@ async function loadGroupMemory(deps: BotDeps, msg: NormalizedMessage, askerName:
   }
 }
 
-function applyEvent(state: ProgressState, event: AgentEvent): void {
+/** 每轮模型调用和每次工具调用各记一行，用来看一次回复的时间花在哪 */
+function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
+  if (event.type === "model") {
+    const usage = event.usage
+      ? ` 输入=${event.usage.input} 输出=${event.usage.output}${event.usage.reasoning ? ` 其中思考=${event.usage.reasoning}` : ""}`
+      : "";
+    const next = event.toolNames.length > 0 ? `调用 ${event.toolNames.join(", ")}` : "给出回答";
+    logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${usage} → ${next}`);
+  } else if (event.type === "tool_end") {
+    if (event.ok) {
+      logger.info(`工具 ${event.name} message=${messageId} 用时=${event.ms}ms`);
+    } else {
+      logger.warn(`工具 ${event.name} 失败 message=${messageId} 用时=${event.ms}ms：${event.error ?? "未知原因"}`);
+    }
+  }
+}
+
+function applyEvent(state: ProgressState, event: Exclude<AgentEvent, { type: "model" }>): void {
   if (event.type === "tool_start") {
     state.steps.push({ id: event.id, label: event.label, status: "running" });
     return;

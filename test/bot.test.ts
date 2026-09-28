@@ -458,3 +458,78 @@ test("按任务创建的工具拿到当前群和发起人，和其他工具一�
   ]);
   assert.match(requests[0].system, /飞书文档链接（\/docx\/、\/wiki\/ 等）用 feishu_doc_read 读，不要用 fetch_url/);
 });
+
+test("勾了「同时发送到群」时群里多出的那份一样的提问跳过，不调用模型也不回复", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "追加好了", finish: "stop" }));
+  const logs: string[] = [];
+  const { sent, handle } = setup({ model, logger: { ...quiet, info: (line: string) => logs.push(line) } });
+
+  await handle(message("在文档末尾追加一行", { messageId: "om_t", rootId: "om_root", threadId: "omt_1" }));
+  await handle(message("在文档末尾追加一行", { messageId: "om_g" }));
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(markdowns(sent), ["追加好了"]);
+  assert.ok(sent.every((s) => s.opts?.replyTo === "om_t"));
+  assert.match(logs.join("\n"), /跳过重复的提问 message=om_g：和 om_t/);
+});
+
+test("群里那份副本先到时，停掉它的任务，改为回答话题里那条", async () => {
+  let calls = 0;
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  const model: ChatModel = {
+    model: "fake",
+    chat: ({ signal }) => {
+      calls++;
+      if (calls === 1) {
+        return new Promise((_, reject) => {
+          started();
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      return Promise.resolve({ text: "追加好了", finish: "stop" });
+    },
+  };
+  const { sent, updates, handle } = setup({ model });
+
+  const copy = handle(message("在文档末尾追加一行", { messageId: "om_g" }));
+  await running;
+  await handle(message("在文档末尾追加一行", { messageId: "om_t", rootId: "om_root", threadId: "omt_1" }));
+  await copy;
+
+  assert.equal(calls, 2);
+  assert.deepEqual(
+    sent.filter((s) => "markdown" in s.input).map((s) => s.opts?.replyTo),
+    ["om_t"],
+  );
+  assert.deepEqual(markdowns(sent), ["追加好了"]);
+  // 副本的进度卡片（第一张）标成已停止
+  assert.ok(updates.some((u) => u.messageId === "om_reply_1" && /已停止/.test(cardText(u.card))));
+});
+
+test("日志里记下每轮模型调用和每次工具调用的用时", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }],
+      usage: { input: 1500, output: 20, reasoning: 12 },
+    },
+    { text: "总结", finish: "stop", usage: { input: 1600, output: 300 } },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const logs: string[] = [];
+  const { handle } = setup({ model, tools: [tool], logger: { ...quiet, info: (line: string) => logs.push(line) } });
+
+  await handle(message("查一下"));
+
+  const text = logs.join("\n");
+  assert.match(text, /模型第1轮 message=om_1 用时=\d+ms 输入=1500 输出=20 其中思考=12 → 调用 lookup/);
+  assert.match(text, /工具 lookup message=om_1 用时=\d+ms/);
+  assert.match(text, /模型第2轮 message=om_1 用时=\d+ms 输入=1600 输出=300 → 给出回答/);
+});

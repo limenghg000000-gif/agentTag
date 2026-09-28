@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatModel, ChatResult, ToolCall } from "./llm.js";
+import type { ChatMessage, ChatModel, ChatResult, TokenUsage, ToolCall } from "./llm.js";
 import type { Tool } from "./tools/tool.js";
 
 /** 单次任务最多几轮工具调用。到了上限就让模型用已有信息直接作答。 */
@@ -10,8 +10,11 @@ const LAST_ROUND_NOTE = "工具调用次数已经用完了。请根据上面已�
 const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限（${MAX_TOOL_ROUNDS} 轮工具调用），我先停在这里。可以把任务拆小一点再交给我。`;
 
 export type AgentEvent =
+  /** 一轮模型调用结束。toolNames 为空表示这一轮给出了回答 */
+  | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[] }
   | { type: "tool_start"; id: string; label: string }
-  | { type: "tool_end"; id: string; ok: boolean };
+  /** error 是交给模型的失败原因 */
+  | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string };
 
 export interface AgentRequest {
   model: ChatModel;
@@ -21,6 +24,8 @@ export interface AgentRequest {
   signal: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
   maxToolRounds?: number;
+  /** 计时用的时钟（毫秒） */
+  now?: () => number;
 }
 
 export interface AgentResult {
@@ -42,6 +47,7 @@ export async function runAgent({
   signal,
   onEvent = () => {},
   maxToolRounds = MAX_TOOL_ROUNDS,
+  now = Date.now,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
   const specs = tools.map((tool) => tool.spec);
@@ -54,7 +60,15 @@ export async function runAgent({
     if (lastRound) {
       conversation.push({ role: "user", content: LAST_ROUND_NOTE });
     }
+    const startedAt = now();
     const result = await model.chat({ system, messages: conversation, tools: specs, signal });
+    onEvent({
+      type: "model",
+      round: round + 1,
+      ms: now() - startedAt,
+      ...(result.usage ? { usage: result.usage } : {}),
+      toolNames: result.finish === "tool_calls" ? (result.toolCalls ?? []).map((call) => call.name) : [],
+    });
     if (result.finish !== "tool_calls" || !result.toolCalls?.length) {
       return { text: result.text, finish: result.finish === "tool_calls" ? "stop" : result.finish, toolCalls };
     }
@@ -64,7 +78,7 @@ export async function runAgent({
 
     conversation.push({ role: "assistant", content: result.text, toolCalls: result.toolCalls });
     const outputs = await Promise.all(
-      result.toolCalls.map((call) => runTool(call, byName.get(call.name), signal, onEvent)),
+      result.toolCalls.map((call) => runTool(call, byName.get(call.name), signal, onEvent, now)),
     );
     toolCalls += result.toolCalls.length;
     signal.throwIfAborted();
@@ -79,6 +93,7 @@ async function runTool(
   tool: Tool | undefined,
   signal: AbortSignal,
   onEvent: (event: AgentEvent) => void,
+  now: () => number,
 ): Promise<string> {
   if (!tool) {
     return `没有名为 ${call.name} 的工具。`;
@@ -95,12 +110,13 @@ async function runTool(
   }
 
   onEvent({ type: "tool_start", id: call.id, label: safeDescribe(tool, args) });
+  const startedAt = now();
   try {
     const output = await tool.run(args, { signal });
-    onEvent({ type: "tool_end", id: call.id, ok: true });
+    onEvent({ type: "tool_end", id: call.id, name: call.name, ok: true, ms: now() - startedAt });
     return truncate(output, MAX_TOOL_OUTPUT_CHARS);
   } catch (err) {
-    onEvent({ type: "tool_end", id: call.id, ok: false });
+    onEvent({ type: "tool_end", id: call.id, name: call.name, ok: false, ms: now() - startedAt, error: errorMessage(err) });
     if (signal.aborted) {
       throw err;
     }

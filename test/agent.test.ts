@@ -87,7 +87,11 @@ test("工具不存在、参数不是 JSON、工具抛错时，把错误交给模
   assert.match(outputs[0], /没有名为 nope 的工具/);
   assert.match(outputs[1], /不是合法的 JSON/);
   assert.match(outputs[2], /工具执行失败：网站返回 HTTP 404/);
-  assert.deepEqual(events.at(-1), { type: "tool_end", id: "c3", ok: false });
+  const failed = events.find((e) => e.type === "tool_end" && e.id === "c3");
+  assert.ok(failed?.type === "tool_end");
+  assert.equal(failed.ok, false);
+  assert.equal(failed.name, "fail");
+  assert.equal(failed.error, "网站返回 HTTP 404");
 });
 
 test("工具结果太长时截断", async () => {
@@ -137,4 +141,39 @@ test("停止后中止正在执行的工具，不再调用模型", async () => {
 
   await assert.rejects(run);
   assert.equal(requests.length, 1);
+});
+
+test("每轮模型调用和每次工具调用都报告用时，带上模型用量和要调的工具", async () => {
+  const { model } = scriptedModel([
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [call("c1", "echo", { text: "a" }), call("c2", "echo", { text: "b" })],
+      usage: { input: 900, output: 40, reasoning: 30 },
+    },
+    { text: "好了", finish: "stop" },
+  ]);
+  let clock = 0;
+  const events: AgentEvent[] = [];
+
+  await runAgent({
+    model,
+    system: "s",
+    messages: user,
+    tools: [echoTool()],
+    signal,
+    now: () => (clock += 5),
+    onEvent: (e) => events.push(e),
+  });
+
+  const rounds = events.filter((e) => e.type === "model");
+  assert.deepEqual(rounds, [
+    { type: "model", round: 1, ms: 5, usage: { input: 900, output: 40, reasoning: 30 }, toolNames: ["echo", "echo"] },
+    { type: "model", round: 2, ms: 5, toolNames: [] },
+  ]);
+  const ends = events.filter((e) => e.type === "tool_end");
+  assert.equal(ends.length, 2);
+  for (const end of ends) {
+    assert.ok(end.type === "tool_end" && end.ok && end.name === "echo" && end.ms > 0);
+  }
 });
