@@ -63,17 +63,17 @@ function workspaces(host: CodeHost, now?: () => Date) {
 test("克隆后列文件、带行号读文件、搜代码", async () => {
   const ws = await workspaces(fakeHost().host).open("om_1", "ACME/demo");
   assert.equal(ws.repo, "acme/demo");
-  assert.equal(ws.defaultBranch, "main");
-  assert.match(await ws.listFiles(), /共 5 个文件：\nREADME.md\nleak\nlogo.bin\nsrc\/a.ts\nsrc\/b.ts/);
-  assert.equal(await ws.listFiles({ glob: "src/**/*.ts" }), "共 2 个文件：\nsrc/a.ts\nsrc/b.ts");
+  assert.equal(ws.baseBranch, "main");
+  assert.match(await ws.listFiles(), /^共 5 个文件（main 分支 @ [0-9a-f]{7}）：\nREADME.md\nleak\nlogo.bin\nsrc\/a.ts\nsrc\/b.ts/);
+  assert.match(await ws.listFiles({ glob: "src/**/*.ts" }), /^共 2 个文件（main 分支 @ [0-9a-f]{7}）：\nsrc\/a.ts\nsrc\/b.ts$/);
   assert.equal(
     await ws.readFile("src/a.ts", 2, 3),
     "src/a.ts（共 4 行，下面是第 2 到 3 行，要看后面用 start_line=4）\n2| export function hello() {\n3|   return 'hi';",
   );
   assert.match(await ws.readFile("./src"), /src\/a.ts/);
-  assert.equal(await ws.search("hello"), "共 1 处：\nsrc/a.ts:2:export function hello() {");
-  assert.equal(await ws.search("A, A", { literal: true, ignoreCase: true }), "共 1 处：\nsrc/b.ts:2:console.log(a, a);");
-  assert.equal(await ws.search("nothing_here"), "没有搜到「nothing_here」。");
+  assert.match(await ws.search("hello"), /^共 1 处（main 分支 @ [0-9a-f]{7}）：\nsrc\/a.ts:2:export function hello\(\) \{$/);
+  assert.match(await ws.search("A, A", { literal: true, ignoreCase: true }), /：\nsrc\/b.ts:2:console.log\(a, a\);$/);
+  assert.match(await ws.search("nothing_here"), /^没有搜到「nothing_here」（main 分支 @ [0-9a-f]{7}）。$/);
   await assert.rejects(ws.readFile("logo.bin"), /二进制/);
   await assert.rejects(ws.readFile("missing.ts"), /没有这个文件/);
 });
@@ -89,7 +89,7 @@ test("不许跳出仓库：../、.git、指向仓库外的符号链接都拒绝"
   await assert.rejects(ws.editFile("src/../../x.ts", undefined, "x"), /要在仓库里面/);
   await assert.rejects(ws.search("x", { glob: "../*" }), /git grep 失败/);
   // 搜索不会顺着符号链接读到仓库外的文件
-  assert.equal(await ws.search("sk-secret"), "没有搜到「sk-secret」。");
+  assert.match(await ws.search("sk-secret"), /^没有搜到「sk-secret」/);
 });
 
 test("改文件：替换唯一的片段、新建文件，找不到或不唯一时报错；diff 列出全部改动", async () => {
@@ -284,4 +284,142 @@ test("代码工具：只有一个仓库时可以不填 repo，PR 描述带上发
   assert.equal(opens, 1);
   assert.equal(tools.code_search.describe({ pattern: "hello" }), "搜代码：hello");
   await assert.rejects(tools.code_edit_file.run({ path: "x.ts" }, { signal }), /缺少 new_text/);
+});
+
+// 分支的「远端」：默认分支 main 上只有 README，代码在 aiops 分支上，另有一个旧分支和一个最近的功能分支
+const branchRemote = path.join(tmp, "branches.git");
+const branchSeed = path.join(tmp, "branch-seed");
+async function commitAt(date: string, message: string) {
+  await runGit(["add", "-A"], { cwd: branchSeed });
+  await runGit(["commit", "-q", "-m", message], { cwd: branchSeed, env: { ...author, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } });
+}
+await runGit(["init", "-q", "--bare", "-b", "main", branchRemote]);
+await runGit(["clone", "-q", branchRemote, branchSeed]);
+await writeFile(path.join(branchSeed, "README.md"), "# aiops-mcp\n");
+await commitAt("2026-03-12T10:00:00+08:00", "Initial commit");
+await runGit(["checkout", "-q", "-b", "old"], { cwd: branchSeed });
+await writeFile(path.join(branchSeed, "legacy.go"), "// K8S client, deprecated\n");
+await commitAt("2026-05-01T10:00:00+08:00", "old k8s client");
+await runGit(["checkout", "-q", "-b", "aiops", "main"], { cwd: branchSeed });
+await mkdir(path.join(branchSeed, "internal", "tools"), { recursive: true });
+await writeFile(path.join(branchSeed, "internal", "tools", "k8s.go"), "package tools\n\nfunc RegisterK8sTools() {}\n");
+await commitAt("2026-09-20T10:00:00+08:00", "feat: k8s tools");
+await runGit(["checkout", "-q", "-b", "feature/x", "main"], { cwd: branchSeed });
+await writeFile(path.join(branchSeed, "x.txt"), "x\n");
+await commitAt("2026-09-25T10:00:00+08:00", "feature x");
+await runGit(["push", "-q", "origin", "main", "old", "aiops", "feature/x"], { cwd: branchSeed });
+
+function branchWorkspaces() {
+  const { host, prs } = fakeHost();
+  host.cloneUrl = () => `file://${branchRemote}`;
+  return { all: new CodeWorkspaces({ root: path.join(tmp, `ws${rootCount++}`), host, repos: ["ai/aiops-mcp"], logger: quiet }), prs };
+}
+
+test("分支：列出分支、在最近活跃的分支上一起搜、读别的分支上的文件，都不切换当前分支", async () => {
+  const ws = await branchWorkspaces().all.open("om_b1", "ai/aiops-mcp");
+  assert.match(await ws.search("k8s", { ignoreCase: true }), /^没有搜到「k8s」（main 分支 @ [0-9a-f]{7}）。$/);
+
+  const branches = await ws.listBranches();
+  assert.match(branches, /^ai\/aiops-mcp 共 4 个分支，按最近提交从新到旧：\n/);
+  assert.deepEqual(
+    branches.split("\n").slice(1).map((line) => line.split("：")[0]),
+    ["- feature/x", "- aiops", "- old", "- main（默认分支，当前在看）"],
+  );
+  assert.match(branches, /- aiops：2026-09-20 Seed「feat: k8s tools」/);
+  assert.equal((await ws.listBranches("AIO")).split("\n").length, 2);
+  assert.match(await ws.listBranches("nothing"), /没有名字里带「nothing」的分支，共 4 个分支/);
+
+  const found = await ws.search("k8s", { ignoreCase: true, branches: ["recent"] });
+  assert.match(found, /^在 2 个分支上共搜到 2 处：\n/);
+  assert.match(found, /【aiops 分支 @ [0-9a-f]{7}，1 处】\ninternal\/tools\/k8s.go:3:func RegisterK8sTools\(\) \{\}/);
+  assert.match(found, /【old 分支 @ [0-9a-f]{7}，1 处】\nlegacy.go:1:\/\/ K8S client, deprecated/);
+  assert.match(found, /没搜到的分支：feature\/x、main$/);
+  assert.match(await ws.search("RegisterK8sTools", { branches: ["aiops"], glob: "**/*.go" }), /在 1 个分支上共搜到 1 处/);
+  assert.match(await ws.search("nothing_here", { branches: ["aiops", "old"] }), /在这 2 个分支上都没有搜到「nothing_here」：aiops、old。/);
+
+  assert.match(await ws.readFile("internal/tools/k8s.go", 3, undefined, "origin/aiops"), /^internal\/tools\/k8s.go（aiops 分支 @ [0-9a-f]{7}，共 3 行，下面是第 3 到 3 行）\n3\| func RegisterK8sTools\(\) \{\}$/);
+  assert.match(await ws.readFile("internal", 1, undefined, "aiops"), /internal\/tools\/k8s.go/);
+  assert.match(await ws.listFiles({ glob: "**/*.go", branch: "aiops" }), /^共 1 个文件（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go$/);
+  assert.match(await ws.listFiles({ dir: "internal/tools", branch: "aiops" }), /internal\/tools\/k8s.go$/);
+  await assert.rejects(ws.readFile("nope.go", 1, undefined, "aiops"), /aiops 分支上没有这个文件：nope.go/);
+  await assert.rejects(ws.readFile("x", 1, undefined, "nope"), /没有 nope 这个分支，用 code_branches 看看有哪些分支/);
+  await assert.rejects(ws.search("x", { branches: ["../etc"] }), /分支名不对/);
+  await assert.rejects(ws.search("x", { branches: ["-x"] }), /分支名不对/);
+
+  assert.equal(ws.baseBranch, "main");
+  assert.match(await ws.listFiles(), /^共 1 个文件（main 分支 @ [0-9a-f]{7}）：\nREADME.md$/);
+});
+
+test("切换分支：之后读、搜、开合并请求都基于它，下个任务沿用；改过代码后不能再切", async () => {
+  const { all, prs } = branchWorkspaces();
+  const ws = await all.open("om_b2", "ai/aiops-mcp");
+  assert.match(await ws.switchBranch("origin/aiops"), /^已切到 aiops 分支，最新提交 [0-9a-f]{7} 2026-09-20 Seed「feat: k8s tools」。/);
+  assert.equal(ws.baseBranch, "aiops");
+  assert.match(await ws.search("RegisterK8sTools"), /^共 1 处（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go:3:/);
+  assert.match(await ws.listBranches(), /- aiops（当前在看）/);
+
+  const again = await all.open("om_b2", "ai/aiops-mcp");
+  assert.equal(again.baseBranch, "aiops");
+  await again.editFile("internal/tools/k8s.go", "func RegisterK8sTools() {}", "func RegisterK8sTools() {\n\t// TODO\n}");
+  await assert.rejects(again.switchBranch("main"), /已经基于 aiops 分支改了代码，不能再切分支/);
+  assert.equal(await again.switchBranch("aiops"), "已经在 aiops 分支上了。");
+
+  // 远端分支后来又有新提交：比较改动时不会把它混进来
+  await runGit(["checkout", "-q", "aiops"], { cwd: branchSeed });
+  await writeFile(path.join(branchSeed, "later.go"), "package later\n");
+  await commitAt("2026-09-27T10:00:00+08:00", "later");
+  await runGit(["push", "-q", "origin", "aiops"], { cwd: branchSeed });
+  const third = await all.open("om_b2", "ai/aiops-mcp");
+  assert.match(await third.search("package later", { branches: ["aiops"] }), /later.go:1/);
+  const diff = await third.diff();
+  assert.match(diff, /internal\/tools\/k8s.go/);
+  assert.doesNotMatch(diff, /later.go/);
+
+  const pr = await third.openPullRequest("加 TODO", "");
+  assert.equal(prs[0].base, "aiops");
+  assert.doesNotMatch(pr.stat, /later.go/);
+  assert.match(await third.search("TODO"), /（aiops 分支 @ [0-9a-f]{7}，含机器人的改动）/);
+});
+
+test("话题里切过去的分支被删了：下次打开时回到默认分支", async () => {
+  const { all } = branchWorkspaces();
+  const ws = await all.open("om_b3", "ai/aiops-mcp");
+  await ws.switchBranch("feature/x");
+  await runGit(["push", "-q", "origin", "--delete", "feature/x"], { cwd: branchSeed });
+  const again = await all.open("om_b3", "ai/aiops-mcp");
+  assert.equal(again.baseBranch, "main");
+  assert.match(await again.listFiles(), /README.md$/);
+});
+
+test("GitLab 列分支：调 v4 接口，按最近更新排，带最近一次提交", async () => {
+  const urls: string[] = [];
+  const fakeFetch = (async (url: string) => {
+    urls.push(url);
+    return new Response(
+      JSON.stringify([
+        { name: "master", default: true, commit: { committed_date: "2026-03-12T10:00:00.000+08:00", author_name: "张三", title: "Initial commit" } },
+        { name: "aiops", default: false, commit: { committed_date: "2026-09-20T10:00:00.000+08:00", author_name: "李四", title: "feat: k8s" } },
+      ]),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://lab.corp", "glpat-x", fakeFetch);
+  assert.deepEqual(await host.listBranches!("ai/aiops-mcp"), [
+    { name: "master", isDefault: true, date: "2026-03-12T10:00:00.000+08:00", author: "张三", title: "Initial commit" },
+    { name: "aiops", isDefault: false, date: "2026-09-20T10:00:00.000+08:00", author: "李四", title: "feat: k8s" },
+  ]);
+  assert.equal(urls[0], "https://lab.corp/api/v4/projects/ai%2Faiops-mcp/repository/branches?per_page=100&sort=updated_desc");
+});
+
+test("代码工具：code_branches 列出和切换分支，code_search 的 branches 也接受逗号分隔的字符串", async () => {
+  const { all } = branchWorkspaces();
+  const tools = Object.fromEntries(createCodeTools({ workspaces: all, threadKey: "om_b4", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  assert.equal(tools.code_branches.describe({}), "列出代码分支");
+  assert.equal(tools.code_branches.describe({ switch_to: "aiops" }), "切到 aiops 分支");
+  assert.equal(tools.code_search.describe({ pattern: "k8s", branches: ["recent"] }), "搜代码：k8s（最近活跃的分支）");
+  assert.equal(tools.code_read_file.describe({ path: "a.go", branch: "aiops" }), "读代码 a.go（aiops 分支）");
+  assert.match(await tools.code_branches.run({ filter: "aio" }, { signal }), /- aiops：/);
+  assert.match(await tools.code_search.run({ pattern: "k8s", ignore_case: true, branches: "aiops, old" }, { signal }), /在 2 个分支上共搜到 2 处/);
+  assert.match(await tools.code_branches.run({ switch_to: "aiops" }, { signal }), /已切到 aiops 分支/);
+  assert.match(await tools.code_list_files.run({ glob: "**/*.go" }, { signal }), /（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go/);
 });

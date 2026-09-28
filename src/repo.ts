@@ -11,6 +11,10 @@ export const MAX_READ_CHARS = 20000;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_MATCHES = 100;
 const MAX_LIST_FILES = 500;
+const MAX_LIST_BRANCHES = 50;
+/** 跨分支搜索时，「最近活跃的分支」取几个；一次最多搜几个分支 */
+export const RECENT_BRANCHES = 8;
+const MAX_SEARCH_BRANCHES = 10;
 const MAX_DIFF_CHARS = 15000;
 const GIT_TIMEOUT_MS = 120_000;
 /** 话题里的工作目录多久没用就删掉 */
@@ -31,6 +35,18 @@ export interface CodeHost {
   openPullRequest(repo: string, pr: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
   /** 检查令牌能不能访问这个仓库：能访问时返回一句说明，不能时抛 RepoError 说明原因。启动时用来在日志里报告每个仓库的状态 */
   checkAccess?(repo: string): Promise<string>;
+  /** 用平台接口列出分支和各自最近一次提交，不用拉代码。没有实现时用 git 把所有分支拉下来再列 */
+  listBranches?(repo: string, signal?: AbortSignal): Promise<BranchInfo[]>;
+}
+
+/** 一个分支和它最近一次提交 */
+export interface BranchInfo {
+  name: string;
+  isDefault?: boolean;
+  /** 最近一次提交的时间（ISO 格式） */
+  date?: string;
+  author?: string;
+  title?: string;
 }
 
 /** GitLab 的角色等级 */
@@ -115,6 +131,27 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         throw new RepoError(`能看到项目，但角色是 ${role ?? level}，推不了分支，要 Developer 以上`);
       }
       return `能访问${role ? `，角色 ${role}` : ""}${branch}`;
+    },
+    async listBranches(repo, signal) {
+      const res = await fetchImpl(
+        `${base}/api/v4/projects/${encodeURIComponent(repo)}/repository/branches?per_page=100&sort=updated_desc`,
+        { headers: { "private-token": token }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) },
+      );
+      if (!res.ok) {
+        throw new RepoError(`GitLab 列分支失败（HTTP ${res.status}）`);
+      }
+      const body = (await res.json()) as {
+        name: string;
+        default?: boolean;
+        commit?: { committed_date?: string; author_name?: string; title?: string };
+      }[];
+      return body.map((b) => ({
+        name: b.name,
+        isDefault: b.default === true,
+        date: b.commit?.committed_date,
+        author: b.commit?.author_name,
+        title: b.commit?.title,
+      }));
     },
   };
 }
@@ -238,6 +275,10 @@ export function runGit(args: string[], { cwd, env, signal, okCodes = [] }: GitOp
 }
 
 interface WorkspaceState {
+  /** 这个话题切换到的分支，看代码、改代码、开合并请求都基于它。没切过时用仓库默认分支 */
+  base?: string;
+  /** 工作目录检出时 base 分支的提交。比较改动时和它比，远端分支后来更新了也不会混进来 */
+  baseSha?: string;
   /** 机器人为这个话题建的分支，第一次提交时建 */
   branch?: string;
   /** 最近一次推上去的提交 */
@@ -348,9 +389,15 @@ async function readState(dir: string): Promise<WorkspaceState> {
 
 /** 一个仓库的工作目录。路径都相对仓库根目录，不能跳出去，也不能碰 .git */
 export class Workspace {
-  defaultBranch = "main";
+  /** 当前看的分支：切换过就是切换后的，否则是仓库默认分支 */
+  baseBranch = "main";
   private realDir = "";
   private queue: Promise<unknown> = Promise.resolve();
+  /** git fetch 排队执行，免得几个并行的读取同时拉代码抢锁 */
+  private fetching: Promise<unknown> = Promise.resolve();
+  /** 这个任务里已经拉过最新提交的分支 */
+  private readonly fetched = new Set<string>();
+  private branches?: Promise<BranchInfo[]>;
 
   constructor(
     readonly repo: string,
@@ -370,30 +417,112 @@ export class Workspace {
   async init(existed: boolean, signal?: AbortSignal): Promise<void> {
     this.realDir = await realpath(this.dir);
     const head = await this.git(["rev-parse", "--abbrev-ref", "origin/HEAD"], signal).catch(() => "origin/main");
-    this.defaultBranch = head.trim().replace(/^origin\//, "") || "main";
-    if (existed && !this.state.branch && !(await this.hasChanges(signal))) {
-      await this.git(["fetch", "--depth", "1", "--no-tags", "origin", this.defaultBranch], signal);
-      await this.git(["reset", "--hard", "FETCH_HEAD"], signal);
+    const remoteDefault = head.trim().replace(/^origin\//, "") || "main";
+    this.baseBranch = this.state.base ?? remoteDefault;
+    if (!existed) {
+      this.state.baseSha = (await this.git(["rev-parse", "HEAD"], signal)).trim();
+    } else if (!this.state.branch && !(await this.hasChanges(signal))) {
+      try {
+        await this.fetchBranches([this.baseBranch], signal);
+      } catch (err) {
+        // 话题里切过去的分支后来被删了：回到默认分支
+        if (!this.state.base || !(err instanceof RepoError)) {
+          throw err;
+        }
+        this.state.base = undefined;
+        this.baseBranch = remoteDefault;
+        await this.fetchBranches([this.baseBranch], signal);
+      }
+      await this.checkout(this.baseBranch, signal);
     }
     // 状态文件的修改时间记作最近使用时间，sweep 按它删旧目录
     await this.saveState();
   }
 
-  /** 列出文件（含新建还没提交的）。glob 如 src/**\/*.ts，dir 如 src/tools */
-  async listFiles({ dir, glob }: { dir?: string; glob?: string } = {}): Promise<string> {
-    const specs = glob ? [`:(glob)${glob}`] : dir ? [this.relative(dir)] : [];
-    const out = await this.git(["ls-files", "--cached", "--others", "--exclude-standard", "--", ...specs]);
-    const files = [...new Set(out.split("\n").filter(Boolean))];
+  /**
+   * 列出分支，按最近提交从新到旧，带最近一次提交的时间、作者和说明。filter 只列名字里带这个词的
+   */
+  async listBranches(filter?: string, signal?: AbortSignal): Promise<string> {
+    const all = await this.branchList(signal);
+    const word = filter?.trim().toLowerCase();
+    const matched = word ? all.filter((b) => b.name.toLowerCase().includes(word)) : all;
+    if (matched.length === 0) {
+      return word ? `${this.repo} 没有名字里带「${filter}」的分支，共 ${all.length} 个分支。` : `${this.repo} 还没有分支。`;
+    }
+    const shown = matched.slice(0, MAX_LIST_BRANCHES);
+    const more = matched.length - shown.length;
+    const lines = shown.map((b) => {
+      const tags = [b.isDefault ? "默认分支" : "", b.name === this.baseBranch ? "当前在看" : ""].filter(Boolean);
+      const commit = [b.date?.slice(0, 10), b.author].filter(Boolean).join(" ") + (b.title ? `「${oneLine(b.title)}」` : "");
+      return `- ${b.name}${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`;
+    });
+    const head =
+      `${this.repo} 共 ${all.length} 个分支${word ? `，名字带「${filter}」的有 ${matched.length} 个` : ""}，按最近提交从新到旧` +
+      `${more > 0 ? `，只列出前 ${MAX_LIST_BRANCHES} 个，用 filter 缩小范围` : ""}：`;
+    return [head, ...lines].join("\n");
+  }
+
+  /**
+   * 切换这个话题看的分支。之后不指定分支的读、搜、改和开合并请求都基于它。
+   * 已经改了代码或开过合并请求时不能切，免得改动混到别的分支上。
+   */
+  switchBranch(branch: string, signal?: AbortSignal): Promise<string> {
+    return this.serial(async () => {
+      const name = branchName(branch);
+      if (this.state.branch || (await this.hasChanges(signal))) {
+        if (name === this.baseBranch) {
+          return `已经在 ${name} 分支上了。`;
+        }
+        throw new RepoError(
+          `这个话题里已经基于 ${this.baseBranch} 分支改了代码${this.pullRequest ? `，开了${this.host.requestName} ${this.pullRequest.url}` : ""}，不能再切分支。` +
+            "只是看别的分支的代码，给读、搜工具传 branch 就行；要基于别的分支改代码，请群成员新开一个话题",
+        );
+      }
+      await this.fetchBranches([name], signal);
+      await this.checkout(name, signal);
+      this.baseBranch = name;
+      this.state.base = name;
+      await this.saveState();
+      const last = (await this.git(["log", "-1", "--format=%h %cs %an「%s」"], signal)).trim();
+      return `已切到 ${name} 分支，最新提交 ${last}。这个话题后面看代码、改代码、开${this.host.requestName}都基于这个分支。`;
+    });
+  }
+
+  /**
+   * 列出文件。glob 如 src/**\/*.ts，dir 如 src/tools。
+   * 不指定 branch 时列当前分支的工作目录（含机器人新建还没提交的）；指定时列那个分支上的
+   */
+  async listFiles({ dir, glob, branch }: { dir?: string; glob?: string; branch?: string } = {}, signal?: AbortSignal): Promise<string> {
+    await this.queue;
+    const ref = await this.branchRef(branch, signal);
+    let files: string[];
+    if (ref) {
+      const prefix = dir ? this.relative(dir) : ".";
+      const pattern = glob ? globToRegExp(glob) : undefined;
+      files = (await this.git(["ls-tree", "-r", "--name-only", ref.ref], signal))
+        .split("\n")
+        .filter((f) => f && (prefix === "." || f === prefix || f.startsWith(`${prefix}/`)) && (!pattern || pattern.test(f)));
+    } else {
+      const specs = glob ? [`:(glob)${glob}`] : dir ? [this.relative(dir)] : [];
+      const out = await this.git(["ls-files", "--cached", "--others", "--exclude-standard", "--", ...specs], signal);
+      files = [...new Set(out.split("\n").filter(Boolean))];
+    }
+    const where = await this.label(ref, signal);
     if (files.length === 0) {
-      return "没有匹配的文件。";
+      return `没有匹配的文件（${where}）。`;
     }
     const shown = files.slice(0, MAX_LIST_FILES);
     const more = files.length - shown.length;
-    return [`共 ${files.length} 个文件${more > 0 ? `，只列出前 ${MAX_LIST_FILES} 个，缩小范围再看` : ""}：`, ...shown].join("\n");
+    return [`共 ${files.length} 个文件（${where}）${more > 0 ? `，只列出前 ${MAX_LIST_FILES} 个，缩小范围再看` : ""}：`, ...shown].join("\n");
   }
 
-  /** 读文件，带行号。start/end 是行号（从 1 开始，含 end） */
-  async readFile(file: string, start = 1, end?: number): Promise<string> {
+  /** 读文件，带行号。start/end 是行号（从 1 开始，含 end）。指定 branch 时读那个分支上的 */
+  async readFile(file: string, start = 1, end?: number, branch?: string, signal?: AbortSignal): Promise<string> {
+    await this.queue;
+    const ref = await this.branchRef(branch, signal);
+    if (ref) {
+      return this.readFromBranch(ref, file, start, end, signal);
+    }
     const abs = await this.resolve(file);
     const info = await stat(abs).catch(() => undefined);
     if (!info) {
@@ -409,46 +538,203 @@ export class Workspace {
     if (buf.subarray(0, 8000).includes(0)) {
       throw new RepoError(`${file} 是二进制文件，读不了`);
     }
-    const lines = buf.toString("utf8").split("\n");
-    if (lines.at(-1) === "") {
-      lines.pop();
-    }
-    const from = Math.max(1, Math.floor(start));
-    const to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
-    if (from > lines.length) {
-      return `${file} 只有 ${lines.length} 行。`;
-    }
-    const body: string[] = [];
-    let size = 0;
-    let last = from - 1;
-    for (let i = from; i <= to; i++) {
-      const line = `${i}| ${lines[i - 1]}`;
-      if (size + line.length > MAX_READ_CHARS && body.length > 0) {
-        break;
-      }
-      body.push(line);
-      size += line.length + 1;
-      last = i;
-    }
-    const head = `${file}（共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`;
-    return [head, ...body].join("\n");
+    return numberedLines(file, buf.toString("utf8"), start, end);
   }
 
-  /** 按正则（或原文）搜代码，返回「文件:行号: 内容」 */
-  async search(pattern: string, { literal = false, ignoreCase = false, glob }: { literal?: boolean; ignoreCase?: boolean; glob?: string } = {}): Promise<string> {
-    const args = ["grep", "-n", "-I", "--untracked", "--no-color", literal ? "-F" : "-E"];
+  /** 从别的分支读文件：直接读 git 里的对象，不动工作目录 */
+  private async readFromBranch(ref: BranchRef, file: string, start: number, end: number | undefined, signal?: AbortSignal): Promise<string> {
+    const rel = this.relative(file);
+    if (rel === ".") {
+      return this.listFiles({ branch: ref.name }, signal);
+    }
+    const spec = `${ref.ref}:${rel}`;
+    const type = (await this.git(["cat-file", "-t", spec], signal).catch(() => "")).trim();
+    if (!type) {
+      throw new RepoError(`${ref.name} 分支上没有这个文件：${file}。可以先用 code_list_files 或 code_search 找找`);
+    }
+    if (type === "tree") {
+      return this.listFiles({ dir: rel, branch: ref.name }, signal);
+    }
+    if (type !== "blob") {
+      throw new RepoError(`${file} 是子模块，读不了`);
+    }
+    const size = Number((await this.git(["cat-file", "-s", spec], signal)).trim());
+    if (size > MAX_FILE_BYTES) {
+      throw new RepoError(`${file} 有 ${Math.round(size / 1024)} KB，太大了不读，用 code_search 搜需要的部分`);
+    }
+    const text = await this.git(["cat-file", "blob", spec], signal);
+    if (text.slice(0, 8000).includes("\u0000")) {
+      throw new RepoError(`${file} 是二进制文件，读不了`);
+    }
+    return numberedLines(file, text, start, end, await this.label(ref, signal));
+  }
+
+  /**
+   * 按正则（或原文）搜代码，返回「文件:行号: 内容」。
+   * 不指定 branches 时搜当前分支的工作目录；指定时在这些分支上一起搜，结果按分支分组。branches 里的 recent 表示最近有提交的几个分支
+   */
+  async search(
+    pattern: string,
+    { literal = false, ignoreCase = false, glob, branches }: { literal?: boolean; ignoreCase?: boolean; glob?: string; branches?: readonly string[] } = {},
+    signal?: AbortSignal,
+  ): Promise<string> {
+    await this.queue;
+    const args = ["grep", "-n", "-I", "--no-color", literal ? "-F" : "-E"];
     if (ignoreCase) {
       args.push("-i");
     }
-    args.push("-e", pattern, "--", ...(glob ? [`:(glob)${glob}`] : []));
-    const out = await this.git(args, undefined, [1]);
-    const matches = out.split("\n").filter(Boolean);
-    if (matches.length === 0) {
-      return `没有搜到「${pattern}」。`;
+    args.push("-e", pattern);
+    const pathspec = ["--", ...(glob ? [`:(glob)${glob}`] : [])];
+    if (!branches || branches.length === 0) {
+      const out = await this.git([...args, "--untracked", ...pathspec], signal, [1]);
+      const where = await this.label(undefined, signal);
+      const matches = out.split("\n").filter(Boolean);
+      if (matches.length === 0) {
+        return `没有搜到「${pattern}」（${where}）。`;
+      }
+      const shown = matches.slice(0, MAX_SEARCH_MATCHES).map(clip);
+      const more = matches.length - shown.length;
+      return [`共 ${matches.length} 处（${where}）${more > 0 ? `，只列出前 ${MAX_SEARCH_MATCHES} 处，换个更具体的搜法或加 glob 缩小范围` : ""}：`, ...shown].join("\n");
     }
-    const shown = matches.slice(0, MAX_SEARCH_MATCHES).map((line) => (line.length > 300 ? `${line.slice(0, 300)}…` : line));
-    const more = matches.length - shown.length;
-    return [`共 ${matches.length} 处${more > 0 ? `，只列出前 ${MAX_SEARCH_MATCHES} 处，换个更具体的搜法或加 glob 缩小范围` : ""}：`, ...shown].join("\n");
+
+    const names = await this.pickBranches(branches, signal);
+    await this.fetchBranches(names, signal);
+    const refs = names.map((name) => `refs/remotes/origin/${name}`);
+    const out = await this.git([...args, ...refs, ...pathspec], signal, [1]);
+    const found = new Map<string, string[]>(names.map((name) => [name, []]));
+    for (const line of out.split("\n")) {
+      const i = refs.findIndex((ref) => line.startsWith(`${ref}:`));
+      if (i >= 0) {
+        found.get(names[i])!.push(line.slice(refs[i].length + 1));
+      }
+    }
+    const hit = names.filter((name) => found.get(name)!.length > 0);
+    const miss = names.filter((name) => found.get(name)!.length === 0);
+    if (hit.length === 0) {
+      return `在这 ${names.length} 个分支上都没有搜到「${pattern}」：${names.join("、")}。`;
+    }
+    const labels = await Promise.all(hit.map((name) => this.label({ name, ref: `refs/remotes/origin/${name}` }, signal)));
+    const total = hit.reduce((sum, name) => sum + found.get(name)!.length, 0);
+    const lines = [`在 ${hit.length} 个分支上共搜到 ${total} 处${total > MAX_SEARCH_MATCHES ? `，只列出前 ${MAX_SEARCH_MATCHES} 处` : ""}：`];
+    let budget = MAX_SEARCH_MATCHES;
+    hit.forEach((name, i) => {
+      const matches = found.get(name)!;
+      lines.push(`【${labels[i]}，${matches.length} 处】`, ...matches.slice(0, Math.max(0, budget)).map(clip));
+      budget -= matches.length;
+    });
+    if (miss.length > 0) {
+      lines.push(`没搜到的分支：${miss.join("、")}`);
+    }
+    return lines.join("\n");
+  }
+
+  /** 分支和最近一次提交，按提交时间从新到旧。一个任务里只查一次 */
+  private branchList(signal?: AbortSignal): Promise<BranchInfo[]> {
+    if (!this.branches) {
+      // 平台接口出错（比如老版本 GitLab）时退回用 git 列
+      const list = this.host.listBranches
+        ? this.host.listBranches(this.repo, signal).catch(() => this.gitBranchList(signal))
+        : this.gitBranchList(signal);
+      this.branches = list.then((all) => [...all].sort((a, b) => (Date.parse(b.date ?? "") || 0) - (Date.parse(a.date ?? "") || 0)));
+      this.branches.catch(() => {
+        this.branches = undefined;
+      });
+    }
+    return this.branches;
+  }
+
+  /** 平台没有列分支的接口时：把所有分支的最新提交拉下来，用 git 列 */
+  private async gitBranchList(signal?: AbortSignal): Promise<BranchInfo[]> {
+    const head = await this.git(["ls-remote", "--symref", "origin", "HEAD"], signal);
+    const remoteDefault = /^ref: refs\/heads\/(\S+)\s+HEAD/m.exec(head)?.[1];
+    await this.fetch(["+refs/heads/*:refs/remotes/origin/*"], signal);
+    const out = await this.git(
+      ["for-each-ref", "--format=%(refname:lstrip=3)%09%(committerdate:iso-strict)%09%(authorname)%09%(subject)", "refs/remotes/origin/"],
+      signal,
+    );
+    return out
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => line.split("\t"))
+      .filter(([name]) => name !== "HEAD")
+      .map(([name, date, author, title]) => {
+        this.fetched.add(name);
+        return { name, isDefault: name === remoteDefault, date, author, title };
+      });
+  }
+
+  /** 把 branches 参数换成分支名：recent 换成最近有提交的几个分支，去重，最多 MAX_SEARCH_BRANCHES 个 */
+  private async pickBranches(branches: readonly string[], signal?: AbortSignal): Promise<string[]> {
+    const names: string[] = [];
+    for (const item of branches) {
+      if (/^(recent|最近)$/i.test(item.trim())) {
+        names.push(...(await this.branchList(signal)).slice(0, RECENT_BRANCHES).map((b) => b.name));
+      } else if (item.trim()) {
+        names.push(branchName(item));
+      }
+    }
+    const unique = [...new Set(names)];
+    if (unique.length === 0) {
+      throw new RepoError("branches 里没有分支名");
+    }
+    if (unique.length > MAX_SEARCH_BRANCHES) {
+      throw new RepoError(`一次最多在 ${MAX_SEARCH_BRANCHES} 个分支上搜，这次给了 ${unique.length} 个`);
+    }
+    return unique;
+  }
+
+  /** 读别的分支时用的引用（先拉下那个分支的最新提交）。没指定或就是当前分支时返回 undefined，读工作目录 */
+  private async branchRef(branch: string | undefined, signal?: AbortSignal): Promise<BranchRef | undefined> {
+    if (!branch?.trim()) {
+      return undefined;
+    }
+    const name = branchName(branch);
+    if (name === this.baseBranch) {
+      return undefined;
+    }
+    await this.fetchBranches([name], signal);
+    return { name, ref: `refs/remotes/origin/${name}` };
+  }
+
+  /** 结果里写明是哪个分支、哪个提交，如「aiops 分支 @ 3f2a1c9」 */
+  private async label(ref: BranchRef | undefined, signal?: AbortSignal): Promise<string> {
+    const sha = (await this.git(["rev-parse", "--short", ref?.ref ?? "HEAD"], signal)).trim();
+    return ref ? `${ref.name} 分支 @ ${sha}` : `${this.baseBranch} 分支 @ ${sha}${this.state.branch ? "，含机器人的改动" : ""}`;
+  }
+
+  /** 浅拉这些分支的最新提交到 origin/<分支>。一个任务里每个分支只拉一次 */
+  private async fetchBranches(names: readonly string[], signal?: AbortSignal): Promise<void> {
+    const need = names.filter((name) => !this.fetched.has(name));
+    if (need.length === 0) {
+      return;
+    }
+    try {
+      await this.fetch(
+        need.map((name) => `+refs/heads/${name}:refs/remotes/origin/${name}`),
+        signal,
+      );
+    } catch (err) {
+      const missing = err instanceof RepoError ? /couldn't find remote ref refs\/heads\/(\S+)/.exec(err.message) : null;
+      if (missing) {
+        throw new RepoError(`没有 ${missing[1]} 这个分支，用 code_branches 看看有哪些分支`);
+      }
+      throw err;
+    }
+    for (const name of need) {
+      this.fetched.add(name);
+    }
+  }
+
+  private fetch(refspecs: string[], signal?: AbortSignal): Promise<string> {
+    const run = this.fetching.then(() => this.git(["fetch", "-q", "--depth", "1", "--no-tags", "origin", ...refspecs], signal));
+    this.fetching = run.catch(() => {});
+    return run;
+  }
+
+  /** 工作目录换到 origin/<分支> 的最新提交，记下这个提交作为比较改动的基准 */
+  private async checkout(name: string, signal?: AbortSignal): Promise<void> {
+    await this.git(["checkout", "-q", "-B", name, `refs/remotes/origin/${name}`], signal);
+    this.state.baseSha = (await this.git(["rev-parse", "HEAD"], signal)).trim();
   }
 
   /**
@@ -500,8 +786,8 @@ export class Workspace {
 
   private async stagedDiff(): Promise<string> {
     await this.git(["add", "-A"]);
-    // 和上次推上去的（没推过就是默认分支）比，没推的提交和没提交的改动都算
-    const base = this.state.pushedSha ?? `origin/${this.defaultBranch}`;
+    // 和上次推上去的（没推过就是检出时的分支）比，没推的提交和没提交的改动都算
+    const base = this.state.pushedSha ?? this.state.baseSha ?? `origin/${this.baseBranch}`;
     const stat = (await this.git(["diff", "--cached", "--stat", base])).trim();
     if (!stat) {
       return this.pullRequest
@@ -514,7 +800,7 @@ export class Workspace {
   }
 
   /**
-   * 提交全部改动，推到机器人自己建的分支，开 PR 到默认分支。这个话题已经开过 PR 时推到同一个分支，更新那个 PR。
+   * 提交全部改动，推到机器人自己建的分支，开 PR 到当前看的分支（没切过就是默认分支）。这个话题已经开过 PR 时推到同一个分支，更新那个 PR。
    * 分支名由程序生成（agenttag/日期-随机），不会推到默认分支或别人的分支。
    */
   openPullRequest(title: string, body: string, signal?: AbortSignal): Promise<{ url: string; number: number; created: boolean; stat: string }> {
@@ -533,7 +819,7 @@ export class Workspace {
     }
     const branch = this.state.branch;
     const head = (await this.git(["rev-parse", "HEAD"], signal)).trim();
-    const base = this.state.pushedSha ?? (await this.git(["rev-parse", `origin/${this.defaultBranch}`], signal)).trim();
+    const base = this.state.pushedSha ?? this.state.baseSha ?? (await this.git(["rev-parse", `origin/${this.baseBranch}`], signal)).trim();
     const stat = (await this.git(["diff", "--stat", base, "HEAD"], signal)).trim();
     if (!branch || (head === base && this.pullRequest)) {
       throw new RepoError(
@@ -552,7 +838,7 @@ export class Workspace {
       return { ...this.pullRequest, created: false, stat };
     }
     // 上次推上去了但开 PR 失败时，这次直接补开
-    const pr = await this.host.openPullRequest(this.repo, { head: branch, base: this.defaultBranch, title, body });
+    const pr = await this.host.openPullRequest(this.repo, { head: branch, base: this.baseBranch, title, body });
     this.state = { ...this.state, prUrl: pr.url, prNumber: pr.number };
     await this.saveState();
     return { ...pr, created: true, stat };
@@ -642,6 +928,15 @@ export class Workspace {
   }
 }
 
+interface BranchRef {
+  name: string;
+  ref: string;
+}
+
+function clip(line: string): string {
+  return line.length > 300 ? `${line.slice(0, 300)}…` : line;
+}
+
 function newBranchName(now: Date): string {
   const day = now.toISOString().slice(0, 10).replace(/-/g, "");
   return `agenttag/${day}-${randomBytes(3).toString("hex")}`;
@@ -649,4 +944,70 @@ function newBranchName(now: Date): string {
 
 function safeName(name: string): string {
   return name.replace(/[^\w.-]/g, "_");
+}
+
+/** 文件内容加上行号，一次最多 MAX_READ_LINES 行、MAX_READ_CHARS 字。where 写明是哪个分支上的 */
+function numberedLines(file: string, text: string, start: number, end: number | undefined, where?: string): string {
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  const from = Math.max(1, Math.floor(start));
+  const to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
+  if (from > lines.length) {
+    return `${file} 只有 ${lines.length} 行。`;
+  }
+  const body: string[] = [];
+  let size = 0;
+  let last = from - 1;
+  for (let i = from; i <= to; i++) {
+    const line = `${i}| ${lines[i - 1]}`;
+    if (size + line.length > MAX_READ_CHARS && body.length > 0) {
+      break;
+    }
+    body.push(line);
+    size += line.length + 1;
+    last = i;
+  }
+  const head = `${file}（${where ? `${where}，` : ""}共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`;
+  return [head, ...body].join("\n");
+}
+
+/** 分支名：去掉 origin/、refs/heads/ 前缀，只许 git 分支名里常见的字符 */
+function branchName(input: string): string {
+  const name = input.trim().replace(/^refs\/heads\//, "").replace(/^origin\//, "");
+  if (!/^[\p{L}\p{N}_.\/+@-]+$/u.test(name) || name.startsWith("-") || name.includes("..") || name.endsWith("/") || name.endsWith(".lock")) {
+    throw new RepoError(`分支名不对：${input}`);
+  }
+  return name;
+}
+
+/** 把 glob（如 src/**\/*.ts）转成正则，规则和 git 的 :(glob) 一样：* 不跨目录，**\/ 匹配任意层目录 */
+export function globToRegExp(glob: string): RegExp {
+  const pattern = glob.trim().replace(/^\.?\/+/, "");
+  let re = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*" && pattern[i + 1] === "*") {
+      if (pattern[i + 2] === "/") {
+        re += "(?:.*/)?";
+        i += 2;
+      } else {
+        re += ".*";
+        i += 1;
+      }
+    } else if (c === "*") {
+      re += "[^/]*";
+    } else if (c === "?") {
+      re += "[^/]";
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function oneLine(text: string): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > 60 ? `${line.slice(0, 60)}…` : line;
 }
