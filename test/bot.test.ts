@@ -427,3 +427,34 @@ test("读不到群记忆时照常回答，只是不带记忆", async () => {
   assert.doesNotMatch(requests[0].system, /群记忆/);
   assert.match(errors[0], /读取群记忆失败/);
 });
+
+test("按任务创建的工具拿到当前群和发起人，和其他工具一起交给模型，提示词里带上文档规则", async () => {
+  const contexts: unknown[] = [];
+  const docTool = (name: string): Tool => ({
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({
+    model,
+    tools: [docTool("fetch_url")],
+    taskTools: (task) => {
+      contexts.push(task);
+      return [docTool("feishu_doc_read")];
+    },
+    memory: await memoryStore(),
+  });
+
+  await handle(message("看下这篇文档", { senderId: "ou_zhang" }));
+
+  assert.deepEqual(contexts, [{ chatId: "oc_1", senderId: "ou_zhang", messageId: "om_1" }]);
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), [
+    "fetch_url",
+    "feishu_doc_read",
+    "memory_save",
+    "memory_update",
+    "memory_delete",
+  ]);
+  assert.match(requests[0].system, /飞书文档链接（\/docx\/、\/wiki\/ 等）用 feishu_doc_read 读，不要用 fetch_url/);
+});

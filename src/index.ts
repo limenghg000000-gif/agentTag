@@ -6,11 +6,13 @@ import { MemoryBackup } from "./backup.js";
 import { createCardActionHandler, createMessageHandler } from "./bot.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { loadConfig } from "./config.js";
+import { createDocsApi, FeishuDocs } from "./docs.js";
 import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
 import { createOpenAICompatibleModel } from "./llm.js";
 import { MemoryStore } from "./memory.js";
 import { TaskRegistry } from "./tasks.js";
+import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
 
 if (existsSync(".env")) {
@@ -46,9 +48,12 @@ const backup =
     : undefined;
 
 const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
+const docs = new FeishuDocs(createDocsApi(channel.rawClient), () => channel.botIdentity?.name ?? "机器人");
 const handleMessage = createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
   tools,
+  // 文档工具按任务创建：新建的文档要共享给当前群和发起人
+  taskTools: ({ chatId, senderId }) => createDocTools({ docs, chatId, requesterOpenId: senderId }),
   allowedChatIds: config.feishu.allowedChatIds,
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
@@ -95,7 +100,7 @@ try {
 }
 console.log(
   `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
-    `工具 ${tools.map((tool) => tool.spec.name).join(", ")}，群记忆存放在 ${config.memoryDir}`,
+    `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES].join(", ")}，群记忆存放在 ${config.memoryDir}`,
 );
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();

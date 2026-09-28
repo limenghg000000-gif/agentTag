@@ -57,6 +57,8 @@ export class FeishuApiError extends Error {
   constructor(
     readonly code: number | undefined,
     message: string,
+    /** HTTP 状态码，接口直接返回 4xx/5xx 时才有 */
+    readonly status?: number,
   ) {
     super(message);
     this.name = "FeishuApiError";
