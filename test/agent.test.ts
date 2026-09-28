@@ -177,3 +177,56 @@ test("每轮模型调用和每次工具调用都报告用时，带上模型用�
     assert.ok(end.type === "tool_end" && end.ok && end.name === "echo" && end.ms > 0);
   }
 });
+
+test("回答没通过 review 时交回模型重做一次，第二次不再检查", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "瞎编的答案", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+    { text: "查过的答案", finish: "stop" },
+  ]);
+  const events: AgentEvent[] = [];
+  const seen: string[][] = [];
+
+  const result = await runAgent({
+    model,
+    system: "s",
+    messages: user,
+    tools: [echoTool()],
+    signal,
+    onEvent: (e) => events.push(e),
+    review: (answer, used) => {
+      seen.push([answer, ...used]);
+      return "先查再答";
+    },
+  });
+
+  assert.deepEqual(result, { text: "查过的答案", finish: "stop", toolCalls: 1 });
+  // 只检查了第一版；第一版和要求一起交回模型
+  assert.deepEqual(seen, [["瞎编的答案"]]);
+  assert.deepEqual(requests[1].messages.slice(1), [
+    { role: "assistant", content: "瞎编的答案" },
+    { role: "user", content: "先查再答" },
+  ]);
+  assert.ok(events.some((e) => e.type === "retry" && e.reason === "先查再答"));
+});
+
+test("review 拿到这次调过的工具名，通过时直接返回", async () => {
+  const { model } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+    { text: "答案", finish: "stop" },
+  ]);
+  let used: string[] = [];
+  const result = await runAgent({
+    model,
+    system: "s",
+    messages: user,
+    tools: [echoTool()],
+    signal,
+    review: (_answer, tools) => {
+      used = [...tools];
+      return undefined;
+    },
+  });
+  assert.equal(result.text, "答案");
+  assert.deepEqual(used, ["echo"]);
+});

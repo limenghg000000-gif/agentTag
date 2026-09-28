@@ -67,6 +67,7 @@ const handleMessage = createMessageHandler({
       : []),
   ],
   allowedChatIds: config.feishu.allowedChatIds,
+  ...(workspaces ? { codeRepos: workspaces.repos } : {}),
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
   memory,

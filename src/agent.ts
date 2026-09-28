@@ -14,7 +14,9 @@ export type AgentEvent =
   | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[] }
   | { type: "tool_start"; id: string; label: string }
   /** error 是交给模型的失败原因 */
-  | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string };
+  | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string }
+  /** 回答没通过 review，已经让模型重做 */
+  | { type: "retry"; reason: string };
 
 export interface AgentRequest {
   model: ChatModel;
@@ -28,6 +30,11 @@ export interface AgentRequest {
   now?: () => number;
   /** 这次任务单独打开或关掉思考；不传用模型的配置 */
   thinking?: boolean;
+  /**
+   * 模型给出最终回答时检查一遍，比如「回答里提到了仓库的文件，这次却一次代码工具都没调」。
+   * 返回一段话时，这版回答不发出去，把这段话交给模型让它重做；每个任务只重做一次。usedTools 是这次任务调过的工具名
+   */
+  review?: (answer: string, usedTools: ReadonlySet<string>) => string | undefined;
 }
 
 export interface AgentResult {
@@ -51,11 +58,14 @@ export async function runAgent({
   maxToolRounds = MAX_TOOL_ROUNDS,
   now = Date.now,
   thinking,
+  review,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
   const specs = tools.map((tool) => tool.spec);
   const conversation = [...messages];
+  const usedTools = new Set<string>();
   let toolCalls = 0;
+  let reviewed = false;
 
   for (let round = 0; ; round++) {
     signal.throwIfAborted();
@@ -73,6 +83,13 @@ export async function runAgent({
       toolNames: result.finish === "tool_calls" ? (result.toolCalls ?? []).map((call) => call.name) : [],
     });
     if (result.finish !== "tool_calls" || !result.toolCalls?.length) {
+      const redo = !lastRound && !reviewed && result.finish !== "filtered" ? review?.(result.text, usedTools) : undefined;
+      if (redo) {
+        reviewed = true;
+        onEvent({ type: "retry", reason: redo });
+        conversation.push({ role: "assistant", content: result.text }, { role: "user", content: redo });
+        continue;
+      }
       return { text: result.text, finish: result.finish === "tool_calls" ? "stop" : result.finish, toolCalls };
     }
     if (lastRound) {
@@ -84,6 +101,9 @@ export async function runAgent({
       result.toolCalls.map((call) => runTool(call, byName.get(call.name), signal, onEvent, now)),
     );
     toolCalls += result.toolCalls.length;
+    for (const call of result.toolCalls) {
+      usedTools.add(call.name);
+    }
     signal.throwIfAborted();
     result.toolCalls.forEach((call, i) => {
       conversation.push({ role: "tool", toolCallId: call.id, content: outputs[i] });
