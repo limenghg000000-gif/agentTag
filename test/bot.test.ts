@@ -535,3 +535,14 @@ test("日志里记下每轮模型调用和每次工具调用的用时", async ()
   assert.match(text, /工具 lookup message=om_1 用时=\d+ms/);
   assert.match(text, /模型第2轮 message=om_1 用时=\d+ms 输入=1600 输出=300 → 给出回答/);
 });
+
+test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model });
+
+  await handle(message("深度思考一下：这个架构有什么隐患？"));
+  await handle(message("今天周几", { messageId: "om_2" }));
+
+  assert.equal(requests[0].thinking, true);
+  assert.equal(requests[1].thinking, undefined);
+});

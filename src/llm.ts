@@ -26,6 +26,8 @@ export interface ChatRequest {
   tools?: ToolSpec[];
   /** 中止后正在进行的请求会被取消 */
   signal?: AbortSignal;
+  /** 这次单独打开或关掉思考；不传用配置里的 */
+  thinking?: boolean;
 }
 
 /** 一次模型调用用掉的 token，用来看时间花在哪 */
@@ -88,10 +90,11 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   // 百炼默认一轮只调一个工具；打开并行后，互不依赖的几个工具可以一轮发出，少等几轮模型。
   // 这两个参数个别服务或模型不认、报 400 时，去掉重试，之后都不再带
   let parallelToolCalls = true;
-  let thinking = config.thinking;
+  let thinkingSupported = true;
   type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & { enable_thinking?: boolean };
-  const create = async (body: Body, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> => {
+  const create = async (body: Body, thinkingWanted: boolean | undefined, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> => {
     for (let attempt = 0; ; attempt++) {
+      const thinking = thinkingSupported ? (thinkingWanted ?? config.thinking) : undefined;
       const request: Body = {
         ...body,
         ...(body.tools && parallelToolCalls ? { parallel_tool_calls: true } : {}),
@@ -107,7 +110,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
           }
           if (request.enable_thinking !== undefined && /thinking/i.test(err.message)) {
             warn(`模型 ${config.model} 不支持设置思考模式（${err.message}），之后不再传 enable_thinking`);
-            thinking = undefined;
+            thinkingSupported = false;
             continue;
           }
         }
@@ -118,7 +121,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
 
   return {
     model: config.model,
-    async chat({ system, messages, tools, signal }) {
+    async chat({ system, messages, tools, signal, thinking }) {
       const body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
         model: config.model,
         messages: [{ role: "system", content: system }, ...messages.map(toOpenAIMessage)],
@@ -128,7 +131,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
       };
       let completion: OpenAI.Chat.ChatCompletion;
       try {
-        completion = await create(body, signal);
+        completion = await create(body, thinking, signal);
       } catch (err) {
         // 百炼对输入做内容审核，不通过时返回 400 data_inspection_failed
         if (err instanceof OpenAI.BadRequestError && err.code === "data_inspection_failed") {

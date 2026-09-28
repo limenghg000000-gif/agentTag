@@ -26,6 +26,8 @@ const CHUNK_CHARS = 3000;
 const FALLBACK_BOT_NAME = "AI 助手";
 /** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
 const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
+/** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
+export const DEEP_THINKING = /深度思考|仔细(想|思考)|认真(想|思考)/;
 
 export interface ThreadContextSource {
   load(msg: NormalizedMessage): Promise<ThreadContext>;
@@ -164,8 +166,13 @@ async function runTask(
       ...(memory?.tools ?? []),
     ];
     const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
+    const deep = DEEP_THINKING.test(question);
+    if (deep) {
+      logger.info(`这次打开深度思考 message=${msg.messageId}`);
+    }
     result = await runAgent({
       model,
+      ...(deep ? { thinking: true } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),

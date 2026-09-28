@@ -74,6 +74,9 @@ test("联网搜索：百炼的兼容接口换成同域名的原生接口，可�
     }).webSearch,
     { url: "https://ws123.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/text-generation/generation", model: "qwen3.8-flash" },
   );
+  // 主模型不是千问时，搜索仍用千问旗舰；是千问时跟着主模型
+  assert.equal(loadConfig({ ...base, MODEL_ID: "kimi-k3" }).webSearch?.model, DEFAULT_MODEL_ID);
+  assert.equal(loadConfig({ ...base, MODEL_ID: "qwen3.7-plus" }).webSearch?.model, "qwen3.7-plus");
   assert.equal(loadConfig({ ...base, WEB_SEARCH: "off" }).webSearch, undefined);
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).webSearch, undefined);
   assert.throws(() => loadConfig({ ...base, WEB_SEARCH: "yes" }), /WEB_SEARCH 只能是 on 或 off/);

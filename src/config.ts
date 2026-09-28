@@ -97,7 +97,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
     memoryBackupDays: backupDays,
-    webSearch: searchUrl ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || model } : undefined,
+    // 百炼的联网搜索只有千问模型支持：主模型换成 Kimi、GLM、DeepSeek 等时，搜索仍用千问旗舰
+    webSearch: searchUrl
+      ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || (/^qwen/i.test(model) ? model : DEFAULT_MODEL_ID) }
+      : undefined,
     code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
   };
 }

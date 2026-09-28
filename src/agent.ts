@@ -26,6 +26,8 @@ export interface AgentRequest {
   maxToolRounds?: number;
   /** 计时用的时钟（毫秒） */
   now?: () => number;
+  /** 这次任务单独打开或关掉思考；不传用模型的配置 */
+  thinking?: boolean;
 }
 
 export interface AgentResult {
@@ -48,6 +50,7 @@ export async function runAgent({
   onEvent = () => {},
   maxToolRounds = MAX_TOOL_ROUNDS,
   now = Date.now,
+  thinking,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
   const specs = tools.map((tool) => tool.spec);
@@ -61,7 +64,7 @@ export async function runAgent({
       conversation.push({ role: "user", content: LAST_ROUND_NOTE });
     }
     const startedAt = now();
-    const result = await model.chat({ system, messages: conversation, tools: specs, signal });
+    const result = await model.chat({ system, messages: conversation, tools: specs, signal, ...(thinking !== undefined ? { thinking } : {}) });
     onEvent({
       type: "model",
       round: round + 1,

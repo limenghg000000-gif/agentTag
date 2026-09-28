@@ -204,3 +204,17 @@ test("按配置传 enable_thinking；模型不支持时去掉重试并提示一�
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /不支持设置思考模式/);
 });
+
+test("单次请求可以覆盖配置里的思考模式", async () => {
+  const configured = createOpenAICompatibleModel({
+    baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+    apiKey: "sk-test",
+    model: "qwen3.8-max",
+    thinking: false,
+  });
+  responses.push(completion("好"), completion("好"));
+  await configured.chat({ system: "s", messages: [{ role: "user", content: "难题" }], thinking: true });
+  assert.equal(requests.at(-1)!.body.enable_thinking, true);
+  await configured.chat({ system: "s", messages: [{ role: "user", content: "简单" }] });
+  assert.equal(requests.at(-1)!.body.enable_thinking, false);
+});
