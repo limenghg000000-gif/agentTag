@@ -297,14 +297,18 @@ export class FeishuDocs {
     if (share.openId) {
       shares.push([{ type: "openid", id: share.openId }, "full_access", "发起人"]);
     }
-    for (const [member, perm, who] of shares) {
-      try {
-        await this.api.addCollaborator(documentId, member, perm);
-      } catch (err) {
-        problems.push(`没能把文档共享给${who}：${this.describe(err)}`);
-      }
-    }
-    return { documentId, url: await this.urlOf(documentId), blocks, problems };
+    // 共享和查链接互不依赖，一起发
+    const [url, ...shareProblems] = await Promise.all([
+      this.urlOf(documentId),
+      ...shares.map(([member, perm, who]) =>
+        this.api.addCollaborator(documentId, member, perm).then(
+          () => undefined,
+          (err: unknown) => `没能把文档共享给${who}：${this.describe(err)}`,
+        ),
+      ),
+    ]);
+    problems.push(...shareProblems.filter((p): p is string => p !== undefined));
+    return { documentId, url, blocks, problems };
   }
 
   /** 按块修改文档，返回一句做了什么 */
