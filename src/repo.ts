@@ -29,7 +29,12 @@ export interface CodeHost {
   /** 给 git 进程的环境变量（认证），不能出现在命令行参数里 */
   gitEnv(): Record<string, string>;
   openPullRequest(repo: string, pr: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
+  /** 检查令牌能不能访问这个仓库：能访问时返回一句说明，不能时抛 RepoError 说明原因。启动时用来在日志里报告每个仓库的状态 */
+  checkAccess?(repo: string): Promise<string>;
 }
+
+/** GitLab 的角色等级 */
+const GITLAB_ROLES: Record<number, string> = { 10: "Guest", 20: "Reporter", 30: "Developer", 40: "Maintainer", 50: "Owner" };
 
 /**
  * 自建 GitLab：用一个访问令牌（项目或群组访问令牌、个人访问令牌都行，要 api 权限，角色至少 Developer）
@@ -81,6 +86,36 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       }
       return { url: body.web_url, number: body.iid };
     },
+    async checkAccess(repo) {
+      const res = await fetchImpl(`${base}/api/v4/projects/${encodeURIComponent(repo)}`, {
+        headers: { "private-token": token },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        path_with_namespace?: string;
+        default_branch?: string;
+        permissions?: { project_access?: { access_level?: number } | null; group_access?: { access_level?: number } | null };
+      };
+      if (res.status === 401) {
+        throw new RepoError("令牌无效或过期了（HTTP 401）");
+      }
+      if (res.status === 404) {
+        throw new RepoError(
+          "找不到项目，或者令牌看不到它（HTTP 404）。检查项目路径和网页地址栏里的是否一致；令牌对应的账号要是项目成员；" +
+            "项目访问令牌只能访问建它的那个项目，要访问多个项目请用群组访问令牌或个人访问令牌",
+        );
+      }
+      if (!res.ok) {
+        throw new RepoError(`检查失败（HTTP ${res.status}）`);
+      }
+      const level = Math.max(body.permissions?.project_access?.access_level ?? 0, body.permissions?.group_access?.access_level ?? 0);
+      const role = GITLAB_ROLES[level];
+      const branch = body.default_branch ? `，默认分支 ${body.default_branch}` : "";
+      if (level > 0 && level < 30) {
+        throw new RepoError(`能看到项目，但角色是 ${role ?? level}，推不了分支，要 Developer 以上`);
+      }
+      return `能访问${role ? `，角色 ${role}` : ""}${branch}`;
+    },
   };
 }
 
@@ -125,6 +160,31 @@ export function createGitHubHost(token: string, fetchImpl: typeof fetch = fetch)
         );
       }
       return { url: body.html_url, number: body.number };
+    },
+    async checkAccess(repo) {
+      const res = await fetchImpl(`https://api.github.com/repos/${repo}`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "AgentTag",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body = (await res.json().catch(() => ({}))) as { default_branch?: string; permissions?: { push?: boolean } };
+      if (res.status === 401) {
+        throw new RepoError("token 无效或过期了（HTTP 401）");
+      }
+      if (res.status === 403 || res.status === 404) {
+        throw new RepoError(`找不到仓库，或者 token 没有这个仓库的权限（HTTP ${res.status}）`);
+      }
+      if (!res.ok) {
+        throw new RepoError(`检查失败（HTTP ${res.status}）`);
+      }
+      if (body.permissions?.push === false) {
+        throw new RepoError("能看到仓库，但没有写权限，推不了分支");
+      }
+      return `能访问${body.default_branch ? `，默认分支 ${body.default_branch}` : ""}`;
     },
   };
 }

@@ -132,7 +132,8 @@ if (config.webSearch) {
   console.log("联网搜索没开：WEB_SEARCH=off，或者 MODEL_BASE_URL 不是百炼的 OpenAI 兼容接口（web_search 只支持百炼）");
 }
 if (workspaces) {
-  console.log(`代码仓库已接入（${workspaces.host.name}）：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
+  console.log(`代码仓库已配置（${workspaces.host.name}）：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
+  void checkRepos(workspaces);
 }
 if (backup) {
   backup.start();
@@ -155,6 +156,23 @@ const shutdown = async () => {
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+
+/** 启动时逐个检查令牌能不能访问配置的仓库，结果写进日志，免得配错了要等到群里用时才发现 */
+async function checkRepos(workspaces: CodeWorkspaces): Promise<void> {
+  const check = workspaces.host.checkAccess?.bind(workspaces.host);
+  if (!check) {
+    return;
+  }
+  await Promise.all(
+    workspaces.repos.map(async (repo) => {
+      try {
+        console.log(`代码仓库 ${repo}：${await check(repo)}`);
+      } catch (err) {
+        console.warn(`代码仓库 ${repo} 访问不了：${err instanceof Error ? err.message : String(err)}`);
+      }
+    }),
+  );
+}
 
 /** 代码仓库工具要用 git。没装 git 时不开这些工具，别的照常 */
 async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promise<CodeWorkspaces | undefined> {
