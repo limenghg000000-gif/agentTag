@@ -28,6 +28,14 @@ export interface ChatRequest {
   signal?: AbortSignal;
 }
 
+/** 一次模型调用用掉的 token，用来看时间花在哪 */
+export interface TokenUsage {
+  input: number;
+  output: number;
+  /** 其中花在思考上的（模型开了思考模式时才有） */
+  reasoning?: number;
+}
+
 export interface ChatResult {
   text: string;
   /**
@@ -36,6 +44,8 @@ export interface ChatResult {
    */
   finish: "stop" | "length" | "filtered" | "tool_calls";
   toolCalls?: ToolCall[];
+  /** 模型服务返回了用量时才有 */
+  usage?: TokenUsage;
 }
 
 /** 模型调用层。业务代码只依赖这个接口，换模型服务只需换实现或改环境变量。 */
@@ -70,22 +80,37 @@ export class LlmError extends Error {
  */
 export function createOpenAICompatibleModel(config: LlmConfig): ChatModel {
   const client = new OpenAI({ baseURL: config.baseURL, apiKey: config.apiKey });
+  // 百炼默认一轮只调一个工具；打开并行后，互不依赖的几个工具可以一轮发出，少等几轮模型。
+  // 个别服务不认这个参数、报 400 时，去掉它重试，之后都不再带
+  let parallelToolCalls = true;
+  const create = (body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming, signal?: AbortSignal) =>
+    client.chat.completions.create(body, { signal });
 
   return {
     model: config.model,
     async chat({ system, messages, tools, signal }) {
+      const body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
+        model: config.model,
+        messages: [{ role: "system", content: system }, ...messages.map(toOpenAIMessage)],
+        ...(tools && tools.length > 0
+          ? { tools: tools.map((tool) => ({ type: "function" as const, function: tool })) }
+          : {}),
+      };
       let completion: OpenAI.Chat.ChatCompletion;
       try {
-        completion = await client.chat.completions.create(
-          {
-            model: config.model,
-            messages: [{ role: "system", content: system }, ...messages.map(toOpenAIMessage)],
-            ...(tools && tools.length > 0
-              ? { tools: tools.map((tool) => ({ type: "function" as const, function: tool })) }
-              : {}),
-          },
-          { signal },
-        );
+        if (body.tools && parallelToolCalls) {
+          try {
+            completion = await create({ ...body, parallel_tool_calls: true }, signal);
+          } catch (err) {
+            if (!(err instanceof OpenAI.BadRequestError && /parallel_tool_calls/i.test(err.message))) {
+              throw err;
+            }
+            parallelToolCalls = false;
+            completion = await create(body, signal);
+          }
+        } else {
+          completion = await create(body, signal);
+        }
       } catch (err) {
         // 百炼对输入做内容审核，不通过时返回 400 data_inspection_failed
         if (err instanceof OpenAI.BadRequestError && err.code === "data_inspection_failed") {
@@ -96,20 +121,22 @@ export function createOpenAICompatibleModel(config: LlmConfig): ChatModel {
 
       const choice = completion.choices[0];
       const text = choice?.message.content?.trim() ?? "";
+      const usage = toUsage(completion.usage);
+      const withUsage = <T extends ChatResult>(result: T): T => (usage ? { ...result, usage } : result);
       const toolCalls = (choice?.message.tool_calls ?? [])
         .filter((call) => call.type === "function")
         .map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments }));
       // 有的模型带着工具调用返回时 finish_reason 仍是 stop，以是否真的有工具调用为准
       if (toolCalls.length > 0) {
-        return { text, finish: "tool_calls", toolCalls };
+        return withUsage({ text, finish: "tool_calls", toolCalls });
       }
       switch (choice?.finish_reason) {
         case "length":
-          return { text, finish: "length" };
+          return withUsage({ text, finish: "length" });
         case "content_filter":
-          return { text, finish: "filtered" };
+          return withUsage({ text, finish: "filtered" });
         default:
-          return { text, finish: "stop" };
+          return withUsage({ text, finish: "stop" });
       }
     },
   };
@@ -135,6 +162,18 @@ function toOpenAIMessage(message: ChatMessage): OpenAI.Chat.ChatCompletionMessag
         })),
       };
   }
+}
+
+function toUsage(usage: OpenAI.CompletionUsage | undefined): TokenUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+  return {
+    input: usage.prompt_tokens,
+    output: usage.completion_tokens,
+    ...(reasoning ? { reasoning } : {}),
+  };
 }
 
 function toLlmError(err: unknown): unknown {
