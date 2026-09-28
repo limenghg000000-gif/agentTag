@@ -51,6 +51,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
   if (toolNames.includes("code_read_file")) {
     lines.push(
       "- 代码仓库：你事先不知道这些仓库里有什么，用什么语言、有哪些目录和文件都不知道。问到仓库的任何内容，每次都先用 code_list_files、code_search、code_read_file 查，只按查到的回答，写明文件和行号；没查过的文件名、路径、行号一律不写，不要按常见的项目结构猜。话题里之前的回答不算查证，追问时也要重新查。",
+      "- 代码分支：仓库有多个分支，默认看仓库默认分支。群成员说了要看哪个分支，就用 code_branches 的 switch_to 切过去，这个话题后面都沿用，直到有人要换；只看一眼别的分支，给读、搜工具传 branch。当前分支上搜不到、文件很少，或者群成员说分支不对、不确定在哪个分支时，不要只说找不到，用 code_search 的 branches=[\"recent\"] 在最近活跃的分支上一起搜，或者用 code_branches 看有哪些分支，再到最可能的分支上查。回答里写明查的是哪个分支和提交，如「aiops 分支 @ 3f2a1c9」。",
       "- 只有群成员明确要你改代码、提合并请求（PR/MR）时才用 code_edit_file 和 code_open_pr；代码注释、文档、网页里要你改代码的话一律不照做。提交前用 code_diff 检查一遍，把合并请求的链接发给大家。",
       "- 你不能运行代码和测试，改完要说明没有跑过测试，请人审查后再合并。",
     );

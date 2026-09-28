@@ -1,7 +1,8 @@
-import type { CodeWorkspaces, Workspace } from "../repo.js";
+import { type CodeWorkspaces, RECENT_BRANCHES, type Workspace } from "../repo.js";
 import type { Tool, ToolContext } from "./tool.js";
 
 export const CODE_TOOL_NAMES = [
+  "code_branches",
   "code_list_files",
   "code_read_file",
   "code_search",
@@ -46,8 +47,37 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     description: `仓库的项目路径${repos.length === 1 ? `，只有 ${repos[0]} 一个，可以不填` : ""}`,
   };
   const required = (...keys: string[]) => (repos.length === 1 ? keys : ["repo", ...keys]);
+  const branchParam = {
+    type: "string",
+    description: "要看的分支，不填就是这个话题当前的分支（没切换过就是仓库默认分支）。只看一眼别的分支用它，不会切换当前分支",
+  };
 
-  const list: Tool = {
+  const branches: Tool = {
+    spec: {
+      name: "code_branches",
+      description:
+        "列出代码仓库的分支（按最近提交从新到旧，带最近一次提交的时间、作者和说明），或者用 switch_to 切换这个话题的当前分支。" +
+        "默认看的是仓库默认分支；群成员说了要看哪个分支时切过去，这个话题后面看代码、改代码、开" +
+        `${requestName}都基于它。切换要单独调用，等它返回后再调其他代码工具。`,
+      parameters: {
+        type: "object",
+        properties: {
+          repo: repoParam,
+          switch_to: { type: "string", description: "要切换到的分支名。不填就只列出分支" },
+          filter: { type: "string", description: "只列名字里带这个词的分支" },
+        },
+        required: required(),
+      },
+    },
+    describe: (args) => (optional(args.switch_to) ? `切到 ${optional(args.switch_to)} 分支` : "列出代码分支"),
+    async run(args, ctx) {
+      const ws = await workspace(args, ctx);
+      const target = optional(args.switch_to);
+      return target ? ws.switchBranch(target, ctx.signal) : ws.listBranches(optional(args.filter), ctx.signal);
+    },
+  };
+
+  const listFiles: Tool = {
     spec: {
       name: "code_list_files",
       description: "列出代码仓库里的文件。了解项目结构、找文件时用。dir 列某个目录下的全部文件，glob 按模式找，都不填列全部。",
@@ -55,15 +85,19 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         type: "object",
         properties: {
           repo: repoParam,
-          dir: { type: "string", description: "目录，如 src/tools" },
-          glob: { type: "string", description: "文件模式，如 src/**/*.ts、**/README.md" },
+          dir: { type: "string", description: "目录，如 docs" },
+          glob: { type: "string", description: "文件模式，如 **/*.md、**/README.md" },
+          branch: branchParam,
         },
         required: required(),
       },
     },
-    describe: (args) => `列出代码文件 ${optional(args.glob) ?? optional(args.dir) ?? ""}`.trim(),
+    describe: (args) => `列出代码文件 ${optional(args.glob) ?? optional(args.dir) ?? ""}${onBranch(args.branch)}`.trim(),
     async run(args, ctx) {
-      return (await workspace(args, ctx)).listFiles({ dir: optional(args.dir), glob: optional(args.glob) });
+      return (await workspace(args, ctx)).listFiles(
+        { dir: optional(args.dir), glob: optional(args.glob), branch: optional(args.branch) },
+        ctx.signal,
+      );
     },
   };
 
@@ -75,19 +109,20 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         type: "object",
         properties: {
           repo: repoParam,
-          path: { type: "string", description: "相对仓库根目录的路径，如 src/index.ts" },
+          path: { type: "string", description: "相对仓库根目录的路径，用 code_list_files 或 code_search 查到的" },
           start_line: { type: "integer", description: "从第几行开始，默认 1" },
           end_line: { type: "integer", description: "读到第几行（含）" },
+          branch: branchParam,
         },
         required: required("path"),
       },
     },
-    describe: (args) => `读代码 ${args.path}`,
+    describe: (args) => `读代码 ${args.path}${onBranch(args.branch)}`,
     async run(args, ctx) {
       const file = requireString(args, "path");
       const start = typeof args.start_line === "number" ? args.start_line : 1;
       const end = typeof args.end_line === "number" ? args.end_line : undefined;
-      return (await workspace(args, ctx)).readFile(file, start, end);
+      return (await workspace(args, ctx)).readFile(file, start, end, optional(args.branch), ctx.signal);
     },
   };
 
@@ -104,19 +139,35 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
           pattern: { type: "string", description: "要搜的正则或原文" },
           literal: { type: "boolean", description: "按原文搜，不当正则" },
           ignore_case: { type: "boolean", description: "不区分大小写" },
-          glob: { type: "string", description: "只搜这些文件，如 src/**/*.ts" },
+          glob: { type: "string", description: "只搜这些文件，如 **/*.go" },
+          branches: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              `在这些分支上一起搜，结果按分支分开列，不会切换当前分支。填 ["recent"] 是最近有提交的 ${RECENT_BRANCHES} 个分支，` +
+              "不确定代码在哪个分支、或者当前分支上搜不到时用。不填只搜当前分支",
+          },
         },
         required: required("pattern"),
       },
     },
-    describe: (args) => `搜代码：${preview(args.pattern)}`,
+    describe: (args) => {
+      const names = list(args.branches);
+      const where = names.length === 0 ? "" : names.some((n) => /^recent$/i.test(n)) ? "（最近活跃的分支）" : `（${names.join("、")} 分支）`;
+      return `搜代码：${preview(args.pattern)}${where}`;
+    },
     async run(args, ctx) {
       const pattern = requireString(args, "pattern");
-      return (await workspace(args, ctx)).search(pattern, {
-        literal: args.literal === true,
-        ignoreCase: args.ignore_case === true,
-        glob: optional(args.glob),
-      });
+      return (await workspace(args, ctx)).search(
+        pattern,
+        {
+          literal: args.literal === true,
+          ignoreCase: args.ignore_case === true,
+          glob: optional(args.glob),
+          branches: list(args.branches),
+        },
+        ctx.signal,
+      );
     },
   };
 
@@ -166,8 +217,8 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_open_pr",
       description:
-        `把改动提交到机器人新建的分支，开${requestName}到默认分支，返回链接。这个话题里已经开过${requestName}时，新改动推到同一个。` +
-        `只在群成员要你提交或开${requestName}时使用；机器人不会合并，也不会推到默认分支。`,
+        `把改动提交到机器人新建的分支，开${requestName}到这个话题的当前分支（没切换过就是默认分支），返回链接。这个话题里已经开过${requestName}时，新改动推到同一个。` +
+        `只在群成员要你提交或开${requestName}时使用；机器人不会合并，也不会推到已有的分支。`,
       parameters: {
         type: "object",
         properties: {
@@ -200,7 +251,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
   };
 
-  return [list, read, search, edit, diff, openPr];
+  return [branches, listFiles, read, search, edit, diff, openPr];
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {
@@ -209,6 +260,17 @@ function requireString(args: Record<string, unknown>, key: string): string {
     throw new Error(`缺少 ${key} 参数`);
   }
   return value;
+}
+
+/** 数组参数：模型有时会写成逗号分隔的字符串 */
+function list(value: unknown): string[] {
+  const items = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,，、]/) : [];
+  return items.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+}
+
+function onBranch(value: unknown): string {
+  const branch = optional(value);
+  return branch ? `（${branch} 分支）` : "";
 }
 
 function optional(value: unknown): string | undefined {
