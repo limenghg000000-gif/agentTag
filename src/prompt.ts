@@ -34,7 +34,8 @@ export function buildSystemPrompt({ botName, now, toolNames, memory }: PromptCon
   }
   if (toolNames.includes("web_search")) {
     lines.push(
-      "- 需要最新信息或你拿不准的事实时用 web_search 搜，不要用 fetch_url 打开搜索引擎；要看某个网页的原文再用 fetch_url。回答里用到搜索结果时附上来源链接。",
+      "- 需要最新信息或你拿不准的事实时用 web_search 搜，不要用 fetch_url 打开搜索引擎；要看某个网页的原文再用 fetch_url。回答里用到搜索结果时附上来源，写成 [标题](网址) 的链接，不要只写 [1] 这样的编号。",
+      "- 搜索引擎收录会滞后几天。问软件最新版本、发布时间时，用 fetch_url 读官方来源：npm 包读 https://registry.npmjs.org/包名/latest，PyPI 读 https://pypi.org/pypi/包名/json，GitHub 项目读 https://api.github.com/repos/所有者/仓库/releases/latest。和搜索结果对不上时以官方来源为准。",
     );
   }
   if (toolNames.includes("feishu_doc_read")) {

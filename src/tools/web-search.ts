@@ -96,6 +96,7 @@ export function createWebSearchTool({ url, apiKey, model, now = () => new Date()
       name: "web_search",
       description:
         "联网搜索，返回整理好的搜索结果和来源链接。需要最新信息（新闻、版本、价格、政策、近期事件）或你不确定的事实时使用。" +
+        "搜索引擎收录会滞后几天，最新版本号这类变化快的事实要到官方来源核实（见系统提示）。" +
         "已经知道具体网址时用 fetch_url 读原文；不要用 fetch_url 打开搜索引擎的网址。",
       parameters: {
         type: "object",
@@ -135,11 +136,21 @@ function format(query: string, body: GenerationResponse): string {
   lines.push(answer.length > MAX_ANSWER_CHARS ? `${answer.slice(0, MAX_ANSWER_CHARS)}…（后面省略）` : answer || "（没有返回内容）");
   lines.push("");
   if (sources.length > 0) {
-    lines.push("来源：", ...sources.map((s, i) => `[${s.index ?? i + 1}] ${s.title || s.site_name || "网页"} ${s.url}`));
+    lines.push(
+      "来源：",
+      ...sources.map((s, i) => `[${s.index ?? i + 1}] [${linkText(s.title || s.site_name || "网页")}](${s.url})`),
+      "",
+      "（回答里引用时写成上面的 [标题](网址) 链接，不要只写 [编号]。搜索结果可能滞后几天，版本号、价格等以官方来源为准）",
+    );
   } else {
     lines.push("（这次没有返回搜索来源，上面的内容可能不是联网搜到的，引用前请核实，或换个说法再搜）");
   }
   return lines.join("\n");
+}
+
+/** 标题里的方括号会打断 Markdown 链接 */
+function linkText(title: string): string {
+  return title.replace(/[[\]]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function describeError(status: number, body: GenerationResponse, multimodal: boolean): string {
