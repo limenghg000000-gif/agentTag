@@ -65,6 +65,8 @@ export interface BotDeps {
   now?: () => number;
   /** 同一张进度卡片两次更新的最小间隔 */
   cardIntervalMs?: number;
+  /** 配置的代码仓库（CODE_REPOS）。用来检查回答是不是没读代码就说了仓库里的内容 */
+  codeRepos?: readonly string[];
 }
 
 /**
@@ -182,9 +184,12 @@ async function runTask(
       messages: [...context.history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
+      ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
+        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? []) }
+        : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
-        if (event.type !== "model") {
+        if (event.type === "tool_start" || event.type === "tool_end") {
           applyEvent(state, event);
           card?.update(render());
         }
@@ -259,6 +264,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
       : "";
     const next = event.toolNames.length > 0 ? `调用 ${event.toolNames.join(", ")}` : "给出回答";
     logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${usage} → ${next}`);
+  } else if (event.type === "retry") {
+    logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);
   } else if (event.type === "tool_end") {
     if (event.ok) {
       logger.info(`工具 ${event.name} message=${messageId} 用时=${event.ms}ms`);
@@ -268,7 +275,35 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
   }
 }
 
-function applyEvent(state: ProgressState, event: Exclude<AgentEvent, { type: "model" }>): void {
+const CODE_TOOL_PREFIX = "code_";
+/** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
+const CODE_PATH =
+  /(?:^|[\s`'"(（:：])(?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)\b/;
+export const UNVERIFIED_CODE_ANSWER =
+  "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
+  "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
+  "如果和仓库无关，去掉没查证的文件路径后重新回答。不要提这段检查。";
+
+/**
+ * 模型不读代码就回答仓库的问题时（问题或回答提到了配置的仓库、或者回答里写了代码文件路径，这次却没调任何代码工具），
+ * 让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
+ */
+export function reviewCodeAnswer(question: string, repos: readonly string[]) {
+  return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
+    if ([...usedTools].some((name) => name.startsWith(CODE_TOOL_PREFIX))) {
+      return undefined;
+    }
+    const text = `${question}\n${answer}`.toLowerCase();
+    const mentionsRepo = repos.some((repo) => {
+      const full = repo.toLowerCase();
+      const short = full.split("/").pop() ?? full;
+      return text.includes(full) || (short.length >= 5 && text.includes(short));
+    });
+    return mentionsRepo || CODE_PATH.test(answer) ? UNVERIFIED_CODE_ANSWER : undefined;
+  };
+}
+
+function applyEvent(state: ProgressState, event: Extract<AgentEvent, { type: "tool_start" | "tool_end" }>): void {
   if (event.type === "tool_start") {
     state.steps.push({ id: event.id, label: event.label, status: "running" });
     return;

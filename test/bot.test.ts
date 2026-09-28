@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
-import { type BotDeps, createCardActionHandler, createMessageHandler, type ThreadContextSource } from "../src/bot.js";
+import {
+  type BotDeps,
+  createCardActionHandler,
+  createMessageHandler,
+  reviewCodeAnswer,
+  type ThreadContextSource,
+  UNVERIFIED_CODE_ANSWER,
+} from "../src/bot.js";
 import type { ThreadContext } from "../src/history.js";
 import { type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { MemoryStore } from "../src/memory.js";
@@ -547,4 +554,47 @@ test("提问里说「深度思考」时这次任务打开思考，平时不指�
   assert.equal(requests[0].thinking, true);
   assert.equal(requests[1].thinking, undefined);
   assert.equal(requests[2].thinking, true);
+});
+
+test("有代码工具时，没读代码就说仓库内容的回答被打回去，查过之后才发出", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "internal/k8s/tools.go:12: func GetPods()",
+  };
+  const results: ChatResult[] = [
+    { text: "在 ai/aiops-mcp 里，K8s tool 注册在 `src/index.ts:30-36`", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: "定义在 `internal/k8s/tools.go:12`", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const warnings: string[] = [];
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["ai/aiops-mcp", "ai/agent-tag"],
+    logger: { ...quiet, warn: (line: string) => warnings.push(line) },
+  });
+
+  await handle(message("在 ai/aiops-mcp 里搜一下 k8s 相关的 tool 在哪里定义？"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(markdowns(sent), ["定义在 `internal/k8s/tools.go:12`"]);
+  assert.match(warnings.join("\n"), /回答没通过检查，已让模型重做 message=om_1/);
+});
+
+test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {
+  const review = reviewCodeAnswer("ai/agent-tag 的 README 讲了什么", ["ai/aiops-mcp", "ai/agent-tag"]);
+  assert.equal(review("README 说……", new Set(["code_read_file"])), undefined);
+  assert.equal(review("README 说……", new Set()), UNVERIFIED_CODE_ANSWER);
+  // 只写了仓库最后一段名字也算提到
+  const byShortName = reviewCodeAnswer("aiops-mcp 用什么语言写的", ["ai/aiops-mcp"]);
+  assert.equal(byShortName("Go", new Set()), UNVERIFIED_CODE_ANSWER);
+  // 没提仓库，但回答里写了代码文件路径
+  const general = reviewCodeAnswer("这个服务怎么启动", ["ai/aiops-mcp"]);
+  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), UNVERIFIED_CODE_ANSWER);
+  // 和仓库无关的一般问题不管
+  assert.equal(general("用 systemctl 重启，配置写在 tsconfig.json", new Set()), undefined);
+  assert.equal(reviewCodeAnswer("今天周几", ["ai/api"])("周一，api 文档见 https://x.com/a/b.js", new Set()), undefined);
 });
