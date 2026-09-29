@@ -30,8 +30,8 @@ export interface CodeHost {
   /** 合并请求编号的写法：GitLab 是 !12，GitHub 是 #12 */
   refOf(number: number): string;
   cloneUrl(repo: string): string;
-  /** 给 git 进程的环境变量（认证），不能出现在命令行参数里 */
-  gitEnv(): Record<string, string>;
+  /** 给这个仓库的 git 进程的环境变量（认证），不能出现在命令行参数里 */
+  gitEnv(repo: string): Record<string, string>;
   openPullRequest(repo: string, pr: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
   /** 检查令牌能不能访问这个仓库：能访问时返回一句说明，不能时抛 RepoError 说明原因。启动时用来在日志里报告每个仓库的状态 */
   checkAccess?(repo: string): Promise<string>;
@@ -53,27 +53,32 @@ export interface BranchInfo {
 const GITLAB_ROLES: Record<number, string> = { 10: "Guest", 20: "Reporter", 30: "Developer", 40: "Maintainer", 50: "Owner" };
 
 /**
- * 自建 GitLab：用一个访问令牌（项目或群组访问令牌、个人访问令牌都行，要 api 权限，角色至少 Developer）
+ * 自建 GitLab：用访问令牌（项目或群组访问令牌、个人访问令牌都行，要 api 权限，角色至少 Developer）
  * 拉代码、推分支、开合并请求。repo 是项目路径，如 group/sub/project。
+ * token 可以是所有仓库共用的一个，也可以按仓库给（不同群组的项目用不同的群组访问令牌）。
  */
-export function createGitLabHost(baseUrl: string, token: string, fetchImpl: typeof fetch = fetch): CodeHost {
+export function createGitLabHost(
+  baseUrl: string,
+  token: string | ((repo: string) => string),
+  fetchImpl: typeof fetch = fetch,
+): CodeHost {
   const base = baseUrl.trim().replace(/\/+$/, "");
-  // git 走 HTTP 时用户名随便填，密码是令牌
-  const basic = Buffer.from(`oauth2:${token}`).toString("base64");
+  const tokenOf = typeof token === "string" ? () => token : token;
   return {
     name: "GitLab",
     requestName: "合并请求",
     refOf: (number) => `!${number}`,
     cloneUrl: (repo) => `${base}/${repo}.git`,
-    gitEnv: () => ({
+    gitEnv: (repo) => ({
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: `http.${base}/.extraheader`,
-      GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
+      // git 走 HTTP 时用户名随便填，密码是令牌
+      GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`oauth2:${tokenOf(repo)}`).toString("base64")}`,
     }),
     async openPullRequest(repo, pr) {
       const res = await fetchImpl(`${base}/api/v4/projects/${encodeURIComponent(repo)}/merge_requests`, {
         method: "POST",
-        headers: { "private-token": token, "content-type": "application/json" },
+        headers: { "private-token": tokenOf(repo), "content-type": "application/json" },
         body: JSON.stringify({
           source_branch: pr.head,
           target_branch: pr.base,
@@ -104,7 +109,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
     },
     async checkAccess(repo) {
       const res = await fetchImpl(`${base}/api/v4/projects/${encodeURIComponent(repo)}`, {
-        headers: { "private-token": token },
+        headers: { "private-token": tokenOf(repo) },
         signal: AbortSignal.timeout(15_000),
       });
       const body = (await res.json().catch(() => ({}))) as {
@@ -118,7 +123,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       if (res.status === 404) {
         throw new RepoError(
           "找不到项目，或者令牌看不到它（HTTP 404）。检查项目路径和网页地址栏里的是否一致；令牌对应的账号要是项目成员；" +
-            "项目访问令牌只能访问建它的那个项目，要访问多个项目请用群组访问令牌或个人访问令牌",
+            "项目访问令牌只能访问建它的那个项目，群组访问令牌只能访问那个群组里的项目，别的项目要单独配令牌（见 README 的 GITLAB_TOKEN_群组）",
         );
       }
       if (!res.ok) {
@@ -135,7 +140,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
     async listBranches(repo, signal) {
       const res = await fetchImpl(
         `${base}/api/v4/projects/${encodeURIComponent(repo)}/repository/branches?per_page=100&sort=updated_desc`,
-        { headers: { "private-token": token }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) },
+        { headers: { "private-token": tokenOf(repo) }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) },
       );
       if (!res.ok) {
         throw new RepoError(`GitLab 列分支失败（HTTP ${res.status}）`);
@@ -327,7 +332,7 @@ export class CodeWorkspaces {
       throw new RepoError(`没有接入仓库 ${repo}，能操作的只有：${this.repos.join("、")}`);
     }
     const dir = path.join(this.root, safeName(threadKey), safeName(name.replace("/", "__")));
-    const env = this.host.gitEnv();
+    const env = this.host.gitEnv(name);
     const configured = this.branches[name];
     const exists = await stat(path.join(dir, ".git")).then(
       () => true,

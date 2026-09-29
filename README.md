@@ -143,7 +143,8 @@ npm start
 | `CODE_REPOS` | 否 | 允许机器人操作的仓库，多个用逗号分隔：GitLab 写项目路径（`group/project`，可以多层），GitHub 写 `owner/repo`。仓库的默认分支不是大家平时用的那个时写成 `group/project@分支`，没被点名分支时先看它。不填就没有代码仓库工具 |
 | `WRITE_ALLOWED_USERS` | 否 | 写权限名单，逗号分隔的飞书 open_id（`ou_` 开头）。只有这些人能让机器人新建或修改飞书文档、改代码、开合并请求，其他人只能问和读。自己的 open_id 在日志「收到提问 … sender=ou_xxx」里。不填时所有人都能 |
 | `GITLAB_URL` | 接 GitLab 时必填 | 公司 GitLab 的地址，如 `https://gitlab.example.com` |
-| `GITLAB_TOKEN` | 接 GitLab 时必填 | GitLab 访问令牌，权限选 `api`，角色至少 Developer。只接一个项目时用它的项目访问令牌；接多个项目时用群组访问令牌或个人访问令牌（项目访问令牌只能访问建它的那个项目） |
+| `GITLAB_TOKEN` | 接 GitLab 时必填 | GitLab 访问令牌，权限选 `api`，角色至少 Developer，`CODE_REPOS` 里没单独配令牌的仓库都用它。推荐给机器人建一个专用账号，把它加进要接的项目当 Developer，用这个账号的个人访问令牌，一个令牌就能跨群组。项目访问令牌只能访问建它的那个项目，群组访问令牌只能访问那个群组里的项目 |
+| `GITLAB_TOKEN_群组`、`GITLAB_TOKEN_群组_项目` | 否 | 给某个群组或某个项目单独配令牌，比如接别的群组的仓库、用群组或项目访问令牌时。路径转成大写，`/`、`-`、`.` 都写成 `_`：`golang` 群组写 `GITLAB_TOKEN_GOLANG`，`ai/aiops-mcp` 项目写 `GITLAB_TOKEN_AI_AIOPS_MCP`。先找项目的，再找群组的，都没有用 `GITLAB_TOKEN`；启动日志里每个仓库会写明用的是哪个 |
 | `GITHUB_TOKEN` | 接 GitHub 时必填 | 没配 `GITLAB_URL` 时接 GitHub。fine-grained token，只选这些仓库，权限给 Contents 和 Pull requests 的读写 |
 | `DATA_DIR` | 否 | 数据目录，默认启动目录下的 `data`。群记忆存在 `<DATA_DIR>/memory/<chat_id>.json` |
 

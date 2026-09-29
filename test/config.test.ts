@@ -100,15 +100,53 @@ test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层）�
   assert.deepEqual(gitlab, {
     repos: ["team/backend/api", "team/web"],
     branches: {},
-    host: { kind: "gitlab", url: "https://git.corp.example.com", token: "glpat-x" },
+    host: {
+      kind: "gitlab",
+      url: "https://git.corp.example.com",
+      tokens: {
+        "team/backend/api": { token: "glpat-x", env: "GITLAB_TOKEN" },
+        "team/web": { token: "glpat-x", env: "GITLAB_TOKEN" },
+      },
+    },
     workspaceDir: path.resolve("/srv/agenttag", "workspaces"),
   });
   assert.deepEqual(loadConfig({ ...base, CODE_REPOS: "acme/app", GITHUB_TOKEN: "ghp" }).code?.host, { kind: "github", token: "ghp" });
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app" }), /GITLAB_URL 和 GITLAB_TOKEN/);
-  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app", GITLAB_URL: "https://git.corp" }), /GITLAB_TOKEN/);
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app", GITLAB_URL: "https://git.corp" }), /acme\/app 没有令牌.*GITLAB_TOKEN_ACME/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "app", GITLAB_URL: "https://git.corp", GITLAB_TOKEN: "t" }), /项目路径/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b/c", GITHUB_TOKEN: "t" }), /owner\/repo/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "a/b", GITLAB_URL: "git.corp", GITLAB_TOKEN: "t" }), /GITLAB_URL 要写成/);
+});
+
+test("GitLab 令牌可以按群组或项目单独配，没配的用 GITLAB_TOKEN；都没有时报错", () => {
+  const tokens = (env: NodeJS.ProcessEnv) => {
+    const host = loadConfig({ ...base, GITLAB_URL: "https://lab.corp", ...env }).code?.host;
+    assert.equal(host?.kind, "gitlab");
+    return host.kind === "gitlab" ? host.tokens : {};
+  };
+  assert.deepEqual(
+    tokens({
+      CODE_REPOS: "ai/aiops-mcp@aiops, ai/agent-tag, golang/app-service, golang/pay/core",
+      GITLAB_TOKEN: "all",
+      GITLAB_TOKEN_AI_AIOPS_MCP: "only-aiops",
+      GITLAB_TOKEN_golang: "golang-group",
+      GITLAB_TOKEN_GOLANG_PAY: " ",
+    }),
+    {
+      "ai/aiops-mcp": { token: "only-aiops", env: "GITLAB_TOKEN_AI_AIOPS_MCP" },
+      "ai/agent-tag": { token: "all", env: "GITLAB_TOKEN" },
+      "golang/app-service": { token: "golang-group", env: "GITLAB_TOKEN_golang" },
+      "golang/pay/core": { token: "golang-group", env: "GITLAB_TOKEN_golang" },
+    },
+  );
+  // 不配 GITLAB_TOKEN 也行，只要每个仓库都有自己的
+  assert.deepEqual(tokens({ CODE_REPOS: "ai/agent-tag", GITLAB_TOKEN_AI: "ai-group" }), {
+    "ai/agent-tag": { token: "ai-group", env: "GITLAB_TOKEN_AI" },
+  });
+  assert.throws(
+    () => tokens({ CODE_REPOS: "ai/agent-tag, golang/app", GITLAB_TOKEN_AI: "ai-group" }),
+    /golang\/app 没有令牌.*GITLAB_TOKEN_GOLANG（golang 群组的）、GITLAB_TOKEN_GOLANG_APP（只给这个项目）/,
+  );
 });
 
 test("CODE_REPOS 可以给仓库指定默认分支：group/project@分支", () => {

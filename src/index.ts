@@ -172,11 +172,13 @@ async function checkRepos(workspaces: CodeWorkspaces): Promise<void> {
   }
   await Promise.all(
     workspaces.repos.map(async (repo) => {
+      // 按群组、项目配了不同令牌时，日志里说明每个仓库用的是哪个
+      const token = config.code?.host.kind === "gitlab" ? `，令牌用 ${config.code.host.tokens[repo]?.env}` : "";
       try {
         const branch = workspaces.branches[repo];
-        console.log(`代码仓库 ${repo}：${await check(repo)}${branch ? `，机器人默认看 ${branch} 分支` : ""}`);
+        console.log(`代码仓库 ${repo}：${await check(repo)}${branch ? `，机器人默认看 ${branch} 分支` : ""}${token}`);
       } catch (err) {
-        console.warn(`代码仓库 ${repo} 访问不了：${err instanceof Error ? err.message : String(err)}`);
+        console.warn(`代码仓库 ${repo} 访问不了${token}：${err instanceof Error ? err.message : String(err)}`);
       }
     }),
   );
@@ -190,7 +192,11 @@ async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promis
     console.error("配了 CODE_REPOS，但服务器上跑不了 git，代码仓库工具先不开", err);
     return undefined;
   }
-  const host = code.host.kind === "gitlab" ? createGitLabHost(code.host.url, code.host.token) : createGitHubHost(code.host.token);
+  const { host: hostConfig } = code;
+  const host =
+    hostConfig.kind === "gitlab"
+      ? createGitLabHost(hostConfig.url, (repo) => hostConfig.tokens[repo].token)
+      : createGitHubHost(hostConfig.token);
   const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos, branches: code.branches });
   // 几天没用的话题工作目录，启动时和之后每天清一次
   const sweep = () => workspaces.sweep().catch((err) => console.error("清理代码工作目录失败", err));

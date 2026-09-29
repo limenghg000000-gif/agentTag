@@ -31,7 +31,14 @@ export interface Config {
     repos: string[];
     /** 给仓库指定的默认分支（CODE_REPOS 里写成 group/project@分支），没点名分支时先看它 */
     branches: Record<string, string>;
-    host: { kind: "gitlab"; url: string; token: string } | { kind: "github"; token: string };
+    host:
+      | {
+          kind: "gitlab";
+          url: string;
+          /** 每个仓库用的令牌和它来自哪个环境变量（GITLAB_TOKEN，或按群组、项目单独配的 GITLAB_TOKEN_XXX） */
+          tokens: Record<string, { token: string; env: string }>;
+        }
+      | { kind: "github"; token: string };
     /** 拉代码的工作目录（每个话题一个子目录） */
     workspaceDir: string;
   };
@@ -154,14 +161,11 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     if (!/^https?:\/\/[^/\s]+/.test(gitlabUrl)) {
       throw new Error(`GITLAB_URL 要写成 https://gitlab.example.com 这样的地址，当前为 ${gitlabUrl}`);
     }
-    if (!env.GITLAB_TOKEN) {
-      throw new Error("配了 GITLAB_URL 就要配 GITLAB_TOKEN（要 api 权限的访问令牌）");
-    }
     const bad = repos.find((r) => !/^[\w.-]+(\/[\w.-]+)+$/.test(r));
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 GitLab 的项目路径（如 group/project），多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
+    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, tokens: gitlabTokens(repos, env) } };
   }
   if (env.GITHUB_TOKEN) {
     const bad = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
@@ -171,6 +175,43 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN } };
   }
   throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
+}
+
+/**
+ * 每个仓库用哪个 GitLab 令牌：先找只给这个项目的 GITLAB_TOKEN_群组_项目，再往上找群组的 GITLAB_TOKEN_群组，
+ * 都没有时用 GITLAB_TOKEN。环境变量名里路径转成大写，/ - . 都写成 _，如 ai/aiops-mcp → GITLAB_TOKEN_AI_AIOPS_MCP。
+ * 群组访问令牌只能访问那个群组里的项目，接别的群组的仓库时给它单独配一个。
+ */
+function gitlabTokens(repos: string[], env: NodeJS.ProcessEnv): Record<string, { token: string; env: string }> {
+  const scoped = new Map<string, { token: string; env: string }>();
+  for (const [name, value] of Object.entries(env)) {
+    const match = /^GITLAB_TOKEN_(.+)$/i.exec(name);
+    if (match && value?.trim()) {
+      scoped.set(gitlabTokenEnv(match[1]), { token: value.trim(), env: name });
+    }
+  }
+  const fallback = env.GITLAB_TOKEN?.trim();
+  const tokens: Record<string, { token: string; env: string }> = {};
+  for (const repo of repos) {
+    const parts = repo.split("/");
+    const prefixes = parts.map((_, i) => parts.slice(0, parts.length - i).join("/"));
+    const found = prefixes.map((prefix) => scoped.get(gitlabTokenEnv(prefix))).find(Boolean);
+    if (found) {
+      tokens[repo] = found;
+    } else if (fallback) {
+      tokens[repo] = { token: fallback, env: "GITLAB_TOKEN" };
+    } else {
+      throw new Error(
+        `CODE_REPOS 里的 ${repo} 没有令牌：配 GITLAB_TOKEN（所有仓库共用），` +
+          `或者 ${gitlabTokenEnv(parts[0])}（${parts[0]} 群组的）、${gitlabTokenEnv(repo)}（只给这个项目）`,
+      );
+    }
+  }
+  return tokens;
+}
+
+function gitlabTokenEnv(repoPath: string): string {
+  return `GITLAB_TOKEN_${repoPath.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`;
 }
 
 function isBailian(baseURL: string): boolean {

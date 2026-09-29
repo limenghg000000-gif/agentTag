@@ -199,7 +199,7 @@ test("GitLab：git 用 Basic 认证头（放在环境变量里），开合并请
   const host = createGitLabHost("https://git.corp/", "glpat-x", fakeFetch);
 
   assert.equal(host.cloneUrl("g/sub/p"), "https://git.corp/g/sub/p.git");
-  assert.deepEqual(host.gitEnv(), {
+  assert.deepEqual(host.gitEnv("g/sub/p"), {
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "http.https://git.corp/.extraheader",
     GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from("oauth2:glpat-x").toString("base64")}`,
@@ -247,6 +247,23 @@ test("启动检查：GitLab 按角色和默认分支说明能否访问，404、4
   await assert.rejects(host.checkAccess!("ai/agent-tag"), /HTTP 404.*项目成员.*项目访问令牌只能访问建它的那个项目/);
   await assert.rejects(host.checkAccess!("ai/agent-tag"), /令牌无效或过期/);
   await assert.rejects(host.checkAccess!("ai/agent-tag"), /角色是 Reporter，推不了分支/);
+});
+
+test("GitLab 可以按仓库用不同的令牌：拉代码、开合并请求、检查访问都用这个仓库的令牌", async () => {
+  const tokens: string[] = [];
+  const fakeFetch = (async (_url: string, init: RequestInit) => {
+    tokens.push((init.headers as Record<string, string>)["private-token"]);
+    return new Response(JSON.stringify({ iid: 1, web_url: "u", default_branch: "main", permissions: {} }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://lab.corp", (repo) => (repo.startsWith("golang/") ? "glpat-golang" : "glpat-ai"), fakeFetch);
+
+  const auth = (repo: string) => host.gitEnv(repo).GIT_CONFIG_VALUE_0;
+  assert.equal(auth("ai/aiops-mcp"), `Authorization: Basic ${Buffer.from("oauth2:glpat-ai").toString("base64")}`);
+  assert.equal(auth("golang/appservice"), `Authorization: Basic ${Buffer.from("oauth2:glpat-golang").toString("base64")}`);
+  await host.checkAccess!("golang/appservice");
+  await host.openPullRequest("ai/aiops-mcp", { head: "h", base: "main", title: "t", body: "b" });
+  await host.listBranches!("golang/appservice").catch(() => undefined);
+  assert.deepEqual(tokens, ["glpat-golang", "glpat-ai", "glpat-golang"]);
 });
 
 test("启动检查：GitHub 没有写权限或看不到仓库时说清原因", async () => {
