@@ -172,6 +172,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
   };
 
   const edit: Tool = {
+    writes: true,
     spec: {
       name: "code_edit_file",
       description:
@@ -214,6 +215,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
   };
 
   const openPr: Tool = {
+    writes: true,
     spec: {
       name: "code_open_pr",
       description:

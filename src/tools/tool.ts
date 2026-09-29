@@ -11,6 +11,8 @@ export interface ToolContext {
  */
 export interface Tool {
   spec: ToolSpec;
+  /** 会改动文档、代码仓库等外部内容。配了 WRITE_ALLOWED_USERS 时，只有名单里的人提问才给模型这类工具 */
+  writes?: boolean;
   /** 进度卡片上显示的一句话，如「读取网页 example.com」 */
   describe(args: Record<string, unknown>): string;
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<string>;

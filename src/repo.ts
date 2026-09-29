@@ -293,6 +293,8 @@ export interface CodeWorkspacesOptions {
   host: CodeHost;
   /** 允许操作的仓库（GitLab 的项目路径 group/project，或 GitHub 的 owner/repo） */
   repos: readonly string[];
+  /** 给仓库指定的默认分支（仓库 → 分支）。没指定的用仓库自己的默认分支 */
+  branches?: Readonly<Record<string, string>>;
   logger?: Logger;
   now?: () => Date;
 }
@@ -304,6 +306,7 @@ export interface CodeWorkspacesOptions {
 export class CodeWorkspaces {
   readonly repos: readonly string[];
   readonly host: CodeHost;
+  readonly branches: Readonly<Record<string, string>>;
   private readonly root: string;
   private readonly logger: Logger;
   private readonly now: () => Date;
@@ -312,6 +315,7 @@ export class CodeWorkspaces {
     this.root = opts.root;
     this.host = opts.host;
     this.repos = opts.repos;
+    this.branches = opts.branches ?? {};
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? (() => new Date());
   }
@@ -324,6 +328,7 @@ export class CodeWorkspaces {
     }
     const dir = path.join(this.root, safeName(threadKey), safeName(name.replace("/", "__")));
     const env = this.host.gitEnv();
+    const configured = this.branches[name];
     const exists = await stat(path.join(dir, ".git")).then(
       () => true,
       () => false,
@@ -332,14 +337,17 @@ export class CodeWorkspaces {
       await rm(dir, { recursive: true, force: true });
       await mkdir(path.dirname(dir), { recursive: true });
       try {
-        await runGit(["clone", "--depth", "1", "--no-tags", this.host.cloneUrl(name), dir], { env, signal });
+        await runGit(
+          ["clone", "--depth", "1", "--no-tags", ...(configured ? ["--branch", configured] : []), this.host.cloneUrl(name), dir],
+          { env, signal },
+        );
       } catch (err) {
         await rm(dir, { recursive: true, force: true });
         throw err;
       }
       this.logger.info(`代码仓库 ${name} 已克隆到 ${dir}`);
     }
-    const workspace = new Workspace(name, dir, env, this.host, await readState(dir), this.now);
+    const workspace = new Workspace(name, dir, env, this.host, await readState(dir), this.now, configured);
     await workspace.init(exists, signal);
     return workspace;
   }
@@ -406,6 +414,8 @@ export class Workspace {
     private readonly host: CodeHost,
     private state: WorkspaceState,
     private readonly now: () => Date,
+    /** 配置里给这个仓库指定的默认分支 */
+    private readonly configuredBranch?: string,
   ) {}
 
   get pullRequest(): { url: string; number: number; branch: string } | undefined {
@@ -417,7 +427,7 @@ export class Workspace {
   async init(existed: boolean, signal?: AbortSignal): Promise<void> {
     this.realDir = await realpath(this.dir);
     const head = await this.git(["rev-parse", "--abbrev-ref", "origin/HEAD"], signal).catch(() => "origin/main");
-    const remoteDefault = head.trim().replace(/^origin\//, "") || "main";
+    const remoteDefault = this.configuredBranch ?? (head.trim().replace(/^origin\//, "") || "main");
     this.baseBranch = this.state.base ?? remoteDefault;
     if (!existed) {
       this.state.baseSha = (await this.git(["rev-parse", "HEAD"], signal)).trim();

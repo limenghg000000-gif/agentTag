@@ -75,6 +75,7 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
   };
 
   const create: Tool = {
+    writes: true,
     spec: {
       name: "feishu_doc_create",
       description:
@@ -109,6 +110,7 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
   };
 
   const edit: Tool = {
+    writes: true,
     spec: {
       name: "feishu_doc_edit",
       description:
