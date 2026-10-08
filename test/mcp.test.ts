@@ -175,6 +175,24 @@ test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
   assert.equal(server.calls.filter((call) => call.name === "get_active_alerts").length, 3);
 });
 
+test("aiops 的 query_logs 取满了 limit：结果前面加机器人注，审计日志里记一笔；别的服务同名工具不加", async () => {
+  const logs = Array.from({ length: 3 }, () => ({ timestamp: "1791448406000000000", line: "searchV2 fail" }));
+  const body = JSON.stringify({ total: 3, query_start: "2026-10-08 15:43:30", query_end: "2026-10-08 16:43:30", logs });
+  const server = await fake({ call: () => text(body) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+
+  const output = await toolOf(hub, "aiops_query_logs").run({ logql: '{app="a"}', limit: 3 }, { signal });
+  assert.match(output, /^（机器人注：这次只拿到最新的 3 条日志：Loki 按 limit=3 取满了。这些日志在 2026-10-08 16:33:26\.000～2026-10-08 16:33:26\.000/);
+  assert.ok(output.endsWith(`\n${body}`));
+  assert.match(log.find(/MCP 调用 aiops\.query_logs/)!.text, /→\d+字 加了机器人注 用时=/);
+  // 没取满不加
+  assert.equal(await toolOf(hub, "aiops_query_logs").run({ logql: '{app="a"}', limit: 4 }, { signal }), body);
+
+  const other = await hubFor([config(server.url, { name: "ops" })], { logger: recorder().logger });
+  assert.equal(await toolOf(other, "ops_query_logs").run({ logql: '{app="a"}', limit: 3 }, { signal }), body);
+});
+
 test("超过工具的时限就报超时，提示缩小范围", async () => {
   const server = await fake({
     call: (_name, _args, abort) =>
