@@ -69,6 +69,12 @@ export interface BotDeps {
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
   writeAllowed?: ReadonlySet<string>;
+  /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
+  mcp?: {
+    tools(task: TaskToolContext): readonly Tool[];
+    /** 这些工具的使用说明，写进系统提示词。toolNames 是这次任务的全部工具名 */
+    prompt(toolNames: readonly string[]): string | undefined;
+  };
 }
 
 /**
@@ -158,17 +164,26 @@ async function runTask(
     source = context.source;
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
-    const allTools = [
-      ...tools,
-      ...(deps.taskTools?.({
-        chatId: msg.chatId,
-        threadKey: threadKeyOf(msg),
-        senderId: msg.senderId,
-        askerName: context.askerName,
-        messageId: msg.messageId,
-      }) ?? []),
-      ...(memory?.tools ?? []),
-    ];
+    const taskContext: TaskToolContext = {
+      chatId: msg.chatId,
+      threadKey: threadKeyOf(msg),
+      senderId: msg.senderId,
+      askerName: context.askerName,
+      messageId: msg.messageId,
+    };
+    // MCP 工具的结果记下来：回答里引用的文件路径出现在这些结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    const evidence: string[] = [];
+    const mcpTools = (deps.mcp?.tools(taskContext) ?? []).map(
+      (tool): Tool => ({
+        ...tool,
+        run: async (args, ctx) => {
+          const output = await tool.run(args, ctx);
+          evidence.push(output);
+          return output;
+        },
+      }),
+    );
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])];
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
     const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
@@ -180,21 +195,23 @@ async function runTask(
     if (deep) {
       logger.info(`这次打开深度思考 message=${msg.messageId}`);
     }
+    const toolNames = taskTools.map((tool) => tool.spec.name);
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
-        toolNames: taskTools.map((tool) => tool.spec.name),
+        toolNames,
         memory: memory?.prompt,
         readOnly,
+        extra: deps.mcp?.prompt(toolNames),
       }),
       messages: [...context.history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
       ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? []) }
+        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path))) }
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
@@ -286,8 +303,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 
 const CODE_TOOL_PREFIX = "code_";
 /** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
-const CODE_PATH =
-  /(?:^|[\s`'"(（:：])(?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)\b/;
+const CODE_PATHS =
+  /(?:^|[\s`'"(（:：])((?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto))\b/g;
 export const UNVERIFIED_CODE_ANSWER =
   "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
   "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
@@ -296,8 +313,10 @@ export const UNVERIFIED_CODE_ANSWER =
 /**
  * 模型不读代码就回答仓库的问题时（问题或回答提到了配置的仓库、或者回答里写了代码文件路径，这次却没调任何代码工具），
  * 让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
+ * seenInEvidence 认的文件路径不算：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，不是编的；
+ * 只放过工具结果里真出现过的路径，回答里多写一个结果里没有的路径照样打回
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[]) {
+export function reviewCodeAnswer(question: string, repos: readonly string[], seenInEvidence: (path: string) => boolean = () => false) {
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     if ([...usedTools].some((name) => name.startsWith(CODE_TOOL_PREFIX))) {
       return undefined;
@@ -308,7 +327,8 @@ export function reviewCodeAnswer(question: string, repos: readonly string[]) {
       const short = full.split("/").pop() ?? full;
       return text.includes(full) || (short.length >= 5 && text.includes(short));
     });
-    return mentionsRepo || CODE_PATH.test(answer) ? UNVERIFIED_CODE_ANSWER : undefined;
+    const unverifiedPath = [...answer.matchAll(CODE_PATHS)].some((match) => !seenInEvidence(match[1]));
+    return mentionsRepo || unverifiedPath ? UNVERIFIED_CODE_ANSWER : undefined;
   };
 }
 

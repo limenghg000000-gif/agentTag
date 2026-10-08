@@ -10,6 +10,7 @@ import { createDocsApi, FeishuDocs } from "./docs.js";
 import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
 import { createOpenAICompatibleModel } from "./llm.js";
+import { McpHub } from "./mcp.js";
 import { MemoryStore } from "./memory.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { TaskRegistry } from "./tasks.js";
@@ -56,6 +57,9 @@ const backup =
 const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
 const docs = new FeishuDocs(createDocsApi(channel.rawClient), () => channel.botIdentity?.name ?? "机器人");
 const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefined;
+// MCP 服务在后台连接，连上之前（或连不上时）的提问没有它的工具，不耽误机器人启动
+const mcp = config.mcp.length > 0 ? new McpHub(config.mcp) : undefined;
+void mcp?.start();
 const handleMessage = createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
   tools,
@@ -69,6 +73,7 @@ const handleMessage = createMessageHandler({
   allowedChatIds: config.feishu.allowedChatIds,
   ...(workspaces ? { codeRepos: workspaces.repos } : {}),
   ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
+  ...(mcp ? { mcp } : {}),
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
   memory,
@@ -142,6 +147,9 @@ if (workspaces) {
   console.log(`代码仓库已配置（${workspaces.host.name}）：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
   void checkRepos(workspaces);
 }
+if (mcp) {
+  console.log(`MCP 服务：${mcp.names.join(", ")}，在后台连接，连上后日志里有一行「MCP <名字>：已连上」`);
+}
 if (backup) {
   backup.start();
   console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
@@ -158,6 +166,7 @@ const shutdown = async () => {
   await backup?.stop();
   tasks.stopAll();
   await tasks.idle(5000);
+  await mcp?.stop();
   await channel.disconnect();
   process.exit(0);
 };

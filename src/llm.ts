@@ -154,7 +154,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
       }
 
       const choice = completion.choices[0];
-      const text = choice?.message.content?.trim() ?? "";
+      const text = stripThinkTags(choice?.message.content ?? "");
       const usage = toUsage(completion.usage);
       const withUsage = <T extends ChatResult>(result: T): T => (usage ? { ...result, usage } : result);
       const toolCalls = (choice?.message.tool_calls ?? [])
@@ -174,6 +174,22 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
       }
     },
   };
+}
+
+/**
+ * 千问多轮调工具时偶尔把思考漏进正文（aiops 的模型代理也专门处理过），发到群里前去掉：
+ * 正文以一段思考开头、以 </think> 结束（开头的 <think> 有时在模板里，正文里看不到），后面还有正文时，去掉这段思考；
+ * 其余零散的标签只去掉标签本身、保留文字，免得误删回答
+ */
+export function stripThinkTags(text: string): string {
+  let out = text.replace(/<think>\s*<\/think>/g, "");
+  const end = out.indexOf("</think>");
+  const start = out.indexOf("<think>");
+  const leading = start === -1 || start > end || !out.slice(0, start).trim();
+  if (end !== -1 && leading && out.slice(end + "</think>".length).trim()) {
+    out = out.slice(end + "</think>".length);
+  }
+  return out.replace(/<\/?think>/g, "").trim();
 }
 
 function toOpenAIMessage(message: ChatMessage): OpenAI.Chat.ChatCompletionMessageParam {

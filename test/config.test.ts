@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { Domain } from "@larksuiteoapi/node-sdk";
-import { DEFAULT_MODEL_BASE_URL, DEFAULT_MODEL_ID, DEFAULT_THINKING_BUDGET, loadConfig } from "../src/config.js";
+import {
+  AIOPS_DEFAULT_TOOLS,
+  DEFAULT_MODEL_BASE_URL,
+  DEFAULT_MODEL_ID,
+  DEFAULT_THINKING_BUDGET,
+  loadConfig,
+} from "../src/config.js";
 
 const base = { FEISHU_APP_ID: "cli_x", FEISHU_APP_SECRET: "s", MODEL_API_KEY: "k" };
 
@@ -147,4 +154,60 @@ test("MODEL_THINKING_BUDGET 限制思考长度：百炼默认 4000，0 表示不
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).llm.thinkingBudget, undefined);
   assert.throws(() => loadConfig({ ...base, MODEL_THINKING_BUDGET: "很多" }), /MODEL_THINKING_BUDGET/);
   assert.throws(() => loadConfig({ ...base, MODEL_THINKING_BUDGET: "-1" }), /MODEL_THINKING_BUDGET/);
+});
+
+test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开第一批 19 个只读工具，令牌从 MCP_AIOPS_TOKEN 读", () => {
+  assert.deepEqual(loadConfig(base).mcp, []);
+  const [aiops, ...rest] = loadConfig({ ...base, MCP_SERVERS: " aiops=https://aiops.example.com/mcp ", MCP_AIOPS_TOKEN: " t0k " }).mcp;
+  assert.equal(rest.length, 0);
+  assert.equal(aiops.name, "aiops");
+  assert.equal(aiops.url, "https://aiops.example.com/mcp");
+  assert.equal(aiops.token, "t0k");
+  assert.deepEqual(aiops.tools, AIOPS_DEFAULT_TOOLS);
+  assert.equal(aiops.tools.length, 19);
+  assert.ok(aiops.tools.includes("find_service"));
+  // promote_case 名字里没有写操作动词，但它是沉淀经验的第一步，默认当写工具
+  assert.deepEqual(aiops.writeTools, ["promote_case"]);
+  assert.equal(aiops.timeoutsMs.diagnose_service, 120_000);
+  assert.equal(aiops.labels.diagnose_service, "诊断");
+  // 默认的使用说明文件在项目里
+  assert.equal(aiops.promptFile, path.resolve("prompts", "mcp", "aiops.md"));
+  assert.ok(existsSync(aiops.promptFile));
+});
+
+test("MCP 服务的工具名单、写工具、说明文件都能用 MCP_<名字>_ 开头的变量改", () => {
+  const [aiops, other] = loadConfig({
+    ...base,
+    MCP_SERVERS: "aiops=https://aiops.example.com/mcp,Other=http://10.0.0.5:8080/mcp",
+    MCP_AIOPS_TOOLS: "diagnose_service, get_dashboard",
+    MCP_AIOPS_WRITE_TOOLS: "get_dashboard",
+    MCP_AIOPS_PROMPT: "custom/aiops.md",
+    MCP_OTHER_TOOLS: "*",
+  }).mcp;
+  assert.deepEqual(aiops.tools, ["diagnose_service", "get_dashboard"]);
+  assert.deepEqual(aiops.writeTools, ["promote_case", "get_dashboard"]);
+  assert.equal(aiops.promptFile, path.resolve("custom/aiops.md"));
+  assert.equal(other.name, "other");
+  assert.equal(other.tools, "*");
+  assert.equal(other.token, undefined);
+  assert.deepEqual(other.timeoutsMs, {});
+});
+
+test("MCP_SERVERS 写错时报错：格式不对、名字重复、地址带令牌、别的服务没写开哪些工具", () => {
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "https://aiops.example.com/mcp" }), /名字=地址/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "ai-ops=https://a.example.com/mcp" }), /名字只用字母和数字/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=aiops.example.com" }), /完整地址/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=ftp://a.example.com" }), /http 或 https/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a/mcp,AIOPS=https://b/mcp" }), /aiops 写了两次/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp?t=secret" }), /带了令牌.*MCP_AIOPS_TOKEN/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://user:pw@a.example.com/mcp" }), /带了令牌/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "grafana=https://g.example.com/mcp" }), /MCP_GRAFANA_TOOLS/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a/mcp", MCP_AIOPS_TOOLS: "a b" }), /MCP_AIOPS_TOOLS.*a b/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a/mcp", MCP_AIOPS_TOOLS: " , " }), /MCP_AIOPS_TOOLS 里没有工具名/);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "code=https://a/mcp", MCP_CODE_TOOLS: "*" }), /和内置工具的前缀（code_）重了/);
+  for (const param of ["api_key", "signature", "X-Amz-Signature", "authToken", "access_key", "sig", "credential"]) {
+    assert.throws(() => loadConfig({ ...base, MCP_SERVERS: `aiops=https://a.example.com/mcp?${param}=x` }), /带了令牌/, param);
+  }
+  // 参数名里只是含有 key 这几个字母的不算令牌
+  assert.equal(loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp?monkey=1" }).mcp[0].url, "https://a.example.com/mcp?monkey=1");
 });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
-import { createOpenAICompatibleModel, LlmError } from "../src/llm.js";
+import { createOpenAICompatibleModel, LlmError, stripThinkTags } from "../src/llm.js";
 
 // 本地假 OpenAI 兼容接口：记录收到的请求，按队列返回预设的状态码和响应
 const requests: { url: string; headers: IncomingHttpHeaders; body: any }[] = [];
@@ -253,4 +253,17 @@ test("打开思考时带上思考长度上限；关着时不带；服务不认�
   assert.deepEqual(bodies, [[true, 4000], [true, undefined], [true, undefined]]);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /不支持限制思考长度/);
+});
+
+test("回答里漏出来的 <think> 标签去掉：开头整段思考连同内容去掉，零散的标签只去标签", async () => {
+  responses.push(completion("<think>\n先查日志\n</think>\n\n**结论**：下游超时"));
+  assert.equal((await model.chat({ system: "s", messages: [{ role: "user", content: "q" }] })).text, "**结论**：下游超时");
+
+  assert.equal(stripThinkTags("<think></think>答案"), "答案");
+  // 开头的 <think> 在模板里、正文只漏出思考和 </think>
+  assert.equal(stripThinkTags("先看日志再看指标。\n</think>\n\n结论：OOM"), "结论：OOM");
+  assert.equal(stripThinkTags("答案</think>"), "答案");
+  assert.equal(stripThinkTags("先说结论 <think>补充</think> 再说依据"), "先说结论 补充 再说依据");
+  // 只有思考没有正文时保留文字，不发空回答
+  assert.equal(stripThinkTags("<think>只有这段</think>"), "只有这段");
 });

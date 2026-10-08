@@ -108,6 +108,18 @@ test("工具结果太长时截断", async () => {
   assert.match(output, /后面 100 字已省略/);
 });
 
+test("工具可以自己定结果的字数上限", async () => {
+  const big = { ...echoTool("big", async () => "字".repeat(MAX_TOOL_OUTPUT_CHARS + 100)), maxOutputChars: MAX_TOOL_OUTPUT_CHARS + 200 };
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "big", {})] },
+    { text: "好", finish: "stop" },
+  ]);
+
+  await runAgent({ model, system: "s", messages: user, tools: [big], signal });
+
+  assert.equal(requests[1].messages.at(-1)!.content, "字".repeat(MAX_TOOL_OUTPUT_CHARS + 100));
+});
+
 test("工具轮数用完后要求模型直接作答", async () => {
   const { model, requests } = scriptedModel([
     { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "1" })] },

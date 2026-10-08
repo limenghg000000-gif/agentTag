@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Domain } from "@larksuiteoapi/node-sdk";
 import type { LlmConfig } from "./llm.js";
 
@@ -35,6 +36,27 @@ export interface Config {
     /** 拉代码的工作目录（每个话题一个子目录） */
     workspaceDir: string;
   };
+  /** 通过 MCP 接入的服务（MCP_SERVERS），没配时为空数组 */
+  mcp: McpServerConfig[];
+}
+
+export interface McpServerConfig {
+  /** 服务名，也是交给模型的工具名前缀，如 aiops → aiops_diagnose_service */
+  name: string;
+  /** Streamable HTTP 地址 */
+  url: string;
+  /** 用 Authorization: Bearer 头发送，不拼进地址 */
+  token?: string;
+  /** 开哪些工具（服务端的工具名）；"*" 表示服务端的全部工具。会写东西的工具这一版一律不开 */
+  tools: readonly string[] | "*";
+  /** 额外算作「会写东西」的工具。名字里带 create、save、delete 这类动词的不用列，程序自己认 */
+  writeTools: readonly string[];
+  /** 这个服务的使用说明文件，开了它的工具时写进系统提示词；文件不存在就不写 */
+  promptFile: string;
+  /** 单独指定超时的工具（毫秒），其余用默认的 60 秒 */
+  timeoutsMs: Readonly<Record<string, number>>;
+  /** 进度卡片上的步骤名，如 diagnose_service → 诊断；没列的显示工具原名 */
+  labels: Readonly<Record<string, string>>;
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
@@ -48,6 +70,78 @@ export const DEFAULT_DATA_DIR = "data";
 export const DEFAULT_CATCHUP_INTERVAL_SECONDS = 10;
 /** 群记忆备份默认保留 14 天 */
 export const DEFAULT_MEMORY_BACKUP_DAYS = 14;
+
+/**
+ * aiops 第一批开放的只读工具（阶段 3.5 方案第 4 条）。服务端新加的工具要在 MCP_AIOPS_TOOLS 里点名才开。
+ * 先不开：get_log_labels（和 get_label_values 重复）、get_targets_health（采集目标体检）、两个资源配额工具（diagnose_service 里已经在用）、
+ * 两个 Grafana 工具（只返回面板名称和链接）；会写东西的 save_lesson、archive_lesson、create_annotation 和 promote_case 等第二批
+ */
+export const AIOPS_DEFAULT_TOOLS = [
+  "diagnose_service",
+  "find_service",
+  "list_namespaces",
+  "list_pods",
+  "describe_pod",
+  "get_pod_logs",
+  "get_events",
+  "list_deployments",
+  "query_logs",
+  "get_label_values",
+  "query_metrics",
+  "query_metrics_range",
+  "get_service_metrics",
+  "get_active_alerts",
+  "search_traces",
+  "get_trace",
+  "search_knowledge",
+  "get_case",
+  "get_knowledge",
+] as const;
+
+/** 已知 MCP 服务的默认配置。别的服务要在 MCP_<名字>_TOOLS 里写明开哪些工具 */
+const MCP_SERVER_DEFAULTS: Record<string, Pick<McpServerConfig, "tools" | "writeTools" | "timeoutsMs" | "labels">> = {
+  aiops: {
+    tools: AIOPS_DEFAULT_TOOLS,
+    // promote_case 只生成草稿，但它是沉淀经验的第一步，和 save_lesson 一起放到第二批（确认卡片）；别的写工具名字里带动词，程序自己认
+    writeTools: ["promote_case"],
+    // 服务端 diagnose_service 最长跑 90 秒，其余工具 30 秒
+    timeoutsMs: { diagnose_service: 120_000 },
+    labels: {
+      diagnose_service: "诊断",
+      find_service: "定位服务",
+      list_namespaces: "列出命名空间",
+      list_pods: "查看 Pod",
+      describe_pod: "查看 Pod 详情",
+      get_pod_logs: "查看 Pod 日志",
+      get_events: "查看 K8s 事件",
+      list_deployments: "查看 Deployment",
+      query_logs: "查日志",
+      get_label_values: "查日志标签",
+      query_metrics: "查指标",
+      query_metrics_range: "查指标趋势",
+      get_service_metrics: "查服务有哪些指标",
+      get_active_alerts: "查活跃告警",
+      search_traces: "搜链路",
+      get_trace: "查看链路",
+      search_knowledge: "查知识库",
+      get_case: "查看案例",
+      get_knowledge: "查看经验",
+    },
+  },
+};
+
+/** 内置工具名的前缀（code_read_file、memory_save 等），MCP 服务不能用这些名字 */
+const RESERVED_MCP_NAMES = new Set(["code", "memory", "feishu", "web", "fetch"]);
+/** 地址里像令牌的参数名：t（aiops 的写法），或者按 _ - . 和大小写拆开后有一段像密钥，如 api_key、X-Amz-Signature、authToken */
+const SECRET_PARAM_PARTS = /^(token|secret|key|apikey|auth|authorization|password|passwd|pwd|sig|signature|credential|credentials|session|jwt|bearer)$/;
+
+function isSecretParam(param: string): boolean {
+  const parts = param.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[_.-]+/);
+  return param === "t" || parts.some((part) => SECRET_PARAM_PARTS.test(part));
+}
+
+/** 使用说明文件默认放在项目的 prompts/mcp/<服务名>.md（src 和 dist 都在项目根目录下一层） */
+const PROMPTS_DIR = fileURLToPath(new URL("../prompts/mcp/", import.meta.url));
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -126,7 +220,74 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || (/^qwen/i.test(model) ? model : DEFAULT_MODEL_ID) }
       : undefined,
     code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
+    mcp: loadMcpConfig(env),
   };
+}
+
+/** MCP_SERVERS=aiops=https://aiops.example.com/mcp,别的=…，每个服务的其他设置用 MCP_<名字>_ 开头的变量 */
+function loadMcpConfig(env: NodeJS.ProcessEnv): McpServerConfig[] {
+  const entries = (env.MCP_SERVERS ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
+  const names = new Set<string>();
+  return entries.map((entry) => {
+    const eq = entry.indexOf("=");
+    const name = (eq > 0 ? entry.slice(0, eq) : "").trim().toLowerCase();
+    const url = entry.slice(eq + 1).trim();
+    if (!/^[a-z][a-z0-9]*$/.test(name)) {
+      throw new Error(`MCP_SERVERS 要写成「名字=地址」，名字只用字母和数字，多个用逗号分隔，这一项不对：${entry}`);
+    }
+    if (names.has(name)) {
+      throw new Error(`MCP_SERVERS 里 ${name} 写了两次`);
+    }
+    if (RESERVED_MCP_NAMES.has(name)) {
+      throw new Error(`MCP_SERVERS 里的名字 ${name} 和内置工具的前缀（${name}_）重了，换一个名字`);
+    }
+    names.add(name);
+    const key = `MCP_${name.toUpperCase()}`;
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`MCP_SERVERS 里 ${name} 的地址要写成 https://… 这样的完整地址`);
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new Error(`MCP_SERVERS 里 ${name} 的地址要用 http 或 https`);
+    }
+    // 令牌写进地址容易被各处日志记下来，只从 MCP_<名字>_TOKEN 读，用请求头发送
+    if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(isSecretParam)) {
+      throw new Error(`MCP_SERVERS 里 ${name} 的地址带了令牌，请去掉，把令牌写进 ${key}_TOKEN`);
+    }
+
+    const defaults = MCP_SERVER_DEFAULTS[name];
+    const toolsEnv = env[`${key}_TOOLS`]?.trim();
+    const tools = toolsEnv === "*" ? "*" : toolsEnv ? toolList(toolsEnv, `${key}_TOOLS`, true) : defaults?.tools;
+    if (!tools) {
+      throw new Error(`配了 MCP 服务 ${name}，要在 ${key}_TOOLS 里写开哪些工具（服务端的工具名，逗号分隔；* 表示全部）`);
+    }
+    const prompt = env[`${key}_PROMPT`]?.trim();
+    const token = env[`${key}_TOKEN`]?.trim();
+    return {
+      name,
+      url: parsed.href,
+      ...(token ? { token } : {}),
+      tools,
+      writeTools: [...(defaults?.writeTools ?? []), ...toolList(env[`${key}_WRITE_TOOLS`] ?? "", `${key}_WRITE_TOOLS`)],
+      promptFile: prompt ? path.resolve(prompt) : path.join(PROMPTS_DIR, `${name}.md`),
+      timeoutsMs: defaults?.timeoutsMs ?? {},
+      labels: defaults?.labels ?? {},
+    };
+  });
+}
+
+function toolList(value: string, key: string, required = false): string[] {
+  const names = value.split(",").map((name) => name.trim()).filter(Boolean);
+  const bad = names.find((name) => !/^[\w.-]+$/.test(name));
+  if (bad) {
+    throw new Error(`${key} 要写服务端的工具名，多个用逗号分隔，这一项不对：${bad}`);
+  }
+  if (required && names.length === 0) {
+    throw new Error(`${key} 里没有工具名，要写服务端的工具名，多个用逗号分隔（* 表示全部）`);
+  }
+  return names;
 }
 
 /** 代码仓库：配了 GITLAB_URL 就接 GitLab，否则配了 GITHUB_TOKEN 接 GitHub */
