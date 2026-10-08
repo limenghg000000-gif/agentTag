@@ -356,7 +356,8 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
 
 /**
  * 回答里像线上数据的写法：带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39）、K8s Pod 名（gateway-api-6978f9454f-tnc56）、
- * 带单位的数量（47 条、93 个 Pod、95%、120ms、3.1 cores）、「没有报错」「无异常」这类结论
+ * 带单位的数量（47 条、93 个 Pod、95%、120ms、3.1 cores）、就绪数（1/1 就绪、ready 2/3）、「没有报错」「无异常」这类结论。
+ * 就绪数：2026-10-08 复测时，模型没调工具就照着话题里前两次的定位结果，编出 network-tester 在三个命名空间「1/1 就绪」让用户选
  */
 const OPS_DATA = new RegExp(
   [
@@ -364,6 +365,8 @@ const OPS_DATA = new RegExp(
     String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
     String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
     String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
+    String.raw`\d+\s*/\s*\d+\s*(?:就绪|ready|running|副本)`,
+    String.raw`(?:就绪|ready)\s*[:：]?\s*\d+\s*/\s*\d+`,
     String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?(?:报错|错误|异常|告警|重启)`,
   ].join("|"),
   "gi",

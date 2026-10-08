@@ -709,7 +709,7 @@ test("有 aiops 工具时，一个工具都没调就给出线上数据的回答�
   assert.deepEqual(markdowns(sent), ["最近 1 小时没有查到报错日志"]);
 });
 
-test("线上数据检查：没成功调过工具就给出时间、Pod、条数、「没有报错」时打回；成功调过工具、没有线上数据、或者数据来自提问时放行", () => {
+test("线上数据检查：没成功调过工具就给出时间、Pod、条数、就绪数、「没有报错」时打回；成功调过工具、没有线上数据、或者数据来自提问时放行", () => {
   const ok = (...names: string[]) => reviewOpsAnswer("product-service-api 最近一小时报错多吗", ["aiops"], new Set(names));
   const flagged = unverifiedOpsAnswer(["aiops"]);
   for (const answer of [
@@ -721,6 +721,10 @@ test("线上数据检查：没成功调过工具就给出时间、Pod、条数�
     "CPU 使用率 95%",
     "93 个 Pod 都在运行",
     "无明显异常",
+    // 复测时没调工具编出来的定位候选
+    "network-tester 在多个命名空间都有部署，请确认要诊断哪个：\n- default：1/1 就绪（Deployment）\n- kube-system：2/2 就绪（DaemonSet）",
+    "prod：Ready 4/4",
+    "3/3 Running",
   ]) {
     assert.equal(ok()(answer), flagged, answer);
   }
@@ -732,6 +736,7 @@ test("线上数据检查：没成功调过工具就给出时间、Pod、条数�
   // 反问、解释概念、只说到分钟的时间都不算线上数据
   assert.equal(ok()("gateway-api 在 prod、staging、test 都有，查哪个？"), undefined);
   assert.equal(ok()("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存"), undefined);
+  assert.equal(ok()("kubectl get pods 里 READY 列的 1/2 表示两个容器只有一个就绪"), undefined);
   // 提问里本来就有的数字不算
   const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
   assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
