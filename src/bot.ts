@@ -372,19 +372,27 @@ const OPS_DATA = new RegExp(
   "gi",
 );
 
+/**
+ * 提问像是在问线上服务：带连字符的服务名（network-tester、product-service-api），或者说到日志、告警、Pod、重启、指标这类。
+ * 宽一点没关系：只有一个工具都没成功调过的回答才会因为它多重做一次，确实不用查的，模型照原来的意思再答一次
+ */
+const OPS_QUESTION = /[a-z][a-z0-9]*(?:-[a-z0-9]+)+|日志|报错|告警|异常|pod|重启|崩溃|oom|cpu|内存|超时|5xx|诊断|排查|命名空间|namespace|副本|链路|指标|监控/i;
+
 export function unverifiedOpsAnswer(servers: readonly string[]): string {
   const tools = servers.map((name) => `${name}_`).join("、");
   return (
-    "（系统检查）你的回答里有线上数据或结论（具体时间、Pod 名、日志条数、「没有报错」这类），但这次没有成功调用过工具，这些内容没有经过查证。" +
-    `问线上服务的情况，每次都要用 ${tools} 开头的工具重新查，话题里之前的回答只能当线索，不能照搬其中的数据。` +
+    "（系统检查）这个问题像是在问线上服务，或者你的回答里有线上的情况（命名空间候选、具体时间、Pod 名、日志条数、「没有报错」这类），但这次没有成功调用过工具，没有经过查证。" +
+    `问线上服务的情况，每次都要用 ${tools} 开头的工具重新查，话题里之前的回答只能当线索，不能照搬其中的命名空间、Pod 和数据。` +
     "先查，再只按这次查到的结果回答；这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
     "如果这个问题本来就不用查线上（比如解释概念、整理用户自己给的内容），照原来的意思再回答一次就行。不要提这段检查。"
   );
 }
 
 /**
- * 配了 MCP 服务（如 aiops）的任务里，模型没成功调过工具就给出时间、Pod 名、条数、「没有报错」这类线上数据时，让它先查再答。
- * 同一话题里接着问另一个服务时，模型容易照着上一次的回答编出日志和 Pod。
+ * 配了 MCP 服务（如 aiops）的任务里，模型一个工具都没成功调过，提问又像在问线上服务，或者回答里有时间、Pod 名、条数、
+ * 「没有报错」这类线上数据时，让它先查再答。
+ * 同一话题里接着问另一个服务时，模型容易照着之前的回答编：2026-10-08 先是照搬了别的服务的日志和 Pod，
+ * 后来又照着前两次的定位结果编出了命名空间候选。只认回答的写法总会漏掉新的编法，所以提问像线上问题就要求查过。
  * succeeded 是这次成功跑完的工具：调用失败（超时、到上限、服务繁忙、工具不存在）不算查过。
  * 成功调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；只调了群记忆工具的照样打回。
  * 提问里本来就有的数字和说法不算（比如让机器人润色一段带数字的文字）
@@ -396,7 +404,7 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
     if ([...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)))) {
       return undefined;
     }
-    const unverified = [...answer.matchAll(OPS_DATA)].some((match) => !question.includes(match[0]));
+    const unverified = OPS_QUESTION.test(question) || [...answer.matchAll(OPS_DATA)].some((match) => !question.includes(match[0]));
     return unverified ? unverifiedOpsAnswer(servers) : undefined;
   };
 }
