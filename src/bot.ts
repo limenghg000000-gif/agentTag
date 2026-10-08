@@ -69,6 +69,12 @@ export interface BotDeps {
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
   writeAllowed?: ReadonlySet<string>;
+  /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
+  mcp?: {
+    tools(task: TaskToolContext): readonly Tool[];
+    /** 这些工具的使用说明，写进系统提示词。toolNames 是这次任务的全部工具名 */
+    prompt(toolNames: readonly string[]): string | undefined;
+  };
 }
 
 /**
@@ -158,17 +164,15 @@ async function runTask(
     source = context.source;
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
-    const allTools = [
-      ...tools,
-      ...(deps.taskTools?.({
-        chatId: msg.chatId,
-        threadKey: threadKeyOf(msg),
-        senderId: msg.senderId,
-        askerName: context.askerName,
-        messageId: msg.messageId,
-      }) ?? []),
-      ...(memory?.tools ?? []),
-    ];
+    const taskContext: TaskToolContext = {
+      chatId: msg.chatId,
+      threadKey: threadKeyOf(msg),
+      senderId: msg.senderId,
+      askerName: context.askerName,
+      messageId: msg.messageId,
+    };
+    const mcpTools = deps.mcp?.tools(taskContext) ?? [];
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])];
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
     const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
@@ -180,21 +184,23 @@ async function runTask(
     if (deep) {
       logger.info(`这次打开深度思考 message=${msg.messageId}`);
     }
+    const toolNames = taskTools.map((tool) => tool.spec.name);
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
-        toolNames: taskTools.map((tool) => tool.spec.name),
+        toolNames,
         memory: memory?.prompt,
         readOnly,
+        extra: deps.mcp?.prompt(toolNames),
       }),
       messages: [...context.history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
       ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? []) }
+        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? [], (name) => mcpTools.some((tool) => tool.spec.name === name)) }
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
@@ -296,8 +302,9 @@ export const UNVERIFIED_CODE_ANSWER =
 /**
  * 模型不读代码就回答仓库的问题时（问题或回答提到了配置的仓库、或者回答里写了代码文件路径，这次却没调任何代码工具），
  * 让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
+ * 调过 hasEvidence 认的工具时，回答里的文件路径不算：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，不是编的
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[]) {
+export function reviewCodeAnswer(question: string, repos: readonly string[], hasEvidence: (toolName: string) => boolean = () => false) {
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     if ([...usedTools].some((name) => name.startsWith(CODE_TOOL_PREFIX))) {
       return undefined;
@@ -308,7 +315,8 @@ export function reviewCodeAnswer(question: string, repos: readonly string[]) {
       const short = full.split("/").pop() ?? full;
       return text.includes(full) || (short.length >= 5 && text.includes(short));
     });
-    return mentionsRepo || CODE_PATH.test(answer) ? UNVERIFIED_CODE_ANSWER : undefined;
+    const pathsFromEvidence = [...usedTools].some(hasEvidence);
+    return mentionsRepo || (!pathsFromEvidence && CODE_PATH.test(answer)) ? UNVERIFIED_CODE_ANSWER : undefined;
   };
 }
 

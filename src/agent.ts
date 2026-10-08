@@ -1,9 +1,9 @@
 import type { ChatMessage, ChatModel, ChatResult, TokenUsage, ToolCall } from "./llm.js";
 import type { Tool } from "./tools/tool.js";
 
-/** 单次任务最多几轮工具调用。到了上限就让模型用已有信息直接作答。 */
-export const MAX_TOOL_ROUNDS = 8;
-/** 单个工具结果交给模型前的字数上限，防止一个大网页挤掉上下文 */
+/** 单次任务最多几轮工具调用。到了上限就让模型用已有信息直接作答。排查线上问题时一次诊断加几次补查，8 轮不太够 */
+export const MAX_TOOL_ROUNDS = 12;
+/** 单个工具结果交给模型前默认的字数上限，防止一个大网页挤掉上下文。工具可以用 maxOutputChars 另定 */
 export const MAX_TOOL_OUTPUT_CHARS = 16000;
 
 const LAST_ROUND_NOTE = "工具调用次数已经用完了。请根据上面已经拿到的信息直接给出最终回答，不要再调用工具；没查到的部分如实说明。";
@@ -137,7 +137,7 @@ async function runTool(
   try {
     const output = await tool.run(args, { signal });
     onEvent({ type: "tool_end", id: call.id, name: call.name, ok: true, ms: now() - startedAt });
-    return truncate(output, MAX_TOOL_OUTPUT_CHARS);
+    return truncate(output, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS);
   } catch (err) {
     onEvent({ type: "tool_end", id: call.id, name: call.name, ok: false, ms: now() - startedAt, error: errorMessage(err) });
     if (signal.aborted) {

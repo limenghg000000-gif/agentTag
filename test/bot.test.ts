@@ -468,6 +468,37 @@ test("按任务创建的工具拿到当前群和发起人，和其他工具一�
   assert.match(requests[0].system, /飞书文档链接（\/docx\/、\/wiki\/ 等）用 feishu_doc_read 读，不要用 fetch_url/);
 });
 
+test("MCP 工具按任务创建，拿到当前群和发起人；它的使用说明写进提示词", async () => {
+  const contexts: unknown[] = [];
+  const seen: string[][] = [];
+  const mcpTool: Tool = {
+    spec: { name: "aiops_get_active_alerts", description: "活跃告警", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查活跃告警",
+    run: async () => "[]",
+  };
+  const { model, requests } = fakeModel(() => ({ text: "没有告警", finish: "stop" }));
+  const { handle } = setup({
+    model,
+    mcp: {
+      tools: (task) => {
+        contexts.push(task);
+        return [mcpTool];
+      },
+      prompt: (names) => {
+        seen.push([...names]);
+        return "## aiops（MCP 服务）\n先调 diagnose_service";
+      },
+    },
+  });
+
+  await handle(message("现在有哪些告警", { senderId: "ou_li" }));
+
+  assert.deepEqual(contexts, [{ chatId: "oc_1", threadKey: "om_1", senderId: "ou_li", askerName: undefined, messageId: "om_1" }]);
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["aiops_get_active_alerts"]);
+  assert.deepEqual(seen, [["aiops_get_active_alerts"]]);
+  assert.match(requests[0].system, /## aiops（MCP 服务）\n先调 diagnose_service/);
+});
+
 test("勾了「同时发送到群」时群里多出的那份一样的提问跳过，不调用模型也不回复", async () => {
   const { model, requests } = fakeModel(() => ({ text: "追加好了", finish: "stop" }));
   const logs: string[] = [];
@@ -629,4 +660,11 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   // 和仓库无关的一般问题不管
   assert.equal(general("用 systemctl 重启，配置写在 tsconfig.json", new Set()), undefined);
   assert.equal(reviewCodeAnswer("今天周几", ["ai/api"])("周一，api 文档见 https://x.com/a/b.js", new Set()), undefined);
+  // 文件和行号来自 aiops 查到的崩溃日志
+  const crash = reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"], (name) => name.startsWith("aiops_"));
+  assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["aiops_get_pod_logs"])), undefined);
+  assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["web_search"])), UNVERIFIED_CODE_ANSWER);
+  // 问的是配置的仓库，调了 aiops 工具也不算读过代码
+  const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], (name) => name.startsWith("aiops_"));
+  assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
 });
