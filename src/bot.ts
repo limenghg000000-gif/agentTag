@@ -365,8 +365,9 @@ const OPS_DATA = new RegExp(
     String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
     String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
     String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
-    String.raw`\d+\s*/\s*\d+\s*(?:就绪|ready|running|副本)`,
-    String.raw`(?:就绪|ready)\s*[:：]?\s*\d+\s*/\s*\d+`,
+    // 中间可能夹着 Markdown 的加粗、行内代码：**1/1** 就绪、Ready: `4/4`
+    String.raw`\d+\s*/\s*\d+[*_\x60\s]*(?:就绪|ready|running|副本)`,
+    String.raw`(?:就绪|ready)[*_\x60\s]*[:：]?[*_\x60\s]*\d+\s*/\s*\d+`,
     String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?(?:报错|错误|异常|告警|重启)`,
   ].join("|"),
   "gi",
@@ -404,9 +405,16 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
     if ([...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)))) {
       return undefined;
     }
-    const unverified = OPS_QUESTION.test(question) || [...answer.matchAll(OPS_DATA)].some((match) => !question.includes(match[0]));
+    const unverified = OPS_QUESTION.test(question) || [...answer.matchAll(OPS_DATA)].some((match) => !inQuestion(question, match[0]));
     return unverified ? unverifiedOpsAnswer(servers) : undefined;
   };
+}
+
+/** 提问里本来就有的说法：不分大小写、不管空格；就绪数只看比值（问「READY 1/2 是什么意思」，答「1/2 Ready 表示…」） */
+function inQuestion(question: string, text: string): boolean {
+  const compact = (value: string) => value.replace(/\s+/g, "").toLowerCase();
+  const ratio = /(\d+)\s*\/\s*(\d+)/.exec(text);
+  return compact(question).includes(compact(text)) || (ratio !== null && new RegExp(`(?<!\\d)${ratio[1]}/${ratio[2]}(?!\\d)`).test(compact(question)));
 }
 
 function applyEvent(state: ProgressState, event: Extract<AgentEvent, { type: "tool_start" | "tool_end" }>): void {

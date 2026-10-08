@@ -744,6 +744,10 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
     "default：1/1 就绪（Deployment）",
     "prod：Ready 4/4",
     "3/3 Running",
+    // Markdown 包着的就绪数
+    "- default：**1/1** 就绪",
+    "- prod（Ready: **4/4**）",
+    "- staging：`2/2` 就绪",
   ]) {
     assert.equal(ok()(answer), flagged, answer);
   }
@@ -757,6 +761,13 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
   // 提问里本来就有的数字不算
   const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
   assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
+  // 提问里的就绪数换了大小写、顺序、空格也不算
+  const concept = reviewOpsAnswer("READY 1/2 是什么意思", ["aiops"], new Set());
+  assert.equal(concept("Ready 1/2 表示两个容器里只有一个就绪"), undefined);
+  assert.equal(concept("1/2 Ready 表示两个容器里只有一个就绪"), undefined);
+  assert.equal(concept("1 / 2 ready 表示两个容器里只有一个就绪"), undefined);
+  assert.equal(concept("1/2 表示一个就绪，prod 那边现在是 4/4 就绪"), flagged);
+  assert.equal(reviewOpsAnswer("READY 11/20 是什么意思", ["aiops"], new Set())("1/2 就绪"), flagged);
 });
 
 test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
