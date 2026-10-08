@@ -47,23 +47,31 @@ export function queryLogsNote(args: Record<string, unknown>, result: string): st
     ...(full ? [`Loki 按 limit=${limit} 取满了${skipped > 0 ? `（其中 ${skipped} 条空行被 aiops 去掉了）` : ""}`] : []),
     ...(halved ? [`结果超过 200KB，aiops 只留了 ${original} 条里的 ${kept} 条`] : []),
   ];
-  const times = json.logs
-    .map((log) => (isObject(log) ? toMs(log.timestamp) : undefined))
-    .filter((ms): ms is number => ms !== undefined);
-  const first = times.length > 0 ? Math.min(...times) : undefined;
-  const last = times.length > 0 ? Math.max(...times) : undefined;
+  const stamps = json.logs.map((log) => (isObject(log) ? toNs(log.timestamp) : undefined));
+  const known = stamps.filter((ns): ns is bigint => ns !== undefined);
+  const first = known.reduce<bigint | undefined>((min, ns) => (min === undefined || ns < min ? ns : min), undefined);
+  const last = known.reduce<bigint | undefined>((max, ns) => (max === undefined || ns > max ? ns : max), undefined);
   const window =
     typeof json.query_start === "string" && typeof json.query_end === "string" ? `，查询窗口是 ${json.query_start}～${json.query_end}` : "";
   const span =
     first !== undefined && last !== undefined
       ? `这些日志在 ${formatTime(first)}～${formatTime(last)}（北京时间）${window}，${forward ? "更晚" : "更早"}的没取到。`
       : `${forward ? "更晚" : "更早"}的没取到。`;
-  const next =
-    first !== undefined && last !== undefined
-      ? forward
-        ? `要看更晚的，把 start_time 改成 ${formatTime(last)}、end_time 不变再查`
-        : `要看更早的，start_time 不变、end_time 改成 ${formatTime(first)} 再查`
-      : "要看其余的，缩小时间范围再查";
+  // 接着查的边界用 19 位纳秒（aiops 的入参认），不按秒取整：同一秒里常有几十条，取整会漏掉或者重复取回同一批。
+  // 边界上多带回这批的头一条，宁可重复也不漏；时间只精确到秒时多留一秒
+  const precise = json.logs.every((log) => isObject(log) && /^\d{19}$/.test(String(log.timestamp).trim()));
+  const overlap = "，会和这批有一点重叠，去掉重复的即可";
+  let next = "要看其余的，缩小时间范围再查";
+  if (first !== undefined && last !== undefined) {
+    if (forward) {
+      const end = toNs(json.query_end_ns) ?? toNs(json.query_end);
+      next = `要看更晚的，start_time 填 ${last}${end !== undefined ? `、end_time 填 ${end}` : "、end_time 不变"}（19 位纳秒）再查${overlap}`;
+    } else {
+      const start = toNs(json.query_start_ns) ?? toNs(json.query_start);
+      const end = first + (precise ? 1n : 1_000_000_000n);
+      next = `要看更早的，${start !== undefined ? `start_time 填 ${start}` : "start_time 不变"}、end_time 填 ${end}（19 位纳秒）再查${overlap}`;
+    }
+  }
   return (
     `（机器人注：这次只拿到${which}的 ${kept} 条日志：${reasons.join("；")}。${span}` +
     `只能说这一段里的情况，不能当成整段时间的条数、分布或趋势，也不能说${forward ? "更晚" : "更早"}没有。` +
@@ -86,22 +94,24 @@ function count(value: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/** 19 位纳秒（Loki 原样）、北京时间「2006-01-02 15:04:05」或带时区的 RFC3339 */
-function toMs(value: unknown): number | undefined {
+/** 19 位纳秒（Loki 原样）、北京时间「2006-01-02 15:04:05」或带时区的 RFC3339，换成纳秒 */
+function toNs(value: unknown): bigint | undefined {
   if (typeof value !== "string" && typeof value !== "number") {
     return undefined;
   }
   const text = String(value).trim();
   if (/^\d{19}$/.test(text)) {
-    return Number(BigInt(text) / 1_000_000n);
+    return BigInt(text);
   }
   const local = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(text);
   const ms = Date.parse(local ? `${local[1]}T${local[2]}+08:00` : text);
-  return Number.isFinite(ms) ? ms : undefined;
+  return Number.isFinite(ms) ? BigInt(ms) * 1_000_000n : undefined;
 }
 
-function formatTime(ms: number): string {
-  return TIME_FORMAT.format(ms);
+/** 北京时间，精确到毫秒 */
+function formatTime(ns: bigint): string {
+  const ms = Number(ns / 1_000_000n);
+  return `${TIME_FORMAT.format(ms)}.${String(ms % 1000).padStart(3, "0")}`;
 }
 
 function parseObject(text: string): Record<string, unknown> | undefined {

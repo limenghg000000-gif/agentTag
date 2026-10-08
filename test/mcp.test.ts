@@ -183,7 +183,7 @@ test("aiops 的 query_logs 取满了 limit：结果前面加机器人注，审�
   const hub = await hubFor([config(server.url)], { logger: log.logger });
 
   const output = await toolOf(hub, "aiops_query_logs").run({ logql: '{app="a"}', limit: 3 }, { signal });
-  assert.match(output, /^（机器人注：这次只拿到最新的 3 条日志：Loki 按 limit=3 取满了。这些日志在 2026-10-08 16:33:26～2026-10-08 16:33:26/);
+  assert.match(output, /^（机器人注：这次只拿到最新的 3 条日志：Loki 按 limit=3 取满了。这些日志在 2026-10-08 16:33:26\.000～2026-10-08 16:33:26\.000/);
   assert.ok(output.endsWith(`\n${body}`));
   assert.match(log.find(/MCP 调用 aiops\.query_logs/)!.text, /→\d+字 加了机器人注 用时=/);
   // 没取满不加
