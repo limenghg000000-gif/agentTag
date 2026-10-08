@@ -173,19 +173,25 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    // MCP 工具的结果记下来：回答里引用的文件路径出现在这些结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    // 记下这次成功跑完的工具和 MCP 工具的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
+    // 回答里引用的文件路径出现在 MCP 结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    const succeeded = new Set<string>();
     const evidence: string[] = [];
-    const mcpTools = (deps.mcp?.tools(taskContext) ?? []).map(
+    const mcpTools = deps.mcp?.tools(taskContext) ?? [];
+    const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
           const output = await tool.run(args, ctx);
-          evidence.push(output);
+          succeeded.add(tool.spec.name);
+          if (mcpNames.has(tool.spec.name)) {
+            evidence.push(output);
+          }
           return output;
         },
       }),
     );
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])];
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
     const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
@@ -203,7 +209,7 @@ async function runTask(
         ? [reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path)))]
         : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
-      ...(deps.mcp?.names.length ? [reviewOpsAnswer(question, deps.mcp.names, () => evidence.length > 0)] : []),
+      ...(deps.mcp?.names.length ? [reviewOpsAnswer(question, deps.mcp.names, succeeded)] : []),
     ];
     result = await runAgent({
       model,
@@ -376,15 +382,15 @@ export function unverifiedOpsAnswer(servers: readonly string[]): string {
 /**
  * 配了 MCP 服务（如 aiops）的任务里，模型没成功调过工具就给出时间、Pod 名、条数、「没有报错」这类线上数据时，让它先查再答。
  * 同一话题里接着问另一个服务时，模型容易照着上一次的回答编出日志和 Pod。
- * mcpSucceeded 说这次有没有 MCP 工具调用成功过：调用失败（超时、到上限、服务繁忙）不算查过。
- * 调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；只调了群记忆工具的照样打回。
+ * succeeded 是这次成功跑完的工具：调用失败（超时、到上限、服务繁忙、工具不存在）不算查过。
+ * 成功调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；只调了群记忆工具的照样打回。
  * 提问里本来就有的数字和说法不算（比如让机器人润色一段带数字的文字）
  */
-export function reviewOpsAnswer(question: string, servers: readonly string[], mcpSucceeded: () => boolean) {
+export function reviewOpsAnswer(question: string, servers: readonly string[], succeeded: ReadonlySet<string>) {
   const prefixes = servers.map((name) => `${name}_`);
-  return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
-    const otherTools = [...usedTools].some((name) => !name.startsWith("memory_") && !prefixes.some((prefix) => name.startsWith(prefix)));
-    if (mcpSucceeded() || otherTools) {
+  return (answer: string): string | undefined => {
+    // 成功调过 MCP 工具，或者成功调过群记忆以外的别的工具，都算有依据
+    if ([...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)))) {
       return undefined;
     }
     const unverified = [...answer.matchAll(OPS_DATA)].some((match) => !question.includes(match[0]));

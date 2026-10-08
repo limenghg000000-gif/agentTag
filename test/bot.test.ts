@@ -709,9 +709,8 @@ test("有 aiops 工具时，一个工具都没调就给出线上数据的回答�
   assert.deepEqual(markdowns(sent), ["最近 1 小时没有查到报错日志"]);
 });
 
-test("线上数据检查：没成功调过工具就给出时间、Pod、条数、「没有报错」时打回；调过工具、没有线上数据、或者调的是别的工具时放行", () => {
-  let succeeded = false;
-  const review = reviewOpsAnswer("product-service-api 最近一小时报错多吗", ["aiops"], () => succeeded);
+test("线上数据检查：没成功调过工具就给出时间、Pod、条数、「没有报错」时打回；成功调过工具、没有线上数据、或者数据来自提问时放行", () => {
+  const ok = (...names: string[]) => reviewOpsAnswer("product-service-api 最近一小时报错多吗", ["aiops"], new Set(names));
   const flagged = unverifiedOpsAnswer(["aiops"]);
   for (const answer of [
     "15:39:19 有一条 warning",
@@ -723,21 +722,54 @@ test("线上数据检查：没成功调过工具就给出时间、Pod、条数�
     "93 个 Pod 都在运行",
     "无明显异常",
   ]) {
-    assert.equal(review(answer, new Set()), flagged, answer);
+    assert.equal(ok()(answer), flagged, answer);
   }
-  assert.equal(review("15:39:19 有一条 warning", new Set(["memory_search"])), flagged);
-  // 调了 aiops 但失败了（超时、到上限）不算查过
-  assert.equal(review("15:39:19 有一条 warning", new Set(["aiops_query_logs"])), flagged);
-  succeeded = true;
-  assert.equal(review("15:39:19 有一条 warning", new Set(["aiops_query_logs"])), undefined);
-  succeeded = false;
-  assert.equal(review("提交时间 2026-10-07 18:22:10", new Set(["code_search"])), undefined);
+  // 只成功调了群记忆工具不算查过
+  assert.equal(ok("memory_search")("15:39:19 有一条 warning"), flagged);
+  // 成功调过 aiops，或者成功调过读代码这类别的工具，都放行
+  assert.equal(ok("aiops_query_logs")("15:39:19 有一条 warning"), undefined);
+  assert.equal(ok("code_search")("提交时间 2026-10-07 18:22:10"), undefined);
   // 反问、解释概念、只说到分钟的时间都不算线上数据
-  assert.equal(review("gateway-api 在 prod、staging、test 都有，查哪个？", new Set()), undefined);
-  assert.equal(review("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存", new Set()), undefined);
+  assert.equal(ok()("gateway-api 在 prod、staging、test 都有，查哪个？"), undefined);
+  assert.equal(ok()("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存"), undefined);
   // 提问里本来就有的数字不算
-  const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], () => false);
-  assert.equal(polish("本周共发布 3 次，成功率达到 95%。", new Set()), undefined);
+  const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
+  assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
+});
+
+test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
+  const failing = (name: string): Tool => ({
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => {
+      throw new Error("超时");
+    },
+  });
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [
+        { id: "c1", name: "aiops_query_logs", arguments: "{}" },
+        { id: "c2", name: "web_search", arguments: "{}" },
+        { id: "c3", name: "no_such_tool", arguments: "{}" },
+      ],
+    },
+    { text: "最近 1 小时没有查到报错日志", finish: "stop" },
+    { text: "aiops 这次查询超时了，暂时没法确认，请稍后再试", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    tools: [failing("web_search")],
+    mcp: { names: ["aiops"], tools: () => [failing("aiops_query_logs")], prompt: () => undefined },
+  });
+
+  await handle(message("product-service-api 最近一小时报错多吗"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.deepEqual(markdowns(sent), ["aiops 这次查询超时了，暂时没法确认，请稍后再试"]);
 });
 
 test("aiops 连不上、这次没有它的工具时，照搬话题里之前的数据也会被打回", async () => {
