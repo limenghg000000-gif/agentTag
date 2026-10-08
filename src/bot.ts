@@ -196,6 +196,12 @@ async function runTask(
       logger.info(`这次打开深度思考 message=${msg.messageId}`);
     }
     const toolNames = taskTools.map((tool) => tool.spec.name);
+    const reviews = [
+      ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
+        ? [reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path)))]
+        : []),
+      ...(mcpTools.length > 0 ? [reviewOpsAnswer(mcpTools.map((tool) => tool.spec.name))] : []),
+    ];
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
@@ -210,8 +216,8 @@ async function runTask(
       messages: [...context.history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
-      ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path))) }
+      ...(reviews.length > 0
+        ? { review: (answer: string, usedTools: ReadonlySet<string>) => reviews.map((review) => review(answer, usedTools)).find(Boolean) }
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
@@ -329,6 +335,31 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
     });
     const unverifiedPath = [...answer.matchAll(CODE_PATHS)].some((match) => !seenInEvidence(match[1]));
     return mentionsRepo || unverifiedPath ? UNVERIFIED_CODE_ANSWER : undefined;
+  };
+}
+
+/** 回答里像线上数据的写法：带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39）、K8s Pod 名（gateway-api-6978f9454f-tnc56） */
+const OPS_DATA = /(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)|\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}|\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b/;
+
+export function unverifiedOpsAnswer(prefixes: readonly string[]): string {
+  const tools = prefixes.map((prefix) => `${prefix}_`).join("、");
+  return (
+    "（系统检查）你的回答里有线上数据（具体时间、Pod 名、日志条数这类），但这次一个工具都没调用，这些数据没有经过查证。" +
+    `问线上服务的情况，每次都要用 ${tools} 开头的工具重新查，话题里之前的回答只能当线索，不能照搬其中的数据。` +
+    "先查，再只按这次查到的结果回答；如果这个问题不需要线上数据，去掉这些数据后重新回答。不要提这段检查。"
+  );
+}
+
+/**
+ * 有 MCP 工具（如 aiops）的任务里，模型一个工具都没调就给出时间、Pod 名这类线上数据时，让它先查再答。
+ * 同一话题里接着问另一个服务时，模型容易照着上一次的回答编出日志和 Pod。调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；
+ * 只调了群记忆工具的照样打回
+ */
+export function reviewOpsAnswer(mcpToolNames: readonly string[]) {
+  const prefixes = [...new Set(mcpToolNames.map((name) => name.split("_")[0]))];
+  return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
+    const fetched = [...usedTools].some((name) => !name.startsWith("memory_"));
+    return !fetched && OPS_DATA.test(answer) ? unverifiedOpsAnswer(prefixes) : undefined;
   };
 }
 

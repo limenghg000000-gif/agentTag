@@ -9,8 +9,10 @@ import {
   createCardActionHandler,
   createMessageHandler,
   reviewCodeAnswer,
+  reviewOpsAnswer,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
+  unverifiedOpsAnswer,
 } from "../src/bot.js";
 import type { ThreadContext } from "../src/history.js";
 import { type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
@@ -682,6 +684,41 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   assert.equal(guessed.requests.length, 3);
   assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
   assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
+});
+
+test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const results: ChatResult[] = [
+    { text: "product-service-api 最近 1 小时只有 2 条 warning（15:47:33~15:47:34），分布在 gateway-api-6978f9454f-tnc56", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "最近 1 小时没有查到报错日志", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("查一下 product-service-api 最近一小时的报错日志"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.match(unverifiedOpsAnswer(["aiops"]), /每次都要用 aiops_ 开头的工具重新查/);
+  assert.deepEqual(markdowns(sent), ["最近 1 小时没有查到报错日志"]);
+});
+
+test("线上数据检查：调过工具、没有线上数据、或者调的是别的工具时放行", () => {
+  const review = reviewOpsAnswer(["aiops_query_logs", "aiops_diagnose_service"]);
+  const flagged = unverifiedOpsAnswer(["aiops"]);
+  assert.equal(review("15:39:19 有一条 warning", new Set()), flagged);
+  assert.equal(review("最新 Pod 创建于 2026-10-08 15:40", new Set(["memory_search"])), flagged);
+  assert.equal(review("Pod gateway-api-6978f9454f-tnc56 重启了", new Set()), flagged);
+  assert.equal(review("15:39:19 有一条 warning", new Set(["aiops_query_logs"])), undefined);
+  assert.equal(review("提交时间 2026-10-07 18:22:10", new Set(["code_search"])), undefined);
+  // 反问、解释概念、只说到分钟的时间都不算线上数据
+  assert.equal(review("gateway-api 在 prod、staging、test 都有，查哪个？", new Set()), undefined);
+  assert.equal(review("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存", new Set()), undefined);
 });
 
 test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {
