@@ -132,8 +132,13 @@ const MCP_SERVER_DEFAULTS: Record<string, Pick<McpServerConfig, "tools" | "write
 
 /** 内置工具名的前缀（code_read_file、memory_save 等），MCP 服务不能用这些名字 */
 const RESERVED_MCP_NAMES = new Set(["code", "memory", "feishu", "web", "fetch"]);
-/** 地址里像令牌的参数名 */
-const SECRET_PARAMS = /^(t|token|access_?token|api_?key|key|secret|auth|password)$/i;
+/** 地址里像令牌的参数名：t（aiops 的写法），或者按 _ - . 和大小写拆开后有一段像密钥，如 api_key、X-Amz-Signature、authToken */
+const SECRET_PARAM_PARTS = /^(token|secret|key|apikey|auth|authorization|password|passwd|pwd|sig|signature|credential|credentials|session|jwt|bearer)$/;
+
+function isSecretParam(param: string): boolean {
+  const parts = param.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[_.-]+/);
+  return param === "t" || parts.some((part) => SECRET_PARAM_PARTS.test(part));
+}
 
 /** 使用说明文件默认放在项目的 prompts/mcp/<服务名>.md（src 和 dist 都在项目根目录下一层） */
 const PROMPTS_DIR = fileURLToPath(new URL("../prompts/mcp/", import.meta.url));
@@ -248,7 +253,7 @@ function loadMcpConfig(env: NodeJS.ProcessEnv): McpServerConfig[] {
       throw new Error(`MCP_SERVERS 里 ${name} 的地址要用 http 或 https`);
     }
     // 令牌写进地址容易被各处日志记下来，只从 MCP_<名字>_TOKEN 读，用请求头发送
-    if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some((param) => SECRET_PARAMS.test(param))) {
+    if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(isSecretParam)) {
       throw new Error(`MCP_SERVERS 里 ${name} 的地址带了令牌，请去掉，把令牌写进 ${key}_TOKEN`);
     }
 

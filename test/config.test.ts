@@ -205,7 +205,9 @@ test("MCP_SERVERS 写错时报错：格式不对、名字重复、地址带令�
   assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a/mcp", MCP_AIOPS_TOOLS: "a b" }), /MCP_AIOPS_TOOLS.*a b/);
   assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a/mcp", MCP_AIOPS_TOOLS: " , " }), /MCP_AIOPS_TOOLS 里没有工具名/);
   assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "code=https://a/mcp", MCP_CODE_TOOLS: "*" }), /和内置工具的前缀（code_）重了/);
-  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp?api_key=x" }), /带了令牌/);
+  for (const param of ["api_key", "signature", "X-Amz-Signature", "authToken", "access_key", "sig", "credential"]) {
+    assert.throws(() => loadConfig({ ...base, MCP_SERVERS: `aiops=https://a.example.com/mcp?${param}=x` }), /带了令牌/, param);
+  }
   // 参数名里只是含有 key 这几个字母的不算令牌
   assert.equal(loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp?monkey=1" }).mcp[0].url, "https://a.example.com/mcp?monkey=1");
 });

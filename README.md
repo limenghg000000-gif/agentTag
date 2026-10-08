@@ -152,8 +152,8 @@ npm start
 | `GITHUB_TOKEN` | 接 GitHub 时必填 | 没配 `GITLAB_URL` 时接 GitHub。fine-grained token，只选这些仓库，权限给 Contents 和 Pull requests 的读写 |
 | `MCP_SERVERS` | 否 | 通过 MCP 接入的服务，写成 `名字=地址`（Streamable HTTP），多个用逗号分隔，如 `aiops=https://aiops.example.com/mcp`。工具名会加上 `名字_` 前缀。不填就没有 MCP 工具 |
 | `MCP_<名字>_TOKEN` | 看服务 | 这个服务的令牌，用 `Authorization: Bearer` 头发送，不要写进地址。如 `MCP_AIOPS_TOKEN` |
-| `MCP_<名字>_TOOLS` | aiops 以外必填 | 开哪些工具，服务端的工具名逗号分隔，`*` 表示全部。aiops 默认开第一批 19 个只读工具（见 `.env.example`），服务端新加的工具要在这里点名才开。会写东西的工具这一版一律不开 |
-| `MCP_<名字>_WRITE_TOOLS` | 否 | 额外算作「会写东西」的工具。名字里带 create、save、delete 这类动词的程序自己认，不用列 |
+| `MCP_<名字>_TOOLS` | aiops 以外必填 | 开哪些工具，服务端的工具名逗号分隔，`*` 表示服务端标成只读（readOnlyHint）的全部工具。aiops 默认开第一批 19 个只读工具（见 `.env.example`），服务端新加的工具要在这里点名才开。会写东西的工具（服务端标了不是只读的也算）这一版一律不开 |
+| `MCP_<名字>_WRITE_TOOLS` | 否 | 额外算作「会写东西」的工具。名字里带 create、save、delete 这类动词的程序自己认，不用列；aiops 的 promote_case 默认就算 |
 | `MCP_<名字>_PROMPT` | 否 | 这个服务在飞书群里的使用说明文件，默认 `prompts/mcp/<名字>.md` |
 | `DATA_DIR` | 否 | 数据目录，默认启动目录下的 `data`。群记忆存在 `<DATA_DIR>/memory/<chat_id>.json` |
 

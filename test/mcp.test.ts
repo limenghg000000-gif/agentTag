@@ -269,6 +269,23 @@ test("调用遇到 HTTP 404 时马上重连一次，不等定时刷新", async (
   assert.equal(hub.tools(task).length, 3);
 });
 
+test("离上次连接不到 30 秒时调用出错，等满 30 秒再重连，不丢掉这次重连", async () => {
+  const server = await fake();
+  const log = recorder();
+  let clock = 0;
+  const hub = await hubFor([config(server.url)], { logger: log.logger, retryMs: [60_000], now: () => clock });
+  const tool = toolOf(hub, "aiops_get_active_alerts");
+  server.token = "tok_rotated_789";
+  clock += 30_000 - 50;
+
+  await assert.rejects(tool.run({}, { signal }), /HTTP 404/);
+  assert.equal(log.find(/刷新失败/), undefined);
+  for (let i = 0; i < 100 && !log.find(/刷新失败/); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(log.find(/MCP aiops 刷新失败/)!.text, /HTTP 404，令牌或地址不对/);
+});
+
 test("停止任务时中止进行中的调用", async () => {
   let reached!: () => void;
   const arrived = new Promise<void>((resolve) => (reached = resolve));
@@ -316,6 +333,53 @@ test("连不上不影响启动，提示词里说明连不上；之后自动重�
   assert.equal(hub.tools(task).length, 3);
   assert.ok(log.find(/MCP aiops：已连上/));
   assert.ok(server.initializes >= 1);
+});
+
+test("连上了但一个工具都没开时，提示词里也说明，免得模型凭空回答", async () => {
+  const server = await fake();
+  const hub = await hubFor([config(server.url, { tools: ["no_such_tool"] })], { logger: recorder().logger });
+
+  assert.deepEqual(hub.tools(task), []);
+  assert.match(hub.prompt([]) ?? "", /aiops 连上了，但一个工具都没开（管理员在 MCP_AIOPS_TOOLS 里配置），这次没有 aiops_ 开头的工具/);
+});
+
+test("服务端要求按 MCP 任务方式调用的工具不开；工具清单分页重复时算连不上，不一直拉", async () => {
+  const report: RemoteTool = { ...remoteTool("build_report", "生成报告"), execution: { taskSupport: "required" } };
+  const server = await fake({ tools: [...TOOLS, report] });
+  const log = recorder();
+  const hub = await hubFor([config(server.url, { tools: ["query_logs", "build_report"] })], { logger: log.logger });
+  assert.deepEqual(
+    hub.tools(task).map((tool) => tool.spec.name),
+    ["aiops_query_logs"],
+  );
+  assert.equal(log.find(/build_report 只能按 MCP 任务（tasks）方式调用/)?.level, "warn");
+
+  let pages = 0;
+  const looping = await fake({
+    list: () => {
+      pages++;
+      return { tools: [], nextCursor: "same" };
+    },
+  });
+  const loopLog = recorder();
+  const loopHub = await hubFor([config(looping.url)], { logger: loopLog.logger, retryMs: [60_000] });
+  assert.deepEqual(loopHub.tools(task), []);
+  assert.match(loopLog.find(/MCP aiops 连不上/)!.text, /工具清单分页出错/);
+  assert.equal(pages, 2);
+});
+
+test("有状态的服务端：断开时结束会话；日志里的地址不带查询参数的值", async () => {
+  const server = await fake({ stateful: true });
+  const log = recorder();
+  const hub = await hubFor([config(`${server.url}?region=cn-hz`)], { logger: log.logger });
+  assert.equal(hub.tools(task).length, 3);
+  assert.equal(server.sessions.size, 1);
+  assert.match(log.find(/已连上/)!.text, /\/mcp\?region=…，/);
+  assert.ok(log.lines.every((line) => !line.text.includes("cn-hz")));
+
+  await hub.stop();
+  assert.equal(server.deleted, 1);
+  assert.equal(server.sessions.size, 0);
 });
 
 test("令牌不对时（aiops 回 404）按「令牌或地址不对」记日志，日志里没有令牌", async () => {

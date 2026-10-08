@@ -176,6 +176,12 @@ export class McpHub {
             `- ${name} 现在连不上（程序在自动重连），这次没有 ${name}_ 开头的工具。有人要用 ${name} 查东西时如实说明，请他稍后再试，不要凭印象编结果。`,
         ];
       }
+      if (server.enabled.length === 0) {
+        return [
+          `## ${name}（MCP 服务）\n` +
+            `- ${name} 连上了，但一个工具都没开（管理员在 MCP_${name.toUpperCase()}_TOOLS 里配置），这次没有 ${name}_ 开头的工具。有人要用 ${name} 查东西时如实说明，请他找管理员，不要凭印象编结果。`,
+        ];
+      }
       return [];
     });
     return sections.length > 0 ? sections.join("\n\n") : undefined;
@@ -205,10 +211,16 @@ export class McpHub {
     return server.syncing;
   }
 
-  /** 调用遇到 HTTP 层的错误（服务端重启、会话失效、令牌改了）时马上重连，不等下一次定时刷新 */
+  /** 调用遇到 HTTP 层的错误（服务端重启、会话失效、令牌改了）时马上重连，不等下一次定时刷新；离上次连接不到 30 秒就等到满 30 秒再连 */
   private resyncSoon(server: ServerState): void {
-    if (!server.syncing && this.now() - server.syncedAt >= RESYNC_GAP_MS) {
+    if (server.syncing) {
+      return;
+    }
+    const wait = server.syncedAt + RESYNC_GAP_MS - this.now();
+    if (wait <= 0) {
       void this.sync(server);
+    } else {
+      this.schedule(server, wait);
     }
   }
 
@@ -217,7 +229,8 @@ export class McpHub {
       return;
     }
     server.syncedAt = this.now();
-    const { name, url } = server.config;
+    const { name } = server.config;
+    const url = logUrl(server.config.url);
     try {
       const synced = await server.conn.sync();
       server.instructions = synced.instructions?.trim() || undefined;
@@ -258,7 +271,8 @@ export class McpHub {
   }
 
   private logTools(server: ServerState, synced: SyncResult, picked: PickedTools): void {
-    const { name, url } = server.config;
+    const { name } = server.config;
+    const url = logUrl(server.config.url);
     const key = `MCP_${name.toUpperCase()}`;
     const extras = [
       synced.version,
@@ -279,6 +293,9 @@ export class McpHub {
     }
     if (picked.clashes.length > 0) {
       this.logger.warn(`MCP ${name}：${picked.clashes.join(", ")} 换成机器人的工具名后和别的工具重名，先不开`);
+    }
+    if (picked.needsTasks.length > 0) {
+      this.logger.warn(`MCP ${name}：${picked.needsTasks.join(", ")} 只能按 MCP 任务（tasks）方式调用，机器人还不支持，先不开`);
     }
     if (picked.missing.length > 0) {
       this.logger.warn(`MCP ${name}：${key}_TOOLS 里的 ${picked.missing.join(", ")} 服务端没有，先跳过`);
@@ -416,7 +433,7 @@ interface SyncResult {
  * 每次同步都新建一个连接（initialize 拿到最新的使用说明，再拉工具清单），成功后换上，旧连接留一会儿让进行中的调用跑完再关。
  */
 class McpConnection {
-  private client?: Client;
+  private current?: { client: Client; transport: StreamableHTTPClientTransport };
   private closed = false;
   /** 上一句传输层的后台错误。每次刷新都新建连接，同一句不重复记 */
   private lastError = "";
@@ -442,47 +459,71 @@ class McpConnection {
     try {
       await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS });
       const tools: RemoteTool[] = [];
+      const cursors = new Set<string>();
       let cursor: string | undefined;
       do {
         const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: CONNECT_TIMEOUT_MS });
         tools.push(...page.tools);
         cursor = page.nextCursor;
+        if (cursor && cursors.has(cursor)) {
+          throw new Error("服务端的工具清单分页出错（重复返回同一页），没拉完");
+        }
+        if (cursor) {
+          cursors.add(cursor);
+        }
       } while (cursor && tools.length < 1000);
       if (this.closed) {
         throw new Error("已停止");
       }
       const server = client.getServerVersion();
-      const retired = this.client;
-      this.client = client;
+      const retired = this.current;
+      this.current = { client, transport };
       if (retired) {
-        setTimeout(() => void retired.close().catch(() => {}), RETIRE_MS).unref();
+        setTimeout(() => void disconnect(retired), RETIRE_MS).unref();
       }
       return { tools, instructions: client.getInstructions(), version: server && `${server.name} ${server.version}` };
     } catch (err) {
-      void client.close().catch(() => {});
+      void disconnect({ client, transport });
       throw err;
     }
   }
 
   async call(name: string, args: Record<string, unknown>, options: { signal: AbortSignal; timeout: number }): Promise<CallToolResult> {
-    if (!this.client) {
+    if (!this.current) {
       throw new Error(`还没连上 ${this.config.name}`);
     }
-    return (await this.client.callTool({ name, arguments: args }, undefined, options)) as CallToolResult;
+    return (await this.current.client.callTool({ name, arguments: args }, undefined, options)) as CallToolResult;
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    const client = this.client;
-    this.client = undefined;
-    await client?.close().catch(() => {});
+    const current = this.current;
+    this.current = undefined;
+    if (current) {
+      await disconnect(current);
+    }
   }
+}
+
+/** 断开一个连接。有状态的服务端（返回了会话 ID）先发 DELETE 结束会话，免得每次刷新都在服务端留下一个；aiops 无状态，直接关 */
+async function disconnect({ client, transport }: { client: Client; transport: StreamableHTTPClientTransport }): Promise<void> {
+  await transport.terminateSession().catch(() => {});
+  await client.close().catch(() => {});
+}
+
+/** 日志里的地址：查询参数只留名字不留值，免得参数里有没认出来的密钥 */
+function logUrl(url: string): string {
+  const parsed = new URL(url);
+  const params = [...parsed.searchParams.keys()];
+  return `${parsed.origin}${parsed.pathname}${params.length > 0 ? `?${params.map((param) => `${param}=…`).join("&")}` : ""}`;
 }
 
 interface PickedTools {
   enabled: RemoteTool[];
   /** 换成机器人的工具名后和前面的重名，没开 */
   clashes: string[];
+  /** 服务端要求按 MCP 任务（tasks）方式调用，普通调用会被 SDK 拒绝，没开 */
+  needsTasks: string[];
   /** 服务端有、没开的 */
   notEnabled: string[];
   /** 要开、但会写东西（或者按 * 开时服务端没标成只读），这一版不开的 */
@@ -497,8 +538,13 @@ function pickTools(config: McpServerConfig, tools: readonly RemoteTool[]): Picke
   const names = new Set(tools.map((tool) => tool.name));
   const taken = new Set<string>();
   const clashes: string[] = [];
+  const needsTasks: string[] = [];
   const enabled = requested.filter((tool) => {
     if (mayWrite(tool, config, !wanted)) {
+      return false;
+    }
+    if (tool.execution?.taskSupport === "required") {
+      needsTasks.push(tool.name);
       return false;
     }
     const name = toolName(config.name, tool.name);
@@ -512,6 +558,7 @@ function pickTools(config: McpServerConfig, tools: readonly RemoteTool[]): Picke
   return {
     enabled,
     clashes,
+    needsTasks,
     notEnabled: tools.filter((tool) => wanted && !wanted.has(tool.name)).map((tool) => tool.name),
     skippedWrites: requested.filter((tool) => mayWrite(tool, config, !wanted)).map((tool) => tool.name),
     missing: wanted ? [...wanted].filter((name) => !names.has(name)) : [],

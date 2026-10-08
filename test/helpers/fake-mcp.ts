@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -19,6 +20,10 @@ export interface FakeMcpOptions {
   json?: boolean;
   /** 指定端口（测连不上再连上时用） */
   port?: number;
+  /** true 时像有状态的服务端一样发会话 ID，接受 DELETE 结束会话（aiops 是无状态的） */
+  stateful?: boolean;
+  /** 自己控制工具清单怎么分页（测分页出错时用）；不配就一页返回全部 */
+  list?: (cursor: string | undefined) => { tools: Tool[]; nextCursor?: string };
 }
 
 export interface FakeMcp {
@@ -30,6 +35,10 @@ export interface FakeMcp {
   /** 收到的 initialize 次数 */
   initializes: number;
   tools: Tool[];
+  /** stateful 时还开着的会话 */
+  sessions: Set<string>;
+  /** stateful 时收到的结束会话请求（DELETE）次数 */
+  deleted: number;
   close(): Promise<void>;
 }
 
@@ -41,11 +50,40 @@ export async function startFakeMcp(options: FakeMcpOptions): Promise<FakeMcp> {
     calls: [],
     initializes: 0,
     tools: options.tools,
+    sessions: new Set(),
+    deleted: 0,
     close: async () => {},
   };
+  const newServer = () => {
+    const server = new Server(
+      { name: "fake-aiops", version: "0.14.0" },
+      { capabilities: { tools: {} }, ...(options.instructions ? { instructions: options.instructions } : {}) },
+    );
+    server.setRequestHandler(ListToolsRequestSchema, async (request) =>
+      options.list ? options.list(request.params?.cursor) : { tools: state.tools },
+    );
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      const args = request.params.arguments ?? {};
+      state.calls.push({ name: request.params.name, args });
+      if (!options.call) {
+        return { content: [{ type: "text", text: "{}" }] };
+      }
+      return options.call(request.params.name, args, extra.signal);
+    });
+    return server;
+  };
+  const sessions = new Map<string, StreamableHTTPServerTransport>();
   const httpServer = http.createServer(async (req, res) => {
     if (state.token && req.headers.authorization !== `Bearer ${state.token}`) {
       res.writeHead(404, { "content-type": "text/plain" }).end("404 page not found");
+      return;
+    }
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (options.stateful && req.method === "DELETE" && sessionId && sessions.has(sessionId)) {
+      state.deleted++;
+      await sessions.get(sessionId)!.handleRequest(req, res);
+      sessions.delete(sessionId);
+      state.sessions.delete(sessionId);
       return;
     }
     if (req.method !== "POST") {
@@ -60,19 +98,24 @@ export async function startFakeMcp(options: FakeMcpOptions): Promise<FakeMcp> {
     if (body.method === "initialize") {
       state.initializes++;
     }
-    const server = new Server(
-      { name: "fake-aiops", version: "0.14.0" },
-      { capabilities: { tools: {} }, ...(options.instructions ? { instructions: options.instructions } : {}) },
-    );
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: state.tools }));
-    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-      const args = request.params.arguments ?? {};
-      state.calls.push({ name: request.params.name, args });
-      if (!options.call) {
-        return { content: [{ type: "text", text: "{}" }] };
+    if (options.stateful) {
+      let transport = sessionId ? sessions.get(sessionId) : undefined;
+      if (!transport) {
+        const created = new StreamableHTTPServerTransport({
+          sessionIdGenerator: randomUUID,
+          enableJsonResponse: options.json ?? true,
+          onsessioninitialized: (id) => {
+            sessions.set(id, created);
+            state.sessions.add(id);
+          },
+        });
+        await newServer().connect(created);
+        transport = created;
       }
-      return options.call(request.params.name, args, extra.signal);
-    });
+      await transport.handleRequest(req, res, body);
+      return;
+    }
+    const server = newServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: options.json ?? true });
     res.on("close", () => {
       void transport.close();
