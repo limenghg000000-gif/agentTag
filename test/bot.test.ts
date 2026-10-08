@@ -9,8 +9,10 @@ import {
   createCardActionHandler,
   createMessageHandler,
   reviewCodeAnswer,
+  reviewOpsAnswer,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
+  unverifiedOpsAnswer,
 } from "../src/bot.js";
 import type { ThreadContext } from "../src/history.js";
 import { type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
@@ -480,6 +482,7 @@ test("MCP 工具按任务创建，拿到当前群和发起人；它的使用说�
   const { handle } = setup({
     model,
     mcp: {
+      names: ["aiops"],
       tools: (task) => {
         contexts.push(task);
         return [mcpTool];
@@ -668,7 +671,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
       model,
       taskTools: () => [codeSearch],
       codeRepos: ["ai/aiops-mcp"],
-      mcp: { tools: () => [podLogs], prompt: () => undefined },
+      mcp: { names: ["aiops"], tools: () => [podLogs], prompt: () => undefined },
     });
     await handle(message("order-api 的 Pod 为什么重启"));
     return { requests, replies: markdowns(sent) };
@@ -682,6 +685,128 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   assert.equal(guessed.requests.length, 3);
   assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
   assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
+});
+
+test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const results: ChatResult[] = [
+    { text: "product-service-api 最近 1 小时只有 2 条 warning（15:47:33~15:47:34），分布在 gateway-api-6978f9454f-tnc56", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "最近 1 小时没有查到报错日志", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("查一下 product-service-api 最近一小时的报错日志"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.match(unverifiedOpsAnswer(["aiops"]), /每次都要用 aiops_ 开头的工具重新查/);
+  assert.deepEqual(markdowns(sent), ["最近 1 小时没有查到报错日志"]);
+});
+
+test("线上数据检查：没成功调过工具就给出时间、Pod、条数、「没有报错」时打回；成功调过工具、没有线上数据、或者数据来自提问时放行", () => {
+  const ok = (...names: string[]) => reviewOpsAnswer("product-service-api 最近一小时报错多吗", ["aiops"], new Set(names));
+  const flagged = unverifiedOpsAnswer(["aiops"]);
+  for (const answer of [
+    "15:39:19 有一条 warning",
+    "最新 Pod 创建于 2026-10-08 15:40",
+    "Pod gateway-api-6978f9454f-tnc56 重启了",
+    "最近 1 小时没有查到报错日志",
+    "有 47 条错误日志",
+    "CPU 使用率 95%",
+    "93 个 Pod 都在运行",
+    "无明显异常",
+  ]) {
+    assert.equal(ok()(answer), flagged, answer);
+  }
+  // 只成功调了群记忆工具不算查过
+  assert.equal(ok("memory_search")("15:39:19 有一条 warning"), flagged);
+  // 成功调过 aiops，或者成功调过读代码这类别的工具，都放行
+  assert.equal(ok("aiops_query_logs")("15:39:19 有一条 warning"), undefined);
+  assert.equal(ok("code_search")("提交时间 2026-10-07 18:22:10"), undefined);
+  // 反问、解释概念、只说到分钟的时间都不算线上数据
+  assert.equal(ok()("gateway-api 在 prod、staging、test 都有，查哪个？"), undefined);
+  assert.equal(ok()("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存"), undefined);
+  // 提问里本来就有的数字不算
+  const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
+  assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
+});
+
+test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
+  const failing = (name: string): Tool => ({
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => {
+      throw new Error("超时");
+    },
+  });
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [
+        { id: "c1", name: "aiops_query_logs", arguments: "{}" },
+        { id: "c2", name: "web_search", arguments: "{}" },
+        { id: "c3", name: "no_such_tool", arguments: "{}" },
+      ],
+    },
+    { text: "最近 1 小时没有查到报错日志", finish: "stop" },
+    { text: "aiops 这次查询超时了，暂时没法确认，请稍后再试", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    tools: [failing("web_search")],
+    mcp: { names: ["aiops"], tools: () => [failing("aiops_query_logs")], prompt: () => undefined },
+  });
+
+  await handle(message("product-service-api 最近一小时报错多吗"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.deepEqual(markdowns(sent), ["aiops 这次查询超时了，暂时没法确认，请稍后再试"]);
+});
+
+test("aiops 连不上、这次没有它的工具时，照搬话题里之前的数据也会被打回", async () => {
+  const results: ChatResult[] = [
+    { text: "最近 1 小时只有 2 条 warning（15:47:33~15:47:34）", finish: "stop" },
+    { text: "aiops 现在连不上，暂时查不了，请稍后再试", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [], prompt: () => "## aiops（MCP 服务）\n- aiops 现在连不上" } });
+
+  await handle(message("product-service-api 最近一小时报错多吗"));
+
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.deepEqual(markdowns(sent), ["aiops 现在连不上，暂时查不了，请稍后再试"]);
+});
+
+test("代码和线上数据两项检查都没过时，重做时一起告诉模型", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const results: ChatResult[] = [
+    { text: "panic 在 internal/logic/order.go:88，15:39:19 重启了一次", finish: "stop" },
+    { text: "需要先查一下", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["ai/aiops-mcp"],
+    mcp: { names: ["aiops"], tools: () => [], prompt: () => undefined },
+  });
+
+  await handle(message("order-api 为什么重启"));
+
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${unverifiedOpsAnswer(["aiops"])}` });
 });
 
 test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {

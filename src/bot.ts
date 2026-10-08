@@ -71,6 +71,8 @@ export interface BotDeps {
   writeAllowed?: ReadonlySet<string>;
   /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
   mcp?: {
+    /** 配置的 MCP 服务名（如 aiops），工具名以「服务名_」开头 */
+    readonly names: readonly string[];
     tools(task: TaskToolContext): readonly Tool[];
     /** 这些工具的使用说明，写进系统提示词。toolNames 是这次任务的全部工具名 */
     prompt(toolNames: readonly string[]): string | undefined;
@@ -171,19 +173,25 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    // MCP 工具的结果记下来：回答里引用的文件路径出现在这些结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    // 记下这次成功跑完的工具和 MCP 工具的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
+    // 回答里引用的文件路径出现在 MCP 结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    const succeeded = new Set<string>();
     const evidence: string[] = [];
-    const mcpTools = (deps.mcp?.tools(taskContext) ?? []).map(
+    const mcpTools = deps.mcp?.tools(taskContext) ?? [];
+    const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
           const output = await tool.run(args, ctx);
-          evidence.push(output);
+          succeeded.add(tool.spec.name);
+          if (mcpNames.has(tool.spec.name)) {
+            evidence.push(output);
+          }
           return output;
         },
       }),
     );
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])];
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
     const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
@@ -196,6 +204,13 @@ async function runTask(
       logger.info(`这次打开深度思考 message=${msg.messageId}`);
     }
     const toolNames = taskTools.map((tool) => tool.spec.name);
+    const reviews = [
+      ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
+        ? [reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path)))]
+        : []),
+      // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
+      ...(deps.mcp?.names.length ? [reviewOpsAnswer(question, deps.mcp.names, succeeded)] : []),
+    ];
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
@@ -210,8 +225,15 @@ async function runTask(
       messages: [...context.history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
-      ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path))) }
+      ...(reviews.length > 0
+        ? {
+            // 几项检查都没过时一起告诉模型：重做只有一次，只说一项的话，另一项重做后就没人查了
+            review: (answer: string, usedTools: ReadonlySet<string>) =>
+              reviews
+                .map((review) => review(answer, usedTools))
+                .filter(Boolean)
+                .join("\n") || undefined,
+          }
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
@@ -329,6 +351,50 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
     });
     const unverifiedPath = [...answer.matchAll(CODE_PATHS)].some((match) => !seenInEvidence(match[1]));
     return mentionsRepo || unverifiedPath ? UNVERIFIED_CODE_ANSWER : undefined;
+  };
+}
+
+/**
+ * 回答里像线上数据的写法：带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39）、K8s Pod 名（gateway-api-6978f9454f-tnc56）、
+ * 带单位的数量（47 条、93 个 Pod、95%、120ms、3.1 cores）、「没有报错」「无异常」这类结论
+ */
+const OPS_DATA = new RegExp(
+  [
+    String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
+    String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
+    String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
+    String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
+    String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?(?:报错|错误|异常|告警|重启)`,
+  ].join("|"),
+  "gi",
+);
+
+export function unverifiedOpsAnswer(servers: readonly string[]): string {
+  const tools = servers.map((name) => `${name}_`).join("、");
+  return (
+    "（系统检查）你的回答里有线上数据或结论（具体时间、Pod 名、日志条数、「没有报错」这类），但这次没有成功调用过工具，这些内容没有经过查证。" +
+    `问线上服务的情况，每次都要用 ${tools} 开头的工具重新查，话题里之前的回答只能当线索，不能照搬其中的数据。` +
+    "先查，再只按这次查到的结果回答；这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
+    "如果这个问题本来就不用查线上（比如解释概念、整理用户自己给的内容），照原来的意思再回答一次就行。不要提这段检查。"
+  );
+}
+
+/**
+ * 配了 MCP 服务（如 aiops）的任务里，模型没成功调过工具就给出时间、Pod 名、条数、「没有报错」这类线上数据时，让它先查再答。
+ * 同一话题里接着问另一个服务时，模型容易照着上一次的回答编出日志和 Pod。
+ * succeeded 是这次成功跑完的工具：调用失败（超时、到上限、服务繁忙、工具不存在）不算查过。
+ * 成功调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；只调了群记忆工具的照样打回。
+ * 提问里本来就有的数字和说法不算（比如让机器人润色一段带数字的文字）
+ */
+export function reviewOpsAnswer(question: string, servers: readonly string[], succeeded: ReadonlySet<string>) {
+  const prefixes = servers.map((name) => `${name}_`);
+  return (answer: string): string | undefined => {
+    // 成功调过 MCP 工具，或者成功调过群记忆以外的别的工具，都算有依据
+    if ([...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)))) {
+      return undefined;
+    }
+    const unverified = [...answer.matchAll(OPS_DATA)].some((match) => !question.includes(match[0]));
+    return unverified ? unverifiedOpsAnswer(servers) : undefined;
   };
 }
 
