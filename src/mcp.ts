@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontex
 import { type CallToolResult, ErrorCode, McpError, type Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
+import { RESULT_NOTES } from "./mcp-notes.js";
 import { formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
 import type { Tool } from "./tools/tool.js";
 
@@ -415,8 +416,9 @@ export class McpHub {
       audit(`出错 结果=${raw.length}字：${clip(raw, 200)}`, true);
       throw new Error(message);
     }
-    const text = formatToolResult(result, limit);
-    audit(`结果=${raw.length}字${text.length !== raw.length ? `→${text.length}字` : ""}`);
+    const note = RESULT_NOTES[name]?.[tool]?.(args, raw);
+    const text = note ? `${note}\n${formatToolResult(result, limit - note.length - 1)}` : formatToolResult(result, limit);
+    audit(`结果=${raw.length}字${text.length !== raw.length ? `→${text.length}字` : ""}${note ? " 加了机器人注" : ""}`);
     return text;
   }
 }
