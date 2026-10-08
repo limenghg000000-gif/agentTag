@@ -171,7 +171,18 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    const mcpTools = deps.mcp?.tools(taskContext) ?? [];
+    // MCP 工具的结果记下来：回答里引用的文件路径出现在这些结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    const evidence: string[] = [];
+    const mcpTools = (deps.mcp?.tools(taskContext) ?? []).map(
+      (tool): Tool => ({
+        ...tool,
+        run: async (args, ctx) => {
+          const output = await tool.run(args, ctx);
+          evidence.push(output);
+          return output;
+        },
+      }),
+    );
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])];
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
@@ -200,7 +211,7 @@ async function runTask(
       tools: taskTools,
       signal: task.signal,
       ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? [], (name) => mcpTools.some((tool) => tool.spec.name === name)) }
+        ? { review: reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path))) }
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
@@ -292,8 +303,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 
 const CODE_TOOL_PREFIX = "code_";
 /** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
-const CODE_PATH =
-  /(?:^|[\s`'"(（:：])(?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)\b/;
+const CODE_PATHS =
+  /(?:^|[\s`'"(（:：])((?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto))\b/g;
 export const UNVERIFIED_CODE_ANSWER =
   "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
   "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
@@ -302,9 +313,10 @@ export const UNVERIFIED_CODE_ANSWER =
 /**
  * 模型不读代码就回答仓库的问题时（问题或回答提到了配置的仓库、或者回答里写了代码文件路径，这次却没调任何代码工具），
  * 让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
- * 调过 hasEvidence 认的工具时，回答里的文件路径不算：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，不是编的
+ * seenInEvidence 认的文件路径不算：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，不是编的；
+ * 只放过工具结果里真出现过的路径，回答里多写一个结果里没有的路径照样打回
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], hasEvidence: (toolName: string) => boolean = () => false) {
+export function reviewCodeAnswer(question: string, repos: readonly string[], seenInEvidence: (path: string) => boolean = () => false) {
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     if ([...usedTools].some((name) => name.startsWith(CODE_TOOL_PREFIX))) {
       return undefined;
@@ -315,8 +327,8 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], has
       const short = full.split("/").pop() ?? full;
       return text.includes(full) || (short.length >= 5 && text.includes(short));
     });
-    const pathsFromEvidence = [...usedTools].some(hasEvidence);
-    return mentionsRepo || (!pathsFromEvidence && CODE_PATH.test(answer)) ? UNVERIFIED_CODE_ANSWER : undefined;
+    const unverifiedPath = [...answer.matchAll(CODE_PATHS)].some((match) => !seenInEvidence(match[1]));
+    return mentionsRepo || unverifiedPath ? UNVERIFIED_CODE_ANSWER : undefined;
   };
 }
 

@@ -99,9 +99,11 @@ export const AIOPS_DEFAULT_TOOLS = [
 ] as const;
 
 /** 已知 MCP 服务的默认配置。别的服务要在 MCP_<名字>_TOOLS 里写明开哪些工具 */
-const MCP_SERVER_DEFAULTS: Record<string, Pick<McpServerConfig, "tools" | "timeoutsMs" | "labels">> = {
+const MCP_SERVER_DEFAULTS: Record<string, Pick<McpServerConfig, "tools" | "writeTools" | "timeoutsMs" | "labels">> = {
   aiops: {
     tools: AIOPS_DEFAULT_TOOLS,
+    // promote_case 只生成草稿，但它是沉淀经验的第一步，和 save_lesson 一起放到第二批（确认卡片）；别的写工具名字里带动词，程序自己认
+    writeTools: ["promote_case"],
     // 服务端 diagnose_service 最长跑 90 秒，其余工具 30 秒
     timeoutsMs: { diagnose_service: 120_000 },
     labels: {
@@ -263,7 +265,7 @@ function loadMcpConfig(env: NodeJS.ProcessEnv): McpServerConfig[] {
       url: parsed.href,
       ...(token ? { token } : {}),
       tools,
-      writeTools: toolList(env[`${key}_WRITE_TOOLS`] ?? "", `${key}_WRITE_TOOLS`),
+      writeTools: [...(defaults?.writeTools ?? []), ...toolList(env[`${key}_WRITE_TOOLS`] ?? "", `${key}_WRITE_TOOLS`)],
       promptFile: prompt ? path.resolve(prompt) : path.join(PROMPTS_DIR, `${name}.md`),
       timeoutsMs: defaults?.timeoutsMs ?? {},
       labels: defaults?.labels ?? {},

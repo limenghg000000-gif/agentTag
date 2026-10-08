@@ -166,7 +166,8 @@ test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开第一
   assert.deepEqual(aiops.tools, AIOPS_DEFAULT_TOOLS);
   assert.equal(aiops.tools.length, 19);
   assert.ok(aiops.tools.includes("find_service"));
-  assert.deepEqual(aiops.writeTools, []);
+  // promote_case 名字里没有写操作动词，但它是沉淀经验的第一步，默认当写工具
+  assert.deepEqual(aiops.writeTools, ["promote_case"]);
   assert.equal(aiops.timeoutsMs.diagnose_service, 120_000);
   assert.equal(aiops.labels.diagnose_service, "诊断");
   // 默认的使用说明文件在项目里
@@ -179,12 +180,12 @@ test("MCP 服务的工具名单、写工具、说明文件都能用 MCP_<名字>
     ...base,
     MCP_SERVERS: "aiops=https://aiops.example.com/mcp,Other=http://10.0.0.5:8080/mcp",
     MCP_AIOPS_TOOLS: "diagnose_service, get_dashboard",
-    MCP_AIOPS_WRITE_TOOLS: "promote_case",
+    MCP_AIOPS_WRITE_TOOLS: "get_dashboard",
     MCP_AIOPS_PROMPT: "custom/aiops.md",
     MCP_OTHER_TOOLS: "*",
   }).mcp;
   assert.deepEqual(aiops.tools, ["diagnose_service", "get_dashboard"]);
-  assert.deepEqual(aiops.writeTools, ["promote_case"]);
+  assert.deepEqual(aiops.writeTools, ["promote_case", "get_dashboard"]);
   assert.equal(aiops.promptFile, path.resolve("custom/aiops.md"));
   assert.equal(other.name, "other");
   assert.equal(other.tools, "*");

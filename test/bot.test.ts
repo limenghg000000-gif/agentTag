@@ -647,6 +647,43 @@ test("有代码工具时，没读代码就说仓库内容的回答被打回去�
   assert.match(warnings.join("\n"), /回答没通过检查，已让模型重做 message=om_1/);
 });
 
+test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈）就放行，结果里没有的路径照样打回", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const podLogs: Tool = {
+    spec: { name: "aiops_get_pod_logs", description: "Pod 日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查 Pod 日志",
+    run: async () => "panic: nil map\n\tinternal/logic/order.go:88 +0x1d",
+  };
+  const ask = async (answers: string[]) => {
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_get_pod_logs", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["ai/aiops-mcp"],
+      mcp: { tools: () => [podLogs], prompt: () => undefined },
+    });
+    await handle(message("order-api 的 Pod 为什么重启"));
+    return { requests, replies: markdowns(sent) };
+  };
+
+  const fromLogs = await ask(["空 map 写入，panic 在 `internal/logic/order.go:88`"]);
+  assert.equal(fromLogs.requests.length, 2);
+  assert.deepEqual(fromLogs.replies, ["空 map 写入，panic 在 `internal/logic/order.go:88`"]);
+
+  const guessed = await ask(["panic 在 `internal/logic/order.go:88`，是 `internal/svc/context.go` 里没初始化", "panic 在 `internal/logic/order.go:88`"]);
+  assert.equal(guessed.requests.length, 3);
+  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
+});
+
 test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {
   const review = reviewCodeAnswer("ai/agent-tag 的 README 讲了什么", ["ai/aiops-mcp", "ai/agent-tag"]);
   assert.equal(review("README 说……", new Set(["code_read_file"])), undefined);
@@ -660,11 +697,15 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   // 和仓库无关的一般问题不管
   assert.equal(general("用 systemctl 重启，配置写在 tsconfig.json", new Set()), undefined);
   assert.equal(reviewCodeAnswer("今天周几", ["ai/api"])("周一，api 文档见 https://x.com/a/b.js", new Set()), undefined);
-  // 文件和行号来自 aiops 查到的崩溃日志
-  const crash = reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"], (name) => name.startsWith("aiops_"));
+  // 文件和行号来自 aiops 查到的崩溃日志：只放过结果里真出现过的路径
+  const logs = ["panic: nil map\n\tinternal/logic/order.go:88 +0x1d"];
+  const seen = (path: string) => logs.some((output) => output.includes(path));
+  const crash = reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"], seen);
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["aiops_get_pod_logs"])), undefined);
-  assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["web_search"])), UNVERIFIED_CODE_ANSWER);
-  // 问的是配置的仓库，调了 aiops 工具也不算读过代码
-  const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], (name) => name.startsWith("aiops_"));
+  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["web_search"])), undefined);
+  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), UNVERIFIED_CODE_ANSWER);
+  // 问的是配置的仓库，结果里出现过路径也不算读过代码
+  const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], () => true);
   assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
 });

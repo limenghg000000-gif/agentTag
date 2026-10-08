@@ -14,7 +14,7 @@ export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
 export const MAX_MCP_CALLS_PER_TASK = 10;
 /** 一次任务里同一个 MCP 服务的结果一共交给模型多少字。快用完时后面的结果截得更短，免得撑爆上下文 */
 export const MAX_MCP_CHARS_PER_TASK = 150_000;
-/** 总字数快用完时，单个结果至少还给这么多字 */
+/** 总字数快用完或用完时，单个结果至少还给这么多字（加上调用次数的上限，一次任务最多比总字数多出 3 个这么多） */
 const MIN_RESULT_CHARS = 6000;
 /** 服务端说「服务繁忙」时隔多久重试，重试几次就有几项 */
 const BUSY_RETRY_MS = [1000, 3000];
@@ -72,7 +72,7 @@ export interface McpHubOptions {
   now?: () => number;
 }
 
-/** 会写东西的工具：配置里点名的，加上名字里带 create、save、delete 这类动词的。不看服务端的标注 */
+/** 会写东西的工具：配置里点名的，加上名字里带 create、save、delete 这类动词的 */
 export function isWriteTool(name: string, extra: readonly string[] = []): boolean {
   const snake = name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[.-]/g, "_").toLowerCase();
   return extra.includes(name) || WRITE_VERB.test(snake);
@@ -274,7 +274,7 @@ export class McpHub {
     }
     if (picked.skippedWrites.length > 0) {
       this.logger.warn(
-        `MCP ${name}：${picked.skippedWrites.join(", ")} 会写东西，这一版先不开（写工具要等发起人确认的卡片做好）`,
+        `MCP ${name}：${picked.skippedWrites.join(", ")} 会写东西（或服务端没标成只读），这一版先不开（写工具要等发起人确认的卡片做好）`,
       );
     }
     if (picked.clashes.length > 0) {
@@ -323,11 +323,19 @@ export class McpHub {
           );
         }
         budget.calls++;
+        // 先按这次的上限把字数占住，同一轮并行的几个调用加起来也不会超出总字数；拿到结果后按实际字数退回多占的
         const limit = Math.min(MCP_RESULT_LIMIT, Math.max(MIN_RESULT_CHARS, MAX_MCP_CHARS_PER_TASK - budget.chars));
-        const pending = this.invoke(server, remote.name, args, task, signal, timeout, limit).then((text) => {
-          budget.chars += text.length;
-          return text;
-        });
+        budget.chars += limit;
+        const pending = this.invoke(server, remote.name, args, task, signal, timeout, limit).then(
+          (text) => {
+            budget.chars += text.length - limit;
+            return text;
+          },
+          (err: unknown) => {
+            budget.chars -= limit;
+            throw err;
+          },
+        );
         budget.results.set(key, { at: this.now(), text: pending });
         pending.catch(() => budget.results.delete(key));
         return pending;
@@ -477,7 +485,7 @@ interface PickedTools {
   clashes: string[];
   /** 服务端有、没开的 */
   notEnabled: string[];
-  /** 点名要开、但会写东西，这一版不开的 */
+  /** 要开、但会写东西（或者按 * 开时服务端没标成只读），这一版不开的 */
   skippedWrites: string[];
   /** 点名要开、服务端没有的 */
   missing: string[];
@@ -490,7 +498,7 @@ function pickTools(config: McpServerConfig, tools: readonly RemoteTool[]): Picke
   const taken = new Set<string>();
   const clashes: string[] = [];
   const enabled = requested.filter((tool) => {
-    if (isWriteTool(tool.name, config.writeTools)) {
+    if (mayWrite(tool, config, !wanted)) {
       return false;
     }
     const name = toolName(config.name, tool.name);
@@ -505,9 +513,18 @@ function pickTools(config: McpServerConfig, tools: readonly RemoteTool[]): Picke
     enabled,
     clashes,
     notEnabled: tools.filter((tool) => wanted && !wanted.has(tool.name)).map((tool) => tool.name),
-    skippedWrites: requested.filter((tool) => isWriteTool(tool.name, config.writeTools)).map((tool) => tool.name),
+    skippedWrites: requested.filter((tool) => mayWrite(tool, config, !wanted)).map((tool) => tool.name),
     missing: wanted ? [...wanted].filter((name) => !names.has(name)) : [],
   };
+}
+
+/**
+ * 这一版不开的工具：配置里点名的写工具、名字里带写操作动词的、服务端标了 readOnlyHint=false 的；
+ * 按 * 开全部时，服务端没明确标成只读（readOnlyHint=true）的也不开。服务端的标注只用来多拦，不能让上面拦下的工具放行
+ */
+function mayWrite(tool: RemoteTool, config: McpServerConfig, wildcard: boolean): boolean {
+  const readOnly = tool.annotations?.readOnlyHint;
+  return isWriteTool(tool.name, config.writeTools) || readOnly === false || (wildcard && readOnly !== true);
 }
 
 /** 交给模型的工具名：服务名_工具名，只留 OpenAI 函数名允许的字符 */

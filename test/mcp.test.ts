@@ -237,6 +237,19 @@ test("一次任务里结果的总字数快用完时，后面的结果截得更�
   assert.ok(sizes.reduce((a, b) => a + b, 0) <= MAX_MCP_CHARS_PER_TASK + 6000);
 });
 
+test("同一轮并行调用时先占住字数，加起来也不超过一次任务的总字数", async () => {
+  const big = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => `第 ${i} 行日志 ${"x".repeat(40)}`) });
+  const server = await fake({ call: () => text(big) });
+  const hub = await hubFor([config(server.url)], { logger: recorder().logger });
+  const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
+
+  const results = await Promise.all(Array.from({ length: MAX_MCP_CALLS_PER_TASK }, (_, i) => logs.run({ logql: `q${i}` }, { signal })));
+  const total = results.reduce((sum, result) => sum + result.length, 0);
+  // 前 6 个各占 24000 字，第 7 个占到 15 万；后面 3 个每个最少还给 6000 字。不先占的话 10 个都按 24000 字截
+  assert.ok(total <= MAX_MCP_CHARS_PER_TASK + 3 * 6000, `${total}`);
+  assert.equal(results.filter((result) => result.length <= 6000).length, 4);
+});
+
 test("调用遇到 HTTP 404 时马上重连一次，不等定时刷新", async () => {
   const server = await fake();
   const log = recorder();
@@ -332,8 +345,9 @@ test("定时刷新：服务端新加的工具列进日志但不自动打开，�
   assert.ok(server.initializes >= 2, "每次刷新都重新 initialize，拿到最新的使用说明");
 });
 
-test("MCP_AIOPS_TOOLS=* 开服务端的全部工具，会写东西的除外", async () => {
-  const server = await fake();
+test("MCP_AIOPS_TOOLS=* 开服务端的全部工具，会写东西的和没标成只读的除外", async () => {
+  const unmarked: RemoteTool = { name: "get_dashboard", description: "看板", inputSchema: { type: "object", properties: {} } };
+  const server = await fake({ tools: [...TOOLS, unmarked] });
   const log = recorder();
   const hub = await hubFor([config(server.url, { tools: "*", writeTools: ["get_targets_health"] })], { logger: log.logger });
 
@@ -341,7 +355,23 @@ test("MCP_AIOPS_TOOLS=* 开服务端的全部工具，会写东西的除外", as
     hub.tools(task).map((tool) => tool.spec.name),
     ["aiops_diagnose_service", "aiops_query_logs", "aiops_get_active_alerts"],
   );
-  assert.match(log.find(/会写东西/)!.text, /get_targets_health, save_lesson, archive_lesson 会写东西/);
+  assert.match(log.find(/会写东西/)!.text, /get_targets_health, save_lesson, archive_lesson, get_dashboard 会写东西（或服务端没标成只读）/);
+});
+
+test("服务端标了 readOnlyHint=false 的工具，点名要开也不开；点名开的工具没有标注时照开", async () => {
+  const tools: RemoteTool[] = [
+    { ...remoteTool("ack_alert", "确认告警"), annotations: { readOnlyHint: false } },
+    { name: "get_dashboard", description: "看板", inputSchema: { type: "object", properties: {} } },
+  ];
+  const server = await fake({ tools });
+  const log = recorder();
+  const hub = await hubFor([config(server.url, { tools: ["ack_alert", "get_dashboard"] })], { logger: log.logger });
+
+  assert.deepEqual(
+    hub.tools(task).map((tool) => tool.spec.name),
+    ["aiops_get_dashboard"],
+  );
+  assert.equal(log.find(/ack_alert 会写东西/)?.level, "warn");
 });
 
 test("会写东西的工具：配置里点名的，加上名字里带写操作动词的", () => {
