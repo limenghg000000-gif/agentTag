@@ -94,6 +94,26 @@ test("query_logs 边界那一刻就占满 limit：不让带着边界原样再查
   assert.ok(forward?.includes(`要看更晚的，start_time 填 ${t + 1n}、end_time 填 ${ns("2026-10-08 16:43:30")}（19 位纳秒）再查，这一刻没取到的会跳过`));
 });
 
+test("query_logs 超过 200KB 被减半：丢掉的条数也按最坏情况算进边界；没卡住时建议把 limit 调成装得下的条数", () => {
+  const t = BigInt(ns("2026-10-08 16:43:26")) + 412_345_678n;
+  const same = (n: number) => Array.from({ length: n }, () => ({ timestamp: `${t}`, line: "x".repeat(10) }));
+
+  // 50 条同一纳秒的长日志，减半留 25 条：按 T+1ns 重叠再查还是这 50 条、再减半，要跳过这一刻
+  const stuck = queryLogsNote({ limit: 50 }, result(same(25), { original_total: 50 }));
+  assert.match(stuck ?? "", /Loki 按 limit=50 取满了；结果超过 200KB，aiops 只留了 50 条里的 25 条/);
+  assert.match(stuck ?? "", /这批里有 25 条都在 2026-10-08 16:43:26\.412，带着这个边界再查还会取回同一批/);
+  assert.ok(stuck?.includes(`end_time 填 ${t - 1n}（19 位纳秒）再查，这一刻没取到的会跳过`));
+  // 减半过就不建议调大 limit
+  assert.doesNotMatch(stuck ?? "", /limit 调到|limit 填/);
+  const forward = queryLogsNote({ direction: "forward", limit: 50 }, result(same(25), { original_total: 50 }));
+  assert.ok(forward?.includes(`start_time 填 ${t + 1n}、end_time 填 ${ns("2026-10-08 16:43:30")}（19 位纳秒）再查，这一刻没取到的会跳过`));
+
+  // 时间各不相同：照常重叠续查，limit 调成这次留下的条数
+  const spread = Array.from({ length: 25 }, (_, i) => log(`2026-10-08 16:43:${String(10 + i).padStart(2, "0")}`));
+  const moving = queryLogsNote({ limit: 50 }, result(spread, { original_total: 50 }));
+  assert.match(moving ?? "", /会和这批有一点重叠，去掉重复的即可，limit 填 25，免得结果再超过 200KB 被减半；也可以加级别、关键词过滤缩小范围）$/);
+});
+
 test("补充说明按服务名和工具名登记：只有 aiops 的 query_logs", () => {
   assert.deepEqual(Object.keys(RESULT_NOTES), ["aiops"]);
   assert.deepEqual(Object.keys(RESULT_NOTES.aiops), ["query_logs"]);

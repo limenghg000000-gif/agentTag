@@ -35,8 +35,10 @@ export function queryLogsNote(args: Record<string, unknown>, result: string): st
   const limit = logsLimit(args.limit);
   const skipped = count(json.skipped_empty);
   const original = count(json.original_total);
-  const full = kept + skipped >= limit;
   const halved = original > kept;
+  // 减半丢掉的条数：时间不知道，和去掉的空行一样，判断边界会不会卡住时按最坏情况算
+  const dropped = halved ? original - kept : 0;
+  const full = kept + dropped + skipped >= limit;
   if (!full && !halved) {
     return undefined;
   }
@@ -59,7 +61,7 @@ export function queryLogsNote(args: Record<string, unknown>, result: string): st
       : `${forward ? "更晚" : "更早"}的没取到。`;
   // 接着查的边界用 19 位纳秒（aiops 的入参认），不按秒取整：同一秒里常有几十条，取整会漏掉或者重复取回同一批。
   // 平常让边界多带回这批的头一条，宁可重复也不漏；时间只精确到秒时多留一秒。
-  // 可边界上那一刻已经取回的条数（被去掉的空行按最坏情况也算进去）占满 limit 时，带着边界再查还是同一批，
+  // 可边界上那一刻已经取回的条数（去掉的空行、减半丢掉的条数按最坏情况也算进去）占满 limit 时，带着边界再查还是同一批，
   // 只能跳过那一刻往前走（Loki 的 end 不含本身，填前 1 纳秒更稳），或者加过滤、拆开查
   const precise = json.logs.every((log) => isObject(log) && /^\d{19}$/.test(String(log.timestamp).trim()));
   const bump = precise ? 1n : 1_000_000_000n;
@@ -73,15 +75,15 @@ export function queryLogsNote(args: Record<string, unknown>, result: string): st
       `${from !== undefined ? `start_time 填 ${from}` : "start_time 不变"}、${to !== undefined ? `end_time 填 ${to}` : "end_time 不变"}（19 位纳秒）`;
     const edge = forward ? last : first;
     const atEdge = known.filter((ns) => (forward ? ns === last : ns < first + bump)).length;
-    if (atEdge + skipped >= limit) {
+    if (atEdge + skipped + dropped >= limit) {
       next =
         `这批里有 ${atEdge} 条都在 ${formatTime(edge)}${precise ? "" : " 这一秒"}，带着这个边界再查还会取回同一批。` +
         `要看${later}的，${forward ? bounds(last + bump, end) : bounds(start, first - 1n)}再查，${moment}没取到的会跳过；` +
-        `要看全${moment}的，加级别、关键词过滤，或者按 pod 等标签拆开查${limit < LOGS_MAX_LIMIT ? `，或者把 limit 调到 ${LOGS_MAX_LIMIT}` : ""}`;
+        `要看全${moment}的，加级别、关键词过滤，或者按 pod 等标签拆开查${!halved && limit < LOGS_MAX_LIMIT ? `，或者把 limit 调到 ${LOGS_MAX_LIMIT}` : ""}`;
     } else {
       next =
-        `要看${later}的，${forward ? bounds(last, end) : bounds(start, first + bump)}再查，会和这批有一点重叠，去掉重复的即可；` +
-        "也可以加级别、关键词过滤缩小范围";
+        `要看${later}的，${forward ? bounds(last, end) : bounds(start, first + bump)}再查，会和这批有一点重叠，去掉重复的即可` +
+        `${halved ? `，limit 填 ${kept}，免得结果再超过 200KB 被减半` : ""}；也可以加级别、关键词过滤缩小范围`;
     }
   }
   return (
