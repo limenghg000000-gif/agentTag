@@ -709,8 +709,28 @@ test("有 aiops 工具时，一个工具都没调就给出线上数据的回答�
   assert.deepEqual(markdowns(sent), ["最近 1 小时没有查到报错日志"]);
 });
 
-test("线上数据检查：没成功调过工具就给出时间、Pod、条数、「没有报错」时打回；成功调过工具、没有线上数据、或者数据来自提问时放行", () => {
-  const ok = (...names: string[]) => reviewOpsAnswer("product-service-api 最近一小时报错多吗", ["aiops"], new Set(names));
+test("线上数据检查：提问像在问线上服务，一个工具都没成功调过就打回，不管回答怎么写；成功调过工具、或者提问和线上无关时放行", () => {
+  const flagged = unverifiedOpsAnswer(["aiops"]);
+  // 复测时没调工具编出来的定位候选：没有时间、Pod 名、条数，只看回答认不出来
+  const madeUp = "network-tester 在多个命名空间都有部署，请确认要诊断哪个：default、kube-system、monitoring";
+  for (const question of ["诊断一下 network-tester", "product-service-api 最近一小时报错多吗", "现在有哪些告警", "prod 的 Pod 有没有在重启", "CPU 高吗"]) {
+    const review = (...names: string[]) => reviewOpsAnswer(question, ["aiops"], new Set(names));
+    assert.equal(review()(madeUp), flagged, question);
+    assert.equal(review()("一切正常"), flagged, question);
+    // 只成功调了群记忆工具不算查过
+    assert.equal(review("memory_search")(madeUp), flagged, question);
+    // 成功调过 aiops，或者成功调过读代码这类别的工具，都放行
+    assert.equal(review("aiops_find_service")(madeUp), undefined, question);
+    assert.equal(review("code_search")(madeUp), undefined, question);
+  }
+  for (const question of ["谢谢", "总结一下上面说的", "就选 argocd"]) {
+    assert.equal(reviewOpsAnswer(question, ["aiops"], new Set())("好的"), undefined, question);
+  }
+});
+
+test("线上数据检查：提问看不出是线上问题时，没成功调过工具就给出时间、Pod、条数、就绪数、「没有报错」也打回；数据来自提问时放行", () => {
+  // 选了命名空间以后的追问，提问里只有命名空间
+  const ok = (...names: string[]) => reviewOpsAnswer("就选 argocd", ["aiops"], new Set(names));
   const flagged = unverifiedOpsAnswer(["aiops"]);
   for (const answer of [
     "15:39:19 有一条 warning",
@@ -721,20 +741,33 @@ test("线上数据检查：没成功调过工具就给出时间、Pod、条数�
     "CPU 使用率 95%",
     "93 个 Pod 都在运行",
     "无明显异常",
+    "default：1/1 就绪（Deployment）",
+    "prod：Ready 4/4",
+    "3/3 Running",
+    // Markdown 包着的就绪数
+    "- default：**1/1** 就绪",
+    "- prod（Ready: **4/4**）",
+    "- staging：`2/2` 就绪",
   ]) {
     assert.equal(ok()(answer), flagged, answer);
   }
-  // 只成功调了群记忆工具不算查过
   assert.equal(ok("memory_search")("15:39:19 有一条 warning"), flagged);
-  // 成功调过 aiops，或者成功调过读代码这类别的工具，都放行
   assert.equal(ok("aiops_query_logs")("15:39:19 有一条 warning"), undefined);
   assert.equal(ok("code_search")("提交时间 2026-10-07 18:22:10"), undefined);
   // 反问、解释概念、只说到分钟的时间都不算线上数据
-  assert.equal(ok()("gateway-api 在 prod、staging、test 都有，查哪个？"), undefined);
+  assert.equal(ok()("要查哪个服务？"), undefined);
   assert.equal(ok()("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存"), undefined);
+  assert.equal(ok()("kubectl get pods 里 READY 列的 1/2 表示两个容器只有一个就绪"), undefined);
   // 提问里本来就有的数字不算
   const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
   assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
+  // 提问里的就绪数换了大小写、顺序、空格也不算
+  const concept = reviewOpsAnswer("READY 1/2 是什么意思", ["aiops"], new Set());
+  assert.equal(concept("Ready 1/2 表示两个容器里只有一个就绪"), undefined);
+  assert.equal(concept("1/2 Ready 表示两个容器里只有一个就绪"), undefined);
+  assert.equal(concept("1 / 2 ready 表示两个容器里只有一个就绪"), undefined);
+  assert.equal(concept("1/2 表示一个就绪，prod 那边现在是 4/4 就绪"), flagged);
+  assert.equal(reviewOpsAnswer("READY 11/20 是什么意思", ["aiops"], new Set())("1/2 就绪"), flagged);
 });
 
 test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
