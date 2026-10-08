@@ -61,9 +61,37 @@ test("query_logs 的时间换成北京时间字符串以后照样能算，只精
   assert.ok(beijing?.includes(`start_time 填 ${ns("2026-10-08 15:43:30")}、end_time 填 ${ns("2026-10-08 16:43:21")}`));
   const noTimes = queryLogsNote({ limit: 1 }, result([{ line: "x" }]));
   assert.match(noTimes ?? "", /只拿到最新的 1 条日志：Loki 按 limit=1 取满了。更早的没取到。/);
-  assert.match(noTimes ?? "", /缩小时间范围再查/);
+  assert.match(noTimes ?? "", /缩小时间范围或加级别、关键词过滤再查/);
   assert.equal(queryLogsNote({}, "LogQL 语法错误"), undefined);
   assert.equal(queryLogsNote({}, '{"items":[]}'), undefined);
+});
+
+test("query_logs 边界那一刻就占满 limit：不让带着边界原样再查，改成跳过那一刻往前走，或者加过滤、拆开查", () => {
+  const t = BigInt(ns("2026-10-08 16:43:26")) + 412_345_678n;
+  const same = (n: number) => Array.from({ length: n }, () => ({ timestamp: `${t}`, line: "x" }));
+  const start = ns("2026-10-08 15:43:30");
+
+  // 3 条都在同一纳秒：end_time=T+1ns 还是这 3 条，改成 T 之前
+  const stuck = queryLogsNote({ limit: 3 }, result(same(3), { query_start_ns: start }));
+  assert.match(stuck ?? "", /这批里有 3 条都在 2026-10-08 16:43:26\.412，带着这个边界再查还会取回同一批/);
+  assert.ok(stuck?.includes(`要看更早的，start_time 填 ${start}、end_time 填 ${t - 1n}（19 位纳秒）再查，这一刻没取到的会跳过`));
+  assert.match(stuck ?? "", /要看全这一刻的，加级别、关键词过滤，或者按 pod 等标签拆开查，或者把 limit 调到 200）$/);
+  assert.doesNotMatch(stuck ?? "", /重叠/);
+
+  // 被去掉的空行按最坏情况算在边界上
+  assert.match(queryLogsNote({ limit: 5 }, result(same(2), { skipped_empty: 3 })) ?? "", /带着这个边界再查还会取回同一批/);
+  // limit 已经是 200 就不再建议调大
+  assert.doesNotMatch(queryLogsNote({ limit: 200 }, result(same(200))) ?? "", /limit 调到/);
+
+  // 时间只到秒、整批在同一秒：跳过这一秒
+  const seconds = Array.from({ length: 4 }, () => ({ timestamp: "2026-10-08 16:43:26" }));
+  const bySecond = queryLogsNote({ limit: 4 }, result(seconds));
+  assert.match(bySecond ?? "", /这批里有 4 条都在 2026-10-08 16:43:26\.000 这一秒/);
+  assert.ok(bySecond?.includes(`end_time 填 ${BigInt(ns("2026-10-08 16:43:26")) - 1n}（19 位纳秒）再查，这一秒没取到的会跳过`));
+
+  // 从旧到新：start_time 跳过最晚那一刻
+  const forward = queryLogsNote({ direction: "forward", limit: 3 }, result(same(3), { query_end_ns: ns("2026-10-08 16:43:30") }));
+  assert.ok(forward?.includes(`要看更晚的，start_time 填 ${t + 1n}、end_time 填 ${ns("2026-10-08 16:43:30")}（19 位纳秒）再查，这一刻没取到的会跳过`));
 });
 
 test("补充说明按服务名和工具名登记：只有 aiops 的 query_logs", () => {

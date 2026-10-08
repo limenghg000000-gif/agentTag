@@ -58,24 +58,35 @@ export function queryLogsNote(args: Record<string, unknown>, result: string): st
       ? `这些日志在 ${formatTime(first)}～${formatTime(last)}（北京时间）${window}，${forward ? "更晚" : "更早"}的没取到。`
       : `${forward ? "更晚" : "更早"}的没取到。`;
   // 接着查的边界用 19 位纳秒（aiops 的入参认），不按秒取整：同一秒里常有几十条，取整会漏掉或者重复取回同一批。
-  // 边界上多带回这批的头一条，宁可重复也不漏；时间只精确到秒时多留一秒
+  // 平常让边界多带回这批的头一条，宁可重复也不漏；时间只精确到秒时多留一秒。
+  // 可边界上那一刻已经取回的条数（被去掉的空行按最坏情况也算进去）占满 limit 时，带着边界再查还是同一批，
+  // 只能跳过那一刻往前走（Loki 的 end 不含本身，填前 1 纳秒更稳），或者加过滤、拆开查
   const precise = json.logs.every((log) => isObject(log) && /^\d{19}$/.test(String(log.timestamp).trim()));
-  const overlap = "，会和这批有一点重叠，去掉重复的即可";
-  let next = "要看其余的，缩小时间范围再查";
+  const bump = precise ? 1n : 1_000_000_000n;
+  const moment = precise ? "这一刻" : "这一秒";
+  let next = "要看其余的，缩小时间范围或加级别、关键词过滤再查";
   if (first !== undefined && last !== undefined) {
-    if (forward) {
-      const end = toNs(json.query_end_ns) ?? toNs(json.query_end);
-      next = `要看更晚的，start_time 填 ${last}${end !== undefined ? `、end_time 填 ${end}` : "、end_time 不变"}（19 位纳秒）再查${overlap}`;
+    const later = forward ? "更晚" : "更早";
+    const start = toNs(json.query_start_ns) ?? toNs(json.query_start);
+    const end = toNs(json.query_end_ns) ?? toNs(json.query_end);
+    const bounds = (from: bigint | undefined, to: bigint | undefined) =>
+      `${from !== undefined ? `start_time 填 ${from}` : "start_time 不变"}、${to !== undefined ? `end_time 填 ${to}` : "end_time 不变"}（19 位纳秒）`;
+    const edge = forward ? last : first;
+    const atEdge = known.filter((ns) => (forward ? ns === last : ns < first + bump)).length;
+    if (atEdge + skipped >= limit) {
+      next =
+        `这批里有 ${atEdge} 条都在 ${formatTime(edge)}${precise ? "" : " 这一秒"}，带着这个边界再查还会取回同一批。` +
+        `要看${later}的，${forward ? bounds(last + bump, end) : bounds(start, first - 1n)}再查，${moment}没取到的会跳过；` +
+        `要看全${moment}的，加级别、关键词过滤，或者按 pod 等标签拆开查${limit < LOGS_MAX_LIMIT ? `，或者把 limit 调到 ${LOGS_MAX_LIMIT}` : ""}`;
     } else {
-      const start = toNs(json.query_start_ns) ?? toNs(json.query_start);
-      const end = first + (precise ? 1n : 1_000_000_000n);
-      next = `要看更早的，${start !== undefined ? `start_time 填 ${start}` : "start_time 不变"}、end_time 填 ${end}（19 位纳秒）再查${overlap}`;
+      next =
+        `要看${later}的，${forward ? bounds(last, end) : bounds(start, first + bump)}再查，会和这批有一点重叠，去掉重复的即可；` +
+        "也可以加级别、关键词过滤缩小范围";
     }
   }
   return (
     `（机器人注：这次只拿到${which}的 ${kept} 条日志：${reasons.join("；")}。${span}` +
-    `只能说这一段里的情况，不能当成整段时间的条数、分布或趋势，也不能说${forward ? "更晚" : "更早"}没有。` +
-    `${next}，或者加级别、关键词过滤缩小范围）`
+    `只能说这一段里的情况，不能当成整段时间的条数、分布或趋势，也不能说${forward ? "更晚" : "更早"}没有。${next}）`
   );
 }
 
