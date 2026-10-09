@@ -13,6 +13,7 @@ import {
 } from "../src/knowledge.js";
 import { AiopsLessons, type LessonsMcp, renderAiopsHitsForPrompt, syncedFrom } from "../src/knowledge-aiops.js";
 import { raceAbort } from "../src/abort.js";
+import { generateKeyPairSync } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { buildSystemPrompt } from "../src/prompt.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
@@ -99,6 +100,11 @@ test("起草的经验：去掉空白、检查必填和长度，关键词和错�
   assert.throws(() => normalizeDraft({ ...code8, title: "长".repeat(81) }), /标题（title）最多 80 字/);
   assert.throws(() => normalizeDraft({ ...code8, scope: 42 }), /适用范围（scope）要填文字/);
 });
+
+/** 测试里现生成的密钥对：kubeconfig、Kubernetes Secret 里 base64 编码的私钥用 */
+const ecKeys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const rsaKeys = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const base64 = (value: string | Buffer) => Buffer.from(value).toString("base64");
 
 test("草稿里有密钥、密码时不让存，错误信息里不复述密钥；只是提到令牌过期的照常", () => {
   for (const secret of [
@@ -310,6 +316,14 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 句子中间的，凭据带数字的
     ["用 Authorization: Token abc123def", "456ghi 调接口"].join(""),
     ["call it with Authorization: Token abc123", "def456 and retry"].join(""),
+    // base64 编码的私钥：kubeconfig 的 client-key-data、Secret 里的 tls.key、ssh-privatekey（PEM 编成 base64，YAML 里折成几行的也算），DER 编码的 RSA、EC、PKCS#8
+    `users:\n- name: admin\n  user:\n    client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`,
+    `data:\n  tls.key: ${base64(ecKeys.privateKey.export({ type: "pkcs8", format: "pem" }))}`,
+    `{"ssh-privatekey": "${base64(generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }))}"}`,
+    `tls.key: |-\n    ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" })).replace(/.{60}/g, "$&\n    ")}`,
+    `key: ${base64(rsaKeys.privateKey.export({ type: "pkcs1", format: "der" }))}`,
+    `key: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "der" }))}`,
+    `key: ${base64(generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "der" }))}`,
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -397,6 +411,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "Authorization: Token ${OKTA_TOKEN}\nAuthorization: SSWS {{apiToken}}\nAuthorization: Bearer {access_token}\nAuthorization: Token <your-token>\nAuthorization: token YOUR_API_TOKEN\nAuthorization: Token abcd****wxyz",
     'Authorization: Negotiate；Authorization: SCRAM-SHA-256；Authorization: 需要登录；Authorization header is missing；headers = {"Authorization": f"Token {token}"}',
     'Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", qop=auth, nc=00000001, response="6629fae49393a05397450978507c4ef1"',
+    // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
+    `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
+    `encrypted: ${base64(rsaKeys.privateKey.export({ type: "pkcs8", format: "der", cipher: "aes-256-cbc", passphrase: "x" }))}；sha512: ${base64(Buffer.alloc(64, 7))}`,
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -533,6 +550,33 @@ test("关键词命中按不同的词算：同一个错误码在关键词、错�
   assert.deepEqual(await base.search("订单服务报 ERR_TIMEOUT"), []);
   // 对上两个不同的词照样算
   assert.equal((await base.search("支付回调报 ERR_TIMEOUT"))[0]?.entry.id, "K1");
+});
+
+test("向量缓存只留表格里现在这些行的：改过的行改之前的向量，重新读表格以后清掉；归档的行还在表格里，留着", async () => {
+  const backend = new MemoryBackend();
+  const { embedder, calls } = fakeEmbedder(["降载", "日活"]);
+  let now = new Date("2026-10-09T10:00:00Z");
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet, now: () => now });
+  await base.save(normalizeDraft(code8));
+  await base.save(normalizeDraft(dau));
+  const embedded = (title: string) => calls.flat().filter((text) => text.includes(title)).length;
+  const later = () => (now = new Date(now.getTime() + 2 * 60_000));
+  await base.search("user-rpc 降载了吗");
+  assert.equal(embedded(code8.title), 1);
+
+  // 表格里改了 K1 的结论、归档了 K2
+  const conclusion = backend.entries[0].conclusion;
+  backend.entries[0].conclusion = `${conclusion}（已加 CPU limit）`;
+  backend.entries[1].status = "archived";
+  later();
+  await base.search("user-rpc 降载了吗");
+  assert.equal(embedded(code8.title), 2, "改过的内容算一次");
+  backend.entries[0].conclusion = conclusion;
+  later();
+  await base.search("user-rpc 降载了吗");
+  assert.equal(embedded(code8.title), 3, "改之前的向量已经清掉了，改回去要重新算");
+  await base.search("日活是多少", { includeArchived: true });
+  assert.equal(embedded(dau.title), 1, "归档的行的向量留着");
 });
 
 test("向量没在期限内算完：这次只按关键词，下次照常调向量模型；用户停止任务时整个检索中止", async () => {
@@ -883,6 +927,32 @@ test("保存的结果没传回来、再点之前有人把那一行的结论清�
   backend.entries[0].conclusion = dau.conclusion;
   await desk.handleCardAction(click(lastCard(), "save"));
   await desk.idle();
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已存进团队经验库：经验 K1「日活的口径」/);
+});
+
+test("保存的结果没传回来、再点之前有人复制了那一行又改了编号：两行草稿编号一样分不清，不挑一行接着做；清掉复制的那行的草稿编号后照常完成", async () => {
+  const { backend, base, desk, sent, click, tool, lastCard } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  const add = backend.add.bind(backend);
+  backend.add = async (entry) => {
+    await add(entry);
+    throw new KnowledgeError("飞书接口超时");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  backend.add = add;
+  backend.entries.push({ ...structuredClone(backend.entries[0]), id: "K9", title: "复制出来改过的", conclusion: "别的内容" });
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /上次点确认没成功：表格里有 2 行的「草稿编号」一样（经验 K1、K9）/);
+  assert.equal(sent.length, 1, "没做完时话题里不发结果");
+  await assert.rejects(base.saved(backend.entries[0].requestId!, "K1"), /草稿编号/);
+
+  delete backend.entries[1].requestId;
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 2, "不再存一遍");
   assert.equal(lastCard().header.title.content, "已存进经验库");
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已存进团队经验库：经验 K1「日活的口径」/);
 });
@@ -2349,6 +2419,40 @@ test("归档时表格改成功了、结果没传回来：再点一次照常完�
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档经验 K1.*\naiops 经验库里同步的经验 #31 也已归档/);
 });
 
+test("归档：表格里归档了、aiops 那步没做成，再试之前有人删了这一行：不再报找不到，aiops 里同步的那条核对出处后照样归档；卡片发出后改了编号的按草稿编号认", async () => {
+  const { backend, base, desk, sent, click, tool, lastCard, handlers } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
+  const archiveLesson = handlers.archive_lesson;
+  handlers.archive_lesson = () => {
+    throw new Error("aiops 现在连不上");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.match(cardText(lastCard()), /aiops 经验库里同步的经验 #31 没能归档/);
+
+  backend.entries.splice(0, 1);
+  handlers.archive_lesson = archiveLesson;
+  await desk.handleCardAction(click(lastCard(), "archive"));
+  await desk.idle();
+  assert.match(
+    (sent.at(-1)!.input as { markdown: string }).markdown,
+    /经验 K1 已经从表格里删掉了，团队经验库里检索不到它，不用再归档。\naiops 经验库里同步的经验 #31 也已归档/,
+  );
+
+  const renamed = deskSetup();
+  await renamed.base.save(normalizeDraft(code8), { requestId: "req-1" });
+  await renamed.base.linkAiops("K1", 31);
+  await renamed.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  renamed.backend.entries[0].id = "K9";
+  await renamed.desk.handleCardAction(renamed.click((renamed.sent[0].input as { card: any }).card, "archive"));
+  await renamed.desk.idle();
+  assert.equal(renamed.backend.entries[0].status, "archived");
+  assert.deepEqual(renamed.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }], "aiops 里那条的出处是卡片上的 K1");
+});
+
 /** aiops 检索结果里 #31 的排查过程末尾写着是 K1 同步过去的 */
 const syncedHits = () =>
   JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9, diagnosis_path: "看了 Pod 连接数\n（来自飞书团队经验库 K1）" }, { id: 40, title: "Open WebUI 存的", score: 8 }] });
@@ -2378,6 +2482,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(`gateway-api 报 code=8，日志在 https://bucket.s3.amazonaws.com/k?X-Amz-Expires=300&X-Amz-Signature=${"0123456789abcdef".repeat(4)}`, task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="), task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Authorization: SSWS 00QCjAl4MlV-WPXM", "-ABCDEFGHIJKLMNOPQRSTUVWX"].join(""), task);
+  await desk.lookup(`gateway-api 报 code=8，kubeconfig 里 client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`, task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);

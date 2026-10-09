@@ -167,6 +167,14 @@ export class StaleProposalError extends KnowledgeError {
   }
 }
 
+/** 要归档的那一行在表格里找不到了（编号和草稿编号都对不上，多半是删掉了） */
+export class MissingEntryError extends KnowledgeError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MissingEntryError";
+  }
+}
+
 export interface KnowledgeBaseOptions {
   embedder?: Embedder;
   logger?: Logger;
@@ -189,6 +197,8 @@ export class KnowledgeBase {
   /** 已经警告过的表格行（编号加上缺了什么、哪里像有密钥），同一个问题只警告一次 */
   private readonly warned = new Set<string>();
   private readonly vectors = new Map<string, number[]>();
+  /** 上次按哪一次读到的表格清过向量缓存 */
+  private prunedFor?: Promise<KnowledgeEntry[]>;
   private embedFailedAt?: number;
   private lock: Promise<unknown> = Promise.resolve();
 
@@ -266,7 +276,7 @@ export class KnowledgeBase {
   async saved(requestId: string, id: string): Promise<KnowledgeEntry | undefined> {
     const entries = await this.entries(true);
     const wanted = normalizeId(id);
-    return entries.find((entry) => entry.requestId === requestId) ?? entries.find((entry) => entry.id.toUpperCase() === wanted);
+    return byRequestId(entries, requestId) ?? entries.find((entry) => entry.id.toUpperCase() === wanted);
   }
 
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
@@ -275,7 +285,9 @@ export class KnowledgeBase {
     if (!text) {
       return [];
     }
-    const candidates = (await this.entries()).filter(
+    const entries = await this.entries();
+    this.pruneVectors(entries);
+    const candidates = entries.filter(
       (entry) => usable(entry) && (includeArchived || entry.status === "active") && (!category || entry.category === category),
     );
     if (candidates.length === 0) {
@@ -302,7 +314,7 @@ export class KnowledgeBase {
   save(draft: KnowledgeDraft, meta: KnowledgeMeta = {}): Promise<KnowledgeEntry> {
     return this.exclusive(async () => {
       const entries = await this.entries(true);
-      const saved = meta.requestId ? entries.find((entry) => entry.requestId === meta.requestId) : undefined;
+      const saved = meta.requestId ? byRequestId(entries, meta.requestId) : undefined;
       if (saved) {
         this.logger.info(`经验库 ${saved.id}「${saved.title}」上次已经存进去了（草稿 ${meta.requestId}），不重复保存`);
         return saved;
@@ -357,13 +369,16 @@ export class KnowledgeBase {
 
   /**
    * 归档一条经验：不再被检索到，表格里还留着，改回「有效」就恢复。
-   * 已经归档了的直接返回：上次点确认时表格改成功了、结果没传回来，再点一次要能接着做后面的（归档 aiops 里那条）
+   * 已经归档了的直接返回：上次点确认时表格改成功了、结果没传回来，再点一次要能接着做后面的（归档 aiops 里那条）。
+   * 卡片发出后编号被改了的，按卡片上那条的草稿编号认；两个都对不上时抛 MissingEntryError
    */
   archive(id: string, meta: KnowledgeMeta = {}): Promise<KnowledgeEntry> {
     return this.exclusive(async () => {
-      const entry = (await this.entries(true)).find((e) => e.id.toUpperCase() === normalizeId(id));
+      const entries = await this.entries(true);
+      const entry =
+        entries.find((e) => e.id.toUpperCase() === normalizeId(id)) ?? (meta.seen?.requestId ? byRequestId(entries, meta.seen.requestId) : undefined);
       if (!entry) {
-        throw new KnowledgeError(`经验库里没有 ${id}`);
+        throw new MissingEntryError(`经验库里没有 ${id}`);
       }
       // 先对卡片上的内容，再看是不是已经归档了：上次点确认归档成功、结果没传回来的，内容没变照样接着做；
       // 卡片发出后有人改了内容又归档了的，卡片作废，不去归档它现在同步在 aiops 里的那条
@@ -394,6 +409,24 @@ export class KnowledgeBase {
   }
 
   /**
+   * 向量缓存只留表格里现在这些行的（改之前的旧内容、删掉的行、改坏了不能检索的行的不留），不然表格一直在改、机器人一直开着，
+   * 缓存会越攒越多。归档的行还在表格里、带上 include_archived 还能检索到，留着。表格每重新读一次清一遍
+   */
+  private pruneVectors(entries: readonly KnowledgeEntry[]): void {
+    const read = this.cached?.entries;
+    if (!this.embedder || this.vectors.size === 0 || read === this.prunedFor) {
+      return;
+    }
+    this.prunedFor = read;
+    const live = new Set(entries.filter(usable).map((entry) => vectorKey(this.embedder!.model, indexText(entry))));
+    for (const key of this.vectors.keys()) {
+      if (!live.has(key)) {
+        this.vectors.delete(key);
+      }
+    }
+  }
+
+  /**
    * 提问和每条经验的余弦相似度；没配向量模型、向量服务出错或者到了期限时返回 undefined，只按关键词。
    * 到期限前算好的经验向量留在缓存里，下次接着算
    */
@@ -411,16 +444,21 @@ export class KnowledgeBase {
     const embed = (texts: string[]) => (stop ? raceAbort(embedder.embed(texts, stop), stop) : embedder.embed(texts));
     try {
       const texts = entries.map(indexText);
-      const keys = texts.map((text) => createHash("sha256").update(`${embedder.model}\n${text}`).digest("hex"));
+      const keys = texts.map((text) => vectorKey(embedder.model, text));
       const byKey = new Map(keys.map((key, i) => [key, texts[i]]));
-      const missing = [...byKey.keys()].filter((key) => !this.vectors.has(key));
+      // 这次要用的向量先取出来：等向量服务的时候别的检索读到了新表格、清缓存，清掉的是这次还要用的旧内容的向量
+      const found = new Map([...byKey.keys()].flatMap((key) => (this.vectors.has(key) ? [[key, this.vectors.get(key)!] as const] : [])));
+      const missing = [...byKey.keys()].filter((key) => !found.has(key));
       for (let i = 0; i < missing.length; i += EMBED_BATCH) {
         const batch = missing.slice(i, i + EMBED_BATCH);
         const vectors = await embed(batch.map((key) => byKey.get(key)!));
-        batch.forEach((key, j) => this.vectors.set(key, vectors[j]));
+        batch.forEach((key, j) => {
+          found.set(key, vectors[j]);
+          this.vectors.set(key, vectors[j]);
+        });
       }
       const [queryVector] = await embed([query]);
-      return keys.map((key) => cosine(queryVector, this.vectors.get(key)!));
+      return keys.map((key) => cosine(queryVector, found.get(key)!));
     } catch (err) {
       if (signal?.aborted) {
         throw err;
@@ -434,6 +472,11 @@ export class KnowledgeBase {
       return undefined;
     }
   }
+}
+
+/** 向量缓存的键：向量模型加上检索用的文字 */
+function vectorKey(model: string, text: string): string {
+  return createHash("sha256").update(`${model}\n${text}`).digest("hex");
 }
 
 /** 一条经验用来检索的文字：结论放在问题前面，两者各截一段，总长超了截掉的是问题的末尾 */
@@ -903,6 +946,42 @@ const AUTH_FIELD = new RegExp(String.raw`(?<![\w.-])["']?(\w*auth(?:[_-]?ident)?
 const DOCKER_CONFIG =
   /\.docker(?:configjson|cfg)["']?[^\S\r\n]*[:=][^\S\r\n]*(?:[|>][-+0-9]*[^\S\r\n]*\r?\n[ \t]+)?["']?([A-Za-z0-9+/]{16,}(?:\r?\n[ \t]+[A-Za-z0-9+/]+)*={0,2})(?![\w+/=])/gi;
 
+/**
+ * base64 编码过的私钥：kubeconfig 的 client-key-data、Kubernetes Secret 里的 tls.key、ssh-privatekey 这些，值是 PEM 私钥编成的 base64，
+ * 也可能是 DER 编码的私钥。不按名字认，不短于 64 个字符的一段 base64 都解开看；YAML 里折成几行的连起来再算长短
+ */
+const BASE64_RUN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{16,}(?:\r?\n[ \t]+[A-Za-z0-9+/]+)*={0,2}(?![A-Za-z0-9+/=_-])/g;
+
+function encodedPrivateKey(text: string): boolean {
+  return [...text.matchAll(BASE64_RUN)].some(([run]) => {
+    const encoded = run.replace(/\s+/g, "");
+    if (encoded.length < 64) {
+      return false;
+    }
+    const bytes = Buffer.from(encoded, "base64");
+    return /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(bytes.toString("latin1")) || isDerPrivateKey(bytes);
+  });
+}
+
+/**
+ * DER 编码的私钥：最外面的 SEQUENCE 里先是版本号 0 或 1（INTEGER），后面跟着 RSA 的 INTEGER、PKCS#8 的算法 SEQUENCE
+ * 或者 EC 的 OCTET STRING。证书、公钥的 SEQUENCE 里第一项是 SEQUENCE，加密过的 PKCS#8 也是，不算
+ */
+function isDerPrivateKey(bytes: Buffer): boolean {
+  if (bytes[0] !== 0x30 || bytes.length < 2) {
+    return false;
+  }
+  let i = 2;
+  if (bytes[1] & 0x80) {
+    const lengthBytes = bytes[1] & 0x7f;
+    if (lengthBytes < 1 || lengthBytes > 3) {
+      return false;
+    }
+    i += lengthBytes;
+  }
+  return bytes[i] === 0x02 && bytes[i + 1] === 0x01 && (bytes[i + 2] === 0x00 || bytes[i + 2] === 0x01) && [0x02, 0x30, 0x04].includes(bytes[i + 3]);
+}
+
 /** auth 配置项里写的是不是登录用的用户名和密码 */
 function isAuthCredential(name: string, value: string): boolean {
   if (/^[A-Za-z0-9+/]{8,}={0,2}$/.test(value) && isBasicCredential(value)) {
@@ -1045,6 +1124,9 @@ function findSecret(text: string): string | undefined {
   if (dockerConfig) {
     return dockerConfig;
   }
+  if (encodedPrivateKey(text)) {
+    return "私钥";
+  }
   if ([...text.matchAll(SIGNED_URL)].some(([, value]) => !isPlaceholder(value))) {
     return "带签名的临时访问地址";
   }
@@ -1173,6 +1255,22 @@ function checkSeen(entry: KnowledgeEntry, seen: KnowledgeEntry | undefined): voi
   if (seen && (!usable(entry) || !sameContent(entry, seen))) {
     throw new StaleProposalError(`经验 ${entry.id} 在卡片发出后在表格里改过，卡片上的已经不是现在这条，这张卡片不能再用。需要的话请按现在的内容重新起草`);
   }
+}
+
+/**
+ * 草稿编号是 requestId 的那一行。表格里复制出来的行带着同一个草稿编号、后来又改了编号时，编号查重认不出来，
+ * 随便挑一行可能挑到内容不相干的那行，后面同步、归档就做到别的行上了：分不清时报错，让人在表格里清掉复制出来的那行的草稿编号
+ */
+function byRequestId(entries: readonly KnowledgeEntry[], requestId: string): KnowledgeEntry | undefined {
+  const rows = entries.filter((entry) => entry.requestId === requestId);
+  if (rows.length > 1) {
+    // 编号里写进了密钥的不列出来，卡片上群里人人都看得到
+    const ids = rows.map((row) => row.id).filter((rowId) => !containsSecret(rowId));
+    throw new KnowledgeError(
+      `表格里有 ${rows.length} 行的「草稿编号」一样${ids.length > 0 ? `（经验 ${ids.join("、")}）` : ""}，多半是复制出来的行，分不清哪一行是这张卡片存的。请把复制出来的那几行的草稿编号清空后再点「再试一次」`,
+    );
+  }
+  return rows[0];
 }
 
 /** 这一行能拿来检索、给模型看、起草卡片：没缺标题或结论，没被写进密钥，编号也没和别的行重复 */
