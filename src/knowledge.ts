@@ -492,9 +492,12 @@ const SECRET_PATTERNS: [RegExp, string][] = [
 
 /**
  * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=correct.horse.battery.staple，
- * 这些配置什么样的值都能填）。值后面紧跟着代码符号的不算（getToken()、${MCP_AIOPS_TOKEN}、<token>、os.environ["X"]）
+ * 这些配置什么样的值都能填）。值取一整段：到空白、引号、逗号分号、右括号、星号、中文为止，中间的标点都算（abc:def!ghi）。
+ * 紧跟着 ( [ { < \ 的不算：那是代码、占位或者路径（getToken()、${MCP_AIOPS_TOKEN}、<token>、os.environ["X"]）
  */
-const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?([\w+/~=.-]{8,})(?![\w+/~=.(\[{<$@:\\-])`, "gi");
+const VALUE_CHAR = String.raw`[^\s"'\`,;*()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]`;
+const VALUE_END = String.raw`(?=$|[\s"'\`,;*)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
+const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?(${VALUE_CHAR}{8,})${VALUE_END}`, "gi");
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
 const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
 /** 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here）；夹着别的词的照样算（prod-secret-abcdefghijkl） */
@@ -502,13 +505,19 @@ const PLACEHOLDER_WORD =
   /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|placeholder|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
 /** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
 const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
+/** 整个值是 a.b.c 这样的属性引用 */
+const PROPERTY_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
 
-/** 写在密钥名字后面的值是不是占位：环境变量名、读密钥的属性引用，或者整个由报错、占位用词组成 */
+/** 写在密钥名字后面的值是不是占位：环境变量名、读密钥的属性引用、说密钥放在哪的地址，或者整个由报错、占位用词组成 */
 function isPlaceholder(raw: string): boolean {
-  // 句末的点不算值的一部分（token: expired.）
-  const value = raw.replace(/\.+$/, "");
+  // 句末的标点不算值的一部分（token: expired.、token=expired!）
+  const value = raw.replace(/[.!?:]+$/, "");
+  // 地址里带的密码、查询参数里的 token=… 由别的规则拦；$NAME 是变量引用
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$[A-Za-z_]\w*$/.test(value)) {
+    return true;
+  }
   const last = value.slice(value.lastIndexOf(".") + 1);
-  if (value.includes(".") && (CREDENTIAL_NAME.test(last) || ENV_NAME.test(last))) {
+  if (PROPERTY_PATH.test(value) && (CREDENTIAL_NAME.test(last) || ENV_NAME.test(last))) {
     return true;
   }
   return ENV_NAME.test(value) || value.split(/[_+/~=.-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));

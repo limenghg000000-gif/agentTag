@@ -130,6 +130,13 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 带点的也算，只有读密钥的属性引用（cfg.Token、process.env.MODEL_API_KEY）不算
     "MODEL_API_KEY=correct.horse.battery.staple",
     "token: correct.horse.battery.staple.",
+    // 值里带冒号、感叹号这些标点的整段都算，不会因为中间有标点就放过
+    "MCP_AIOPS_TOKEN=abc:defghijklmnopqrstuvwxyz",
+    "token=correct!horse#battery",
+    'secret: "horse:battery:staple"',
+    "api_key=horse&battery%staple^x",
+    "**MCP_AIOPS_TOKEN=correcthorsebattery**",
+    "token=correct:horse.Token",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -155,6 +162,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "token: expired. 重新登录就好",
     "api_key=process.env.MODEL_API_KEY，apiKey: settings.apiKey",
     "接口要 Basic authentication，Authorization: Basic *** 或者 Basic <base64>，Basic configuration 不对时报 401",
+    "secret 放在 vault 里：secret: https://vault.example.com/agenttag，token=ab***cd 是打了码的，token=$MCP_AIOPS_TOKEN 从环境变量读",
+    "报错 token=expired! 重新登录；api_key=os.environ[\"MODEL_API_KEY\"]；secret_key: C:\\keys\\agent",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
