@@ -230,7 +230,7 @@ async function runTask(
     const failures: string[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext) ?? [];
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...knowledgeTools, ...(memory?.tools ?? [])].map(
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
@@ -249,6 +249,10 @@ async function runTask(
           return output;
         },
       }),
+    ).concat(
+      // 经验库的工具不记进上面几样：查到的是以前确认过的结论，不是这次实时查到的数据，也不是这次读到的代码。
+      // 只查了经验库就给出线上结论、引用文件行号，照样要打回
+      knowledgeTools,
     );
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
@@ -409,7 +413,8 @@ async function lookupKnowledge(
     return undefined;
   }
   const root = history.find((m) => m.role === "user")?.content;
-  const query = root && root !== asked ? `${root}\n${asked}` : asked;
+  // 追问放前面：两个库都只取前面一段去查，第一个问题很长时，追问里新给的错误码、服务名不能被截掉
+  const query = root && root !== asked ? `${asked}\n${root}` : asked;
   // 经验库自己按库限时；这里再给整个检索一个上限：飞书接口不认中止信号，卡住了也不能拖住回答
   const timeout = timeoutSignal(deps.knowledgeLookupMs ?? KNOWLEDGE_LOOKUP_MS);
   try {

@@ -23,6 +23,10 @@ export const MAX_TITLE_CHARS = 80;
 export const MAX_FIELD_CHARS = 2000;
 /** 写进系统提示词时每条经验最多多少字 */
 const PROMPT_ENTRY_CHARS = 1200;
+/** 写进系统提示词时每个字段最多多少字：问题写得很长时结论也要放得下 */
+const PROMPT_FIELD_CHARS = 400;
+/** 写进系统提示词时先列的字段：模型要用的是结论和处理办法 */
+const PROMPT_FIRST_FIELDS = ["结论", "怎么处理"];
 /** 列表多久重新读一次：多维表格里有人直接改了，过一会儿就能用上 */
 const CACHE_MS = 60_000;
 /** 一次给向量模型的条数（百炼 text-embedding-v4 一次最多 10 条） */
@@ -242,7 +246,10 @@ export class KnowledgeBase {
     });
   }
 
-  /** 归档一条经验：不再被检索到，表格里还留着，改回「有效」就恢复 */
+  /**
+   * 归档一条经验：不再被检索到，表格里还留着，改回「有效」就恢复。
+   * 已经归档了的直接返回：上次点确认时表格改成功了、结果没传回来，再点一次要能接着做后面的（归档 aiops 里那条）
+   */
   archive(id: string, meta: KnowledgeMeta = {}): Promise<KnowledgeEntry> {
     return this.exclusive(async () => {
       const entry = (await this.entries(true)).find((e) => e.id.toUpperCase() === normalizeId(id));
@@ -250,7 +257,8 @@ export class KnowledgeBase {
         throw new KnowledgeError(`经验库里没有 ${id}`);
       }
       if (entry.status === "archived") {
-        throw new KnowledgeError(`${entry.id} 已经归档过了`);
+        this.logger.info(`经验库 归档 ${entry.id}：已经是归档状态，不用再改`);
+        return entry;
       }
       await this.backend.update(entry.id, { status: "archived" });
       this.cached = undefined;
@@ -411,7 +419,8 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\bglpat-[\w-]{16,}/, "GitLab 令牌"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, "GitHub 令牌"],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/, "GitHub 令牌"],
-  [/\bsk-[A-Za-z0-9]{20,}/, "API 密钥"],
+  // sk-proj-…、sk-ant-api03-…、sk-svcacct-… 中间带连字符的也算，这种要带数字，免得把 sk- 开头的长名字当成密钥
+  [/\bsk-(?:[A-Za-z0-9]{20,}|(?=[\w-]*\d)[\w-]{20,})/, "API 密钥"],
   [/\b(?:AKIA|LTAI)[A-Za-z0-9]{12,}/, "云服务的 AccessKey"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
@@ -477,16 +486,23 @@ export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
 const DATE_FORMAT = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "numeric", day: "numeric" });
 
 /** 一条经验写成文字：标题一行，下面按字段列出，最后一行是状态、确认人和日期 */
-export function formatKnowledge(entry: KnowledgeEntry, { limit }: { limit?: number } = {}): string {
+export function formatKnowledge(
+  entry: KnowledgeEntry,
+  { limit, fieldChars, first = [] }: { limit?: number; fieldChars?: number; first?: readonly string[] } = {},
+): string {
   const meta = [
     entry.status === "archived" ? "已归档" : "",
     entry.confirmedBy ? `确认人 ${entry.confirmedBy}` : "",
     DATE_FORMAT.format(new Date(entry.createdAt)),
     entry.aiopsId ? `aiops 里是经验 #${entry.aiopsId}` : "",
   ].filter(Boolean);
+  const fields = fieldLines(entry);
   const text = [
     `经验 ${entry.id} [${KNOWLEDGE_CATEGORIES[entry.category]}]：${entry.title}`,
-    ...fieldLines(entry).map(([name, value]) => `- ${name}：${value}`),
+    ...[...fields.filter(([name]) => first.includes(name)), ...fields.filter(([name]) => !first.includes(name))].map(
+      ([name, value]) =>
+        `- ${name}：${fieldChars !== undefined && value.length > fieldChars ? `${value.slice(0, fieldChars)}…（这一项后面省略，要看全文用 knowledge_get）` : value}`,
+    ),
     `（${meta.join("，")}）`,
   ].join("\n");
   return limit !== undefined && text.length > limit ? `${text.slice(0, limit)}…（后面省略，要看全文用 knowledge_get）` : text;
@@ -509,5 +525,7 @@ export function fieldLines(entry: KnowledgeDraft): [string, string][] {
 
 /** 写进系统提示词的「可能相关的经验」 */
 export function renderHitsForPrompt(hits: readonly KnowledgeHit[]): string {
-  return hits.map((hit) => formatKnowledge(hit.entry, { limit: PROMPT_ENTRY_CHARS })).join("\n\n");
+  return hits
+    .map((hit) => formatKnowledge(hit.entry, { limit: PROMPT_ENTRY_CHARS, fieldChars: PROMPT_FIELD_CHARS, first: PROMPT_FIRST_FIELDS }))
+    .join("\n\n");
 }

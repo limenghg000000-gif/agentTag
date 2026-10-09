@@ -9,6 +9,7 @@ import {
   type KnowledgeEntry,
   KnowledgeError,
   normalizeDraft,
+  renderHitsForPrompt,
 } from "../src/knowledge.js";
 import { AiopsLessons, type LessonsMcp } from "../src/knowledge-aiops.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
@@ -22,6 +23,8 @@ class MemoryBackend implements KnowledgeBackend {
   failAdd?: Error;
   /** 前几次 update 失败 */
   failUpdates = 0;
+  /** 前几次 update 改成功了，但结果没传回来 */
+  lostUpdates = 0;
 
   async location() {
     return "https://example.feishu.cn/base/app1?table=tbl1";
@@ -45,6 +48,10 @@ class MemoryBackend implements KnowledgeBackend {
       throw new KnowledgeError("飞书接口限流");
     }
     Object.assign(this.entries.find((entry) => entry.id === id)!, changes);
+    if (this.lostUpdates > 0) {
+      this.lostUpdates--;
+      throw new KnowledgeError("socket hang up");
+    }
   }
 }
 
@@ -85,6 +92,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "GITLAB_TOKEN=glpat-abcdefghijklmnopqrstu",
     "用 sk-abcdefghijklmnopqrstuvwxyz123 调的接口",
     "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789",
+    "OPENAI_KEY 是 sk-proj-abcdefghij0123456789_ABCDEFGHIJ-klmnop",
+    "sk-ant-api03-abcdefghijklmnop0123456789",
+    "sk-svcacct-AbCdEfGhIj0123456789",
     "password=correcthorsebatterystaple",
     "mysql://agent:p4ssw0rd@10.0.0.5:3306/aiops",
     "数据库密码：Abc12345678",
@@ -98,6 +108,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
   }
   assert.ok(normalizeDraft({ ...code8, basis: "报错 token expired，令牌过期后重新登录；密码：***" }));
   assert.ok(normalizeDraft({ ...code8, basis: "密码：请找管理员重置；token=expired_session" }));
+  assert.ok(normalizeDraft({ ...code8, basis: "用 sk-learn-preprocessing-pipeline 处理的数据" }));
 });
 
 function fakeEmbedder(topics: string[]) {
@@ -131,7 +142,9 @@ test("经验库：编号按最大编号加一，记下发起人、确认人和�
   assert.equal(backend.entries[0].status, "archived");
   assert.deepEqual(await base.search("code=8 ResourceExhausted"), []);
   assert.equal((await base.search("code=8 ResourceExhausted", { includeArchived: true }))[0]?.entry.id, "K1");
-  await assert.rejects(base.archive("K1"), /已经归档过了/);
+  backend.failUpdates = 1;
+  assert.equal((await base.archive("K1")).status, "archived", "已经归档了的再归档一次不报错，也不改表格");
+  backend.failUpdates = 0;
   await assert.rejects(base.archive("K9"), /经验库里没有 K9/);
 
   // 有人在表格里删了中间的行，编号还是往后排
@@ -160,7 +173,12 @@ test("问题写得很长时，只在结论里出现的说法也能检索到", as
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet });
   await base.save(normalizeDraft({ ...dau, keywords: "", question: "讨论记录：".concat("大家各自说了统计的口径。".repeat(160)), conclusion: "以埋点表 app_open 去重为准" }));
-  assert.equal((await base.search("app_open 去重"))[0]?.entry.id, "K1");
+  const hits = await base.search("app_open 去重");
+  assert.equal(hits[0]?.entry.id, "K1");
+  // 写进提示词时结论在前，每个字段截短，问题再长结论也在
+  const rendered = renderHitsForPrompt(hits);
+  assert.match(rendered, /^经验 K1 \[数据口径\]：日活的口径\n- 结论：以埋点表 app_open 去重为准\n- 问题或场景：讨论记录：/);
+  assert.ok(rendered.length <= 1300, String(rendered.length));
 });
 
 test("有向量模型时按意思检索：向量按内容缓存，列表一分钟内不重读；向量服务出错时退回关键词", async () => {
@@ -606,6 +624,25 @@ test("归档：团队经验库的按编号，aiops 经验库的按 aiops_id；�
   await desk.handleCardAction({ ...click(lessonCard, "archive"), messageId: "om_card_3" });
   await desk.idle();
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 40 }]);
+});
+
+test("归档时表格改成功了、结果没传回来：再点一次照常完成，aiops 里同步的那条也归档", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  backend.lostUpdates = 1;
+  await desk.handleCardAction(click(card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.match(cardText(lastCard()), /上次点确认没成功：socket hang up/);
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+
+  await desk.handleCardAction(click(card, "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档经验 K1.*\naiops 经验库里同步的经验 #31 也已归档/);
 });
 
 test("回答前检索：两个库一起查，已同步到 aiops 的只列团队经验库那条；一个库出错不影响另一个，都出错时返回空", async () => {

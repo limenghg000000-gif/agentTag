@@ -361,8 +361,9 @@ test("回答前先查经验库：查到的写进提示词，进度卡片多一�
     { role: "user", content: "[张三] gateway-api 报 code=8" },
     { role: "assistant", content: "原因是……" },
   ]);
-  assert.match(queries[1], /^\[张三\] gateway-api 报 code=8\n/);
-  assert.match(queries[1], /那现在修好了吗$/);
+  // 追问放前面：第一个问题很长时两个库只取前面一段，追问不能被截掉
+  assert.match(queries[1], /^那现在修好了吗\n/);
+  assert.match(queries[1], /\[张三\] gateway-api 报 code=8$/);
 
   respond = async () => ({ text: "", ids: [] });
   const none = await ask("今天中午吃什么");
@@ -1173,6 +1174,31 @@ test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查�
   assert.equal(requests.length, 3);
   assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
   assert.deepEqual(markdowns(sent), ["aiops 这次查询超时了，暂时没法确认，请稍后再试"]);
+});
+
+test("只查了经验库就给出线上结论也打回：经验库里是以前的结论，不算这次查过", async () => {
+  const knowledgeSearch: Tool = {
+    spec: { name: "knowledge_search", description: "查经验库", parameters: { type: "object", properties: {} } },
+    describe: () => "查经验库",
+    run: async () => "经验 K1 [排查经验]：product-service-api 最近一小时没有报错",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "knowledge_search", arguments: "{}" }] },
+    { text: "最近 1 小时没有查到报错日志", finish: "stop" },
+    { text: "经验库里有一条以前的结论，这次还没用 aiops 核实", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    knowledge: { lookup: async () => undefined, tools: () => [knowledgeSearch] },
+    mcp: { names: ["aiops"], tools: () => [], prompt: () => undefined },
+  });
+
+  await handle(message("product-service-api 最近一小时报错多吗"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.deepEqual(markdowns(sent), ["经验库里有一条以前的结论，这次还没用 aiops 核实"]);
 });
 
 test("aiops 连不上、这次没有它的工具时，照搬话题里之前的数据也会被打回", async () => {
