@@ -2742,6 +2742,24 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").slice(before).map((call) => call.args), [{ id: 31 }]);
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 上次已经在表格里归档了。\naiops 经验库里同步的经验 #31 也已归档/);
   assert.equal(backend.entries[0].status, "archived");
+
+  // 再试之前有人复制了这一行（草稿编号一样、按草稿编号分不清）：按归档时记下的 aiops 编号接着做
+  const copied = deskSetup();
+  await copied.base.save(normalizeDraft(code8), { requestId: "req-1" });
+  await copied.base.linkAiops("K1", 31);
+  await copied.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  copied.handlers.archive_lesson = () => {
+    throw new Error("aiops 现在连不上");
+  };
+  await copied.desk.handleCardAction(copied.click((copied.sent[0].input as { card: any }).card, "archive"));
+  await copied.desk.idle();
+  copied.backend.entries.push({ ...structuredClone(copied.backend.entries[0]), id: "K2", status: "active" });
+  copied.handlers.archive_lesson = archiveLesson;
+  const tried = copied.calls.filter((call) => call.tool === "archive_lesson").length;
+  await copied.desk.handleCardAction(copied.click(copied.lastCard(), "archive"));
+  await copied.desk.idle();
+  assert.deepEqual(copied.calls.filter((call) => call.tool === "archive_lesson").slice(tried).map((call) => call.args), [{ id: 31 }]);
+  assert.match((copied.sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 上次已经在表格里归档了。\naiops 经验库里同步的经验 #31 也已归档/);
 });
 
 test("归档没有草稿编号的行（表格里手动加的）：卡片发出后改了编号的按内容认出来归档；找不到时不当成删了，卡片留着；内容一样的好几行分不清时也留着", async () => {

@@ -867,10 +867,16 @@ export class KnowledgeDesk {
     }
     if (proposal.archivedRow) {
       // 上次已经在表格里归档了这一行，只差 aiops 那步：之后这一行的内容在表格里改了也接着做（核对卡片上的内容是归档之前的事）。
-      // aiops 编号按表格里现在的（上次是编号填错了没归档成、改正了再试一次）；这一行被删了就用归档时记下的。归档前照样核对出处
+      // aiops 编号按表格里现在的（上次是编号填错了没归档成、改正了再试一次）；这一行被删了、读不出来（表格读失败、复制出了草稿编号一样的行）
+      // 就用归档时记下的。归档前照样核对出处
       const { id, aiopsId } = proposal.archivedRow;
       const { base } = this.options;
-      const current = target.entry.requestId ? await base.saved(target.entry.requestId, id) : await base.get(id, { fresh: true });
+      let current: KnowledgeEntry | undefined;
+      try {
+        current = target.entry.requestId ? await base.saved(target.entry.requestId, id) : await base.get(id, { fresh: true });
+      } catch (err) {
+        this.logger.warn(`经验库卡片 重新读取已归档的经验 ${id} 没成功，按归档时记下的 aiops 编号接着做 proposal=${proposal.id}：${describe(err)}`);
+      }
       const out: Outcome = { done: [`经验 ${id} 上次已经在表格里归档了。`], unfinished: [] };
       const linked = current ? current.aiopsId : aiopsId;
       if (linked !== undefined) {
