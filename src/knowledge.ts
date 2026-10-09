@@ -461,10 +461,10 @@ export function normalizeId(id: string): string {
 /** 写明了是密钥的名字：token、secret、API Key（MODEL_API_KEY、apiKey、x-api-key）、AccessKey、私钥，也算 secret_key、token_key 这类 */
 const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-]?(?:access[_-]?)?key)?`;
 /**
- * 等号、冒号后面到值之前：值可以写在同一行，也可以换行缩进着写（YAML）。换行不缩进的是下一行配置
- * （.env 里空着的 MCP_AIOPS_TOKEN= 下面一行的 KNOWLEDGE=off），不是它的值
+ * 等号、冒号后面到值之前的空白不跨行：下一行是别的配置（.env 里空着的 MCP_AIOPS_TOKEN= 下面一行的 KNOWLEDGE=off）
+ * 或者嵌套的子项（k8s 的 secret: 下面一行的 secretName: …），不是它的值。YAML 里值写在下面几行的见 blockValues
  */
-const BEFORE_VALUE = String.raw`(?:[^\S\r\n]*\r?\n[ \t]+|[^\S\r\n]*)`;
+const BEFORE_VALUE = String.raw`[^\S\r\n]*`;
 /** 名字和值之间：名字可以带引号（{"password": …}），等号、冒号、=>（PHP 数组）都算 */
 const ASSIGN = String.raw`["']?[^\S\r\n]*(?:=>|[:=：])${BEFORE_VALUE}`;
 /** 引号里的一整段值，中间有空格的口令也是一整段（"correct horse battery staple"）；里面有中文的是说明，有 * 的是打了码的，不算 */
@@ -526,10 +526,41 @@ const ENV_ASSIGNMENT = new RegExp(
  * 一行开头的配置项，大小写都算：db_password=…、export api_key=…、YAML 的 api_key: …、- token: …、spring.datasource.password=…。
  * 名字要以密钥的词结尾（token_ttl、tokenizer 说的不是密钥）；句子中间小写的 token=…、token: … 是报错原文，不在这里认
  */
-const LINE_ASSIGNMENT = new RegExp(
-  String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?[\w.-]*(?:${SECRET_LABEL}|password|passwd|[_.-]pwd)\d*[ \t]*(?:=|:(?!:))${LINE_VALUE}`,
-  "gim",
-);
+const CONFIG_KEY = String.raw`[\w.-]*(?:${SECRET_LABEL}|password|passwd|[_.-]pwd)\d*`;
+const LINE_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?${CONFIG_KEY}[ \t]*(?:=|:(?!:))${LINE_VALUE}`, "gim");
+/**
+ * YAML 里值写在下面几行的配置项：块写法（api_key: |-、api_key: >）或者冒号后面空着、下一行缩进着写。
+ * 第 1 组是这一行的缩进，第 2 组是块写法的标记（| 或 >，可带 - + 和数字）
+ */
+const BLOCK_KEY = new RegExp(String.raw`^([ \t]*)(?:-[ \t]+)?["']?${CONFIG_KEY}["']?[ \t]*:[ \t]*([|>][1-9+-]{0,2})?[ \t]*(?:#.*)?$`, "i");
+/** 冒号后面空着时，下面缩进的是一个子项（name: …）或者列表（- …）就不是它的值，是嵌套的配置（k8s 的 secret: 下面写 secretName），子项各自按行检查 */
+const NESTED_LINE = /^[ \t]*(?:-(?:[ \t]|$)|["']?[\w.-]+["']?[ \t]*:(?:[ \t]|$)|#)/;
+/** 值里中文、反引号、行内注释以后是说明 */
+const NOTE_START = /[`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|[ \t]#/;
+
+/** YAML 里写在下面几行的值：下面缩进比配置项深的几行连起来。带 * 的是打了码的，不算 */
+function blockValues(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  return lines.flatMap((line, i) => {
+    const key = BLOCK_KEY.exec(line);
+    if (!key) {
+      return [];
+    }
+    const body: string[] = [];
+    for (const next of lines.slice(i + 1)) {
+      if (next.trim() === "") {
+        continue;
+      }
+      if (/^[ \t]*/.exec(next)![0].length <= key[1].length || (body.length === 0 && !key[2] && NESTED_LINE.test(next))) {
+        break;
+      }
+      const note = NOTE_START.exec(next);
+      body.push((note ? next.slice(0, note.index) : next).trim());
+    }
+    const value = body.join(" ").trim();
+    return value.length >= 8 && !value.includes("*") ? [value] : [];
+  });
+}
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
 const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
 /**
@@ -578,6 +609,7 @@ function findSecret(text: string): string | undefined {
   const values = [
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
     ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
+    ...blockValues(text),
   ];
   return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }

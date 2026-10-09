@@ -148,8 +148,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "export DB_PASSWORD=correct horse battery staple # 2026-10 换的",
     "设置 GITLAB_TOKEN=correct horse battery 后重启",
     "  export api_key=correct horse battery staple",
-    // YAML 里换行缩进着写的值
+    // YAML 里写在下面几行的值：冒号后面空着换行缩进着写，或者块写法（|-、>）
     "aiops:\n  token:\n    correcthorsebatterystaple",
+    "api_key:\n  my correct horse battery staple",
+    "api_key: |-\n  my correct horse battery staple",
+    "aiops:\n  token: >\n    correct horse\n    battery staple\n  url: https://aiops.example",
     // 一行开头的 YAML、properties 配置项，不带引号、中间有空格的值也取到行尾
     "api_key: my correct horse battery staple",
     "aiops:\n  api_key: my correct horse battery staple  # 换过",
@@ -191,6 +194,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "MCP_AIOPS_TOKEN=null, FEISHU_APP_SECRET=undefined\naccess_token=null, refresh_token=undefined",
     // 一行开头的报错原文、名字不以密钥的词结尾的配置项
     "token: signature is invalid\nToken: has expired, please login again\ntoken_ttl: 3600 seconds\ntokenizer: bert base uncased",
+    // 冒号后面空着、下面是嵌套的子项（k8s 的 secret: 下面写 secretName），不是它的值；块写法里是变量引用的也不算
+    "volumes:\n  - name: tok\n    secret:\n      secretName: aiops-secrets\napi_key: |-\n  ${MODEL_API_KEY}",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
