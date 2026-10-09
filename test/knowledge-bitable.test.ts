@@ -527,6 +527,28 @@ test("表格里有两行编号相同（有人复制了行）时不去改它们�
   assert.equal(tables.get("tblX")!.records[2].fields["状态"], "已归档");
 });
 
+test("编号重复的警告里，像是密钥的编号（有人把密钥贴进编号那一列、又复制了这一行）不写出来", async () => {
+  const { api, tables } = fakeBitable();
+  // GitLab 令牌认小写的前缀：统一写法（大写）以后就认不出了，要按表格里的原样查
+  const leaked = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: leaked } },
+      { recordId: "recB", fields: { 标题: "日活的口径（副本）", 结论: "去重用户数", 编号: leaked.toLowerCase() } },
+      { recordId: "recC", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K2" } },
+      { recordId: "recD", fields: { 标题: "留存的口径（副本）", 结论: "次日还打开", 编号: "K2" } },
+    ],
+  });
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "leaked-id", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger });
+  await backend.list();
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /不止一行用了同一个编号：（像是密钥的编号，不写出来） K2。/);
+  assert.ok(!/AbCdEf/i.test(warnings[0]));
+});
+
 test("表格里的编号写成「#K3」「K 3」：按 K3 认，改得到那一行；写法不同、编号一样的两行（K 5 和 k5）算重复，不去改", async () => {
   const { api, tables } = fakeBitable();
   tables.set("tblX", {

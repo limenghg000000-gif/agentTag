@@ -22,7 +22,7 @@ import {
   StaleProposalError,
   usable,
 } from "../knowledge.js";
-import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, lessonHasSecret, renderAiopsHitsForPrompt, syncedFrom } from "../knowledge-aiops.js";
+import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, type AiopsSent, lessonHasSecret, renderAiopsHitsForPrompt, syncedFrom } from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { Tool } from "./tool.js";
 
@@ -126,8 +126,11 @@ interface SaveProposal extends ProposalBase {
   approved?: { draft: KnowledgeDraft; by: string };
   /** 表格里这一行改过，和确认过的不一样：卡片上列出来，写权限名单里的人点「再试一次」才按它同步 */
   reconfirm?: KnowledgeDraft;
-  /** 调 save_lesson 出错时发过去的内容：可能已经存进去、只是结果没传回来，再试之前先按这些找一下 */
-  aiopsUnsure?: KnowledgeDraft[];
+  /**
+   * 调 save_lesson 出错时发过去的内容和注明的出处：可能已经存进去、只是结果没传回来，再试之前先按这些找一下。
+   * 出处要记下来：再试之前表格里改了编号的话，存进去的那条注明的还是当时的编号
+   */
+  aiopsUnsure?: AiopsSent[];
 }
 
 /** 起草时定下的内容，发卡片时再补上编号、群、话题这些 */
@@ -670,7 +673,8 @@ export class KnowledgeDesk {
         const saved = await this.saveLesson(proposal, entry.id, approved, replacedLesson, confirmedBy, task);
         proposal.synced = saved.synced;
         proposal.syncedDraft = saved.draft;
-        proposal.syncedAs = entry.id;
+        // 找回来的上次存的那条注明的是当时的编号：和现在的编号不一样时，keepSynced 归档它、按现在的编号重新同步
+        proposal.syncedAs = saved.teamId;
       } catch (err) {
         out.unfinished.push(`没能同步到 aiops 经验库：${describe(err)}`);
         return "keep-until-synced";
@@ -802,7 +806,7 @@ export class KnowledgeDesk {
     replacedLesson: number | undefined,
     confirmedBy: string,
     task: McpTaskContext,
-  ): Promise<{ synced: AiopsSaveResult; draft: KnowledgeDraft }> {
+  ): Promise<{ synced: AiopsSaveResult; draft: KnowledgeDraft; teamId: string }> {
     const { aiops } = this.options;
     if (!aiops?.writable) {
       throw new KnowledgeError("aiops 现在连不上");
@@ -811,16 +815,16 @@ export class KnowledgeDesk {
       const existing = proposal.aiopsUnsure ? await aiops.findSynced(proposal.aiopsUnsure, teamId, task) : undefined;
       if (existing !== undefined) {
         proposal.aiopsUnsure = undefined;
-        return { synced: { saved: true, id: existing.id }, draft: existing.draft };
+        return { synced: { saved: true, id: existing.id }, draft: existing.draft, teamId: existing.teamId };
       }
       const options = { confirmedBy, teamId, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
       let synced = await aiops.save(draft, options, task);
       if (!synced.saved && proposal.aiopsUnsure) {
         // 上次存进去了、结果没传回来，上面又没检索到（aiops 检索只给前几条）：aiops 说重复的那条正是这一条同步过去的，就是上次存的
-        const own = await aiops.ownDuplicate(synced.duplicate.id, [...proposal.aiopsUnsure, draft], teamId, task);
+        const own = await aiops.ownDuplicate(synced.duplicate.id, [...proposal.aiopsUnsure, { draft, teamId }], teamId, task);
         if (own) {
           proposal.aiopsUnsure = undefined;
-          return { synced: { saved: true, id: own.id }, draft: own.draft };
+          return { synced: { saved: true, id: own.id }, draft: own.draft, teamId: own.teamId };
         }
       }
       if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
@@ -832,10 +836,10 @@ export class KnowledgeDesk {
         }
       }
       proposal.aiopsUnsure = undefined;
-      return { synced, draft };
+      return { synced, draft, teamId };
     } catch (err) {
-      if (!proposal.aiopsUnsure?.some((sent) => JSON.stringify(sent) === JSON.stringify(draft))) {
-        proposal.aiopsUnsure = [...(proposal.aiopsUnsure ?? []), draft];
+      if (!proposal.aiopsUnsure?.some((sent) => sent.teamId === teamId && JSON.stringify(sent.draft) === JSON.stringify(draft))) {
+        proposal.aiopsUnsure = [...(proposal.aiopsUnsure ?? []), { draft, teamId }];
       }
       throw err;
     }

@@ -42,6 +42,19 @@ export interface AiopsLesson {
 
 export type AiopsSaveResult = { saved: true; id: number } | { saved: false; duplicate: { id: number; title: string; why?: string } };
 
+/** 发给 save_lesson 的一次：内容，和排查过程末尾注明的出处（当时这一行在团队经验库里的编号） */
+export interface AiopsSent {
+  draft: KnowledgeDraft;
+  teamId: string;
+}
+
+/** 找回来的之前同步过去的那条：aiops 里的编号、按什么内容存的、出处注明的是哪个编号 */
+export interface AiopsSynced {
+  id: number;
+  draft: KnowledgeDraft;
+  teamId: string;
+}
+
 /** McpHub 里要用的几个方法 */
 export interface LessonsMcp {
   /** 服务端有没有这个工具（不管开没开给模型） */
@@ -190,12 +203,14 @@ export class AiopsLessons {
   }
 
   /**
-   * 团队经验库里这一条之前同步到 aiops 的经验和当时发过去的内容，看排查过程末尾的出处；没有时返回 undefined。
+   * 团队经验库里这一条之前同步到 aiops 的经验和当时发过去的内容，看排查过程末尾的出处；没有时返回 undefined。teamId 是这一行现在的编号，
+   * 出处也可能是发过去那次的编号（之后表格里改了编号）。
    * aiops 不能按出处查，只能检索：用当时发过去的内容查（表格后来改过也不影响），带上服务名和关键词让那一条排在前面，不按分数筛。
-   * 找到的那条之后可能在 aiops 里被改过：和 ownDuplicate 一样取出全文对一遍，对不上的按 aiops 里存的内容算
+   * 找到的那条之后可能在 aiops 里被改过：和 ownDuplicate 一样取出全文对一遍
    */
-  async findSynced(sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<{ id: number; draft: KnowledgeDraft } | undefined> {
-    for (const draft of sent) {
+  async findSynced(sent: readonly AiopsSent[], teamId: string, task: McpTaskContext): Promise<AiopsSynced | undefined> {
+    const teamIds = [teamId, ...sent.map((one) => one.teamId)];
+    for (const { draft } of sent) {
       const hits = await this.query(
         {
           text: `${draft.title}\n${draft.question}`.slice(0, QUERY_CHARS),
@@ -205,10 +220,11 @@ export class AiopsLessons {
         },
         task,
       );
-      const found = hits.find((hit) => syncedFrom(hit.diagnosis_path, teamId));
-      const own = found && (await this.ownDuplicate(found.id, sent, teamId, task));
-      if (own) {
-        return own;
+      for (const hit of hits.filter((hit) => teamIds.some((id) => syncedFrom(hit.diagnosis_path, id)))) {
+        const own = await this.ownDuplicate(hit.id, sent, teamId, task);
+        if (own) {
+          return own;
+        }
       }
     }
     return undefined;
@@ -216,19 +232,24 @@ export class AiopsLessons {
 
   /**
    * aiops 里的经验 #id 是不是团队经验库这一条之前同步过去、还有效的（排查过程最后一行是出处）：findSynced 检索到的，
-   * 或者 aiops 说和它重复的（上次存进去了、结果没传回来，检索又没排到它）。是的话返回它和发过去的内容里对得上的那份；
-   * 都对不上的（在 aiops 里改过）按 aiops 里存的内容算，和表格里的不一样时会归档它、按表格重新同步。不是的返回 undefined
+   * 或者 aiops 说和它重复的（上次存进去了、结果没传回来，检索又没排到它）。是的话返回它和发过去的内容里对得上的那份。
+   * 出处是发过去那次的编号、内容也一样的就是那次存的（之后表格里改了编号也认得出）；内容都对不上的（在 aiops 里改过），
+   * 只认出处是这一行现在编号（teamId）的，按 aiops 里存的内容算，和表格里的不一样时会归档它、按表格重新同步：
+   * 以前的编号可能已经被别的行用了，光凭出处认不出是不是这一条的。不是的返回 undefined
    */
-  async ownDuplicate(id: number, sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<{ id: number; draft: KnowledgeDraft } | undefined> {
+  async ownDuplicate(id: number, sent: readonly AiopsSent[], teamId: string, task: McpTaskContext): Promise<AiopsSynced | undefined> {
     const lesson = await this.get(id, task);
-    if (lesson.status !== "active" || !syncedFrom(lesson.diagnosis_path, teamId)) {
+    if (lesson.status !== "active") {
+      return undefined;
+    }
+    const match = sent.find((one) => syncedFrom(lesson.diagnosis_path, one.teamId) && sameLesson(lesson, lessonContent(one.draft, one.teamId)));
+    if (match) {
+      return { id, draft: match.draft, teamId: match.teamId };
+    }
+    if (!syncedFrom(lesson.diagnosis_path, teamId)) {
       return undefined;
     }
     const stored = (key: LessonField) => (lesson[key] ?? "").trim();
-    const draft = sent.find((draft) => sameLesson(lesson, lessonContent(draft, teamId)));
-    if (draft) {
-      return { id, draft };
-    }
     const basis = stored("diagnosis_path").split(/\r?\n/).slice(0, -1).join("\n").trim();
     return {
       id,
@@ -244,6 +265,7 @@ export class AiopsLessons {
         ...(lesson.error_codes?.trim() ? { errorCodes: lesson.error_codes.trim() } : {}),
         ...(lesson.alertname?.trim() ? { alertname: lesson.alertname.trim() } : {}),
       },
+      teamId,
     };
   }
 

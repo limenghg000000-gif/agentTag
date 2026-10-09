@@ -733,7 +733,7 @@ test("aiops 里的经验只有排查过程最后一行是这一条的出处才�
   }
   await lessons.archiveSynced(31, ["K1"], "ML", task);
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
-  assert.equal((await lessons.findSynced([normalizeDraft(code8)], "K1", task))?.id, 31);
+  assert.equal((await lessons.findSynced([{ draft: normalizeDraft(code8), teamId: "K1" }], "K1", task))?.id, 31);
 });
 
 function deskSetup({
@@ -1635,6 +1635,74 @@ test("同步到 aiops 时结果没传回来、再试时检索没排到存进去�
   const result = (sent.at(-1)!.input as { markdown: string }).markdown;
   assert.match(result, /已同步到 aiops 经验库（经验 #31）/);
   assert.doesNotMatch(result, /相近的经验/);
+});
+
+test("同步到 aiops 时结果没传回来、再试前表格里改了编号：按当时的编号认出存进去的那条（检索到的、aiops 说重复的都算），归档它、按新编号重新同步", async () => {
+  for (const found of [true, false]) {
+    let lose = true;
+    const stored = new Map<number, Record<string, unknown>>();
+    const { backend, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup({
+      saveLesson: (args) => {
+        if (lose) {
+          lose = false;
+          stored.set(31, { ...args, status: "active" });
+          throw new Error("socket hang up");
+        }
+        // 上次存进去的那条还有效时，aiops 说新的和它重复
+        if (stored.get(31)!.status === "active") {
+          return JSON.stringify({ saved: false, duplicate_of: { id: 31, title: String(args.title), why: "标题相同" } });
+        }
+        stored.set(32, { ...args, status: "active" });
+        return JSON.stringify({ saved: true, id: 32 });
+      },
+      // found 为 false 时检索没排到存进去的那条
+      searchLessons: () =>
+        JSON.stringify({
+          hits: found ? [...stored].map(([id, lesson]) => ({ id, title: lesson.title, score: 9.8, diagnosis_path: lesson.diagnosis_path })) : [],
+        }),
+    });
+    handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, ...stored.get(Number(args.id)) });
+    handlers.archive_lesson = (args) => {
+      stored.get(Number(args.id))!.status = "archived";
+      return JSON.stringify({ archived: true });
+    };
+    await tool("knowledge_propose").run(code8, { signal });
+    await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+    await desk.idle();
+    assert.match(cardText(lastCard()), /没能同步到 aiops 经验库：socket hang up/);
+    assert.match(String(stored.get(31)!.diagnosis_path), /（来自飞书团队经验库 K1）$/);
+
+    // 再试之前有人在表格里把 K1 改成了 K7
+    backend.entries[0].id = "K7";
+    await desk.handleCardAction(click(lastCard(), "save"));
+    await desk.idle();
+    assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }], `found=${found}`);
+    assert.equal(stored.get(31)!.status, "archived");
+    assert.match(String(stored.get(32)!.diagnosis_path), /（来自飞书团队经验库 K7）$/);
+    assert.equal(backend.entries[0].aiopsId, 32);
+    assert.equal(lastCard().header.title.content, "已存进经验库");
+    const result = (sent.at(-1)!.input as { markdown: string }).markdown;
+    assert.match(result, /经验 K1 在表格里改成了 K7，aiops 里那条注明的出处对不上了，之前同步到 aiops 的经验 #31 已经不对了，已归档/);
+    assert.match(result, /已同步到 aiops 经验库（经验 #32）/);
+    assert.doesNotMatch(result, /相近的经验/);
+  }
+});
+
+test("找回结果没传回来的那条时，出处是以前的编号、内容却对不上的不认：以前的编号可能已经被别的行用了", async () => {
+  const stored = new Map<number, Record<string, unknown>>();
+  const { mcp } = fakeMcp({
+    search_knowledge: () => JSON.stringify({ hits: [...stored].map(([id, lesson]) => ({ id, title: lesson.title, score: 9.8, diagnosis_path: lesson.diagnosis_path })) }),
+    get_knowledge: (args) => JSON.stringify({ id: args.id, status: "active", ...stored.get(Number(args.id)) }),
+  });
+  const lessons = new AiopsLessons(mcp, "aiops", quiet);
+  const draft = normalizeDraft(code8);
+  stored.set(31, { title: draft.title, symptom: draft.question, root_cause: "别的行的结论", diagnosis_path: "（来自飞书团队经验库 K1）" });
+  // 发过去那次的编号是 K1，这一行现在是 K7：K1 那条内容对不上，不是这次存的
+  assert.equal(await lessons.findSynced([{ draft, teamId: "K1" }], "K7", task), undefined);
+  assert.equal(await lessons.ownDuplicate(31, [{ draft, teamId: "K1" }], "K7", task), undefined);
+  // 出处是现在的编号的，内容对不上也认（在 aiops 里改过），按 aiops 里存的内容算
+  stored.get(31)!.diagnosis_path = "（来自飞书团队经验库 K7）";
+  assert.equal((await lessons.ownDuplicate(31, [{ draft, teamId: "K1" }], "K7", task))?.teamId, "K7");
 });
 
 test("aiops 说重复的那条是这一条上次同步过去的、内容却被改过（和发过去的都对不上）：归档它，按表格重新同步", async () => {

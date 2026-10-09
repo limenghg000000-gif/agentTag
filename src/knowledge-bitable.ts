@@ -5,6 +5,7 @@ import { call } from "./docs.js";
 import { FeishuApiError } from "./feishu.js";
 import type { Logger } from "./history.js";
 import {
+  containsSecret,
   KNOWLEDGE_CATEGORIES,
   type KnowledgeBackend,
   type KnowledgeCategory,
@@ -333,6 +334,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     const records = await this.explain(() => this.options.api.listRecords(target.appToken, target.tableId));
     const rows = new Map<string, string>();
     const ambiguous = new Set<string>();
+    // 编号里写着密钥的（有人把密钥贴进了编号那一列、又复制了这一行）：警告里不写出来。按表格里的原样查，统一写法后大小写变了可能认不出
+    const leaked = new Set<string>();
     const entries: KnowledgeEntry[] = [];
     for (const record of records) {
       const entry = toEntry(record);
@@ -344,21 +347,25 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         } else {
           rows.set(key, record.recordId);
         }
+        if (containsSecret(entry.id)) {
+          leaked.add(key);
+        }
         entries.push(entry);
       }
     }
     if (generation === this.generation) {
       this.rows = rows;
       this.ambiguous = ambiguous;
-      this.warnAmbiguous();
+      this.warnAmbiguous(leaked);
     }
     return entries;
   }
 
-  private warnAmbiguous(): void {
+  private warnAmbiguous(leaked: ReadonlySet<string>): void {
     const ambiguous = [...this.ambiguous].join(" ");
     if (ambiguous && ambiguous !== this.warnedAmbiguous) {
-      this.logger.warn(`经验库：表格里有不止一行用了同一个编号：${ambiguous}。归档这些编号前请先在表格里把重复的改掉`);
+      const shown = [...this.ambiguous].map((id) => (leaked.has(id) ? "（像是密钥的编号，不写出来）" : id)).join(" ");
+      this.logger.warn(`经验库：表格里有不止一行用了同一个编号：${shown}。归档这些编号前请先在表格里把重复的改掉`);
     }
     this.warnedAmbiguous = ambiguous;
   }
