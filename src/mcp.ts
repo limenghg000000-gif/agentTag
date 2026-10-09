@@ -167,9 +167,10 @@ export class McpHub {
     });
   }
 
-  /** 服务端有没有这个能直接调的工具（不管开没开给模型；只能按 MCP 任务方式调的不算，这里不支持）。没连上时为 false */
+  /** 程序能不能直接调这个工具（见 directAllowed）。没连上时为 false */
   hasTool(serverName: string, tool: string): boolean {
-    return this.find(serverName)?.catalog.has(tool) ?? false;
+    const server = this.find(serverName);
+    return server !== undefined && server.catalog.has(tool) && directAllowed(server.config, tool);
   }
 
   /** 连上过、拿到了工具清单（之后刷新失败也算，沿用上次的清单） */
@@ -179,7 +180,8 @@ export class McpHub {
 
   /**
    * 程序自己调服务端的工具，不经过模型：回答前检索 aiops 经验库、有人在确认卡片上点了保存后同步到 aiops 经验库。
-   * 不受「只开只读工具」的限制（写操作的确认由调用方负责），不占模型的调用次数，照样记审计日志。返回结果原文，工具报错时抛错
+   * 写工具不受「只开只读工具」的限制（写操作的确认由调用方负责），读的工具要在配置里开了（directAllowed）。
+   * 不占模型的调用次数，照样记审计日志。返回结果原文，工具报错时抛错
    */
   async callDirect(
     serverName: string,
@@ -194,6 +196,9 @@ export class McpHub {
     }
     if (!server.catalog.has(tool)) {
       throw new Error(`${serverName} 没有 ${tool} 这个工具`);
+    }
+    if (!directAllowed(server.config, tool)) {
+      throw new Error(`${serverName} 的 ${tool} 没开（要开就加进 MCP_${serverName.toUpperCase()}_TOOLS）`);
     }
     const timeout = server.config.timeoutsMs[tool] ?? DEFAULT_MCP_TIMEOUT_MS;
     // 程序要解析结果：有 structuredContent 时用它的 JSON（文字部分可能是给人看的说明），没有时用文字
@@ -647,6 +652,15 @@ function pickTools(config: McpServerConfig, tools: readonly RemoteTool[]): Picke
 function mayWrite(tool: RemoteTool, config: McpServerConfig, wildcard: boolean): boolean {
   const readOnly = tool.annotations?.readOnlyHint;
   return isWriteTool(tool.name, config.writeTools) || readOnly === false || (wildcard && readOnly !== true);
+}
+
+/**
+ * 程序能直接调的工具：读东西的要在配置里开了（MCP_<名字>_TOOLS，* 是全部）。管理员没开的工具，程序也不拿它读东西给群里看
+ * （比如回答前检索 aiops 经验库要开 search_knowledge）。写工具（按名字认，服务端的标注不能把读的说成写的绕过清单）本来就不开给模型，
+ * 由调用方在确认卡片上有人确认后调，不看这个清单
+ */
+function directAllowed(config: McpServerConfig, tool: string): boolean {
+  return config.tools === "*" || config.tools.includes(tool) || isWriteTool(tool, config.writeTools);
 }
 
 /** 交给模型的工具名：服务名_工具名，只留 OpenAI 函数名允许的字符 */

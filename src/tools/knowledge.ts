@@ -143,8 +143,11 @@ interface ArchiveProposal extends ProposalBase {
   kind: "archive";
   target: { type: "team"; entry: KnowledgeEntry } | { type: "aiops"; lesson: AiopsLesson };
   reason?: string;
-  /** 在表格里归档成功时这一行记的 aiops 编号：之后这一行被删了，再试一次时按它归档 aiops 里那条 */
-  archivedAiops?: number;
+  /**
+   * 这张卡片已经在表格里归档了这一行：当时的编号和这一行记的 aiops 编号。再试一次只差 aiops 那步，不再看表格
+   * （之后这一行在表格里被改了、删了都不影响），按记下的编号归档 aiops 里那条
+   */
+  archivedRow?: { id: string; aiopsId?: number };
 }
 
 type Proposal = SaveProposal | ArchiveProposal;
@@ -432,6 +435,14 @@ export class KnowledgeDesk {
       return true;
     }
     if (proposal.state !== "pending" && proposal.state !== "partial") {
+      return true;
+    }
+    // 卡片改不了、重新发过一张（renderButtons）：换下来的旧卡片上还是当时的按钮（比如做了一半时还写着「取消」），点了不算，只认新的那张
+    if (proposal.cardMessageId && evt.messageId !== proposal.cardMessageId) {
+      this.logger.info(`经验库卡片 点的是换下来的旧卡片，没有执行 proposal=${proposal.id} message=${evt.messageId} operator=${operator.openId}`);
+      await this.options
+        .updateCard(evt.messageId, expiredCard("这张卡片已经换成话题里新发的那张，请在新卡片上操作"))
+        .catch((err: unknown) => this.logger.warn("更新经验库卡片失败", err));
       return true;
     }
     if (proposal.revising) {
@@ -854,6 +865,19 @@ export class KnowledgeDesk {
         unfinished: [],
       };
     }
+    if (proposal.archivedRow) {
+      // 上次已经在表格里归档了这一行，只差 aiops 那步：之后这一行的内容在表格里改了也接着做（核对卡片上的内容是归档之前的事）。
+      // aiops 编号按表格里现在的（上次是编号填错了没归档成、改正了再试一次）；这一行被删了就用归档时记下的。归档前照样核对出处
+      const { id, aiopsId } = proposal.archivedRow;
+      const { base } = this.options;
+      const current = target.entry.requestId ? await base.saved(target.entry.requestId, id) : await base.get(id, { fresh: true });
+      const out: Outcome = { done: [`经验 ${id} 上次已经在表格里归档了。`], unfinished: [] };
+      const linked = current ? current.aiopsId : aiopsId;
+      if (linked !== undefined) {
+        await this.archiveLinked([...new Set([current?.id ?? id, id, target.entry.id])], linked, confirmedBy, task, out);
+      }
+      return out;
+    }
     // 用归档时表格里的 aiops 编号：上次同步没做成、再试一次时会重新同步、记下新的编号。归档前核对那条是不是从这一条同步过去的
     let entry: KnowledgeEntry;
     try {
@@ -862,16 +886,16 @@ export class KnowledgeDesk {
       if (!(err instanceof MissingEntryError)) {
         throw err;
       }
-      // 这一行在表格里删掉了（比如上次归档了、aiops 那步没做成，再试之前有人删了它）：团队经验库里已经检索不到它，不用再归档。
-      // aiops 里同步的那条照样归档，编号用上次归档时表格里记的，没有就用卡片上的，核对过出处（卡片上的编号）再归档
+      // 这一行在表格里删掉了（比如上次归档成功、结果没传回来，再试之前有人删了它）：团队经验库里已经检索不到它，不用再归档。
+      // aiops 里同步的那条照样归档，编号用卡片上的，核对过出处（卡片上的编号）再归档
       const out: Outcome = { done: [`经验 ${target.entry.id} 已经从表格里删掉了，团队经验库里检索不到它，不用再归档。`], unfinished: [] };
-      const aiopsId = proposal.archivedAiops ?? target.entry.aiopsId;
+      const aiopsId = target.entry.aiopsId;
       if (aiopsId !== undefined) {
         await this.archiveLinked([target.entry.id], aiopsId, confirmedBy, task, out);
       }
       return out;
     }
-    proposal.archivedAiops = entry.aiopsId;
+    proposal.archivedRow = { id: entry.id, ...(entry.aiopsId !== undefined ? { aiopsId: entry.aiopsId } : {}) };
     const out: Outcome = { done: [`已归档经验 ${entry.id}「${entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`], unfinished: [] };
     if (entry.aiopsId !== undefined) {
       // 卡片发出后编号被改了（按草稿编号认出的这一行）：aiops 里那条的出处还是卡片上的编号

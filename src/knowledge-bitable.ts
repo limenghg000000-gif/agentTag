@@ -32,6 +32,7 @@ const FIELDS = {
   confirmedBy: "确认人",
   source: "来源",
   replaces: "取代的经验",
+  replacesRequestId: "取代的经验的草稿编号",
   aiopsId: "aiops 经验编号",
   requestId: "草稿编号",
   createdAt: "保存时间",
@@ -711,6 +712,7 @@ const TABLE_FIELDS: BitableField[] = [
   { field_name: FIELDS.replaces, type: TEXT },
   { field_name: FIELDS.aiopsId, type: TEXT },
   { field_name: FIELDS.requestId, type: TEXT },
+  { field_name: FIELDS.replacesRequestId, type: TEXT },
   { field_name: FIELDS.createdAt, type: CREATED_TIME, property: { date_formatter: "yyyy/MM/dd HH:mm" } },
   { field_name: FIELDS.updatedAt, type: MODIFIED_TIME, property: { date_formatter: "yyyy/MM/dd HH:mm" } },
 ];
@@ -737,6 +739,7 @@ function toFields(entry: KnowledgeEntry): Record<string, unknown> {
     [FIELDS.replaces, entry.replaces],
     [FIELDS.aiopsId, entry.aiopsId === undefined ? undefined : String(entry.aiopsId)],
     [FIELDS.requestId, entry.requestId],
+    [FIELDS.replacesRequestId, entry.replacesRequestId],
   ];
   for (const [name, value] of optional) {
     if (value) {
@@ -765,7 +768,19 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
   const createdAt = timeOf(fields[FIELDS.createdAt]);
   const updatedAt = timeOf(fields[FIELDS.updatedAt]);
   const optional = (
-    key: "scope" | "handling" | "basis" | "keywords" | "errorCodes" | "alertname" | "proposedBy" | "confirmedBy" | "source" | "requestId" | "replaces",
+    key:
+      | "scope"
+      | "handling"
+      | "basis"
+      | "keywords"
+      | "errorCodes"
+      | "alertname"
+      | "proposedBy"
+      | "confirmedBy"
+      | "source"
+      | "requestId"
+      | "replaces"
+      | "replacesRequestId",
   ) => {
     const value = text(FIELDS[key]);
     return value ? { [key]: value } : {};
@@ -788,6 +803,7 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
     ...optional("source"),
     ...optional("requestId"),
     ...optional("replaces"),
+    ...optional("replacesRequestId"),
     ...(Number.isSafeInteger(aiopsId) && aiopsId > 0 ? { aiopsId } : {}),
     createdAt: createdAt ?? new Date(0).toISOString(),
     ...(updatedAt && updatedAt !== createdAt ? { updatedAt } : {}),

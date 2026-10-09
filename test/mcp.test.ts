@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CallToolResult, Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "../src/config.js";
+import { AiopsLessons } from "../src/knowledge-aiops.js";
 import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, McpHub } from "../src/mcp.js";
 import { MCP_RESULT_LIMIT } from "../src/mcp-result.js";
 import { type FakeMcp, freePort, startFakeMcp } from "./helpers/fake-mcp.js";
@@ -176,6 +177,31 @@ test("程序自己调用（经验库检索和同步）：没开给模型的工�
   await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /aiops 返回错误：经验 #9 不存在/);
   await assert.rejects(hub.callDirect("aiops", "no_such_tool", {}, task), /aiops 没有 no_such_tool 这个工具/);
   await assert.rejects(hub.callDirect("other", "save_lesson", {}, task), /other 现在连不上/);
+});
+
+test("程序自己调用：读的工具要在配置里开了才调（管理员没开 search_knowledge 时回答前不查 aiops 经验库、也不答应同步），写工具不看这个清单；配成 * 的都能调", async () => {
+  const lessonTools = [...TOOLS, remoteTool("search_knowledge", "检索经验"), remoteTool("get_knowledge", "经验详情")];
+  const server = await fake({ tools: lessonTools, call: () => text(JSON.stringify({ hits: [] })) });
+  const quiet = recorder().logger;
+  const hub = await hubFor([config(server.url)], { logger: quiet });
+  assert.ok(!hub.hasTool("aiops", "get_targets_health"), "服务端有、配置里没开的读工具");
+  await assert.rejects(hub.callDirect("aiops", "get_targets_health", {}, task), /aiops 的 get_targets_health 没开（要开就加进 MCP_AIOPS_TOOLS）/);
+  assert.ok(hub.hasTool("aiops", "query_logs"));
+  assert.ok(hub.hasTool("aiops", "save_lesson") && hub.hasTool("aiops", "archive_lesson"), "写工具由确认卡片把关，不用开给模型");
+
+  const lessons = new AiopsLessons(hub, "aiops", quiet);
+  assert.equal(lessons.searchable, false);
+  assert.deepEqual(await lessons.search("gateway-api 报 code=8", task), []);
+  assert.equal(lessons.lacksWriteTools, true, "再试同步时要用的检索、取详情没开，不答应同步");
+  assert.deepEqual(lessons.missingWriteTools, ["search_knowledge", "get_knowledge"]);
+  assert.equal(server.calls.length, 0);
+
+  const opened = await hubFor([config(server.url, { tools: ["query_logs", "search_knowledge", "get_knowledge"] })], { logger: quiet });
+  assert.equal(new AiopsLessons(opened, "aiops", quiet).writable, true);
+  const all = await hubFor([config(server.url, { tools: "*" })], { logger: quiet });
+  assert.ok(all.hasTool("aiops", "get_targets_health") && all.hasTool("aiops", "search_knowledge"));
+  assert.deepEqual(await new AiopsLessons(all, "aiops", quiet).search("gateway-api 报 code=8", task), []);
+  assert.deepEqual(server.calls.map((call) => call.name), ["search_knowledge"]);
 });
 
 test("程序自己调用：有 structuredContent 时按它的 JSON 返回，文字部分是给人看的说明也一样；没有文字时也是", async () => {

@@ -408,13 +408,17 @@ test("取代旧经验的那条在表格里记下取代的编号，读回来也�
   tables.set("tblX", { fields: [], records: [] });
   const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "replaces", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
   const base = new KnowledgeBase(backend, { logger: quiet });
-  await base.save(dau);
+  await base.save(dau, { requestId: "req-0" });
   await base.save({ ...dau, title: "日活的口径（改过）" }, { replaces: "k1" });
   assert.equal(tables.get("tblX")!.records[1].fields["取代的经验"], "K1");
+  assert.equal(tables.get("tblX")!.records[1].fields["取代的经验的草稿编号"], "req-0", "旧的那一行之后改了编号也认得出");
   assert.equal(tables.get("tblX")!.records[0].fields["取代的经验"], undefined);
   assert.deepEqual(
-    (await backend.list()).map((entry) => entry.replaces),
-    [undefined, "K1"],
+    (await backend.list()).map((entry) => [entry.replaces, entry.replacesRequestId]),
+    [
+      [undefined, undefined],
+      ["K1", "req-0"],
+    ],
   );
 });
 
@@ -450,7 +454,7 @@ test("KNOWLEDGE_BITABLE 指定的表缺列时，第一次写之前补上；已�
   await base.save(dau);
   const created = calls.filter((c) => c.startsWith("createField"));
   assert.ok(created.includes("createField 草稿编号") && created.includes("createField 编号") && created.includes("createField 保存时间"));
-  assert.ok(created.includes("createField 取代的经验"));
+  assert.ok(created.includes("createField 取代的经验") && created.includes("createField 取代的经验的草稿编号"));
   assert.ok(!created.includes("createField 标题") && !created.includes("createField 结论"));
   assert.deepEqual(new Set(tables.get("tblX")!.fields.map((f) => f.field_name)).size, tables.get("tblX")!.fields.length);
   await base.save(dau);

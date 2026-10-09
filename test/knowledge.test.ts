@@ -107,6 +107,11 @@ test("起草的经验：去掉空白、检查必填和长度，关键词和错�
 const ecKeys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 const rsaKeys = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const base64 = (value: string | Buffer) => Buffer.from(value).toString("base64");
+/** 按 bech32 的字符表把字节写成字符（不带校验位）：age 的公钥、私钥后面那一段 */
+const bech32 = (bytes: Buffer) => {
+  const bits = [...bytes].map((byte) => byte.toString(2).padStart(8, "0")).join("");
+  return (bits.match(/.{1,5}/g) ?? []).map((chunk) => "qpzry9x8gf2tvdw0s3jn54khce6mua7l"[parseInt(chunk.padEnd(5, "0"), 2)]).join("");
+};
 /** 带密码的数据库地址，Kubernetes Secret 里 base64 编码后放在 DATABASE_URL 下 */
 const dbUrl = ["postgresql://app:Corr3ct", "Horse@db.internal:5432/app"].join("");
 
@@ -343,6 +348,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // PuTTY 的私钥文件（.ppk），加了密码的也算
     ["PuTTY-User-Key-File-3: ssh-ed25519", "Encryption: none", "Comment: eddsa-key-20261009", "Public-Lines: 2", base64(Buffer.alloc(51, 1)).replace(/.{64}/, "$&\n"), ["Private", "Lines: 1"].join("-"), base64(Buffer.alloc(36, 2)), `Private-MAC: ${"ab".repeat(32)}`].join("\n"),
     ["PuTTY-User-Key-File-2: ssh-rsa", "Encryption: aes256-cbc", ["Private", "Lines: 14"].join("-"), base64(Buffer.alloc(48, 3)), base64(Buffer.alloc(48, 4))].join("\r\n"),
+    // age 的私钥（age-keygen 生成的，抗量子的也算），小写的也算
+    `# created: 2026-10-09T12:00:00+08:00\n# public key: age1${bech32(Buffer.alloc(32, 7))}\n${["AGE", "SECRET", "KEY", `1${bech32(Buffer.alloc(32, 8)).toUpperCase()}`].join("-")}`,
+    ["AGE", "SECRET", "KEY", "PQ", `1${bech32(Buffer.alloc(32, 9)).toUpperCase()}`].join("-"),
+    `identity = "${["age", "secret", "key", `1${bech32(Buffer.alloc(32, 10))}`].join("-")}"`,
     // 字符串里套着转义过的 JSON，转义了几层都算
     `payload="{\\"password\\":\\"${["CorrectHorse", "BatteryStaple9"].join("")}\\"}"`,
     `{"body":"{\\"config\\":\\"{\\\\\\"api_key\\\\\\":\\\\\\"${["correct", "horse", "battery", "staple"].join("")}\\\\\\"}\\"}"}`,
@@ -451,6 +460,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host, Signature=<signature>；Digest 里 response=\"see above\"",
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
+    // age 的公钥、只写了私钥开头的说明
+    `age 的公钥 age1${bech32(Buffer.alloc(32, 7))} 可以贴；私钥以 AGE-SECRET-KEY-1 开头，写在 key.txt 里（AGE-SECRET-KEY-1...）`,
     // PuTTY 私钥文件只说了格式、没贴私钥的；转义过的 JSON 里是占位、打了码的
     "PuTTY 的 .ppk 文件里 Private-Lines: 14 后面那几行就是私钥，不要贴到群里；PuTTY-User-Key-File-3 是新格式",
     'payload="{\\"token\\":\\"${MCP_AIOPS_TOKEN}\\",\\"password\\":\\"******\\"}"；路径 C:\\new\\tmp\\report.txt',
@@ -811,7 +822,10 @@ function deskSetup({
     const buttons = JSON.stringify(card).match(/"value":\{[^}]*\}/g)!.map((v) => JSON.parse(v.slice(8)));
     const value = buttons.find((v) => v.op === op);
     assert.ok(value, `卡片上没有 ${op} 按钮`);
-    return { messageId: "om_card_1", chatId: "oc_1", operator: { openId, name }, action: { tag: "button", value } };
+    // 点的是哪条消息上的卡片：发出去的按发的顺序编号，改过的按改的那条
+    const index = sent.findIndex((one) => (one.input as { card?: unknown }).card === card);
+    const messageId = index >= 0 ? `om_card_${index + 1}` : (updates.findLast((one) => one.card === card)?.messageId ?? "om_card_1");
+    return { messageId, chatId: "oc_1", operator: { openId, name }, action: { tag: "button", value } };
   };
   const lastCard = () => updates.at(-1)!.card;
   return { backend, base, desk, sent, updates, calls, mcp, handlers, lessonPaths, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
@@ -2022,6 +2036,38 @@ test("取代旧经验时归档旧的没做成：别的卡片不能再取代那�
   assert.deepEqual([again.id, again.replaces], ["K3", "K1"]);
 });
 
+test("取代旧经验时归档旧的没做成，之后旧的那一行在表格里改了编号：别的卡片按新编号也不能再取代它", async () => {
+  const { backend, base, desk, sent, updates, click, tool } = deskSetup({ aiops: false });
+  await base.save(normalizeDraft(dau), { requestId: "req-0" });
+  await tool("knowledge_propose").run({ ...dau, title: "日活的口径（张三改的）", replaces: "K1" }, { signal });
+  const update = backend.update.bind(backend);
+  backend.update = async (id, changes) => {
+    if (id === "K1") {
+      throw new KnowledgeError("飞书接口限流");
+    }
+    return update(id, changes);
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.deepEqual([backend.entries[1].replaces, backend.entries[1].replacesRequestId], ["K1", "req-0"]);
+
+  backend.update = update;
+  backend.entries[0].id = "K9";
+  await base.entries(true);
+  await tool("knowledge_propose").run({ ...dau, title: "日活的口径（李四改的）", replaces: "K9" }, { signal });
+  await desk.handleCardAction(click((sent.at(-1)!.input as { card: any }).card, "save"));
+  await desk.idle();
+  const voided = updates.filter((u) => u.messageId === `om_card_${sent.length}`).at(-1)!.card;
+  assert.match(cardText(voided), /经验 K9 已经有取代它的新经验 K2「日活的口径（张三改的）」，只是旧的还没归档，这张卡片不能再保存/);
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status]),
+    [
+      ["K9", "active"],
+      ["K2", "active"],
+    ],
+  );
+});
+
 test("归档、取代时用表格里现在的 aiops 编号：卡片发出后编号换成了这一条同步过去的另一条，归档换过的那条", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup();
   await base.save(normalizeDraft(code8));
@@ -2253,6 +2299,39 @@ test("做了一半、卡片改不回带按钮的样子：在话题里重新发�
   control.failUpdate = false;
   down = false;
   await desk.handleCardAction({ ...click(resent, "save"), messageId: "om_card_2" });
+  await desk.idle();
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 2);
+  assert.equal(backend.entries[0].aiopsId, 31);
+  assert.equal(backend.entries.length, 1);
+});
+
+test("卡片重新发过一张以后，换下来的旧卡片上的「取消」点了不算：做了一半的照样留着，点新的这张能补上", async () => {
+  let down = true;
+  const { backend, desk, sent, updates, calls, click, tool, control } = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+  });
+  await tool("knowledge_propose").run(code8, { signal });
+  const original = (sent[0].input as { card: any }).card;
+  control.failUpdate = true;
+  await desk.handleCardAction(click(original, "save"));
+  await desk.idle();
+  assert.equal(sent.length, 2, "重新发了一张");
+
+  // 旧卡片没改成，上面还是当时的「取消」
+  control.failUpdate = false;
+  await desk.handleCardAction(click(original, "cancel"));
+  await desk.idle();
+  const expired = updates.filter((u) => u.messageId === "om_card_1").at(-1)!.card;
+  assert.match(cardText(expired), /这张卡片已经换成话题里新发的那张，请在新卡片上操作/);
+  assert.ok(!JSON.stringify(expired).includes('"op"'), "旧卡片上不再有按钮");
+
+  down = false;
+  await desk.handleCardAction(click((sent[1].input as { card: any }).card, "save"));
   await desk.idle();
   assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 2);
   assert.equal(backend.entries[0].aiopsId, 31);
@@ -2627,7 +2706,7 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
   await desk.idle();
   assert.match(
     (sent.at(-1)!.input as { markdown: string }).markdown,
-    /经验 K1 已经从表格里删掉了，团队经验库里检索不到它，不用再归档。\naiops 经验库里同步的经验 #31 也已归档/,
+    /经验 K1 上次已经在表格里归档了。\naiops 经验库里同步的经验 #31 也已归档/,
   );
 
   const renamed = deskSetup();
@@ -2639,6 +2718,30 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
   await renamed.desk.idle();
   assert.equal(renamed.backend.entries[0].status, "archived");
   assert.deepEqual(renamed.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }], "aiops 里那条的出处是卡片上的 K1");
+});
+
+test("归档：表格里归档了、aiops 那步没做成，再试之前有人改了这一行的内容：照样接着归档 aiops 里同步的那条", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup();
+  await base.save(normalizeDraft(code8), { requestId: "req-0" });
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
+  const archiveLesson = handlers.archive_lesson;
+  handlers.archive_lesson = () => {
+    throw new Error("aiops 现在连不上");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.match(cardText(lastCard()), /aiops 经验库里同步的经验 #31 没能归档/);
+
+  backend.entries[0].conclusion = "归档以后有人在表格里补了一句";
+  handlers.archive_lesson = archiveLesson;
+  const before = calls.filter((call) => call.tool === "archive_lesson").length;
+  await desk.handleCardAction(click(lastCard(), "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").slice(before).map((call) => call.args), [{ id: 31 }]);
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 上次已经在表格里归档了。\naiops 经验库里同步的经验 #31 也已归档/);
+  assert.equal(backend.entries[0].status, "archived");
 });
 
 test("归档没有草稿编号的行（表格里手动加的）：卡片发出后改了编号的按内容认出来归档；找不到时不当成删了，卡片留着；内容一样的好几行分不清时也留着", async () => {
@@ -2711,6 +2814,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(`gateway-api 报 code=8，kubeconfig 里 client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`, task);
   await desk.lookup(`gateway-api 报 code=8，Secret 是这样的：\nkind: Secret\ndata:\n  DATABASE_URL: ${base64(dbUrl)}`, task);
   await desk.lookup(`gateway-api 报 code=8，请求头 Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${base64(Buffer.alloc(32, 9))}"`, task);
+  await desk.lookup(`gateway-api 报 code=8，sops 用的 age 私钥是 ${["AGE", "SECRET", "KEY", `1${bech32(Buffer.alloc(32, 8)).toUpperCase()}`].join("-")}`, task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);

@@ -90,6 +90,8 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   requestId?: string;
   /** 这条取代的旧经验编号。旧的还没归档时（归档那步没做成），别的卡片不能再取代它 */
   replaces?: string;
+  /** 取代的旧经验的草稿编号：旧的那一行之后在表格里改了编号也认得出，不会被别的卡片再取代一次 */
+  replacesRequestId?: string;
   createdAt: string;
   updatedAt?: string;
   /** 有人直接在表格里写进了像密钥的东西（哪一项里像是有什么）：不拿来检索，也不给模型看 */
@@ -333,6 +335,7 @@ export class KnowledgeBase {
         return saved;
       }
       let replaces: string | undefined;
+      let replacesRequestId: string | undefined;
       if (meta.replaces) {
         const wanted = normalizeId(meta.replaces);
         const old = cardTarget(entries, meta.replaces, meta.seen);
@@ -343,8 +346,14 @@ export class KnowledgeBase {
         }
         // 别的卡片已经存了取代它的新经验、只是归档旧的那步没做成：再存一条，就会有两条新的同时有效
         // 取代它的新经验记的是当时的编号：卡片上的编号、它现在的编号都算
+        // 旧的那一行之后又改了编号（取代它的新经验记的编号就对不上了）：按它的草稿编号认
         const oldIds = new Set([wanted, normalizeId(old.id)]);
-        const successor = entries.find((entry) => entry.status === "active" && entry.replaces !== undefined && oldIds.has(normalizeId(entry.replaces)));
+        const successor = entries.find(
+          (entry) =>
+            entry.status === "active" &&
+            ((entry.replaces !== undefined && oldIds.has(normalizeId(entry.replaces))) ||
+              (old.requestId !== undefined && entry.replacesRequestId === old.requestId)),
+        );
         if (successor) {
           throw new StaleProposalError(
             `经验 ${old.id} 已经有取代它的新经验 ${successor.id}${successor.unsafe ? "" : `「${successor.title}」`}，只是旧的还没归档，这张卡片不能再保存。要改的话请在 ${successor.id} 的基础上重新起草，或者直接归档 ${old.id}`,
@@ -352,6 +361,7 @@ export class KnowledgeBase {
         }
         checkSeen(old, meta.seen);
         replaces = old.id;
+        replacesRequestId = old.requestId;
       }
       // 表格里删掉的行的编号也不再发：旧消息里提到的 K 编号、aiops 里注明的出处还指着原来那条。
       // 先记下再写表格，写失败了跳过一个号，不会重复
@@ -373,6 +383,7 @@ export class KnowledgeBase {
         ...(meta.source ? { source: meta.source } : {}),
         ...(meta.requestId ? { requestId: meta.requestId } : {}),
         ...(replaces ? { replaces } : {}),
+        ...(replacesRequestId ? { replacesRequestId } : {}),
         createdAt: this.now().toISOString(),
       };
       await this.backend.add(entry);
@@ -633,6 +644,8 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [PRIVATE_KEY_HEADER, "私钥"],
   // PuTTY 的私钥文件（.ppk）：Private-Lines 后面跟的就是私钥（加了密码的也算）。只有开头一行、没有私钥那几行的不算
   [/\bPrivate-Lines:[^\S\r\n]*\d+\s+[A-Za-z0-9+/]{16,}/, "私钥"],
+  // age 的私钥（age-keygen 生成的 AGE-SECRET-KEY-1…，抗量子的 AGE-SECRET-KEY-PQ-1…），后面是 bech32 字符。只写了开头的说明不算
+  [/\bAGE-SECRET-KEY-(?:[A-Z0-9]+-)?1[02-9AC-HJ-NP-Z]{40,}/i, "私钥"],
   [/\bglpat-[\w-]{16,}/, "GitLab 令牌"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, "GitHub 令牌"],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/, "GitHub 令牌"],
