@@ -143,6 +143,13 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "'password' => 'hunter2hunter'",
     '{"token": "correct horse battery staple"}',
     "MCP_AIOPS_TOKEN='correct horse battery staple'",
+    // .env、shell 里不带引号、中间有空格的值取到行尾
+    "MCP_AIOPS_TOKEN=my correct horse battery staple",
+    "export DB_PASSWORD=correct horse battery staple # 2026-10 换的",
+    "设置 GITLAB_TOKEN=correct horse battery 后重启",
+    "  export api_key=correct horse battery staple",
+    // YAML 里换行缩进着写的值
+    "aiops:\n  token:\n    correcthorsebatterystaple",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -172,6 +179,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "报错 token=expired! 重新登录；api_key=os.environ[\"MODEL_API_KEY\"]；secret_key: C:\\keys\\agent",
     '{"password": "******", "token": "${MCP_AIOPS_TOKEN}", "api_key": "<your-api-key>", "secret": "{{ .Values.secret }}"}',
     '{"token": "your token here", "密码": "请找管理员重置"}',
+    "MCP_AIOPS_TOKEN=${{ secrets.MCP_AIOPS_TOKEN }}\nFEISHU_APP_SECRET=<your app secret>\nDB_PASSWORD=******** # 打码\nMODEL_API_KEY=your api key here",
+    "把 MCP_AIOPS_TOKEN=xxx 写进 .env 后重启；MCP_AIOPS_TOKEN=${MCP_AIOPS_TOKEN} 从环境变量读",
+    // 空着的 .env 配置项：下一行是别的配置，不是它的值；同一行的下一个赋值也不是
+    "需要在 .env 里加：\nMCP_AIOPS_TOKEN=\nKNOWLEDGE=off\nKNOWLEDGE_TTL=3600",
+    "MCP_AIOPS_TOKEN=null, FEISHU_APP_SECRET=undefined\naccess_token=null, refresh_token=undefined",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }

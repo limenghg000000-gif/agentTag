@@ -460,8 +460,13 @@ export function normalizeId(id: string): string {
 
 /** 写明了是密钥的名字：token、secret、API Key（MODEL_API_KEY、apiKey、x-api-key）、AccessKey、私钥，也算 secret_key、token_key 这类 */
 const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-]?(?:access[_-]?)?key)?`;
+/**
+ * 等号、冒号后面到值之前：值可以写在同一行，也可以换行缩进着写（YAML）。换行不缩进的是下一行配置
+ * （.env 里空着的 MCP_AIOPS_TOKEN= 下面一行的 KNOWLEDGE=off），不是它的值
+ */
+const BEFORE_VALUE = String.raw`(?:[^\S\r\n]*\r?\n[ \t]+|[^\S\r\n]*)`;
 /** 名字和值之间：名字可以带引号（{"password": …}），等号、冒号、=>（PHP 数组）都算 */
-const ASSIGN = String.raw`["']?\s*(?:=>|[:=：])\s*`;
+const ASSIGN = String.raw`["']?[^\S\r\n]*(?:=>|[:=：])${BEFORE_VALUE}`;
 /** 引号里的一整段值，中间有空格的口令也是一整段（"correct horse battery staple"）；里面有中文的是说明，有 * 的是打了码的，不算 */
 const quotedValue = (min: number) =>
   String.raw`"([^"\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{${min},})"|'([^'\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{${min},})'`;
@@ -486,13 +491,16 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b[rs]k_live_[A-Za-z0-9]{16,}/, "Stripe 密钥"],
   [/\beyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}/, "JWT 令牌"],
   // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
-  [/(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{16,}/i, "云服务的 AccessKey Secret"],
+  [
+    new RegExp(String.raw`(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)[^\S\r\n]*[:=：]${BEFORE_VALUE}[^\s,，;；*\u4e00-\u9fff]{16,}`, "i"),
+    "云服务的 AccessKey Secret",
+  ],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
   // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple、{"password": "correct horse battery staple"}）；中文说明（「密码：请找管理员重置」）和 *** 不算
   [new RegExp(String.raw`(?:password|passwd|pwd|密码|口令)${ASSIGN}(?:${quotedValue(6)}|["']?[^\s"',，;；*\u4e00-\u9fff]{6,})`, "i"), "密码"],
   // 写明了是密钥的，值里带数字的都算（不带数字的见下面的 TOKEN_ASSIGNMENT）
-  [new RegExp(String.raw`${SECRET_LABEL}\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}`, "i"), "密码或令牌"],
+  [new RegExp(String.raw`${SECRET_LABEL}[^\S\r\n]*[:=：]${BEFORE_VALUE}(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}`, "i"), "密码或令牌"],
 ];
 
 /**
@@ -503,11 +511,27 @@ const SECRET_PATTERNS: [RegExp, string][] = [
 const VALUE_CHAR = String.raw`[^\s"'\`,;*()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]`;
 const VALUE_END = String.raw`(?=$|[\s"'\`,;*)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
 const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}${ASSIGN}(?:${quotedValue(8)}|["']?(${VALUE_CHAR}{8,})${VALUE_END})`, "gi");
+/**
+ * .env、shell 里的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）：不带引号的值也可以有空格（process.loadEnvFile 认到行尾），
+ * 所以取到行尾。中文、反引号、行内注释（空格加 #）、同一行的下一个赋值（, refresh_token=…）前面截断，那是说明不是值；
+ * 带 * 的是打了码的，不算。值短于 8 个字符的不算（token=xxx），在 findSecret 里筛
+ */
+const ENV_VALUE = String.raw`[ \t]*=[ \t]*(?!["'])([^\n*\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
+/** 大写的变量名在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；单独的 PWD 是当前目录，前面带别的词的（MYSQL_PWD）才是密码 */
+const ENV_ASSIGNMENT = new RegExp(
+  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+PWD)(?:_[A-Z0-9]+)*${ENV_VALUE}`,
+  "gm",
+);
+/** 小写的变量名（db_password=…）只认一行开头的，句子里的 token=… 是报错原文 */
+const LINE_ASSIGNMENT = new RegExp(
+  String.raw`^[ \t]*(?:export[ \t]+)?(?:\w*(?:secret|token|api_?key|access_?key|private_?key|password|passwd)|\w+_pwd)\w*${ENV_VALUE}`,
+  "gim",
+);
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
 const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
 /** 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here）；夹着别的词的照样算（prod-secret-abcdefghijkl） */
 const PLACEHOLDER_WORD =
-  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|placeholder|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
+  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|placeholder|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
 /** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
 const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
 /** 整个值是 a.b.c 这样的属性引用 */
@@ -518,7 +542,7 @@ function isPlaceholder(raw: string): boolean {
   // 句末的标点不算值的一部分（token: expired.、token=expired!）
   const value = raw.replace(/[.!?:]+$/, "");
   // 地址里带的密码、查询参数里的 token=… 由别的规则拦；变量引用（$NAME、${NAME}）、尖括号占位（<your-token>）、模板（{{ .Values.token }}）
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\{\{.*\}\}$/.test(value)) {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\$?\{\{.*\}\}$/.test(value)) {
     return true;
   }
   const last = value.slice(value.lastIndexOf(".") + 1);
@@ -545,7 +569,11 @@ function findSecret(text: string): string | undefined {
   if ([...text.matchAll(BASIC_AUTH)].some(([, value]) => isBasicCredential(value))) {
     return "HTTP Basic 认证的用户名和密码";
   }
-  return [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, double, single, bare]) => !isPlaceholder(double ?? single ?? bare)) ? "密码或令牌" : undefined;
+  const values = [
+    ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
+    ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
+  ];
+  return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }
 
 /** 去掉首尾空白、检查必填、长度和密钥 */
