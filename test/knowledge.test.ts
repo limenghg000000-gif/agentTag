@@ -262,6 +262,13 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // .netrc 里的密码：写在一行的、分几行的
     ["machine api.example.com login deploy password", "CorrectHorseBattery9"].join(" "),
     ["machine git.example.com\n  login deploy\n  password", "correcthorsebatterystaple"].join(" "),
+    // .netrc 里不写 login 的（用户名写在地址里）
+    ["machine api.example password", "CorrectHorseBatteryStaple9"].join(" "),
+    ["machine localhost password", "correcthorsebatterystaple"].join(" "),
+    ["default\n  password", "CorrectHorseBattery9"].join(" "),
+    // YAML 块写法里 # 开头的值：块里没有注释，# 是值本身
+    ["password: |\n  #Correct", "HorseBatteryStaple9"].join(""),
+    ["db:\n  password: >-\n    #correct horse", " battery staple"].join(""),
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -335,6 +342,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `.dockerconfigjson: ${Buffer.from(JSON.stringify({ auths: { "registry.example.com": {} } })).toString("base64")}`,
     // 不是 .netrc 记录的句子；.netrc 里密码是占位、打码的
     "machine learning password reset 流程；default 账号要改密码；machine api.example.com login deploy password ${NETRC_PASSWORD}；machine x login y password ******",
+    "machine learning password resetting 流程；default password rotation 策略；machine api.example password ********",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
     'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
@@ -1929,6 +1937,34 @@ test("aiops 返回的经验编号不是正的安全整数时不认：存的结�
   assert.equal((await lessons.get(12, task)).id, 12);
   got = 13;
   await assert.rejects(lessons.get(12, task), /取经验 #12 时返回的是别的编号/);
+});
+
+test("aiops 返回的内容里像有密钥的不列出来：疑似重复的那条的标题、原因，报错里带的原文", async () => {
+  const leaked = ["password=", "Correct", "Horse", "Battery9"].join("");
+  const { mcp } = fakeMcp({
+    save_lesson: (args) =>
+      args.title === "重复的"
+        ? JSON.stringify({ saved: false, duplicate_of: { id: 12, title: `user-rpc 降载 ${leaked}`, why: `原因 ${leaked}` } })
+        : JSON.stringify({ saved: "maybe", note: leaked }),
+    get_knowledge: () => JSON.stringify({ id: 13, title: `别的 ${leaked}`, status: "active" }),
+    search_knowledge: () => JSON.stringify({ error: leaked }),
+  });
+  const lessons = new AiopsLessons(mcp, "aiops", quiet);
+  const draft = normalizeDraft(code8);
+  assert.deepEqual(await lessons.save({ ...draft, title: "重复的" }, { confirmedBy: "ML", teamId: "K1" }, task), { saved: false, duplicate: { id: 12, title: "" } });
+  const hidden = (err: Error) => err instanceof KnowledgeError && /返回的内容里像是有密钥，不列出来/.test(err.message) && !err.message.includes(leaked);
+  await assert.rejects(lessons.save(draft, { confirmedBy: "ML", teamId: "K1" }, task), hidden);
+  await assert.rejects(lessons.get(12, task), hidden);
+  await assert.rejects(lessons.search("code=8", task), hidden);
+
+  // 卡片上、发到群里的结果只写编号
+  const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: false, duplicate_of: { id: 12, title: `user-rpc 降载 ${leaked}` } }) });
+  await setup.tool("knowledge_propose").run(code8, { signal });
+  await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+  await setup.desk.idle();
+  assert.equal(setup.lastCard().header.title.content, "已存进经验库");
+  assert.match(cardText(setup.lastCard()), /aiops 经验库里已经有相近的经验 #12，没有重复同步/);
+  assert.ok(!JSON.stringify([setup.sent, setup.updates]).includes(leaked));
 });
 
 test("同步到 aiops 时有人在表格里改了这一行：存完重新读表格，归档刚存的那条，改过的列在卡片上，确认后再同步、记编号", async () => {

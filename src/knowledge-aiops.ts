@@ -116,7 +116,7 @@ export class AiopsLessons {
     const data = parseJson(raw) as { hits?: unknown } | undefined;
     // 格式不对不能当成没查到：回答前的检索要算没查成，再试同步时要算没找成（不然会再存一条）
     if (!Array.isArray(data?.hits)) {
-      throw new KnowledgeError(`aiops 检索返回的格式不对：${raw.slice(0, 200)}`);
+      throw new KnowledgeError(`aiops 检索返回的格式不对：${excerpt(raw, 200)}`);
     }
     return data.hits.flatMap((hit): AiopsLessonHit[] => {
       const item = hit as Record<string, unknown>;
@@ -135,10 +135,10 @@ export class AiopsLessons {
     // get_knowledge 有的版本把条目放在 knowledge 字段里
     const item = (data && typeof data.knowledge === "object" && data.knowledge !== null ? data.knowledge : data) as Record<string, unknown> | undefined;
     if (!item || typeof item.title !== "string") {
-      throw new KnowledgeError(`aiops 经验库里取不到经验 #${id}：${raw.slice(0, 200)}`);
+      throw new KnowledgeError(`aiops 经验库里取不到经验 #${id}：${excerpt(raw, 200)}`);
     }
     if (item.id !== undefined && lessonId(item.id) !== id) {
-      throw new KnowledgeError(`aiops 取经验 #${id} 时返回的是别的编号：${raw.slice(0, 200)}`);
+      throw new KnowledgeError(`aiops 取经验 #${id} 时返回的是别的编号：${excerpt(raw, 200)}`);
     }
     return {
       id,
@@ -174,12 +174,16 @@ export class AiopsLessons {
     const duplicate = data?.duplicate_of as Record<string, unknown> | undefined;
     const duplicateId = lessonId(duplicate?.id);
     if (data?.saved === false && duplicate && duplicateId !== undefined) {
-      return {
-        saved: false,
-        duplicate: { id: duplicateId, title: String(duplicate.title ?? ""), ...(typeof duplicate.why === "string" ? { why: duplicate.why } : {}) },
-      };
+      // 那一条可能是别的地方（Open WebUI）存的、写进了密钥：标题、原因要列在卡片上给群里看，像有密钥的不要
+      const title = String(duplicate.title ?? "");
+      const leaked = containsSecret(title);
+      if (leaked) {
+        this.logger.warn(`aiops 经验 #${duplicateId} 的标题里像是写进了密钥，卡片上不列它的标题。请 aiops 的管理员删掉密钥`);
+      }
+      const why = typeof duplicate.why === "string" && !containsSecret(duplicate.why) ? duplicate.why : undefined;
+      return { saved: false, duplicate: { id: duplicateId, title: leaked ? "" : title, ...(why !== undefined ? { why } : {}) } };
     }
-    throw new KnowledgeError(`aiops 没有说存没存成功：${raw.slice(0, 300)}`);
+    throw new KnowledgeError(`aiops 没有说存没存成功：${excerpt(raw, 300)}`);
   }
 
   /**
@@ -313,6 +317,11 @@ export function lessonHasSecret(lesson: AiopsLessonHit | AiopsLesson): boolean {
   // 检索结果里没有服务名、关键词
   const { title, symptom, root_cause, solution, diagnosis_path, service, keywords }: Partial<AiopsLesson> = lesson;
   return [title, symptom, root_cause, solution, diagnosis_path, service, keywords].some((value) => value !== undefined && containsSecret(value));
+}
+
+/** 报错里带上 aiops 返回的原文（前 chars 个字符）：报错会列在卡片上给群里看，原文里像有密钥的不带 */
+function excerpt(raw: string, chars: number): string {
+  return containsSecret(raw) ? "（返回的内容里像是有密钥，不列出来）" : raw.slice(0, chars);
 }
 
 /** aiops 的经验编号：正的安全整数，别的（小数、负数、超出范围被四舍五入过的）不认 */

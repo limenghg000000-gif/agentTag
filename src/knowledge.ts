@@ -629,6 +629,8 @@ const NESTED_LINE = /^[ \t]*(?:-(?:[ \t]|$)|["']?[\w.-]+["']?[ \t]*:(?:[ \t]|$))
 const COMMENT_LINE = /^[ \t]*#/;
 /** 值里中文、反引号、行内注释以后是说明 */
 const NOTE_START = /[`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|[ \t]#/;
+/** 块写法（|、>）里没有注释，# 是值本身（|\n  #Abc…），只有中文、反引号以后算说明 */
+const BLOCK_NOTE_START = /[`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/;
 
 /** YAML 里写在下面几行的值：下面缩进比配置项深的几行连起来。整个打了码的不算 */
 function blockValues(text: string): string[] {
@@ -646,7 +648,7 @@ function blockValues(text: string): string[] {
       if (/^[ \t]*/.exec(next)![0].length <= key[1].length || (body.length === 0 && !key[2] && NESTED_LINE.test(next))) {
         break;
       }
-      const note = NOTE_START.exec(next);
+      const note = (key[2] ? BLOCK_NOTE_START : NOTE_START).exec(next);
       body.push((note ? next.slice(0, note.index) : next).trim());
     }
     const value = body.join(" ").trim();
@@ -718,8 +720,9 @@ function curlPasswords(text: string): string[] {
 const NETRC_KEYS = new Set(["login", "password", "account", "port"]);
 
 /**
- * .netrc 里的密码：machine 主机 login 用户 password 密码，写在一行或者分几行都行。按「关键字 值」成对读，
- * 一条记录里 login 和 password 都有、密码不短于 6 个字符才算，「machine learning password reset」这样的句子对不上
+ * .netrc 里的密码：machine 主机 login 用户 password 密码，写在一行或者分几行都行。按「关键字 值」成对读，密码不短于 6 个字符才算。
+ * 可以不写 login（用户名写在地址里，curl 照样用这条的密码）。没有 login 时，主机要像主机名（带点、冒号或数字，或者 localhost），
+ * 或者密码不全是小写字母，「machine learning password resetting」「default password rotation」这样的句子对不上
  */
 function netrcPasswords(text: string): string[] {
   const tokens = text.split(/\s+/);
@@ -733,7 +736,8 @@ function netrcPasswords(text: string): string[] {
       record.set(tokens[j], tokens[j + 1]);
     }
     const password = record.get("password");
-    if (record.has("login") && password !== undefined && password.length >= 6) {
+    const host = token === "machine" && /[.:\d]|^localhost$/i.test(tokens[i + 1] ?? "");
+    if (password !== undefined && password.length >= 6 && (record.has("login") || host || !/^[a-z]+$/.test(password))) {
       found.push(password);
     }
   });

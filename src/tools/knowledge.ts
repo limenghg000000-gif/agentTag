@@ -672,7 +672,7 @@ export class KnowledgeDesk {
     }
     const { synced } = proposal;
     if (!synced.saved) {
-      out.done.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}「${synced.duplicate.title}」，没有重复同步。`);
+      out.done.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}${synced.duplicate.title ? `「${synced.duplicate.title}」` : ""}，没有重复同步。`);
       return "archive";
     }
     out.done.push(
