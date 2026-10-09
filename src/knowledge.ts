@@ -820,6 +820,29 @@ function isBasicCredential(value: string): boolean {
  * 过期前谁拿到都能访问。参数名最后一段是 sig 或 signature，值不短于 16 个字符，到 &、空白、括号、中文为止；变量、占位（xxxx）、打了码的不算
  */
 const SIGNED_URL = /[?&](?:[\w.-]*[_.-])?(?:sig|signature)=([^&\s#"'`<>()[\]\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{16,})/gi;
+/** Cookie、Set-Cookie 头（JSON 里的 "Cookie": "…" 也算）后面的「名字=值; 名字=值」，到行尾或引号为止 */
+const COOKIE_HEADER = /\b(?:set-)?cookie["']?[^\S\r\n]*:[^\S\r\n]*["']?([^\r\n"']+)/gi;
+/** curl 的 -b、--cookie 后面的 Cookie（-b cookies.txt 是文件，里面没有 =，取出来也不算）。第 1 组是双引号里的，第 2 组是单引号里的，第 3 组是没引号的 */
+const CURL_COOKIE = /\bcurl\b(?:[^\n]|\\\r?\n)*?(?<![\w.-])(?:-b|--cookie)(?:[ \t]+|=)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"']+))/g;
+/** Set-Cookie 里的属性，不是 Cookie 本身 */
+const COOKIE_ATTRIBUTES = new Set(["expires", "max-age", "domain", "path", "samesite", "priority", "partitioned", "secure", "httponly"]);
+
+/**
+ * Cookie 里的值：登录态（sessionid、PHPSESSID、laravel_session、connect.sid…）拿到就能冒充登录的人。名字五花八门，
+ * 不按名字挑，不短于 8 个字符的都算；值里不能有空白、逗号、引号、中文（RFC 6265），到这些为止，后面是说明
+ */
+function cookieValues(text: string): string[] {
+  const lists = [
+    ...[...text.matchAll(COOKIE_HEADER)].map(([, list]) => list),
+    ...[...text.matchAll(CURL_COOKIE)].map(([, double, single, bare]) => double ?? single ?? bare),
+  ];
+  return lists.flatMap((list) =>
+    list.split(";").flatMap((pair) => {
+      const match = /^\s*([^=\s]+)=\s*"?([^\s",;\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]*)/.exec(pair);
+      return match && !COOKIE_ATTRIBUTES.has(match[1].toLowerCase()) && match[2].length >= 8 ? [match[2]] : [];
+    }),
+  );
+}
 /**
  * 名字以 auth 结尾的配置项：Docker config.json 的 "auth"、.npmrc 的 _auth、basicAuth 这些，值是「用户名:密码」的 base64；
  * Yarn 的 npmAuthIdent 也可以直接写「用户名:密码」。第 1 组是名字，第 2 组是值
@@ -973,6 +996,9 @@ function findSecret(text: string): string | undefined {
   }
   if ([...text.matchAll(SIGNED_URL)].some(([, value]) => !isPlaceholder(value))) {
     return "带签名的临时访问地址";
+  }
+  if (cookieValues(text).some((value) => !isPlaceholder(value))) {
+    return "Cookie 里的登录态";
   }
   const values = [
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),

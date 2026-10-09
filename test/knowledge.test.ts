@@ -275,6 +275,13 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `https://acct.blob.core.windows.net/c/b.txt?sv=2022-11-02&sp=r&se=2026-10-10T00:00:00Z&sig=${encodeURIComponent(Buffer.from("correct horse battery staple sas").toString("base64"))}`,
     `https://bucket.s3.amazonaws.com/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=300&X-Amz-Signature=${"0123456789abcdef".repeat(4)}`,
     `https://bucket.oss-cn-hangzhou.aliyuncs.com/k?Expires=1700000000&Signature=${encodeURIComponent(Buffer.from("correct horse battery").toString("base64"))}`,
+    // Cookie 里的登录态：请求头、响应头、JSON 里的、curl 的 -H、-b、--cookie
+    ["Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="),
+    `Set-Cookie: PHPSESSID=${"k3j4h5g6f7d8s9a0q1w2e3r4t5"}; Path=/; HttpOnly`,
+    `curl -H 'Cookie: lang=zh; laravel_session=${"eyJpdiI6IkNvcnJlY3RIb3JzZSJ9"}' https://api.example`,
+    ["curl -b \"token", "CorrectHorseBatteryStaple9\" https://api.example"].join("="),
+    ["curl --cookie sid", "CorrectHorse9 https://api.example"].join("="),
+    `{"Cookie": "connect.sid=${"s%3ACorrectHorseBattery.abc123"}"}`,
     // PostgreSQL 的 .pgpass：主机像主机的、端口是 5432 的、提到了 pgpass 的；密码里转义的冒号、反斜杠
     ["db.example.com:5432:prod:svc", "CorrectHorseBatteryStaple9"].join(":"),
     ["postgres:5432:app:app", "correcthorsebatterystaple"].join(":"),
@@ -359,6 +366,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "machine learning password resetting 流程；default password rotation 策略；machine api.example password ********",
     // 签名错误的报错、签名参数是占位、变量、打了码的
     "报错 SignatureDoesNotMatch；?X-Amz-Signature=<signature>；&sig=${SAS_SIG}；?Signature=xxxxxxxxxxxxxxxx；?X-Amz-Signature=****；?signature=invalid",
+    // Cookie 没带上的报错、打了码的、变量、cookie 文件、属性、很短的
+    "Cookie: 没带上登录态；Set-Cookie: sessionid=******; Path=/; Domain=.example.com; Expires=Wed, 21 Oct 2026 07:28:00 GMT；curl -b cookies.txt https://x；cookie: session=${SESSION_ID}；Cookie: lang=zh-CN",
     // Redis 的 key 也是几段冒号；.pgpass 里密码是变量、打码的；Azure 的 AccountKey 是变量的
     "order:1001:item:detail:summary；user:10086:coupon:list:available；db.example.com:5432:prod:svc:${PGPASSWORD}；*:*:*:*:******；AccountName=prod;AccountKey=${AZURE_STORAGE_KEY}",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
@@ -2307,6 +2316,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   // 带签名的临时访问地址也一样（拿到就能下载）
   await desk.lookup(`gateway-api 报 code=8，日志在 https://bucket.s3.amazonaws.com/k?X-Amz-Expires=300&X-Amz-Signature=${"0123456789abcdef".repeat(4)}`, task);
+  await desk.lookup(["gateway-api 报 code=8，请求头带了 Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="), task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);
