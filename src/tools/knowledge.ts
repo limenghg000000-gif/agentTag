@@ -16,7 +16,7 @@ import {
   renderHitsForPrompt,
   StaleProposalError,
 } from "../knowledge.js";
-import { type AiopsLesson, type AiopsLessons, renderAiopsHitsForPrompt } from "../knowledge-aiops.js";
+import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, renderAiopsHitsForPrompt } from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { Tool } from "./tool.js";
 
@@ -58,7 +58,8 @@ interface Person {
   name?: string;
 }
 
-type ProposalState = "pending" | "working" | "done" | "cancelled" | "superseded" | "stale";
+/** partial：已经改了经验库，后面的步骤（同步 aiops、归档旧的）有没成功的，卡片上可以再试一次 */
+type ProposalState = "pending" | "working" | "partial" | "done" | "cancelled" | "superseded" | "stale";
 
 interface ProposalBase {
   id: string;
@@ -73,8 +74,10 @@ interface ProposalBase {
   state: ProposalState;
   /** 卡片上额外的一句：别人点了保存、上次保存失败 */
   note?: string;
-  /** 做完以后卡片上的结果 */
+  /** 做完的步骤，卡片上和话题里的结果 */
   result?: string[];
+  /** 没做成的步骤（partial 时有），再点一次补上 */
+  unfinished?: string[];
 }
 
 interface SaveProposal extends ProposalBase {
@@ -90,6 +93,10 @@ interface SaveProposal extends ProposalBase {
   syncAiops: boolean;
   /** 写多维表格用的幂等编号（UUID）：点保存失败后再点，已经写进去的不会再写一行 */
   requestId: string;
+  /** aiops 给了结果的同步（存了，或者有相近的没存）：再试一次时不再调 save_lesson */
+  synced?: AiopsSaveResult;
+  /** 上次调 save_lesson 出错了，可能已经存进去、只是结果没传回来：再试之前先找一下 */
+  aiopsUnsure?: boolean;
 }
 
 interface ArchiveProposal extends ProposalBase {
@@ -99,6 +106,12 @@ interface ArchiveProposal extends ProposalBase {
 }
 
 type Proposal = SaveProposal | ArchiveProposal;
+
+/** 点确认以后做完的和没做成的，各是发到卡片和话题里的几行 */
+interface Outcome {
+  done: string[];
+  unfinished: string[];
+}
 
 export interface KnowledgeDeskOptions {
   base: KnowledgeBase;
@@ -343,12 +356,17 @@ export class KnowledgeDesk {
         .catch((err: unknown) => this.logger.warn("更新经验库卡片失败", err));
       return true;
     }
-    if (proposal.state !== "pending") {
+    if (proposal.state !== "pending" && proposal.state !== "partial") {
       return true;
     }
     if (this.now() - proposal.createdAt > PROPOSAL_TTL_MS) {
       this.proposals.delete(proposal.id);
-      await this.render(proposal, expiredCard("这张卡片超过 24 小时，已经失效。要存的话，在话题里再说一次「沉淀成经验」"));
+      if (proposal.state === "partial") {
+        giveUp(proposal, "卡片超过 24 小时，下面没做成的不再试了，需要的话请手动处理：");
+        await this.render(proposal);
+      } else {
+        await this.render(proposal, expiredCard("这张卡片超过 24 小时，已经失效。要存的话，在话题里再说一次「沉淀成经验」"));
+      }
       return true;
     }
     const approver = !this.options.approvers || this.options.approvers.has(operator.openId);
@@ -359,8 +377,12 @@ export class KnowledgeDesk {
         await this.render(proposal);
         return true;
       }
-      proposal.state = "cancelled";
-      proposal.result = [`${who}取消了，没有改动经验库`];
+      if (proposal.state === "partial") {
+        giveUp(proposal, `${who}点了「不用了」，下面没做成的不再试了：`);
+      } else {
+        proposal.state = "cancelled";
+        proposal.result = [`${who}取消了，没有改动经验库`];
+      }
       this.proposals.delete(proposal.id);
       this.logger.info(`经验库卡片 取消 proposal=${proposal.id} operator=${operator.openId}`);
       await this.render(proposal);
@@ -391,8 +413,9 @@ export class KnowledgeDesk {
     await this.render(proposal);
     const task: McpTaskContext = { chatId: proposal.chatId, senderId: operator.openId, messageId: proposal.sourceMessageId };
     const confirmedBy = operator.name ?? operator.openId;
+    let outcome: Outcome;
     try {
-      proposal.result = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
+      outcome = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
     } catch (err) {
       if (err instanceof StaleProposalError) {
         proposal.state = "stale";
@@ -401,13 +424,24 @@ export class KnowledgeDesk {
         await this.render(proposal);
         return;
       }
-      proposal.state = "pending";
+      // 再试一次时第一步就失败了：上次做完的还在，卡片还是「没做完」
+      proposal.state = proposal.unfinished ? "partial" : "pending";
       proposal.note = `上次点确认没成功：${describe(err)}。可以再点一次`;
       this.logger.warn(`经验库卡片 执行失败 proposal=${proposal.id}`, err);
       await this.render(proposal);
       return;
     }
+    proposal.result = outcome.done;
+    if (outcome.unfinished.length > 0) {
+      // 经验库已经改了，后面有步骤没成功：卡片留着「再试一次」。每一步都能重做（表格按草稿编号认、aiops 先找再存、归档过的不再报错），做完的不会做两遍
+      proposal.state = "partial";
+      proposal.unfinished = outcome.unfinished;
+      this.logger.warn(`经验库卡片 有步骤没做成 proposal=${proposal.id}：${outcome.unfinished.join("；")}`);
+      await this.render(proposal);
+      return;
+    }
     proposal.state = "done";
+    proposal.unfinished = undefined;
     this.proposals.delete(proposal.id);
     await this.render(proposal);
     await this.options
@@ -416,10 +450,10 @@ export class KnowledgeDesk {
   }
 
   /**
-   * 保存，排查经验再同步到 aiops；返回发到话题里的几行。存进团队经验库之后的步骤失败只记在结果里。
+   * 保存，排查经验再同步到 aiops，取代旧经验的再归档旧的。存进团队经验库失败时抛错；后面的步骤失败记在 unfinished 里，卡片可以再试一次。
    * 取代旧经验的一张一张来：两张卡片取代同一条时，后点的那张存之前就能看到旧的已经归档了
    */
-  private save(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
+  private save(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
     if (!proposal.replaces) {
       return this.saveNow(proposal, confirmedBy, task);
     }
@@ -428,9 +462,10 @@ export class KnowledgeDesk {
     return run;
   }
 
-  private async saveNow(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
-    const { base, aiops } = this.options;
+  private async saveNow(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
+    const { base } = this.options;
     const { draft } = proposal;
+    // 再试一次时草稿编号一样，已经写进去的直接返回那一行
     const entry = await base.save(draft, {
       proposedBy: proposal.proposer.name ?? proposal.proposer.openId,
       confirmedBy,
@@ -440,102 +475,149 @@ export class KnowledgeDesk {
     });
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号
     const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
-    const lines = [`已存进团队经验库：经验 ${entry.id}「${draft.title}」，确认人 ${confirmedBy}。`];
+    const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
     // aiops 里有没有这条经验（新存的或者已有相近的）。没有时不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
-    let inAiops = false;
-    if (proposal.syncAiops && !aiops?.writable) {
-      lines.push("aiops 现在连不上，这条没有同步到 aiops 经验库。");
-    } else if (proposal.syncAiops && aiops) {
-      try {
-        const options = { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
-        let synced = await aiops.save(draft, options, task);
-        const replacedLesson = replaced?.aiopsId;
-        if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
-          // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的在下面归档
-          synced = await aiops.save(draft, { ...options, force: true }, task);
-        }
-        inAiops = true;
-        if (synced.saved) {
-          lines.push(`已同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`);
-          lines.push(...(await this.linkAiops(entry, synced.id)));
-        } else {
-          lines.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}「${synced.duplicate.title}」，没有重复同步。`);
-        }
-      } catch (err) {
-        lines.push(`没能同步到 aiops 经验库：${describe(err)}`);
-      }
-    }
+    const inAiops = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : true;
     if (replaced) {
-      lines.push(...(await this.archiveEntry(replaced, confirmedBy, task, "旧的", proposal.syncAiops && !inAiops)));
+      await this.archiveReplaced(replaced, confirmedBy, task, !inAiops, out);
     }
     const location = await base.location().catch(() => undefined);
     if (location) {
-      lines.push(`经验库表格：${location}`);
+      out.done.push(`经验库表格：${location}`);
     }
-    return lines;
+    return out;
   }
 
-  private async archive(proposal: ArchiveProposal, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
+  /** 排查经验同步到 aiops，再在表格里记下 aiops 编号；返回 aiops 里有没有这条（新存的或者已有相近的） */
+  private async syncAiops(
+    proposal: SaveProposal,
+    entry: KnowledgeEntry,
+    replacedLesson: number | undefined,
+    confirmedBy: string,
+    task: McpTaskContext,
+    out: Outcome,
+  ): Promise<boolean> {
+    if (!proposal.synced) {
+      try {
+        proposal.synced = await this.saveLesson(proposal, entry, replacedLesson, confirmedBy, task);
+      } catch (err) {
+        out.unfinished.push(`没能同步到 aiops 经验库：${describe(err)}`);
+        return false;
+      }
+    }
+    const { synced } = proposal;
+    if (!synced.saved) {
+      out.done.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}「${synced.duplicate.title}」，没有重复同步。`);
+      return true;
+    }
+    out.done.push(`已同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`);
+    if (entry.aiopsId !== synced.id) {
+      try {
+        await this.linkAiops(entry, synced.id);
+      } catch (err) {
+        out.unfinished.push(
+          `没能在经验库表格里记下 aiops 编号 #${synced.id}（${describe(err)}）。不记下的话检索时会列出两遍，以后归档 ${entry.id} 时 aiops 里这条也不会跟着归档`,
+        );
+      }
+    }
+    return true;
+  }
+
+  /** 写进 aiops。上次调用出错了（可能已经存进去，只是结果没传回来）时，先找这条团队经验同步过去的，找到了就不再存 */
+  private async saveLesson(
+    proposal: SaveProposal,
+    entry: KnowledgeEntry,
+    replacedLesson: number | undefined,
+    confirmedBy: string,
+    task: McpTaskContext,
+  ): Promise<AiopsSaveResult> {
+    const { aiops } = this.options;
+    if (!aiops?.writable) {
+      throw new KnowledgeError("aiops 现在连不上");
+    }
+    try {
+      const existing = proposal.aiopsUnsure ? await aiops.findSynced(proposal.draft, entry.id, task) : undefined;
+      if (existing !== undefined) {
+        return { saved: true, id: existing };
+      }
+      const options = { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
+      const synced = await aiops.save(proposal.draft, options, task);
+      if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
+        // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的后面归档
+        return await aiops.save(proposal.draft, { ...options, force: true }, task);
+      }
+      return synced;
+    } catch (err) {
+      proposal.aiopsUnsure = true;
+      throw err;
+    }
+  }
+
+  private async archive(proposal: ArchiveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
     const { target } = proposal;
     if (target.type === "aiops") {
       await this.options.aiops!.archive(target.lesson.id, confirmedBy, task);
-      return [`已归档 aiops 经验 #${target.lesson.id}「${target.lesson.title}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`];
+      return {
+        done: [`已归档 aiops 经验 #${target.lesson.id}「${target.lesson.title}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`],
+        unfinished: [],
+      };
     }
     // 用归档时表格里的样子：卡片发出后可能有人在表格里改过 aiops 编号
     const entry = await this.options.base.archive(target.entry.id, { confirmedBy });
-    const lines = [`已归档经验 ${entry.id}「${entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`];
+    const out: Outcome = { done: [`已归档经验 ${entry.id}「${entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`], unfinished: [] };
     if (entry.aiopsId !== undefined) {
-      lines.push(...(await this.archiveLinked(entry.aiopsId, confirmedBy, task)));
+      await this.archiveLinked(entry.aiopsId, confirmedBy, task, out);
     }
-    return lines;
+    return out;
   }
 
-  /** 在表格里记下同步到 aiops 后的编号，失败隔一会儿再试；都没成功时请人在表格里手动填 */
-  private async linkAiops(entry: KnowledgeEntry, aiopsId: number): Promise<string[]> {
+  /** 在表格里记下同步到 aiops 后的编号，失败隔一会儿再试，都没成功时抛错 */
+  private async linkAiops(entry: KnowledgeEntry, aiopsId: number): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       try {
         await this.options.base.linkAiops(entry.id, aiopsId);
-        return [];
+        return;
       } catch (err) {
         if (attempt >= LINK_ATTEMPTS) {
           this.logger.warn(`经验库：${entry.id} 没能记下 aiops 编号 ${aiopsId}`, err);
-          return [
-            `没能在经验库表格里记下 aiops 编号（${describe(err)}）。请在表格里把 ${entry.id} 的「aiops 经验编号」填成 ${aiopsId}，不然检索时会列出两遍，以后归档 ${entry.id} 时 aiops 里这条也不会跟着归档。`,
-          ];
+          throw err;
         }
         await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
       }
     }
   }
 
-  /** 保存新经验后归档被取代的旧经验，失败只写进结果。keepAiops：新的没进 aiops，旧的在 aiops 里那条先留着 */
-  private async archiveEntry(old: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, label: string, keepAiops = false): Promise<string[]> {
+  /** 保存新经验后归档被取代的旧经验。keepAiops：新的没进 aiops，旧的在 aiops 里那条先留着，新的进了 aiops 再归档 */
+  private async archiveReplaced(old: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, keepAiops: boolean, out: Outcome): Promise<void> {
     let entry: KnowledgeEntry;
     try {
       entry = await this.options.base.archive(old.id, { confirmedBy });
     } catch (err) {
-      return [`${label}经验 ${old.id} 没能归档：${describe(err)}`];
+      out.unfinished.push(`旧的经验 ${old.id} 没能归档：${describe(err)}。不归档的话新旧两条都会被检索到`);
+      return;
     }
-    const lines = [`${label}经验 ${entry.id}「${entry.title}」已归档。`];
-    if (entry.aiopsId !== undefined && keepAiops) {
-      lines.push(`aiops 经验库里同步的旧经验 #${entry.aiopsId} 先留着没归档：新的这条没同步到 aiops，归档了告警自动排查就查不到这个问题了。aiops 能用以后请在 aiops 里更新它。`);
-    } else if (entry.aiopsId !== undefined) {
-      lines.push(...(await this.archiveLinked(entry.aiopsId, confirmedBy, task)));
+    out.done.push(`旧的经验 ${entry.id}「${entry.title}」已归档。`);
+    if (entry.aiopsId === undefined) {
+      return;
     }
-    return lines;
+    if (keepAiops) {
+      out.unfinished.push(`aiops 经验库里同步的旧经验 #${entry.aiopsId} 先留着没归档：新的这条进了 aiops 再归档它，不然告警自动排查就查不到这个问题了。`);
+      return;
+    }
+    await this.archiveLinked(entry.aiopsId, confirmedBy, task, out);
   }
 
   /** 团队经验库里归档的排查经验，aiops 里同步的那条也归档 */
-  private async archiveLinked(aiopsId: number, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
+  private async archiveLinked(aiopsId: number, confirmedBy: string, task: McpTaskContext, out: Outcome): Promise<void> {
     const { aiops } = this.options;
-    if (!aiops?.writable) {
-      return [`aiops 经验库里同步的经验 #${aiopsId} 这次没能归档（aiops 没连上），请在 aiops 里手动归档。`];
-    }
     try {
+      if (!aiops?.writable) {
+        throw new KnowledgeError("aiops 现在连不上");
+      }
       await aiops.archive(aiopsId, confirmedBy, task);
-      return [`aiops 经验库里同步的经验 #${aiopsId} 也已归档。`];
+      out.done.push(`aiops 经验库里同步的经验 #${aiopsId} 也已归档。`);
     } catch (err) {
-      return [`aiops 经验库里同步的经验 #${aiopsId} 没能归档：${describe(err)}`];
+      out.unfinished.push(`aiops 经验库里同步的经验 #${aiopsId} 没能归档：${describe(err)}`);
     }
   }
 
@@ -631,11 +713,15 @@ export class KnowledgeDesk {
     await this.options.updateCard(proposal.cardMessageId, card).catch((err: unknown) => this.logger.warn("更新经验库卡片失败", err));
   }
 
-  /** 过期的草稿不再留在内存里 */
+  /** 过期的草稿不再留在内存里；做了一半的卡片写上没做成的，免得以后点了只提示失效 */
   private sweep(): void {
     for (const [id, proposal] of this.proposals) {
       if (this.now() - proposal.createdAt > PROPOSAL_TTL_MS) {
         this.proposals.delete(id);
+        if (proposal.state === "partial") {
+          giveUp(proposal, "卡片超过 24 小时，下面没做成的不再试了，需要的话请手动处理：");
+          void this.render(proposal);
+        }
       }
     }
   }
@@ -644,6 +730,7 @@ export class KnowledgeDesk {
 const HEADERS: Record<ProposalState, { save: string; archive: string; template: string }> = {
   pending: { save: "存进经验库？", archive: "归档这条经验？", template: "blue" },
   working: { save: "正在存进经验库…", archive: "正在归档…", template: "blue" },
+  partial: { save: "已存进经验库，还有没做成的", archive: "已归档，还有没做成的", template: "orange" },
   done: { save: "已存进经验库", archive: "已归档", template: "green" },
   cancelled: { save: "已取消", archive: "已取消", template: "grey" },
   superseded: { save: "已换成新的草稿", archive: "已换成新的草稿", template: "grey" },
@@ -698,6 +785,9 @@ export function renderProposalCard(proposal: Proposal): object {
         : "只有写权限名单里的人能点「归档」。",
     );
   }
+  if (proposal.state === "partial") {
+    notes.push("点「再试一次」补上没做成的，做完的不会再做一遍；只有写权限名单里的人能点。不需要了就点「不用了」。");
+  }
   if (proposal.note) {
     notes.push(proposal.note);
   }
@@ -708,11 +798,19 @@ export function renderProposalCard(proposal: Proposal): object {
   if (proposal.result) {
     elements.push({ tag: "markdown", content: proposal.result.join("\n") });
   }
-  if (proposal.state === "pending") {
+  if (proposal.unfinished) {
+    elements.push({ tag: "markdown", content: ["**没做成的**：", ...proposal.unfinished.map((line) => `- ${line}`)].join("\n") });
+  }
+  if (proposal.state === "pending" || proposal.state === "partial") {
     const op = proposal.kind === "archive" ? "archive" : "save";
+    const retry = proposal.state === "partial";
     elements.push(
-      button(op === "archive" ? "归档" : "保存", op === "archive" ? "danger" : "primary", { action: KNOWLEDGE_ACTION, proposal: proposal.id, op }),
-      button("取消", "default", { action: KNOWLEDGE_ACTION, proposal: proposal.id, op: "cancel" }),
+      button(retry ? "再试一次" : op === "archive" ? "归档" : "保存", op === "archive" && !retry ? "danger" : "primary", {
+        action: KNOWLEDGE_ACTION,
+        proposal: proposal.id,
+        op,
+      }),
+      button(retry ? "不用了" : "取消", "default", { action: KNOWLEDGE_ACTION, proposal: proposal.id, op: "cancel" }),
     );
   }
   const title = proposal.kind === "save" ? header.save : header.archive;
@@ -722,6 +820,14 @@ export function renderProposalCard(proposal: Proposal): object {
     header: { title: { tag: "plain_text", content: title }, template: header.template },
     body: { elements },
   };
+}
+
+/** 做了一半的卡片不再试了：没做成的写进结果，卡片收起按钮 */
+function giveUp(proposal: Proposal, lead: string): void {
+  proposal.state = "done";
+  proposal.result = [...(proposal.result ?? []), lead, ...(proposal.unfinished ?? []).map((line) => `- ${line}`)];
+  proposal.unfinished = undefined;
+  proposal.note = undefined;
 }
 
 function expiredCard(text: string): object {

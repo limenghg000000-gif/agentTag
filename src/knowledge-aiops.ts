@@ -9,8 +9,9 @@ const QUERY_CHARS = 800;
  * 语义相似度不低于 0.55 时加相似度×10。所以这个数大致等于「语义相似度 0.55 以上，或者错误码对上了」
  */
 const MIN_PROMPT_SCORE = 5.5;
-/** 写进提示词时每条经验最多多少字 */
+/** 写进提示词时每条经验最多多少字、每一项最多多少字 */
 const PROMPT_HIT_CHARS = 1200;
+const PROMPT_FIELD_CHARS = 400;
 
 /** aiops 检索返回的一条经验 */
 export interface AiopsLessonHit {
@@ -122,8 +123,8 @@ export class AiopsLessons {
       symptom: draft.question,
       source: caseId === undefined ? "chat" : "case",
       created_by: `feishu:${confirmedBy}`,
-      // 排查过程末尾注明出自团队经验库，aiops 里看到的人知道去哪改
-      diagnosis_path: [draft.basis, `（来自飞书团队经验库 ${teamId}）`].filter(Boolean).join("\n"),
+      // 排查过程末尾注明出自团队经验库，aiops 里看到的人知道去哪改，再试一次时也靠它认出已经存过的
+      diagnosis_path: [draft.basis, teamSourceNote(teamId)].filter(Boolean).join("\n"),
       ...(caseId === undefined ? {} : { case_id: caseId }),
       ...(draft.scope ? { service: draft.scope } : {}),
       ...(draft.handling ? { solution: draft.handling } : {}),
@@ -148,26 +149,53 @@ export class AiopsLessons {
     throw new KnowledgeError(`aiops 没有说存没存成功：${raw.slice(0, 300)}`);
   }
 
+  /** 团队经验库里这一条同步到 aiops 的经验（按草稿检索，看排查过程末尾的出处）；没有时返回 undefined */
+  async findSynced(draft: KnowledgeDraft, teamId: string, task: McpTaskContext): Promise<number | undefined> {
+    const hits = await this.search(`${draft.title}\n${draft.question}`, task);
+    return hits.find((hit) => hit.diagnosis_path?.includes(teamSourceNote(teamId)))?.id;
+  }
+
+  /** 归档。archive_lesson 只改有效的，对已经归档的报错：报错时看一下，已经归档了（比如上次归档成功、结果没传回来）就算成功 */
   async archive(id: number, confirmedBy: string, task: McpTaskContext): Promise<void> {
-    await this.mcp.callDirect(this.server, "archive_lesson", { id }, task);
+    try {
+      await this.mcp.callDirect(this.server, "archive_lesson", { id }, task);
+    } catch (err) {
+      const lesson = await this.get(id, task).catch(() => undefined);
+      if (!lesson || lesson.status === "active") {
+        throw err;
+      }
+      this.logger.info(`aiops 经验库 经验 #${id} 已经是归档的`);
+      return;
+    }
     this.logger.info(`aiops 经验库 归档 经验 #${id} 确认人=${confirmedBy}`);
   }
+}
+
+/** 同步到 aiops 的经验在排查过程末尾注明的出处 */
+function teamSourceNote(teamId: string): string {
+  return `（来自飞书团队经验库 ${teamId}）`;
 }
 
 /** 写进系统提示词的「aiops 经验库里可能相关的经验」 */
 export function renderAiopsHitsForPrompt(hits: readonly AiopsLessonHit[]): string {
   return hits
     .map((hit) => {
+      // 根因和处理办法放前面，每一项限长：现象写得很长时也不会把结论挤出去
       const text = [
         `aiops 经验 #${hit.id}：${hit.title}`,
-        ...([
-          ["现象", hit.symptom],
-          ["根因", hit.root_cause],
-          ["处理办法", hit.solution],
-          ["排查过程", hit.diagnosis_path],
-        ] as const)
-          .filter(([, value]) => value)
-          .map(([name, value]) => `- ${name}：${value}`),
+        ...(
+          [
+            ["根因", hit.root_cause],
+            ["处理办法", hit.solution],
+            ["现象", hit.symptom],
+            ["排查过程", hit.diagnosis_path],
+          ] as [string, string | undefined][]
+        )
+          .filter((pair): pair is [string, string] => Boolean(pair[1]))
+          .map(
+            ([name, value]) =>
+              `- ${name}：${value.length > PROMPT_FIELD_CHARS ? `${value.slice(0, PROMPT_FIELD_CHARS)}…（这一项后面省略，要看全文用 aiops_get_knowledge）` : value}`,
+          ),
       ].join("\n");
       return text.length > PROMPT_HIT_CHARS ? `${text.slice(0, PROMPT_HIT_CHARS)}…（后面省略，要看全文用 aiops_get_knowledge）` : text;
     })

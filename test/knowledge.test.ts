@@ -11,7 +11,7 @@ import {
   normalizeDraft,
   renderHitsForPrompt,
 } from "../src/knowledge.js";
-import { AiopsLessons, type LessonsMcp } from "../src/knowledge-aiops.js";
+import { AiopsLessons, type LessonsMcp, renderAiopsHitsForPrompt } from "../src/knowledge-aiops.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
@@ -297,14 +297,20 @@ function deskSetup({
   aiops = true,
   approvers = new Set(["ou_admin"]),
   saveLesson = () => JSON.stringify({ saved: true, id: 31 }),
-}: { aiops?: boolean; approvers?: ReadonlySet<string>; saveLesson?: (args: Record<string, unknown>) => string } = {}) {
+  searchLessons = () => JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9 }, { id: 40, title: "Open WebUI 存的", score: 8 }] }),
+}: {
+  aiops?: boolean;
+  approvers?: ReadonlySet<string>;
+  saveLesson?: (args: Record<string, unknown>) => string;
+  searchLessons?: (args: Record<string, unknown>) => string;
+} = {}) {
   const control = { failSend: false };
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
   const updates: { messageId: string; card: any }[] = [];
   const { mcp, calls } = fakeMcp({
-    search_knowledge: () => JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9 }, { id: 40, title: "Open WebUI 存的", score: 8 }] }),
+    search_knowledge: searchLessons,
     get_knowledge: (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", root_cause: "旧结论" }),
     save_lesson: saveLesson,
     archive_lesson: () => JSON.stringify({ archived: true }),
@@ -550,7 +556,7 @@ test("起草时经验库里有很像的，卡片上提示；带 replaces 时保�
   await assert.rejects(tool("knowledge_propose").run({ ...code8, replaces: "K1" }, { signal }), /经验 K1 已经归档了/);
 });
 
-test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一条新的再归档旧的；新的没进 aiops 时旧的在 aiops 里那条先留着", async () => {
+test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一条新的再归档旧的；新的没进 aiops 时旧的在 aiops 里那条先留着，再试一次进了 aiops 才归档", async () => {
   const replace = async (saveLesson: (args: Record<string, unknown>) => string) => {
     const setup = deskSetup({ saveLesson });
     await setup.base.save(normalizeDraft(code8));
@@ -558,23 +564,152 @@ test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一�
     await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
     await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
     await setup.desk.idle();
-    return { ...setup, text: (setup.sent.at(-1)!.input as { markdown: string }).markdown };
+    return setup;
   };
+  const markdown = (setup: { sent: { input: SendInput }[] }) => (setup.sent.at(-1)!.input as { markdown: string }).markdown;
 
   const dup = await replace((args) =>
     args.force ? JSON.stringify({ saved: true, id: 32 }) : JSON.stringify({ saved: false, duplicate_of: { id: 31, title: "旧的", why: "错误码相同" } }),
   );
   assert.equal(dup.backend.entries.find((e) => e.id === "K2")!.aiopsId, 32);
   assert.deepEqual(dup.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
-  assert.match(dup.text, /已同步到 aiops 经验库（经验 #32）/);
+  assert.match(markdown(dup), /已同步到 aiops 经验库（经验 #32）/);
 
+  let up = false;
   const down = await replace(() => {
-    throw new Error("aiops 现在连不上");
+    if (!up) {
+      throw new Error("aiops 现在连不上");
+    }
+    return JSON.stringify({ saved: true, id: 33 });
   });
   assert.equal(down.backend.entries.find((e) => e.id === "K1")!.status, "archived");
   assert.equal(down.calls.filter((call) => call.tool === "archive_lesson").length, 0);
-  assert.match(down.text, /没能同步到 aiops 经验库：aiops 现在连不上/);
-  assert.match(down.text, /aiops 经验库里同步的旧经验 #31 先留着没归档/);
+  const partial = down.lastCard();
+  assert.equal(partial.header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(partial), /没能同步到 aiops 经验库：aiops 现在连不上/);
+  assert.match(cardText(partial), /aiops 经验库里同步的旧经验 #31 先留着没归档/);
+  assert.match(cardText(partial), /"content":"再试一次"/);
+  assert.equal(down.sent.length, 1, "没做完时话题里不发结果");
+
+  up = true;
+  await down.desk.handleCardAction(down.click(partial, "save"));
+  await down.desk.idle();
+  assert.deepEqual(
+    down.backend.entries.map((e) => [e.id, e.status, e.aiopsId]),
+    [
+      ["K1", "archived", 31],
+      ["K2", "active", 33],
+    ],
+  );
+  assert.deepEqual(down.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal(down.lastCard().header.title.content, "已存进经验库");
+  assert.match(markdown(down), /已同步到 aiops 经验库（经验 #33）[\s\S]*旧的经验 K1「.*」已归档。\naiops 经验库里同步的经验 #31 也已归档。/);
+});
+
+test("取代旧经验时归档旧的失败：卡片留着再试一次，新的不会存两遍，aiops 也不再存一条", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  const update = backend.update.bind(backend);
+  let limited = true;
+  backend.update = async (id, changes) => {
+    if (id === "K1" && limited) {
+      throw new KnowledgeError("飞书接口限流");
+    }
+    return update(id, changes);
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status]),
+    [
+      ["K1", "active"],
+      ["K2", "active"],
+    ],
+  );
+  const partial = lastCard();
+  assert.equal(partial.header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(partial), /旧的经验 K1 没能归档：飞书接口限流/);
+  assert.match(cardText(partial), /已存进团队经验库：经验 K2/);
+
+  limited = false;
+  await desk.handleCardAction(click(partial, "save"));
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status, e.aiopsId]),
+    [
+      ["K1", "archived", 31],
+      ["K2", "active", 32],
+    ],
+  );
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1);
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /旧的经验 K1「.*」已归档/);
+});
+
+test("同步到 aiops 时结果没传回来：再试一次先找到已经存进去的那条，不再存一条", async () => {
+  const lessons: { id: number; title: string; score: number; diagnosis_path: string }[] = [
+    { id: 50, title: "另一条团队经验同步的", score: 9, diagnosis_path: "（来自飞书团队经验库 K10）" },
+  ];
+  let lose = true;
+  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+    saveLesson: (args) => {
+      lessons.push({ id: 31, title: String(args.title), score: 9.8, diagnosis_path: String(args.diagnosis_path) });
+      if (lose) {
+        lose = false;
+        throw new Error("socket hang up");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+    searchLessons: () => JSON.stringify({ hits: lessons }),
+  });
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  const partial = lastCard();
+  assert.match(cardText(partial), /没能同步到 aiops 经验库：socket hang up/);
+  assert.equal(backend.entries[0].aiopsId, undefined);
+
+  await desk.handleCardAction(click(partial, "save"));
+  await desk.idle();
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1);
+  assert.equal(backend.entries.length, 1);
+  assert.equal(backend.entries[0].aiopsId, 31);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已同步到 aiops 经验库（经验 #31）/);
+});
+
+test("没做成的卡片：点「不用了」或者超过 24 小时就不再试，结果里写上没做成的", async () => {
+  const fail = () => {
+    throw new Error("aiops 现在连不上");
+  };
+  const quit = deskSetup({ saveLesson: fail });
+  await quit.tool("knowledge_propose").run(code8, { signal });
+  await quit.desk.handleCardAction(quit.click((quit.sent[0].input as { card: any }).card, "save"));
+  await quit.desk.idle();
+  const partial = quit.lastCard();
+  await quit.desk.handleCardAction(quit.click(partial, "cancel", "ou_2", "李四"));
+  assert.match(cardText(quit.lastCard()), /只有发起人或写权限名单里的人能取消/);
+  await quit.desk.handleCardAction(quit.click(partial, "cancel", "ou_1", "张三"));
+  const given = quit.lastCard();
+  assert.equal(given.header.title.content, "已存进经验库");
+  assert.match(cardText(given), /已存进团队经验库：经验 K1/);
+  assert.match(cardText(given), /张三点了「不用了」，下面没做成的不再试了：\\n- 没能同步到 aiops 经验库：aiops 现在连不上/);
+  assert.doesNotMatch(cardText(given), /"tag":"button"/);
+  assert.equal(quit.backend.entries.length, 1);
+
+  const late = deskSetup({ saveLesson: fail });
+  await late.tool("knowledge_propose").run(code8, { signal });
+  await late.desk.handleCardAction(late.click((late.sent[0].input as { card: any }).card, "save"));
+  await late.desk.idle();
+  late.advance(PROPOSAL_TTL_MS + 1);
+  await late.desk.handleCardAction(late.click(late.lastCard(), "save"));
+  await late.desk.idle();
+  assert.equal(late.lastCard().header.title.content, "已存进经验库");
+  assert.match(cardText(late.lastCard()), /卡片超过 24 小时，下面没做成的不再试了/);
+  assert.equal(late.calls.filter((call) => call.tool === "save_lesson").length, 1);
 });
 
 test("两张卡片取代同一条经验：先点的存好并归档旧的，后点的不再存（同时点也一样）", async () => {
@@ -628,7 +763,7 @@ test("归档、取代时用表格里现在的 aiops 编号：卡片发出后有�
   assert.deepEqual(replace.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
 });
 
-test("同步到 aiops 后记编号失败会再试，试了几次都不行时请人在表格里手动填", async () => {
+test("同步到 aiops 后记编号失败会再试；几次都不行时卡片可以再试一次，aiops 里不再存一条", async () => {
   const once = deskSetup();
   await once.tool("knowledge_propose").run(code8, { signal });
   once.backend.failUpdates = 1;
@@ -643,7 +778,38 @@ test("同步到 aiops 后记编号失败会再试，试了几次都不行时请�
   await never.desk.handleCardAction(never.click((never.sent[0].input as { card: any }).card, "save"));
   await never.desk.idle();
   assert.equal(never.backend.entries[0].aiopsId, undefined);
-  assert.match((never.sent.at(-1)!.input as { markdown: string }).markdown, /请在表格里把 K1 的「aiops 经验编号」填成 31/);
+  const partial = never.lastCard();
+  assert.equal(partial.header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(partial), /没能在经验库表格里记下 aiops 编号 #31（飞书接口限流）/);
+
+  never.backend.failUpdates = 0;
+  await never.desk.handleCardAction(never.click(partial, "save"));
+  await never.desk.idle();
+  assert.equal(never.backend.entries[0].aiopsId, 31);
+  assert.equal(never.calls.filter((call) => call.tool === "save_lesson").length, 1);
+  assert.equal(never.lastCard().header.title.content, "已存进经验库");
+});
+
+test("aiops 归档：archive_lesson 报错时看一下，已经归档了就算成功，还有效的照样报错", async () => {
+  let status = "archived";
+  const { mcp } = fakeMcp({
+    archive_lesson: () => {
+      throw new Error("经验不存在或已归档");
+    },
+    get_knowledge: (args) => JSON.stringify({ id: args.id, title: "user-rpc 降载", status }),
+  });
+  const lessons = new AiopsLessons(mcp, "aiops", quiet);
+  await lessons.archive(12, "ML", task);
+  status = "active";
+  await assert.rejects(lessons.archive(12, "ML", task), /经验不存在或已归档/);
+});
+
+test("aiops 经验写进提示词：根因和处理办法在前面，每一项限长，现象写得很长也看得到根因", () => {
+  const text = renderAiopsHitsForPrompt([
+    { id: 12, title: "user-rpc 降载", score: 9, symptom: "接口返回空".repeat(300), root_cause: "单 Pod 被打满", solution: "改 headless Service", diagnosis_path: "看 Pod CPU" },
+  ]);
+  assert.match(text, /^aiops 经验 #12：user-rpc 降载\n- 根因：单 Pod 被打满\n- 处理办法：改 headless Service\n- 现象：/);
+  assert.match(text, /- 现象：(接口返回空)+…（这一项后面省略，要看全文用 aiops_get_knowledge）\n- 排查过程：看 Pod CPU/);
 });
 
 test("模型查经验库、看经验时任务停了不等表格", async () => {
