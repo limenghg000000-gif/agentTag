@@ -485,6 +485,25 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/(?:secret|token)(?:[_-]?(?:access[_-]?)?key)?\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}/i, "密码或令牌"],
 ];
 
+/**
+ * token、secret 后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple，aiops 的令牌什么样的都能配）。
+ * 值后面紧跟着代码符号的不算（cfg.Token、getToken()、${MCP_AIOPS_TOKEN}、<token>）；
+ * 值里有一段是报错、占位或者变量名里的词也不算（token=expired_session、your_token_here、xxxxxxxx、FEISHU_APP_SECRET）
+ */
+const TOKEN_ASSIGNMENT = /(?:secret|token)(?:[_-]?(?:access[_-]?)?key)?["']?\s*[:=：]\s*["']?([\w+/~=-]{8,})(?![\w+/~=(\[{<$@:\\-]|\.\S)/gi;
+const NOT_A_TOKEN =
+  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|stale|bad|wrong|fail(?:ed|ure)?|malformed|unknown|absent|disabled|placeholder|redacted|masked|hidden|example|sample|dummy|your|here|token|key|secret|x{3,})$/i;
+
+/** 草稿里像是密钥的是哪一种；没有时返回 undefined */
+function findSecret(text: string): string | undefined {
+  const known = SECRET_PATTERNS.find(([pattern]) => pattern.test(text));
+  if (known) {
+    return known[1];
+  }
+  const assigned = [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, value]) => !value.split(/[_+/~=-]+/).some((part) => NOT_A_TOKEN.test(part)));
+  return assigned ? "密码或令牌" : undefined;
+}
+
 /** 去掉首尾空白、检查必填、长度和密钥 */
 export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
   const category = draft.category;
@@ -506,10 +525,10 @@ export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
     if (text.length > limit) {
       throw new KnowledgeError(`${name}（${key}）最多 ${limit} 字，现在 ${text.length} 字，请写得更精炼`);
     }
-    const secret = SECRET_PATTERNS.find(([pattern]) => pattern.test(text));
+    const secret = findSecret(text);
     if (secret) {
       throw new KnowledgeError(
-        `${name}（${key}）里像是有${secret[1]}。经验库所有群都能看到，不能存密钥和密码：去掉或者换成 *** 再起草，回答里也不要复述它`,
+        `${name}（${key}）里像是有${secret}。经验库所有群都能看到，不能存密钥和密码：去掉或者换成 *** 再起草，回答里也不要复述它`,
       );
     }
     return text;

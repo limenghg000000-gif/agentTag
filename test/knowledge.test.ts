@@ -113,6 +113,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     ["AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"].join(""),
     ["sk", "_live_", "abcdefghijklmnop0123"].join(""),
     ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "abcdefghijklmnopqrstuv"].join("."),
+    // token、secret 后面写的值没有数字也算
+    "MCP_AIOPS_TOKEN=correcthorsebatterystaple",
+    "secret: correct-horse-battery-staple",
+    'aiops 配置是 {"token": "CorrectHorseBatteryStaple"}',
+    "https://aiops.example.com/mcp?token=correcthorsebattery&ns=prod",
+    "FEISHU_APP_SECRET=CorrectHorseBattery。",
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -125,6 +131,16 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
   assert.ok(normalizeDraft({ ...code8, basis: "用 sk-learn-preprocessing-pipeline 处理的数据" }));
   assert.ok(normalizeDraft({ ...code8, basis: "这次调用 total_tokens: 123456789" }));
   assert.ok(normalizeDraft({ ...code8, basis: "群机器人的 Webhook 地址在飞书群设置里，xoxo 不是令牌" }));
+  for (const prose of [
+    "日志里是 token=invalid_signature，换新令牌后好了",
+    "MCP_AIOPS_TOKEN=${MCP_AIOPS_TOKEN}，从 .env 读",
+    "token=<your-token>、token=your_token_here、access_token=xxxxxxxxxxxx 都是占位",
+    "secret=FEISHU_APP_SECRET，在服务器 .env 里",
+    "代码里 token := cfg.Token，token = getToken()，secret: config.secret",
+    "token: expired. 重新登录就好",
+  ]) {
+    assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
+  }
 });
 
 function fakeEmbedder(topics: string[]) {
