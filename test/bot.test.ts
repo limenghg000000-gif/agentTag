@@ -825,6 +825,22 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
     maxOutputChars: json.indexOf("user.go:123") + "user.go:12".length,
     run: async () => json,
   };
+  // 正好截在路径后面的冒号前：路径是完整的
+  const trace = "panic at internal/logic/pay.go:123 +0x1d";
+  const cutTrace: Tool = {
+    spec: { name: "aiops_get_trace", description: "查链路", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查链路",
+    maxOutputChars: trace.indexOf(":123"),
+    run: async () => trace,
+  };
+  // 截在路径中间：模型看到的 src/index.ts 其实是 src/index.tsx 的前半截
+  const stack = "Error: boom\n    at render (src/index.tsx:5:3)";
+  const cutStack: Tool = {
+    spec: { name: "aiops_get_stack", description: "查堆栈", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查堆栈",
+    maxOutputChars: stack.indexOf("x:5"),
+    run: async () => stack,
+  };
   const ask = async (answers: string[], tool = "aiops_get_pod_logs") => {
     const results: ChatResult[] = [
       { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: tool, arguments: "{}" }] },
@@ -835,7 +851,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
       model,
       taskTools: () => [codeSearch],
       codeRepos: ["ai/aiops-mcp"],
-      mcp: { names: ["aiops"], tools: () => [podLogs, longLogs], prompt: () => undefined },
+      mcp: { names: ["aiops"], tools: () => [podLogs, longLogs, cutTrace, cutStack], prompt: () => undefined },
     });
     await handle(message("order-api 的 Pod 为什么重启"));
     return { requests, replies: markdowns(sent) };
@@ -855,6 +871,15 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   assert.equal(clipped.requests.length, 3);
   assert.match(String(clipped.requests[1].messages.at(-1)?.content), /user\.go:12/);
   assert.deepEqual(clipped.replies, ["panic 在 `internal/logic/order.go:88`"]);
+  // 切在行号里：路径照样算，只是不算哪一行
+  const pathOnly = await ask(["`internal/logic/user.go` 也报错"], "aiops_query_logs");
+  assert.equal(pathOnly.requests.length, 2);
+  const beforeColon = await ask(["panic 在 `internal/logic/pay.go` 里"], "aiops_get_trace");
+  assert.equal(beforeColon.requests.length, 2);
+  assert.deepEqual(beforeColon.replies, ["panic 在 `internal/logic/pay.go` 里"]);
+  const halfPath = await ask(["报错在 `src/index.ts` 里", "报错在 render 里"], "aiops_get_stack");
+  assert.equal(halfPath.requests.length, 3);
+  assert.deepEqual(halfPath.replies, ["报错在 render 里"]);
 });
 
 test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
@@ -1435,6 +1460,10 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.equal(asked.requests.length, 3);
   assert.match(String(asked.requests[2].messages.at(-1)?.content), /读失败、没搜到的路径也不算/);
   assert.deepEqual(asked.replies, [missing]);
+  // 群成员写的是「仓库名/路径」，回答里写的是仓库里的路径，也算照着复述
+  const prefixed = await ask([missing, missing], { question: "ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的", tool: "code_read_file" });
+  assert.equal(prefixed.requests.length, 3);
+  assert.deepEqual(prefixed.replies, [missing]);
 
   // 读失败、没搜到以后照样讲这个文件写了什么，或者自己猜的路径读失败了还写着：打回重做，重做后还这么写就不发出
   for (const [claim, tool] of [

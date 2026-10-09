@@ -304,8 +304,11 @@ async function runTask(
       // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
-      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, deps.codeRepos ?? []);
-      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || mentions(userText, text)).filter(
+      const repos = deps.codeRepos ?? [];
+      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
+      // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts）、回答里写 src/foo.ts 的也算照着复述
+      const inQuestion = (text: string) => mentions(userText, text) || repos.some((repo) => mentions(userText, `${repo}/${text}`));
+      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || inQuestion(text)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -702,15 +705,21 @@ function hasLine(output: string, path: string, line: number): boolean {
 }
 
 /**
- * 工具结果里模型看到的部分：和 runAgent 交给模型时一样截短。被截掉的不算查到；
- * 截断处被切开的路径、行号（src/foo.ts:12 后面其实还有个 3）也去掉
+ * 工具结果里模型看到的部分：和 runAgent 交给模型时一样截短。被截掉的不算查到；截断处被切开的路径、行号也去掉：
+ * 切在行号里（src/foo.ts:12 后面其实还有个 3）只去掉行号，路径是完整的；切在路径里（src/foo.t）整个去掉；
+ * 正好切在路径后面的冒号前（src/foo.ts 后面是 :123）路径是完整的，都留着
  */
 function seenByModel(output: string, limit: number): string {
   if (output.length <= limit) {
     return output;
   }
   const kept = output.slice(0, limit);
-  return /[\w./:-]/.test(output[limit]) ? kept.replace(/[\w./:-]+$/, "") : kept;
+  const next = output[limit];
+  if (next === ":" || !/[\w./-]/.test(next)) {
+    return kept;
+  }
+  const token = /[\w./:-]+$/.exec(kept)?.[0] ?? "";
+  return token.includes(":") ? kept.replace(/:[\w./-]*$/, "") : kept.slice(0, kept.length - token.length);
 }
 
 /**
