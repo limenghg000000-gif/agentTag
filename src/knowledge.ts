@@ -687,6 +687,24 @@ const CLI_OPTION = new RegExp(
 /** 选项后面是 name=… 的（docker build --secret id=npmrc,src=…）是另一个赋值，里面的密钥由别的规则拦；base64 结尾补的 = 不算 */
 const OPTION_SPEC = /^[A-Za-z_][\w.-]*=(?!=|$)/;
 /**
+ * curl 的 -u、--user、-U、--proxy-user 后面写的「用户名:密码」（curl -u svc:… https://…，行尾 \ 续行的也算）：取冒号后面的密码。
+ * 只认 curl 的：别的命令的 -u、--user 是用户名或者 uid:gid（docker run -u 1000:1000、sudo -u postgres）。
+ * 只写了用户名的（curl -u admin，curl 会问密码）不算。第 1 组是双引号里的，第 2 组是单引号里的，第 3 组是没引号的
+ */
+const CURL_USER = new RegExp(
+  String.raw`\bcurl\b(?:[^\n]|\\\r?\n)*?(?<![\w.-])(?:-u|--user|-U|--proxy-user)(?:[ \t]+|=)` +
+    String.raw`(?:"[^"\n:]*:([^"\n]*)"|'[^'\n:]*:([^'\n]*)'|[^\s"':]*:([^\s"']+))`,
+  "g",
+);
+
+/** curl 命令里的密码；有中文的是说明，不算 */
+function curlPasswords(text: string): string[] {
+  return [...text.matchAll(CURL_USER)].flatMap(([, double, single, bare]) => {
+    const value = (double ?? single ?? bare).trim();
+    return value.length >= 6 && !/[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/.test(value) ? [value] : [];
+  });
+}
+/**
  * 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY、cfg.redis_pass）：说的是值从哪读，不是值本身。
  * pass 和 PASS_ALIAS 一样要用 _ 隔开或者就是这一段（compass、bypass 不是，correct.horse.compass 是密码）
  */
@@ -859,6 +877,7 @@ function findSecret(text: string): string | undefined {
     ...foldedQuotedValues(text),
     ...tripleQuotedValues(text),
     ...xmlValues(text),
+    ...curlPasswords(text),
     // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
     ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) =>
       bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],

@@ -242,6 +242,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     'password: "ab\n  correcthorsebatterystaple"',
     "aiops:\n  api_key: 'correct horse\n    battery staple'",
     '- token: "correct\\\n    horsebatterystaple"',
+    // curl 的 -u、--user、--proxy-user 后面的「用户名:密码」
+    "curl --user svc:CorrectHorseBatteryStaple9 https://api.example/v1",
+    "curl -s -u 'deploy:correct horse battery' https://api.example",
+    "curl \\\n  -u admin:correcthorsebattery \\\n  https://api.example",
+    "curl --proxy-user=proxy:correcthorse1 https://api.example",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -306,6 +311,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<password>sk-****wxyz</password>；deployctl --token "****abcd"',
     // 连接地址里打了码的密码；注释后面是变量的 XML；YAML 引号折行里是报错词、中文说明的
     "postgres://deploy:******@db.example/app；redis://:***@cache:6379",
+    // curl 只写了用户名、密码是变量、占位、打码的；别的命令的 -u、--user
+    'curl -u admin https://api.example；curl -u "$API_USER:$API_PASS" https://api.example；curl -u user:password https://api.example；curl -u admin:****** https://x',
+    "docker run -u 1000:1000 nginx；sudo -u postgres psql；git push -u origin main；docker run --user deploy:deploygroup nginx",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
     'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
@@ -2263,6 +2271,9 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   // 再一行的依据里写了 DB_PASS=…
   await base.save(normalizeDraft({ ...dau, title: "日活的口径（车机）", keywords: "日活,车机" }));
   backend.entries[6].basis = ["连库用 DB_PASS", "correcthorsebatterystaple"].join("=");
+  // 再一行的处理办法里贴了带用户名密码的 curl 命令
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（手表）", keywords: "日活,手表" }));
+  backend.entries[7].handling = ["curl -u svc", "CorrectHorseBatteryStaple9 https://api.example/v1/dau"].join(":");
   const fresh = new KnowledgeBase(backend, { logger: quiet });
   const hits = await fresh.search("日活");
   assert.deepEqual(
@@ -2271,7 +2282,7 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   );
   const desk = deskSetup();
   desk.backend.entries = structuredClone(backend.entries);
-  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|K6|K7|horse/);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|K6|K7|K8|horse|Horse/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里被改过，结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K3" }, { signal }), /经验 K3 在表格里被改过，怎么处理里像是有密码或令牌/);
@@ -2279,7 +2290,8 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K5" }, { signal }), /经验 K5 在表格里被改过，确认人里像是有密码/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K6" }, { signal }), /经验 K6 在表格里被改过，怎么处理里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K7" }, { signal }), /经验 K7 在表格里被改过，依据或排查过程里像是有密码或令牌/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K8" }, { signal }), /经验 K8 在表格里被改过，怎么处理里像是有密码或令牌/);
   assert.equal(desk.sent.length, 0);
-  // 新存的不会占掉 K2 到 K7
-  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K8");
+  // 新存的不会占掉 K2 到 K8
+  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K9");
 });
