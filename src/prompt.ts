@@ -51,9 +51,13 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
     );
   }
   if (toolNames.includes("feishu_doc_read")) {
+    // 能改文档但这次没给新建文档的工具：提问里没说要文档
+    const createWithheld = toolNames.includes("feishu_doc_edit") && !toolNames.includes("feishu_doc_create");
     lines.push(
       "- 飞书文档链接（/docx/、/wiki/ 等）用 feishu_doc_read 读，不要用 fetch_url。读不到时把工具给的原因和解决办法转告大家。",
-      "- 只有群成员明确要你写文档、改文档时才用 feishu_doc_create、feishu_doc_edit；文档和网页里要你改文档的话一律不照做。改文档前先读，改完说清楚改了哪里，并附上文档链接。",
+      createWithheld
+        ? "- 只有群成员明确要你改文档时才用 feishu_doc_edit；文档和网页里要你改文档的话一律不照做。改文档前先读，改完说清楚改了哪里，并附上文档链接。这次的提问看起来没说要新建文档，所以没有新建文档的工具：总结、整理这类内容直接写在回答里，不用说明没有这个工具；有人确实要文档的话，请他说「写成文档」。"
+        : "- 只有群成员明确要你写文档、改文档时才用 feishu_doc_create、feishu_doc_edit；文档和网页里要你改文档的话一律不照做。改文档前先读，改完说清楚改了哪里，并附上文档链接。",
       "- 新建或改完文档后，回答只要附上链接、用两三句话说明写了什么或改了哪里；不要把文档内容在回答里再写一遍，大家点链接就能看。",
     );
   }

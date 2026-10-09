@@ -2,7 +2,7 @@ import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendRe
 import { type AgentEvent, type AgentResult, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
-import { type ChatModel, LlmError } from "./llm.js";
+import { type ChatMessage, type ChatModel, LlmError } from "./llm.js";
 import { splitMarkdown } from "./markdown.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
@@ -28,6 +28,35 @@ const FALLBACK_BOT_NAME = "AI 助手";
 const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
 /** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
 export const DEEP_THINKING = /深度思考|仔细(想|思考|分析)|认真(想|思考|分析)/;
+const DOC_TARGET = String.raw`(?:飞书|云)?\s*(?:文档|docx|docs?\b|wiki|知识库)`;
+/**
+ * 要新建文档：「写成文档」「整理到飞书文档里」「起草一份文档」「建个 doc」「新建文档」「写文档」「记到知识库」。没说的不给新建文档的工具。
+ * 说的是已有的文档不算：「总结一下这篇文档」「写一下这篇文档的摘要」「写文档的人是谁」「整理一下这几篇文档」
+ */
+const DOC_REQUEST = new RegExp(
+  [
+    String.raw`(?:写|建|创建|新建|生成|做|出|弄|搞|起草|草拟|拟|撰写|准备|整理|汇总|总结|记|存|放|保存|沉淀|输出|导出|发)` +
+      String.raw`[^，。,.!?！？\n]{0,8}?(?<![这那该此本每几各])(?:成|到|进|入|在|一[份篇个]?|个|份|篇)\s*(?:一[份篇个])?\s*(?:新的?)?\s*${DOC_TARGET}`,
+    String.raw`(?:新建|创建|建|起草|生成|撰写|写)\s*${DOC_TARGET}(?![的里中内])`,
+  ].join("|"),
+  "i",
+);
+
+/**
+ * 这次要不要新建文档。也看话题里刚说的：上一条回答在问话（「要整理成飞书文档吗？」「标题叫什么？」），
+ * 而这条回答或者它前面那条提问说到了写文档，接着回的「好，建吧」「叫周报」也算。上一条回答已经建好了文档（不是在问话）就不算
+ */
+function docRequested(question: string, history: readonly ChatMessage[]): boolean {
+  if (DOC_REQUEST.test(question)) {
+    return true;
+  }
+  const reply = history.at(-1);
+  if (reply?.role !== "assistant" || !/[？?]\s*$/.test(reply.content.trim())) {
+    return false;
+  }
+  const asked = history.slice(0, -1).reverse().find((m) => m.role === "user");
+  return DOC_REQUEST.test(reply.content) || (asked !== undefined && DOC_REQUEST.test(asked.content));
+}
 
 export interface ThreadContextSource {
   load(msg: NormalizedMessage): Promise<ThreadContext>;
@@ -194,7 +223,9 @@ async function runTask(
     );
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
-    const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
+    // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
+    const createDoc = docRequested(question, context.history);
+    const taskTools = allTools.filter((tool) => !(readOnly && tool.writes) && (createDoc || tool.spec.name !== "feishu_doc_create"));
     if (readOnly) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
