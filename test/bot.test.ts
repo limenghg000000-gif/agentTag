@@ -6,14 +6,18 @@ import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
   BLOCKED_OPS_ANSWER,
+  blockedCodeAnswer,
   blockUnverifiedOps,
   type BotDeps,
   createCardActionHandler,
   createMessageHandler,
   reviewCodeAnswer,
   reviewOpsAnswer,
+  seenCitation,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
+  unseenCodeAnswer,
+  unseenCodeCitations,
   unverifiedOpsAnswer,
 } from "../src/bot.js";
 import type { ImageRef, ThreadContext } from "../src/history.js";
@@ -1148,4 +1152,77 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   // 问的是配置的仓库，结果里出现过路径也不算读过代码
   const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], () => true);
   assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
+});
+
+test("代码回答检查：调过代码工具也要核对，回答里的文件和提交号得在工具结果里出现过", () => {
+  const outputs = ["internal/k8s/tools.go:12: func GetPods()（master 分支 @ 3f2a1c9）"];
+  const seen = seenCitation(["ai/aiops-mcp"], (text) => outputs.some((output) => output.includes(text)));
+  const review = reviewCodeAnswer("k8s 工具在哪定义", ["ai/aiops-mcp", "ai/agent-tag"], seen);
+  const searched = new Set(["code_search"]);
+  assert.equal(review("定义在 `internal/k8s/tools.go:12`（master 分支 @ 3f2a1c9）", searched), undefined);
+  // 写成「仓库名/路径」也认
+  assert.equal(review("在 ai/aiops-mcp/internal/k8s/tools.go 第 12 行", searched), undefined);
+  assert.equal(review("在 ./internal/k8s/tools.go:12", searched), undefined);
+  // 2026-10-09：调了一次代码工具，回答里的仓库提交和文件都是编的
+  const made = "code=8 是用户不存在（ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`）";
+  assert.equal(
+    review(made, searched),
+    unseenCodeAnswer(["yuebai-user/rpc/internal/logic/common/userlogic.go", "2c6a7d9"], ["ai/aiops-mcp", "ai/agent-tag"]),
+  );
+  assert.match(unseenCodeAnswer(["a/b.go"], ["ai/aiops-mcp"]), /工具结果里都没有出现：a\/b\.go.*直说读不到这部分代码/);
+});
+
+test("没查到的代码位置：带行号的路径和提交号算「说查过」，举例的路径不算", () => {
+  const none = () => false;
+  assert.deepEqual(
+    unseenCodeCitations("ErrUserNotFound 在 rpc/logic/user.go:35，降级在 app/gateway/remote.go 第 47 行，对照 k8s/deployment.yaml，提交 9c1e2f3a", none),
+    [
+      { text: "rpc/logic/user.go", located: true },
+      { text: "app/gateway/remote.go", located: true },
+      { text: "k8s/deployment.yaml", located: false },
+      { text: "9c1e2f3a", located: true },
+    ],
+  );
+  // 全是数字的（requestId）、没有数字的英文单词不算提交号
+  assert.deepEqual(unseenCodeCitations("requestId @ 179152518627422277，版本 deadbeef", none), []);
+});
+
+test("调过代码工具还编出仓库里没有的文件：打回重做，重做后还编就不发出", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有搜到「getUserCenterFromRemote」（master 分支 @ 1a2b3c4）。",
+  };
+  const made =
+    "结论：code=8 是 user-rpc 定义的「用户不存在」（把握：高）。依据：ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`";
+  const ask = async (second: string, question = "去 gateway-api 和 user-rpc 服务代码去排查一下") => {
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+      { text: made, finish: "stop" },
+      { text: second, finish: "stop" },
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const warnings: string[] = [];
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["ai/aiops-mcp", "ai/agent-tag"],
+      logger: { ...quiet, warn: (line: string) => warnings.push(line) },
+    });
+    await handle(message(question));
+    return { requests, replies: markdowns(sent), warnings: warnings.join("\n") };
+  };
+
+  const stillMade = await ask(made);
+  assert.equal(stillMade.requests.length, 3);
+  assert.match(String(stillMade.requests[2].messages.at(-1)?.content), /2c6a7d9/);
+  assert.deepEqual(stillMade.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
+  assert.match(stillMade.warnings, /还是引用了没查到的代码位置，没有发出 message=om_1：yuebai-user\/rpc\/internal\/logic\/common\/userlogic\.go、2c6a7d9/);
+
+  const honest = await ask("gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。");
+  assert.deepEqual(honest.replies, ["gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。"]);
+
+  // 群成员自己问到的路径，回答说没有这个文件，不算编
+  const asked = await ask("src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件", "src/legacy/user.ts 第 10 行是干嘛的");
+  assert.deepEqual(asked.replies, ["src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件"]);
 });
