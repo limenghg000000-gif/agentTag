@@ -140,7 +140,7 @@ npm start
 | `MODEL_BASE_URL` | 否 | OpenAI 兼容接口地址，默认百炼北京 `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `MODEL_ID` | 否 | 模型 ID，默认 `qwen3.8-max` |
 | `MODEL_THINKING` | 否 | 思考模式，`on` 或 `off`。用百炼时默认 `off`（长回答快一半左右），别家服务默认不设置。关着时，问题里写「深度思考」「仔细想想」「认真分析」，这一次单独打开 |
-| `MODEL_VISION_ID` | 否 | 看图片用的模型（和主模型同一个服务、同一个 Key）。提问和话题里的截图先用它识别成文字，再交给主模型。用百炼时默认和 `MODEL_ID` 一样（千问 3.5 以后的模型能看图），`MODEL_ID` 不是千问时默认 `qwen3.8-max`；别家服务要自己填能看图的模型。填 `off` 关掉，关掉后机器人会请对方把图片里的文字贴出来 |
+| `MODEL_VISION_ID` | 否 | 看图片用的模型（和主模型同一个服务、同一个 Key）。提问和话题里的截图先用它识别成文字，再交给主模型。用百炼时默认和 `MODEL_ID` 一样（千问 3.5 以后的模型和 VL、Omni 能看图），`MODEL_ID` 不能看图时（不是千问，或 `qwen-plus`、`qwen3-max` 这类纯文本千问）默认 `qwen3.8-max`；别家服务要自己填能看图的模型。填 `off` 关掉，关掉后机器人会请对方把图片里的文字贴出来 |
 | `MODEL_THINKING_BUDGET` | 否 | 打开思考时最多想多少 token，超过后立刻开始回答。用百炼时默认 `4000`（大约两分钟），`0` 表示不限 |
 | `CATCHUP_INTERVAL_SECONDS` | 否 | 补漏轮询间隔（秒），默认 `10`，填 `0` 关闭（补漏报警也一起关掉） |
 | `ALERT_CHAT_ID` | 否 | 补漏报警发到哪个群（chat_id）。不填就发到漏了消息的那个群 |

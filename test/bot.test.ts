@@ -663,6 +663,15 @@ test("没配看图模型、或者图片没识别出来时，图片换成「没�
   assert.match(cardText(updates.at(-1)!.card), /识别图片（1 张）/);
 });
 
+test("提问里自己写的 Markdown 图片语法不是截图，原样交给模型", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, images: { read: async () => new Map() } });
+
+  await handle(message("README 里 ![image](https://example.com/a.png) 这行为啥不显示"));
+
+  assert.equal(requests[0].messages.at(-1)!.content, "[群成员] README 里 ![image](https://example.com/a.png) 这行为啥不显示");
+});
+
 test("话题第一条贴了截图，在话题里追问时上文里的截图也换成识别出的文字", async () => {
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const read: ImageRef[][] = [];

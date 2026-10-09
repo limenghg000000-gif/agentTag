@@ -104,9 +104,15 @@ export function imageKeysIn(text: string): string[] {
   return [...text.matchAll(IMAGE_MARK)].map((match) => match[1]);
 }
 
-/** 把文字里的 ![image](image_key) 换成识别出的内容；没识别出来的换成 UNREAD_IMAGE */
-export function inlineImages(text: string, results: ReadonlyMap<string, string>): string {
-  return text.replace(IMAGE_MARK, (_mark, key: string) => {
+/**
+ * 把文字里飞书图片的 ![image](image_key) 换成识别出的内容，没识别出来的换成 UNREAD_IMAGE。
+ * 只换 known 里的（消息里真有这张图）：群成员自己贴的 Markdown 图片语法原样保留
+ */
+export function inlineImages(text: string, results: ReadonlyMap<string, string>, known: ReadonlySet<string>): string {
+  return text.replace(IMAGE_MARK, (mark, key: string) => {
+    if (!known.has(key)) {
+      return mark;
+    }
     const content = results.get(key);
     return content === undefined
       ? UNREAD_IMAGE

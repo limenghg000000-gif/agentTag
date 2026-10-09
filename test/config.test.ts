@@ -8,6 +8,7 @@ import {
   DEFAULT_MODEL_BASE_URL,
   DEFAULT_MODEL_ID,
   DEFAULT_THINKING_BUDGET,
+  isMultimodalQwen,
   loadConfig,
 } from "../src/config.js";
 
@@ -100,6 +101,13 @@ test("看图模型：百炼上默认用主模型（千问 3.5 以后是多模态
   assert.deepEqual(loadConfig({ ...base, MODEL_THINKING: "on" }).vision, { model: DEFAULT_MODEL_ID, thinking: false });
   assert.deepEqual(loadConfig({ ...base, MODEL_ID: "qwen3.7-plus" }).vision, { model: "qwen3.7-plus", thinking: false });
   assert.deepEqual(loadConfig({ ...base, MODEL_ID: "kimi-k3" }).vision, { model: DEFAULT_MODEL_ID, thinking: false });
+  // 纯文本的千问不拿来看图
+  for (const text of ["qwen-plus", "qwen3-max", "qwen2.5-72b-instruct", "qwen3-coder-plus"]) {
+    assert.deepEqual(loadConfig({ ...base, MODEL_ID: text }).vision, { model: DEFAULT_MODEL_ID, thinking: false }, text);
+  }
+  for (const multimodal of ["qwen3.5-plus", "qwen3-vl-plus", "qwen-vl-max", "qwen3-omni-flash", "qwen3.8-max"]) {
+    assert.equal(isMultimodalQwen(multimodal), true, multimodal);
+  }
   assert.deepEqual(loadConfig({ ...base, MODEL_VISION_ID: " qwen3-vl-plus " }).vision, { model: "qwen3-vl-plus", thinking: false });
   assert.equal(loadConfig({ ...base, MODEL_VISION_ID: "OFF" }).vision, undefined);
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).vision, undefined);

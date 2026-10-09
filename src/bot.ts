@@ -201,8 +201,9 @@ async function runTask(
     // 主模型只看文字：图片先识别成文字再放进提问和上文。2026-10-09 有人贴告警截图问「这个线上报警是咋回事」，
     // 模型只看到一行图片编号，自己挑了别的服务去查
     const images = await readImages(deps, msg, context, task.signal, state, () => card?.update(render()));
-    const asked = inlineImages(question, images);
-    const history = context.history.map((m) => (m.role === "user" ? { ...m, content: inlineImages(m.content, images) } : m));
+    const known = new Set([...imageKeysOf(msg), ...(context.images ?? []).map((ref) => ref.imageKey)]);
+    const asked = inlineImages(question, images, known);
+    const history = context.history.map((m) => (m.role === "user" ? { ...m, content: inlineImages(m.content, images, known) } : m));
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
     const taskContext: TaskToolContext = {

@@ -29,14 +29,17 @@ function setup(options: { download?: () => Promise<typeof png>; describe?: Visio
   return { reader, downloads, described, warnings };
 }
 
-test("把图片标记换成识别出的文字，没识别出来的换成「没能看到」的说明", () => {
+test("把图片标记换成识别出的文字，没识别出来的换成「没能看到」的说明；不是消息里的图片（自己贴的 Markdown）原样保留", () => {
   const text = "![image](img_a)\n这个线上报警是咋回事 ![image](img_b)";
+  const known = new Set(["img_a", "img_b"]);
   assert.deepEqual(imageKeysIn(text), ["img_a", "img_b"]);
-  const out = inlineImages(text, new Map([["img_a", "服务名称：prod/gateway-api"]]));
+  const out = inlineImages(text, new Map([["img_a", "服务名称：prod/gateway-api"]]), known);
   assert.match(out, /\[图片内容：机器人用看图模型识别的文字，个别字可能识别错\]\n服务名称：prod\/gateway-api\n\[图片内容结束\]/);
   assert.ok(out.endsWith(UNREAD_IMAGE));
   assert.doesNotMatch(out, /img_/);
-  assert.equal(inlineImages("没有图片", new Map()), "没有图片");
+  assert.equal(inlineImages("没有图片", new Map(), known), "没有图片");
+  const readme = "README 里这行 ![image](https://example.com/a.png) 为啥不显示";
+  assert.equal(inlineImages(readme, new Map(), known), readme);
 });
 
 test("挑图片：提问里的在前，再从新到旧挑上文里还看得到的，同一张只挑一次，最多 4 张", () => {

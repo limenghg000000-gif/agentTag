@@ -173,13 +173,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const baseURL = env.MODEL_BASE_URL || DEFAULT_MODEL_BASE_URL;
   const model = env.MODEL_ID || DEFAULT_MODEL_ID;
   const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
-  // 看图：千问 3.5 以后的模型是多模态的（联网搜索时 qwen3.8-max 只认多模态接口），百炼上默认用主模型看图；
-  // 主模型不是千问时用千问旗舰。别家服务要自己在 MODEL_VISION_ID 里写能看图的模型
+  // 看图：主模型能看图时（千问 3.5 以后、VL、Omni），百炼上默认用主模型看图；别的（Kimi、GLM，或 qwen-plus、qwen3-max 这类纯文本千问）
+  // 用千问旗舰。别家服务要自己在 MODEL_VISION_ID 里写能看图的模型
   const visionEnv = env.MODEL_VISION_ID?.trim();
   const visionModel =
     visionEnv?.toLowerCase() === "off"
       ? undefined
-      : visionEnv || (isBailian(baseURL) ? (/^qwen/i.test(model) ? model : DEFAULT_MODEL_ID) : undefined);
+      : visionEnv || (isBailian(baseURL) ? (isMultimodalQwen(model) ? model : DEFAULT_MODEL_ID) : undefined);
 
   // 百炼默认关掉思考：同样的回答快一半左右。别家服务不传，用它的默认值
   const thinkingEnv = env.MODEL_THINKING?.trim().toLowerCase();
@@ -346,6 +346,19 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN } };
   }
   throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
+}
+
+/** 能看图的千问：3.5 以后的版本（联网搜索时 qwen3.8-max 只认多模态接口），以及名字里带 vl、omni 的 */
+export function isMultimodalQwen(model: string): boolean {
+  const id = model.toLowerCase();
+  if (!id.startsWith("qwen")) {
+    return false;
+  }
+  if (/[-.](vl|omni)([-.]|$)/.test(id)) {
+    return true;
+  }
+  const version = /^qwen(\d+(?:\.\d+)?)/.exec(id);
+  return version !== null && Number(version[1]) >= 3.5;
 }
 
 function isBailian(baseURL: string): boolean {
