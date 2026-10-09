@@ -100,6 +100,33 @@ test("下载失败、识别失败、识别超时、识别出空的：这张图�
   assert.equal(empty.downloads.length, 2);
 });
 
+test("任务在读上下文时就被停止了：不再下载；停止后下载才失败也不会变成未处理的拒绝", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const stopped = new AbortController();
+    stopped.abort();
+    const early = setup();
+    assert.equal((await early.reader.read([{ messageId: "om_1", imageKey: "img_a" }], stopped.signal)).size, 0);
+    assert.deepEqual(early.downloads, []);
+
+    // 下载途中被停止，下载过一会儿才失败（比如没开 im:resource）
+    const midway = new AbortController();
+    const late = setup({
+      download: () => new Promise((_, reject) => setTimeout(() => reject(new Error("Access denied")), 10)),
+    });
+    const pending = late.reader.read([{ messageId: "om_1", imageKey: "img_a" }], midway.signal);
+    midway.abort();
+    assert.equal((await pending).size, 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(late.warnings, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
 test("任务被停止时不再等识别结果，也不当成失败写日志", async () => {
   const controller = new AbortController();
   const { reader, warnings } = setup({

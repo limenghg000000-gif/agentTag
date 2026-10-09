@@ -64,6 +64,10 @@ export class ImageReader {
       this.cache.set(ref.imageKey, cached);
       return cached;
     }
+    // 读上下文时任务已经被停止：不再开始下载
+    if (signal?.aborted) {
+      return undefined;
+    }
     // 不用 AbortSignal.timeout：它的计时器不拦着进程退出，测试里等不到超时
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error("timeout")), timeoutMs);
@@ -144,14 +148,15 @@ function clipText(text: string): string {
   return text.length > MAX_IMAGE_TEXT_CHARS ? `${text.slice(0, MAX_IMAGE_TEXT_CHARS)}\n（图片文字太长，后面省略）` : text;
 }
 
-/** 下载不认中止信号：中止或超时就不再等它 */
+/** 下载不认中止信号：中止或超时就不再等它。下载之后再失败也有人接着，不会变成未处理的 Promise 拒绝（那会让进程退出） */
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) {
-    return Promise.reject(signal.reason);
-  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
     promise.then(
       (value) => {
         signal.removeEventListener("abort", onAbort);
