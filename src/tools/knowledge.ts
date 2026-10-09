@@ -203,9 +203,13 @@ export class KnowledgeDesk {
     }
   }
 
-  /** 查经验、看经验、起草保存和归档的工具 */
-  tools(ctx: KnowledgeTaskContext): Tool[] {
+  /**
+   * 查经验、看经验、起草保存和归档的工具。otherTools 是这次任务里模型的其他工具名：
+   * 没有 aiops_search_knowledge 时不让模型去调它；没接 aiops 时不提同步、归档 aiops 经验和案例编号
+   */
+  tools(ctx: KnowledgeTaskContext, otherTools: readonly string[] = []): Tool[] {
     const { base } = this.options;
+    const withAiops = this.options.aiops !== undefined;
     const categories = Object.entries(KNOWLEDGE_CATEGORIES)
       .map(([key, label]) => `${key} ${label}`)
       .join("、");
@@ -214,7 +218,8 @@ export class KnowledgeDesk {
         name: "knowledge_search",
         description:
           "在团队经验库里查相近的经验（排查经验、应答卡、数据口径、需求结论）。回答前程序已经按提问查过一次，" +
-          "查到报错原文、错误码、服务名这类新线索后，可以换个说法再查。aiops 自带的经验库用 aiops_search_knowledge 查",
+          "查到报错原文、错误码、服务名这类新线索后，可以换个说法再查。" +
+          (otherTools.includes("aiops_search_knowledge") ? "aiops 自带的经验库用 aiops_search_knowledge 查" : ""),
         parameters: {
           type: "object",
           properties: {
@@ -229,12 +234,23 @@ export class KnowledgeDesk {
       run: async (args, { signal }) => {
         const query = typeof args.query === "string" ? args.query : "";
         const category = typeof args.category === "string" && Object.hasOwn(KNOWLEDGE_CATEGORIES, args.category) ? (args.category as KnowledgeCategory) : undefined;
-        // 读表格的接口不认中止信号：任务停了就不等它
-        const hits = await raceAbort(
-          base.search(query, { limit: 5, includeArchived: args.include_archived === true, signal, ...(category ? { category } : {}) }),
-          signal,
-        );
-        return hits.length > 0 ? renderHitsForPrompt(hits) : "团队经验库里没有相近的经验。";
+        // 读表格的接口不认中止信号：任务停了就不等它。向量服务卡住时到期限就只按关键词
+        const semantic = timeoutSignal(this.semanticMs);
+        try {
+          const hits = await raceAbort(
+            base.search(query, {
+              limit: 5,
+              includeArchived: args.include_archived === true,
+              signal,
+              semanticDeadline: semantic.signal,
+              ...(category ? { category } : {}),
+            }),
+            signal,
+          );
+          return hits.length > 0 ? renderHitsForPrompt(hits) : "团队经验库里没有相近的经验。";
+        } finally {
+          semantic.clear();
+        }
       },
     };
     const get: Tool = {
@@ -262,8 +278,8 @@ export class KnowledgeDesk {
       spec: {
         name: "knowledge_propose",
         description:
-          "起草一条经验，发确认卡片到话题里，等写权限名单里的人点「保存」后才写进团队经验库（飞书多维表格；排查经验同时存一份到 aiops 经验库）。" +
-          "群成员说「沉淀成经验」「记到经验库」「把这次排查总结进经验库」「把案例 #N 沉淀为经验」时用；你自己的结论没人确认过的不要主动存。" +
+          `起草一条经验，发确认卡片到话题里，等写权限名单里的人点「保存」后才写进团队经验库（飞书多维表格${withAiops ? "；排查经验同时存一份到 aiops 经验库" : ""}）。` +
+          `群成员说「沉淀成经验」「记到经验库」「把这次排查总结进经验库」${withAiops ? "「把案例 #N 沉淀为经验」" : ""}时用；你自己的结论没人确认过的不要主动存。` +
           "这里只是起草，调用后经验还没存。同一个话题里再调一次会换成新的草稿（旧卡片作废），用来按群成员的意见修改。",
         parameters: {
           type: "object",
@@ -278,7 +294,7 @@ export class KnowledgeDesk {
             keywords: { type: "string", description: "关键词，逗号分隔：报错原文里的关键字、服务名、用户常用的说法。检索主要靠它们" },
             error_codes: { type: "string", description: "错误码，逗号分隔（排查经验才填）" },
             alertname: { type: "string", description: "告警名（排查经验、而且是告警引起的才填）" },
-            case_id: { type: "integer", description: "从 aiops 的「案例 #N」沉淀来的，填 N" },
+            ...(withAiops ? { case_id: { type: "integer", description: "从 aiops 的「案例 #N」沉淀来的，填 N" } } : {}),
             replaces: { type: "string", description: "这条是用来取代某条旧经验的，填旧的编号（如 K3），保存后自动归档旧的" },
           },
           required: ["category", "title", "question", "conclusion"],
@@ -308,13 +324,13 @@ export class KnowledgeDesk {
       spec: {
         name: "knowledge_propose_archive",
         description:
-          "发确认卡片，归档一条过时或错误的经验（归档后不再被检索到）。团队经验库的填 id（如 K3），aiops 经验库里的「经验 #N」填 aiops_id。" +
-          "群成员说「K3 过时了」「归档经验 #N」时用，先取出来给大家看。等写权限名单里的人点「归档」后才执行。",
+          `发确认卡片，归档一条过时或错误的经验（归档后不再被检索到）。${withAiops ? "团队经验库的填 id（如 K3），aiops 经验库里的「经验 #N」填 aiops_id。" : "填编号 id（如 K3）。"}` +
+          `群成员说「K3 过时了」${withAiops ? "「归档经验 #N」" : ""}时用，先取出来给大家看。等写权限名单里的人点「归档」后才执行。`,
         parameters: {
           type: "object",
           properties: {
             id: { type: "string", description: "团队经验库的编号，如 K3" },
-            aiops_id: { type: "integer", description: "aiops 经验库「经验 #N」里的 N" },
+            ...(withAiops ? { aiops_id: { type: "integer", description: "aiops 经验库「经验 #N」里的 N" } } : {}),
             reason: { type: "string", description: "为什么归档，一句话" },
           },
         },

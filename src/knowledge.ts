@@ -490,12 +490,19 @@ const SECRET_PATTERNS: [RegExp, string][] = [
 
 /**
  * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=…，这些配置什么样的值都能填）。
- * 值后面紧跟着代码符号的不算（cfg.Token、getToken()、${MCP_AIOPS_TOKEN}、<token>）；
- * 值里有一段是报错、占位或者变量名里的词也不算（token=expired_session、your_token_here、xxxxxxxx、FEISHU_APP_SECRET）
+ * 值后面紧跟着代码符号的不算（cfg.Token、getToken()、${MCP_AIOPS_TOKEN}、<token>）
  */
 const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?([\w+/~=-]{8,})(?![\w+/~=(\[{<$@:\\-]|\.\S)`, "gi");
-const NOT_A_TOKEN =
-  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|stale|bad|wrong|fail(?:ed|ure)?|malformed|unknown|absent|disabled|placeholder|redacted|masked|hidden|example|sample|dummy|your|here|token|key|secret|x{3,})$/i;
+/** 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here）；夹着别的词的照样算（prod-secret-abcdefghijkl） */
+const PLACEHOLDER_WORD =
+  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|placeholder|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
+/** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
+const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
+
+/** 写在密钥名字后面的值是不是占位：环境变量名，或者整个由报错、占位用词组成 */
+function isPlaceholder(value: string): boolean {
+  return ENV_NAME.test(value) || value.split(/[_+/~=-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
+}
 
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
 function findSecret(text: string): string | undefined {
@@ -503,8 +510,7 @@ function findSecret(text: string): string | undefined {
   if (known) {
     return known[1];
   }
-  const assigned = [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, value]) => !value.split(/[_+/~=-]+/).some((part) => NOT_A_TOKEN.test(part)));
-  return assigned ? "密码或令牌" : undefined;
+  return [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, value]) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }
 
 /** 去掉首尾空白、检查必填、长度和密钥 */

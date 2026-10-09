@@ -229,7 +229,7 @@ async function runTask(
     const evidence: string[] = [];
     const failures: string[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
-    const knowledgeTools = deps.knowledge?.tools(taskContext) ?? [];
+    const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,

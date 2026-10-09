@@ -1203,6 +1203,31 @@ test("只查了经验库就给出线上结论也打回：经验库里是以前�
   assert.deepEqual(markdowns(sent), ["经验库里有一条以前的结论，这次还没用 aiops 核实"]);
 });
 
+test("经验库的工具拿到这次 aiops 的工具名：有没有 aiops_search_knowledge 决定说明里提不提它", async () => {
+  const seen: (readonly string[] | undefined)[] = [];
+  const searchKnowledge: Tool = {
+    spec: { name: "aiops_search_knowledge", description: "查 aiops 经验库", parameters: { type: "object", properties: {} } },
+    describe: () => "查 aiops 经验库",
+    run: async () => "",
+  };
+  const { model } = fakeModel(() => ({ text: "发版固定在每周三", finish: "stop" }));
+  const { handle } = setup({
+    model,
+    knowledge: {
+      lookup: async () => undefined,
+      tools: (_task, other) => {
+        seen.push(other);
+        return [];
+      },
+    },
+    mcp: { names: ["aiops"], tools: () => [searchKnowledge], prompt: () => undefined },
+  });
+
+  await handle(message("发版是哪天"));
+
+  assert.deepEqual(seen, [["aiops_search_knowledge"]]);
+});
+
 test("aiops 连不上、这次没有它的工具时，照搬话题里之前的数据也会被打回", async () => {
   const results: ChatResult[] = [
     { text: "最近 1 小时只有 2 条 warning（15:47:33~15:47:34）", finish: "stop" },

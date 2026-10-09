@@ -124,6 +124,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     'const client = new OpenAI({ apiKey: "CorrectHorseBatteryStaple" })',
     "curl -H 'x-api-key: correct-horse-battery-staple'",
     "api_key=abcdef0123456789",
+    // 夹着 token、secret 这类词的照样算，只有整个值都是报错、占位用词才不算
+    "MCP_AIOPS_TOKEN=prod-secret-abcdefghijkl",
+    "token=my-token-value-abcdef",
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -1069,6 +1072,49 @@ test("「把案例 #N 沉淀为经验」按 aiops 开了的工具说：有 promo
   assert.doesNotMatch(getCase, /aiops_promote_case/);
   assert.match(getCase, /用 aiops_get_case 取出案例，自己整理成草稿再调 knowledge_propose，带上 case_id/);
   assert.doesNotMatch(prompt(["knowledge_propose"]), /「把案例 #N 沉淀为经验」：/);
+});
+
+test("没接 aiops 时：经验库的工具说明和提示词都不提 aiops 的工具和经验库，免得模型去调不存在的工具", () => {
+  const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
+  const specs = (desk: KnowledgeDesk, other: string[] = []) => JSON.stringify(desk.tools(ctx, other).map((tool) => tool.spec));
+  const plain = deskSetup({ aiops: false }).desk;
+  assert.doesNotMatch(specs(plain), /aiops/);
+  const withAiops = deskSetup().desk;
+  // 接了 aiops，但这次模型没有 aiops_search_knowledge（比如 aiops 没连上）：不让模型去调它
+  assert.doesNotMatch(specs(withAiops), /aiops_search_knowledge/);
+  assert.match(specs(withAiops), /aiops_id/);
+  assert.match(specs(withAiops, ["aiops_search_knowledge"]), /aiops 自带的经验库用 aiops_search_knowledge 查/);
+
+  const prompt = (toolNames: string[], knowledge: { hits?: string; missed?: string[]; failed?: boolean }) =>
+    buildSystemPrompt({ botName: "飞书 CLI", now: new Date(0), toolNames, knowledge });
+  const team = ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"];
+  for (const knowledge of [{ hits: "经验 K1 …" }, { hits: "", missed: ["团队经验库"] }, { failed: true }]) {
+    const text = prompt(team, knowledge);
+    assert.doesNotMatch(text.slice(text.indexOf("## 团队经验库")), /aiops/, JSON.stringify(knowledge));
+  }
+  const both = prompt([...team, "aiops_search_knowledge", "aiops_get_knowledge"], { hits: "经验 K1 …" });
+  assert.match(both, /参考 aiops 经验 #N/);
+  assert.match(both, /aiops 的用 aiops_get_knowledge/);
+});
+
+test("模型查经验库时向量服务卡住：到期限就只按关键词，不一直等", async () => {
+  const backend = new MemoryBackend();
+  const { embedder } = fakeEmbedder(["日活"]);
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet });
+  await base.save(normalizeDraft(dau));
+  // 向量服务卡住，也不认中止信号
+  embedder.embed = () => new Promise(() => {});
+  const desk = new KnowledgeDesk({
+    base,
+    send: async () => ({ messageId: "x" }),
+    updateCard: async () => {},
+    allowedChatIds: new Set(["oc_1"]),
+    logger: quiet,
+    semanticMs: 20,
+  });
+  const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
+  const search = desk.tools(ctx).find((tool) => tool.spec.name === "knowledge_search")!;
+  assert.match(await search.run({ query: "日活" }, { signal }), /经验 K1/);
 });
 
 test("aiops 的说明在经验库关掉时也成立：只在有起草工具时让模型用，没有时直说做不了", async () => {
