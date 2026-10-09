@@ -898,8 +898,8 @@ function isPlaceholder(raw: string): boolean {
   if (isMasked(value)) {
     return true;
   }
-  // 地址里带的密码、查询参数里的 token=… 由别的规则拦；变量引用（$NAME、${NAME}）、尖括号占位（<your-token>）、模板（{{ .Values.token }}）
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\$?\{\{.*\}\}$/.test(value)) {
+  // 地址里带的密码、查询参数里的 token=… 由别的规则拦；变量引用（$NAME、${NAME}，Terraform 的 ${var.db_password}）、尖括号占位（<your-token>）、模板（{{ .Values.token }}）
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^\$\{[A-Za-z_][\w.]*\}$/.test(value) || /^<[^<>]+>$/.test(value) || /^\$?\{\{.*\}\}$/.test(value)) {
     return true;
   }
   // 家目录、当前目录、变量、Windows 盘符开头的文件路径（--private-key ~/.ssh/deploy.pem、$HOME/.npmrc、C:\keys\deploy.pem）：说的是值放在哪个文件
@@ -1218,6 +1218,23 @@ function tripleQuotedValues(text: string): string[] {
 }
 
 /**
+ * Terraform/HCL、shell、Ruby 的 heredoc（password = <<EOT … EOT、<<-EOT、<<~EOS、<<'EOF'），值写在下面几行，到单独一行的结束标记为止；
+ * 后面截断了、没有结束标记的，到最后都算。第 2 组是结束标记，第 3 组是中间的内容
+ */
+const HEREDOC = new RegExp(
+  String.raw`${CONFIG_KEY}["']?[^\S\r\n]*[=:][^\S\r\n]*<<[-~]?(["']?)([A-Za-z_]\w*)\1[^\S\r\n]*\r?\n([\s\S]*?)(?:\r?\n[^\S\r\n]*\2(?!\w)|$)`,
+  "gi",
+);
+
+/** heredoc 里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，整个打了码的，不算 */
+function heredocValues(text: string): string[] {
+  return [...text.matchAll(HEREDOC)].flatMap(([, , , body]) => {
+    const value = body.replace(/\s+/g, " ").trim();
+    return value.length >= 6 && !/[　-〿一-鿿＀-￯]/.test(value) && !isMasked(value) ? [value] : [];
+  });
+}
+
+/**
  * XML 配置里名字是密钥的元素（Maven settings.xml 的 <password>…</password>、<api-key><![CDATA[…]]></api-key>），可以带命名空间和属性。
  * 第 2 组是 CDATA 里的，第 3 组是直接写的
  */
@@ -1347,6 +1364,7 @@ function findSecret(text: string): string | undefined {
     ...blockValues(text),
     ...foldedQuotedValues(text),
     ...tripleQuotedValues(text),
+    ...heredocValues(text),
     ...xmlValues(text),
     ...curlPasswords(text),
     ...netrcPasswords(text),

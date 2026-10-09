@@ -371,6 +371,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `postman ${["PMAK", "0a1b2c3d".repeat(3), "0a1b2c3d".repeat(4) + "0a"].join("-")}；newrelic ${["NRAK", "A1B2C3D4E5F6G7H8I9J0K1L2M3N"].join("-")}`,
     `jira ${["ATATT3", "xFfGF0a1B2c3D4e5F6g7H8i9J0kL".repeat(2)].join("")}；telegram ${["123456789", "AA" + "a1B2c3D4e5F6g7H8i9J0k-L_m1N2o3P4q"].join(":")}`,
     `TENCENTCLOUD_SECRET_ID 是 ${["AKID", "a1B2c3D4".repeat(4)].join("")}`,
+    // Terraform/HCL、shell、Ruby 的 heredoc 里的值，后面截断了没有结束标记的也算
+    `resource "aws_db_instance" "main" {\n  password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOT\n}`,
+    `client_secret = <<-EOT\n    ${["abcdefghijkl", "0123456789"].join("")}\n  EOT`,
+    `config.api_token = <<~EOS\n  ${["correct", "horse", "battery", "staple"].join(" ")}\nEOS`,
+    `db_password = <<'EOF'\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOF`,
+    `password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`,
     // 字符串里套着转义过的 JSON，转义了几层都算
     `payload="{\\"password\\":\\"${["CorrectHorse", "BatteryStaple9"].join("")}\\"}"`,
     `{"body":"{\\"config\\":\\"{\\\\\\"api_key\\\\\\":\\\\\\"${["correct", "horse", "battery", "staple"].join("")}\\\\\\"}\\"}"}`,
@@ -479,6 +485,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host, Signature=<signature>；Digest 里 response=\"see above\"",
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
+    // heredoc 里是变量引用、打了码的、中文说明的，名字不是密钥的
+    "password = <<EOT\n${var.db_password}\nEOT\npassword = <<EOT\n******\nEOT\npassword = <<EOT\n请找管理员要\nEOT\ndescription = <<EOT\nCorrect-Horse-Battery-Staple9!\nEOT",
     // 只提到令牌前缀、配置名的
     "npm_config_registry=https://registry.npmmirror.com；hf_hub_download；SG.example；glsa_ 是 Grafana 服务账号令牌的前缀；hvs. 开头的是 Vault 令牌；Credential=AKIDEXAMPLE/20150830",
     // age 的公钥、只写了私钥开头的说明
@@ -2911,6 +2919,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(`gateway-api 报 code=8，Secret 是这样的：\nkind: Secret\ndata:\n  DATABASE_URL: ${base64(dbUrl)}`, task);
   await desk.lookup(`gateway-api 报 code=8，请求头 Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${base64(Buffer.alloc(32, 9))}"`, task);
   await desk.lookup(`gateway-api 报 code=8，sops 用的 age 私钥是 ${["AGE", "SECRET", "KEY", `1${bech32(Buffer.alloc(32, 8)).toUpperCase()}`].join("-")}`, task);
+  await desk.lookup(`gateway-api 报 code=8，terraform 里写的是 password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOT`, task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);
