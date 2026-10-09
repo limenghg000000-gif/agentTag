@@ -541,14 +541,16 @@ export class Workspace {
     if (info.isDirectory()) {
       return this.listFiles({ dir: file });
     }
+    // 读到了的文件，结果里写整理过的路径（真实存在的那个），不写模型传的原样：机器人的回答检查按它认路径和行号
+    const rel = this.relative(file);
     if (info.size > MAX_FILE_BYTES) {
-      throw new RepoError(`${file} 有 ${Math.round(info.size / 1024)} KB，太大了不读，用 code_search 搜需要的部分`);
+      throw new RepoError(`${rel} 有 ${Math.round(info.size / 1024)} KB，太大了不读，用 code_search 搜需要的部分`);
     }
     const buf = await readFile(abs);
     if (buf.subarray(0, 8000).includes(0)) {
-      throw new RepoError(`${file} 是二进制文件，读不了`);
+      throw new RepoError(`${rel} 是二进制文件，读不了`);
     }
-    return numberedLines(file, buf.toString("utf8"), start, end);
+    return numberedLines(rel, buf.toString("utf8"), start, end);
   }
 
   /** 从别的分支读文件：直接读 git 里的对象，不动工作目录 */
@@ -566,17 +568,17 @@ export class Workspace {
       return this.listFiles({ dir: rel, branch: ref.name }, signal);
     }
     if (type !== "blob") {
-      throw new RepoError(`${file} 是子模块，读不了`);
+      throw new RepoError(`${rel} 是子模块，读不了`);
     }
     const size = Number((await this.git(["cat-file", "-s", spec], signal)).trim());
     if (size > MAX_FILE_BYTES) {
-      throw new RepoError(`${file} 有 ${Math.round(size / 1024)} KB，太大了不读，用 code_search 搜需要的部分`);
+      throw new RepoError(`${rel} 有 ${Math.round(size / 1024)} KB，太大了不读，用 code_search 搜需要的部分`);
     }
     const text = await this.git(["cat-file", "blob", spec], signal);
     if (text.slice(0, 8000).includes("\u0000")) {
-      throw new RepoError(`${file} 是二进制文件，读不了`);
+      throw new RepoError(`${rel} 是二进制文件，读不了`);
     }
-    return numberedLines(file, text, start, end, await this.label(ref, signal));
+    return numberedLines(rel, text, start, end, await this.label(ref, signal));
   }
 
   /**
@@ -757,38 +759,40 @@ export class Workspace {
 
   private async applyEdit(file: string, oldText: string | undefined, newText: string): Promise<string> {
     const abs = await this.resolve(file, true);
+    // 和读文件一样，结果里写整理过的路径
+    const rel = this.relative(file);
     const info = await lstat(abs).catch(() => undefined);
     if (info?.isSymbolicLink()) {
-      throw new RepoError(`${file} 是符号链接，不能改`);
+      throw new RepoError(`${rel} 是符号链接，不能改`);
     }
     if (info?.isDirectory()) {
-      throw new RepoError(`${file} 是目录`);
+      throw new RepoError(`${rel} 是目录`);
     }
     if (!oldText) {
       await mkdir(path.dirname(abs), { recursive: true });
       await writeFile(abs, newText);
       // 和 numberedLines 一样数行：结尾的换行不算多一行
       const lines = newText.split("\n");
-      return `${info ? "已覆盖" : "已新建"} ${file}（${lines.at(-1) === "" ? lines.length - 1 : lines.length} 行）。`;
+      return `${info ? "已覆盖" : "已新建"} ${rel}（${lines.at(-1) === "" ? lines.length - 1 : lines.length} 行）。`;
     }
     if (!info) {
       throw new RepoError(`没有这个文件：${file}。要新建文件时不填 old_text`);
     }
     if (info.size > MAX_FILE_BYTES) {
-      throw new RepoError(`${file} 太大了，不改`);
+      throw new RepoError(`${rel} 太大了，不改`);
     }
     const content = await readFile(abs, "utf8");
     const count = content.split(oldText).length - 1;
     if (count === 0) {
-      throw new RepoError(`${file} 里没找到 old_text（要和文件内容一字不差，包括缩进和空格），先用 code_read_file 看准再改`);
+      throw new RepoError(`${rel} 里没找到 old_text（要和文件内容一字不差，包括缩进和空格），先用 code_read_file 看准再改`);
     }
     if (count > 1) {
-      throw new RepoError(`${file} 里 old_text 出现了 ${count} 次，多带几行上下文让它只出现一次`);
+      throw new RepoError(`${rel} 里 old_text 出现了 ${count} 次，多带几行上下文让它只出现一次`);
     }
     const index = content.indexOf(oldText);
     await writeFile(abs, content.slice(0, index) + newText + content.slice(index + oldText.length));
     const line = content.slice(0, index).split("\n").length;
-    return `已修改 ${file} 第 ${line} 行起的内容。`;
+    return `已修改 ${rel} 第 ${line} 行起的内容。`;
   }
 
   /** 当前所有改动（含新建的文件）：先列统计，再给完整 diff */

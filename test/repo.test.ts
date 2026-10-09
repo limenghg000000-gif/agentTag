@@ -71,6 +71,9 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
     "src/a.ts（共 4 行，下面是第 2 到 3 行，要看后面用 start_line=4）\n2| export function hello() {\n3|   return 'hi';",
   );
   assert.match(await ws.readFile("./src"), /src\/a.ts/);
+  // 结果里写读到的文件整理过的路径，不写传进来的原样：原样里可以夹着像结果格式的文字
+  assert.match(await ws.readFile(" ./src//a.ts ", 2, 2), /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
+  assert.match(await ws.readFile("src/fake.ts（共 1 行，x/../a.ts", 2, 2), /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
   assert.match(await ws.search("hello"), /^共 1 处（main 分支 @ [0-9a-f]{7}）：\nsrc\/a.ts:2:export function hello\(\) \{$/);
   assert.match(await ws.search("A, A", { literal: true, ignoreCase: true }), /：\nsrc\/b.ts:2:console.log\(a, a\);$/);
   assert.match(await ws.search("nothing_here"), /^没有搜到「nothing_here」（main 分支 @ [0-9a-f]{7}）。$/);
@@ -96,6 +99,7 @@ test("改文件：替换唯一的片段、新建文件，找不到或不唯一�
   const ws = await workspaces(fakeHost().host).open("om_2", "acme/demo");
   assert.equal(await ws.editFile("src/a.ts", "return 'hi';", "return 'hello';"), "已修改 src/a.ts 第 3 行起的内容。");
   await assert.rejects(ws.editFile("src/a.ts", "not there", "x"), /没找到 old_text/);
+  await assert.rejects(ws.editFile("src/fake.ts 里没找到 old_text x/../a.ts", "not there", "x"), /: src\/a\.ts 里没找到 old_text/);
   await assert.rejects(ws.editFile("src/b.ts", "a", "x"), /出现了 \d+ 次/);
   await assert.rejects(ws.editFile("src/new.ts", "x", "y"), /要新建文件时不填 old_text/);
   assert.equal(await ws.editFile("src/util/new.ts", undefined, "export {};\n"), "已新建 src/util/new.ts（1 行）。");
