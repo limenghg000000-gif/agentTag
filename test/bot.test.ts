@@ -1176,11 +1176,9 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
   assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), UNVERIFIED_CODE_ANSWER);
 });
 
-test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行；报错里提到的路径也认", () => {
+test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行", () => {
   const read = "src/app.ts（master 分支 @ 3f2a1c9，共 80 行，下面是第 1 到 40 行）\n1| import x\n35| export function start() {}";
-  const seen = codeEvidence([], [read, 'Traceback\n  File "app/jobs/sync.py", line 88, in run', "panic\n\tinternal/logic/order.go:88 +0x1d"], [
-    "没有这个文件：src/legacy/user.ts。可以先用 code_list_files 或 code_search 找找",
-  ]);
+  const seen = codeEvidence([], [read, 'Traceback\n  File "app/jobs/sync.py", line 88, in run', "panic\n\tinternal/logic/order.go:88 +0x1d"]);
   assert.equal(seen("src/app.ts", 35), true);
   assert.equal(seen("src/app.ts", 60), false);
   assert.equal(seen("src/app.ts", 3), false);
@@ -1189,28 +1187,6 @@ test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号�
   assert.equal(seen("internal/logic/order.go", 88), true);
   assert.equal(seen("internal/logic/order.go", 8), false);
   assert.equal(seen("src/other.ts"), false);
-  // 读失败的文件只认说它不存在、读不到的那句话；读失败以后照样讲里面写了什么，不认
-  assert.equal(seen("src/legacy/user.ts", 10, "src/legacy/user.ts 第 10 行找不到，没有这个文件"), true);
-  assert.equal(seen("src/legacy/user.ts", undefined, "仓库里没找到 src/legacy/user.ts"), true);
-  assert.equal(seen("src/legacy/user.ts", 10, "`src/legacy/user.ts:10` 初始化配置"), false);
-  assert.equal(seen("src/legacy/user.ts", undefined, "src/legacy/user.ts 里初始化了配置，没有做校验"), false);
-  assert.equal(seen("src/legacy/user.ts"), false);
-});
-
-test("读失败的文件只认说它不存在的那几句话，同一句里转折以后、别的引用后面说的不算", () => {
-  const seen = codeEvidence([], [], ["没有这个文件：src/a.ts", "没有这个文件：src/b.ts", "没有这个文件：src/foo.ts"]);
-  const unseen = (answer: string) => unseenCodeCitations(answer, seen).map((cite) => cite.text);
-  assert.deepEqual(unseen("没找到 src/a.ts，但 src/b.ts:10 初始化配置"), ["src/b.ts:10"]);
-  assert.deepEqual(unseen("没找到 src/a.ts，src/b.ts:10 初始化配置"), ["src/b.ts:10"]);
-  assert.deepEqual(unseen("虽然没找到 src/foo.ts，但 src/foo.ts:10 初始化配置"), ["src/foo.ts:10"]);
-  assert.deepEqual(unseen("一开始没找到，不过 src/foo.ts:10 初始化配置"), ["src/foo.ts:10"]);
-  assert.deepEqual(unseen("src/a.ts:3 初始化配置。src/b.ts 不存在"), ["src/a.ts:3"]);
-  assert.deepEqual(unseen("src/a.ts:3 初始化配置，src/b.ts 不存在"), ["src/a.ts:3"]);
-  // 并列写的几处共用前后的话
-  assert.deepEqual(unseen("src/a.ts 和 src/b.ts 都不存在"), []);
-  assert.deepEqual(unseen("仓库里没找到 src/a.ts 和 src/b.ts"), []);
-  assert.deepEqual(unseen("`src/a.ts`、`src/b.ts:3` 在仓库里都找不到"), []);
-  assert.deepEqual(unseen("你问的 src/foo.ts:10，在仓库里找不到"), []);
 });
 
 test("代码引用的路径要整段对上，改文件的结果里写的行也认", () => {
@@ -1312,21 +1288,24 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   const honest = await ask([made, "gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。"]);
   assert.deepEqual(honest.replies, ["gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。"]);
 
-  // 读文件报「没有这个文件」以后，说这个文件不存在不算编
-  const missing = await ask(["src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件"], {
-    question: "src/legacy/user.ts 第 10 行是干嘛的",
-    tool: "code_read_file",
-  });
-  assert.equal(missing.requests.length, 2);
-  assert.deepEqual(missing.replies, ["src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件"]);
+  // 工具报错（「没有这个文件」）不算查到：照实说找不到也要重做一次，路径是群成员自己问的，重做以后照着复述就发出
+  const missing = "src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件";
+  const asked = await ask([missing, missing], { question: "src/legacy/user.ts 第 10 行是干嘛的", tool: "code_read_file" });
+  assert.equal(asked.requests.length, 3);
+  assert.match(String(asked.requests[2].messages.at(-1)?.content), /读失败、没搜到的路径也不算/);
+  assert.deepEqual(asked.replies, [missing]);
 
-  // 读失败、没搜到以后照样讲这个文件写了什么：打回重做，重做后还这么讲就不发出
-  const claim = "`src/legacy/user.ts:10` 初始化配置";
-  for (const tool of ["code_read_file", "code_find"]) {
+  // 读失败、没搜到以后照样讲这个文件写了什么，或者自己猜的路径读失败了还写着：打回重做，重做后还这么写就不发出
+  for (const [claim, tool] of [
+    ["`src/legacy/user.ts:10` 初始化配置", "code_read_file"],
+    ["`src/legacy/user.ts:10` 没找到 bug，但该行初始化了配置", "code_read_file"],
+    ["`src/legacy/user.ts:10` 初始化配置", "code_find"],
+    ["src/legacy/user.ts 不存在", "code_read_file"],
+  ]) {
     const failedRead = await ask([claim, claim], { tool });
-    assert.equal(failedRead.requests.length, 3, tool);
-    assert.match(String(failedRead.requests[2].messages.at(-1)?.content), /src\/legacy\/user\.ts:10/);
-    assert.deepEqual(failedRead.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], tool);
+    assert.equal(failedRead.requests.length, 3, claim);
+    assert.match(String(failedRead.requests[2].messages.at(-1)?.content), /src\/legacy\/user\.ts/);
+    assert.deepEqual(failedRead.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], claim);
   }
   // code_search 搜的是文件内容：没搜到这个路径，不能拿来说没有这个文件
   const notSearched = await ask(["实现在 src/legacy/user.ts 里", "仓库里不存在 src/legacy/user.ts"], { tool: "code_find" });
