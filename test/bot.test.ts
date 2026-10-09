@@ -624,6 +624,33 @@ test("配了写权限名单：名单外的人只拿到读的工具，提示词�
   assert.doesNotMatch(open.requests[0].system, /WRITE_ALLOWED_USERS/);
 });
 
+test("没说要文档时不给新建文档的工具，提示词让它直接写在回答里；说了要文档才给", async () => {
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_create", true), tool("feishu_doc_edit", true)];
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, taskTools });
+
+  await handle(message("把上面的排查结果总结一下"));
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"]);
+  assert.match(requests[0].system, /这次没说要写文档，所以没有新建文档的工具：总结、整理这类内容直接写在回答里/);
+
+  for (const [index, question] of ["把上面的排查结果写成文档", "整理成飞书文档发我", "建个 doc 记一下"].entries()) {
+    await handle(message(question, { messageId: `om_doc_${index}` }));
+    assert.deepEqual(requests[index + 1].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_create", "feishu_doc_edit"], question);
+    assert.doesNotMatch(requests[index + 1].system, /没有新建文档的工具/, question);
+  }
+  // 读文档、docker 都不算要写文档
+  for (const [index, question] of ["总结一下这篇文档 https://example.feishu.cn/docx/abc", "总结一下 docker 的用法"].entries()) {
+    await handle(message(question, { messageId: `om_read_${index}` }));
+    assert.deepEqual(requests[index + 4].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"], question);
+  }
+});
+
 test("有代码工具时，没读代码就说仓库内容的回答被打回去，查过之后才发出", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },

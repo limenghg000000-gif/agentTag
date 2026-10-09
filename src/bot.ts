@@ -28,6 +28,9 @@ const FALLBACK_BOT_NAME = "AI 助手";
 const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
 /** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
 export const DEEP_THINKING = /深度思考|仔细(想|思考|分析)|认真(想|思考|分析)/;
+/** 要写文档：「写成文档」「整理成飞书文档」「建个 doc」「记到知识库」。没说的不给新建文档的工具；「总结一下这篇文档」是读，不算 */
+const DOC_REQUEST =
+  /(?:写|建|创建|新建|生成|做|出|存|记|放|弄|输出|沉淀|形成|整理成|汇总成|总结成)[^，。,.!?！？\n]{0,8}?(?:文档|\bdocs?\b|docx|wiki|知识库)/i;
 
 export interface ThreadContextSource {
   load(msg: NormalizedMessage): Promise<ThreadContext>;
@@ -194,7 +197,9 @@ async function runTask(
     );
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
-    const taskTools = readOnly ? allTools.filter((tool) => !tool.writes) : allTools;
+    // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
+    const docRequested = DOC_REQUEST.test(question);
+    const taskTools = allTools.filter((tool) => !(readOnly && tool.writes) && (docRequested || tool.spec.name !== "feishu_doc_create"));
     if (readOnly) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
