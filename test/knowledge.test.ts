@@ -1201,6 +1201,43 @@ test("同步到 aiops 没做成、有人在表格里改了这一行：改过的�
   assert.match(result, /已按表格里改过、ML在卡片上核对过的内容同步到 aiops 经验库（经验 #31）/);
 });
 
+test("存好了、后面的步骤没做成，有人在表格里改了草稿编号：再试一次按编号认出存过的那一行，不再存一行；编号也改了就说找不到，也不再存", async () => {
+  for (const both of [false, true]) {
+    let down = true;
+    const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+      saveLesson: () => {
+        if (down) {
+          throw new Error("aiops 现在连不上");
+        }
+        return JSON.stringify({ saved: true, id: 31 });
+      },
+    });
+    await tool("knowledge_propose").run(code8, { signal });
+    await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+    await desk.idle();
+    const partial = lastCard();
+    delete backend.entries[0].requestId;
+    if (both) {
+      backend.entries[0].id = "K100";
+    }
+    down = false;
+    await desk.handleCardAction(click(partial, "save"));
+    await desk.idle();
+    assert.equal(backend.entries.length, 1, "没有再存一行");
+    assert.equal(backend.highest, 1, "没有再发编号");
+    if (both) {
+      assert.match(cardText(lastCard()), /上次存进去的经验 K1 在表格里找不到了（编号和草稿编号都被改了，或者这一行被删了），没有再存一遍/);
+      assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1);
+    } else {
+      assert.deepEqual(
+        backend.entries.map((e) => [e.id, e.aiopsId]),
+        [["K1", 31]],
+      );
+      assert.equal(lastCard().header.title.content, "已存进经验库");
+    }
+  }
+});
+
 test("没做成的卡片：写权限名单里的人点「不用了」或者超过 24 小时就不再试，结果里写上没做成的；发起人不在名单里时不能放弃", async () => {
   const fail = () => {
     throw new Error("aiops 现在连不上");

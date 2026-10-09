@@ -178,6 +178,12 @@ test("程序自己调用（经验库检索和同步）：没开给模型的工�
   await assert.rejects(hub.callDirect("other", "save_lesson", {}, task), /other 现在连不上/);
 });
 
+test("程序自己调用：结果只放在 structuredContent 里、没有文字时按 JSON 返回", async () => {
+  const server = await fake({ call: () => ({ content: [], structuredContent: { saved: true, id: 31 } }) });
+  const hub = await hubFor([config(server.url)], { logger: recorder().logger });
+  assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+});
+
 test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
   let busy = 2;
   const server = await fake({

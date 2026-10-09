@@ -102,6 +102,8 @@ interface SaveProposal extends ProposalBase {
   syncAiops: boolean;
   /** 写多维表格用的幂等编号（UUID）：点保存失败后再点，已经写进去的不会再写一行 */
   requestId: string;
+  /** 已经存进去的经验编号：再试一次时按它和草稿编号找那一行，不再存 */
+  savedId?: string;
   /** aiops 给了结果的同步（存了，或者有相近的没存）：再试一次时表格里这一行没改过就不再调 save_lesson */
   synced?: AiopsSaveResult;
   /** synced 是按什么内容同步的 */
@@ -531,14 +533,27 @@ export class KnowledgeDesk {
   private async saveNow(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
     const { base } = this.options;
     const { draft } = proposal;
-    // 再试一次时草稿编号一样，已经写进去的直接返回那一行
-    const entry = await base.save(draft, {
-      proposedBy: proposal.proposer.name ?? proposal.proposer.openId,
-      confirmedBy,
-      source: `飞书群 ${proposal.chatId} 的话题（消息 ${proposal.sourceMessageId}）`,
-      requestId: proposal.requestId,
-      ...(proposal.replaces ? { replaces: proposal.replaces.id, seen: proposal.replaces } : {}),
-    });
+    let entry: KnowledgeEntry;
+    if (proposal.savedId) {
+      // 上次已经存进去了：找那一行接着做后面的步骤，找不到也不再存一遍
+      const saved = await base.saved(proposal.requestId, proposal.savedId);
+      if (!saved) {
+        throw new KnowledgeError(
+          `上次存进去的经验 ${proposal.savedId} 在表格里找不到了（编号和草稿编号都被改了，或者这一行被删了），没有再存一遍。请在表格里改回来后再点「再试一次」，不需要了就点「不用了」`,
+        );
+      }
+      entry = saved;
+    } else {
+      // 上次存的结果没传回来时草稿编号一样，已经写进去的直接返回那一行
+      entry = await base.save(draft, {
+        proposedBy: proposal.proposer.name ?? proposal.proposer.openId,
+        confirmedBy,
+        source: `飞书群 ${proposal.chatId} 的话题（消息 ${proposal.sourceMessageId}）`,
+        requestId: proposal.requestId,
+        ...(proposal.replaces ? { replaces: proposal.replaces.id, seen: proposal.replaces } : {}),
+      });
+      proposal.savedId = entry.id;
+    }
     const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title || draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号。读不到时不拿卡片上的旧编号凑合
     // （aiops 说重复的那条认不出是要取代的，后面又按表格里的编号归档，aiops 里这个问题就一条都不剩了），后面的步骤等再试一次

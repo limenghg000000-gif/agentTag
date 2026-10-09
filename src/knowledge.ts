@@ -254,6 +254,16 @@ export class KnowledgeBase {
     return (await this.entries(fresh)).find((entry) => entry.id.toUpperCase() === wanted);
   }
 
+  /**
+   * 之前存进去的那一行（再试一次时用）：先按草稿编号找，找不到再按编号找。两列都能在表格里改，改了其中一列也认得出来，
+   * 不会当成没存过再存一行（飞书按 client_token 认出是同一次写入、不建新行，新编号就对不上表格里的那一行了）
+   */
+  async saved(requestId: string, id: string): Promise<KnowledgeEntry | undefined> {
+    const entries = await this.entries(true);
+    const wanted = normalizeId(id);
+    return entries.find((entry) => entry.requestId === requestId) ?? entries.find((entry) => entry.id.toUpperCase() === wanted);
+  }
+
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
   async search(query: string, { limit = 3, category, includeArchived = false, signal, semanticDeadline }: SearchOptions = {}): Promise<KnowledgeHit[]> {
     const text = query.trim().slice(0, QUERY_CHARS);
