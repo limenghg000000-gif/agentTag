@@ -119,6 +119,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     'aiops 配置是 {"token": "CorrectHorseBatteryStaple"}',
     "https://aiops.example.com/mcp?token=correcthorsebattery&ns=prod",
     "FEISHU_APP_SECRET=CorrectHorseBattery。",
+    // API Key：写明了是它的，值里有没有数字都算
+    "MODEL_API_KEY=correcthorsebatterystaple",
+    'const client = new OpenAI({ apiKey: "CorrectHorseBatteryStaple" })',
+    "curl -H 'x-api-key: correct-horse-battery-staple'",
+    "api_key=abcdef0123456789",
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -136,6 +141,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "MCP_AIOPS_TOKEN=${MCP_AIOPS_TOKEN}，从 .env 读",
     "token=<your-token>、token=your_token_here、access_token=xxxxxxxxxxxx 都是占位",
     "secret=FEISHU_APP_SECRET，在服务器 .env 里",
+    "MODEL_API_KEY=${MODEL_API_KEY}，api_key: your_api_key_here",
     "代码里 token := cfg.Token，token = getToken()，secret: config.secret",
     "token: expired. 重新登录就好",
   ]) {

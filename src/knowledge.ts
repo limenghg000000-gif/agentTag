@@ -456,6 +456,9 @@ export function normalizeId(id: string): string {
   return id.replace(/[#\s]/g, "").toUpperCase();
 }
 
+/** 写明了是密钥的名字：token、secret、API Key（MODEL_API_KEY、apiKey、x-api-key）、AccessKey、私钥，也算 secret_key、token_key 这类 */
+const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-]?(?:access[_-]?)?key)?`;
+
 /**
  * 经验库所有群都能看，排查经验还会同步给 aiops 的告警自动排查，所以明显的密钥、密码不让存。
  * 只拦格式很确定的，免得误伤；手机号这类个人信息靠提示词
@@ -481,16 +484,16 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
   // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple）；中文说明（「密码：请找管理员重置」）和 *** 不算
   [/(?:password|passwd|pwd|密码|口令)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{6,}/i, "密码"],
-  // token、secret（也算 secret_key、token_key 这类）后面常跟报错原文（token=expired_session），要带数字才算
-  [/(?:secret|token)(?:[_-]?(?:access[_-]?)?key)?\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}/i, "密码或令牌"],
+  // 写明了是密钥的，值里带数字的都算（不带数字的见下面的 TOKEN_ASSIGNMENT）
+  [new RegExp(String.raw`${SECRET_LABEL}\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}`, "i"), "密码或令牌"],
 ];
 
 /**
- * token、secret 后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple，aiops 的令牌什么样的都能配）。
+ * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=…，这些配置什么样的值都能填）。
  * 值后面紧跟着代码符号的不算（cfg.Token、getToken()、${MCP_AIOPS_TOKEN}、<token>）；
  * 值里有一段是报错、占位或者变量名里的词也不算（token=expired_session、your_token_here、xxxxxxxx、FEISHU_APP_SECRET）
  */
-const TOKEN_ASSIGNMENT = /(?:secret|token)(?:[_-]?(?:access[_-]?)?key)?["']?\s*[:=：]\s*["']?([\w+/~=-]{8,})(?![\w+/~=(\[{<$@:\\-]|\.\S)/gi;
+const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?([\w+/~=-]{8,})(?![\w+/~=(\[{<$@:\\-]|\.\S)`, "gi");
 const NOT_A_TOKEN =
   /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|stale|bad|wrong|fail(?:ed|ure)?|malformed|unknown|absent|disabled|placeholder|redacted|masked|hidden|example|sample|dummy|your|here|token|key|secret|x{3,})$/i;
 
