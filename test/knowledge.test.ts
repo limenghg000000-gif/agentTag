@@ -190,6 +190,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "api_key = '''correct horse battery staple'''",
     '[aiops]\ntoken = """\ncorrect horse\nbattery staple\n"""',
     'db_password = """correct \\\n    horse battery staple"""',
+    '配置里写 password = """ab\\"""correcthorsebatterystaple"""',
     // XML 里名字是密钥的元素（可以带命名空间、属性，值写在 CDATA 里），和 key/name 加 value 属性写的配置项
     "<server>\n  <username>deploy</username>\n  <password>correcthorsebatterystaple</password>\n</server>",
     "<password><![CDATA[correct horse battery staple]]></password>",
@@ -303,6 +304,12 @@ test("经验库：编号按发过的最大编号加一（删掉的行的编号�
   await assert.rejects(base.save(normalizeDraft(dau)), /飞书接口限流/);
   backend.failAdd = undefined;
   assert.equal((await base.save(normalizeDraft(dau))).id, "K12");
+  // 有人填了离上限只差一点的编号：再往后发就超出能精确表示的整数，不存，也不记下这个编号（不然下次读 issued.json 就不认了）
+  backend.entries.push({ ...backend.entries[1], id: "K9007199254740990" });
+  const rows = backend.entries.length;
+  await assert.rejects(base.save(normalizeDraft(dau)), /经验编号已经排到了 K9007199254740990，再发新编号就超出能精确表示的整数了/);
+  assert.equal(backend.highest, 12);
+  assert.equal(backend.entries.length, rows);
   assert.match(formatKnowledge(first), /^经验 K1 \[排查经验\]：gateway-api 报 code=8/);
   assert.match(formatKnowledge(first), /（确认人 ML，2026\/10\/9）$/);
 });
@@ -1334,6 +1341,56 @@ test("归档、取代时用表格里现在的 aiops 编号：卡片发出后编�
   assert.deepEqual(replace.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
 });
 
+test("取代旧经验、存好后重新读旧的那条失败：不拿卡片上的旧 aiops 编号凑合，同步和归档等再试一次，按表格里现在的编号认出重复的那条", async () => {
+  const setup = deskSetup({
+    saveLesson: (args) =>
+      args.force ? JSON.stringify({ saved: true, id: 32 }) : JSON.stringify({ saved: false, duplicate_of: { id: 35, title: "旧的", why: "错误码相同" } }),
+  });
+  const { backend, base, desk, sent, calls, click, tool, lastCard } = setup;
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  // 卡片发出后 K1 的 aiops 编号换成了 35（也是从 K1 同步过去的）；存好新的以后读表格失败一次
+  backend.entries[0].aiopsId = 35;
+  const add = backend.add.bind(backend);
+  const list = backend.list.bind(backend);
+  let failNext = false;
+  backend.add = async (entry) => {
+    await add(entry);
+    failNext = true;
+  };
+  backend.list = async () => {
+    if (failNext) {
+      failNext = false;
+      throw new KnowledgeError("飞书接口超时");
+    }
+    return list();
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  const partial = lastCard();
+  assert.match(cardText(partial), /没能重新读取要取代的旧经验 K1：飞书接口超时。同步 aiops、归档旧经验这几步先没做/);
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 0);
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.equal(backend.entries[0].status, "active");
+
+  await desk.handleCardAction(click(partial, "save"));
+  await desk.idle();
+  // aiops 说重复的是 35，正是表格里 K1 现在的编号：强制存新的，再归档 35
+  assert.deepEqual(
+    calls.filter((call) => call.tool === "save_lesson").map((call) => call.args.force),
+    [undefined, true],
+  );
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status, e.aiopsId]),
+    [
+      ["K1", "archived", 35],
+      ["K2", "active", 32],
+    ],
+  );
+});
+
 test("归档、取代时表格里的 aiops 编号被改成了别的经验（不是从这一条同步过去的）：不归档那条，卡片说明原因，表格改正后再试一次才归档", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
   await base.save(normalizeDraft(code8));
@@ -1982,6 +2039,9 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   // 再一行的依据里贴了 XML 配置里的密码
   await base.save(normalizeDraft({ ...dau, title: "日活的口径（H5）", keywords: "日活,H5" }));
   backend.entries[3].basis = ["<password><![CDATA[correct horse", "battery staple]]></password>"].join(" ");
+  // 还有一行是确认人那一列里贴了密码（检索结果、knowledge_get 里会写出确认人）
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（PC）", keywords: "日活,PC" }));
+  backend.entries[4].confirmedBy = ["password", "correcthorsebatterystaple"].join("=");
   const fresh = new KnowledgeBase(backend, { logger: quiet });
   const hits = await fresh.search("日活");
   assert.deepEqual(
@@ -1990,12 +2050,13 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   );
   const desk = deskSetup();
   desk.backend.entries = structuredClone(backend.entries);
-  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|horse/);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|horse/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里被改过，结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K3" }, { signal }), /经验 K3 在表格里被改过，怎么处理里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K4" }, { signal }), /经验 K4 在表格里被改过，依据或排查过程里像是有密码或令牌/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K5" }, { signal }), /经验 K5 在表格里被改过，确认人里像是有密码/);
   assert.equal(desk.sent.length, 0);
-  // 新存的不会占掉 K2、K3、K4
-  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K5");
+  // 新存的不会占掉 K2 到 K5
+  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K6");
 });

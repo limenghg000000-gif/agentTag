@@ -315,6 +315,12 @@ export class KnowledgeBase {
       // 先记下再写表格，写失败了跳过一个号，不会重复
       const issued = (await this.backend.issued?.()) ?? 0;
       const next = entries.reduce((max, entry) => Math.max(max, numberOf(entry.id)), issued) + 1;
+      // 再往后发一个也要能精确表示（numberOf、读 issued.json 都按这个认）：不然这次发出去的编号下次就不认了，后面都存不了
+      if (!Number.isSafeInteger(next + 1)) {
+        throw new KnowledgeError(
+          `经验编号已经排到了 K${next - 1}，再发新编号就超出能精确表示的整数了，先不保存。可能有人在表格里填了特别大的编号：请改掉它，再把数据目录里 issued.json 的 highest 改成实际用到的最大编号`,
+        );
+      }
       await this.backend.issue?.(next);
       const entry: KnowledgeEntry = {
         ...draft,
@@ -666,9 +672,12 @@ function isBasicCredential(value: string): boolean {
 
 /**
  * TOML、Python 里三个引号的多行字符串（password = """correct horse battery staple"""、api_key = '''…'''），值可以跨好几行。
- * 第 1 组是三个双引号里的，第 2 组是三个单引号里的
+ * 转义的引号（"""ab\"""cd…"""）不算结束。第 1 组是三个双引号里的，第 2 组是三个单引号里的
  */
-const TRIPLE_QUOTED = new RegExp(String.raw`${CONFIG_KEY}["']?[^\S\r\n]*=[^\S\r\n]*(?:"""([\s\S]*?)"""|'''([\s\S]*?)''')`, "gi");
+const TRIPLE_QUOTED = new RegExp(
+  String.raw`${CONFIG_KEY}["']?[^\S\r\n]*=[^\S\r\n]*(?:"""((?:\\[\s\S]|"(?!"")|[^"\\])*)"""|'''((?:\\[\s\S]|'(?!'')|[^'\\])*)''')`,
+  "gi",
+);
 
 /**
  * 三个引号里的值：开头紧跟的换行去掉，行尾 \ 续到下一行的连起来，换行和连续的空白算一个空格。
@@ -727,9 +736,10 @@ function findSecret(text: string): string | undefined {
   return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }
 
-/** 表格里这一行哪一项里像是有密钥；没有时返回 undefined */
+/** 表格里这一行哪一项里像是有密钥；没有时返回 undefined。编号、确认人这些也会写进检索结果，有编辑权限的人也能改，一起查 */
 function entrySecret(entry: KnowledgeEntry): string | undefined {
   const fields: [string, string | undefined][] = [
+    ["编号", entry.id],
     ["标题", entry.title],
     ["适用范围", entry.scope],
     ["问题或场景", entry.question],
@@ -739,6 +749,10 @@ function entrySecret(entry: KnowledgeEntry): string | undefined {
     ["关键词", entry.keywords],
     ["错误码", entry.errorCodes],
     ["告警名", entry.alertname],
+    ["发起人", entry.proposedBy],
+    ["确认人", entry.confirmedBy],
+    ["来源", entry.source],
+    ["取代的经验", entry.replaces],
   ];
   for (const [name, text] of fields) {
     const secret = text ? findSecret(text) : undefined;

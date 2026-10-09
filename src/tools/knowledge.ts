@@ -539,9 +539,18 @@ export class KnowledgeDesk {
       requestId: proposal.requestId,
       ...(proposal.replaces ? { replaces: proposal.replaces.id, seen: proposal.replaces } : {}),
     });
-    // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号
-    const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
     const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title || draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
+    // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号。读不到时不拿卡片上的旧编号凑合
+    // （aiops 说重复的那条认不出是要取代的，后面又按表格里的编号归档，aiops 里这个问题就一条都不剩了），后面的步骤等再试一次
+    let replaced: KnowledgeEntry | undefined;
+    if (proposal.replaces) {
+      try {
+        replaced = (await base.get(proposal.replaces.id, { fresh: true })) ?? proposal.replaces;
+      } catch (err) {
+        out.unfinished.push(`没能重新读取要取代的旧经验 ${proposal.replaces.id}：${describe(err)}。同步 aiops、归档旧经验这几步先没做`);
+        return out;
+      }
+    }
     // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "keep";
     if (replaced) {
