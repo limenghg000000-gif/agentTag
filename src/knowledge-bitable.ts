@@ -293,9 +293,14 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   /** 补齐列：每次启动后第一次写表格前做一次 */
   private schema?: Promise<void>;
   /** 编号 → 行 id，update 时用 */
-  private readonly rows = new Map<string, string>();
+  private rows = new Map<string, string>();
   /** 表格里不止一行用的编号（有人复制了行）：改这些编号时不知道该改哪行，不改 */
-  private readonly ambiguous = new Set<string>();
+  private ambiguous = new Set<string>();
+  /**
+   * 每开始读一次表格、每写进一行加一。读完时这个数变了，说明读的时候又有了更新的读或者新写的行
+   * （比如回答前检索超时、还在后台读的那次），这次读到的比现在记的旧，不拿来换编号 → 行 id 的对照
+   */
+  private generation = 0;
   private warnedAmbiguous = "";
   private readonly logger: Logger;
 
@@ -313,28 +318,37 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     if (!target) {
       return [];
     }
+    const generation = ++this.generation;
     const records = await this.explain(() => this.options.api.listRecords(target.appToken, target.tableId));
-    this.rows.clear();
-    this.ambiguous.clear();
+    const rows = new Map<string, string>();
+    const ambiguous = new Set<string>();
     const entries: KnowledgeEntry[] = [];
     for (const record of records) {
       const entry = toEntry(record);
       if (entry) {
         const key = entry.id.toUpperCase();
-        if (this.rows.has(key)) {
-          this.ambiguous.add(key);
+        if (rows.has(key)) {
+          ambiguous.add(key);
         } else {
-          this.rows.set(key, record.recordId);
+          rows.set(key, record.recordId);
         }
         entries.push(entry);
       }
     }
+    if (generation === this.generation) {
+      this.rows = rows;
+      this.ambiguous = ambiguous;
+      this.warnAmbiguous();
+    }
+    return entries;
+  }
+
+  private warnAmbiguous(): void {
     const ambiguous = [...this.ambiguous].join(" ");
     if (ambiguous && ambiguous !== this.warnedAmbiguous) {
       this.logger.warn(`经验库：表格里有不止一行用了同一个编号：${ambiguous}。归档这些编号前请先在表格里把重复的改掉`);
     }
     this.warnedAmbiguous = ambiguous;
-    return entries;
   }
 
   async add(entry: KnowledgeEntry): Promise<void> {
@@ -344,6 +358,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     }
     await this.ensureColumns(target);
     const recordId = await this.explain(() => this.options.api.createRecord(target.appToken, target.tableId, toFields(entry), entry.requestId));
+    // 写之前开始的读还没回来的话，回来时不再用它换掉对照，不然会把这一行丢掉
+    this.generation++;
     if (recordId) {
       this.rows.set(entry.id.toUpperCase(), recordId);
     }
@@ -385,7 +401,16 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   }
 
   private current(): Promise<BitableState | undefined> {
-    this.target ??= this.options.target ? Promise.resolve(this.options.target) : this.readState();
+    if (!this.target) {
+      const reading = this.options.target ? Promise.resolve(this.options.target) : this.readState();
+      this.target = reading;
+      // 读数据目录出错（比如磁盘一时读不了）不记住，下次再读
+      reading.catch(() => {
+        if (this.target === reading) {
+          this.target = undefined;
+        }
+      });
+    }
     return this.target;
   }
 

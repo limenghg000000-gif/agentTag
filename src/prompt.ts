@@ -78,7 +78,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
     lines.push("", extra);
   }
   if (knowledge) {
-    lines.push("", ...knowledgeSection(knowledge, toolNames.includes("knowledge_propose"), toolNames.includes("aiops_search_knowledge")));
+    lines.push("", ...knowledgeSection(knowledge, toolNames));
   }
   if (memory) {
     lines.push("", ...memorySection(memory));
@@ -88,9 +88,10 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
 
 function knowledgeSection(
   { hits, missed, failed }: { hits?: string; missed?: readonly string[]; failed?: boolean },
-  canPropose: boolean,
-  hasAiops: boolean,
+  toolNames: readonly string[],
 ): string[] {
+  const canPropose = toolNames.includes("knowledge_propose");
+  const hasAiops = toolNames.includes("aiops_search_knowledge");
   const lines = [
     "## 团队经验库",
     "团队经验库存在飞书多维表格里，所有群共用，存的是有人确认过的结论，编号写成「经验 K3」（和群记忆的 #N、aiops 的「案例 #N」「经验 #N」都不是一套编号，不要混）。" +
@@ -132,12 +133,23 @@ function knowledgeSection(
       "数据口径写指标定义、数据来源、查法和要排除的数据，不写某一天的数字；需求结论写结论、理由和需求文档链接，需求本身以文档为准，不抄文档全文。",
     "- 不写密钥、令牌、密码，也不写手机号、身份证号、用户姓名这类个人信息；用户反馈的问题只写现象，不写是谁反馈的。",
     "- 排查经验先问清修没修：修了写提交和分支，没修写「未修复」再写建议。报错原文里的关键字、错误码、服务名写进 keywords 和 error_codes，检索主要靠它们命中。",
-    "- 「把案例 #N 沉淀为经验」：先用 aiops_promote_case 拿草稿，补全以后再调 knowledge_propose，带上 case_id。",
+    ...caseLine(toolNames),
     "- 起草后确认卡片会发到话题里，要等写权限名单里的人点「保存」才写入。回答里用一两句话请大家看卡片确认，不要把草稿再写一遍，也不要说已经存好了。有人要改，按他说的改好再调一次 knowledge_propose，新卡片会替换旧的。",
     "- 一条经验过时了或者错了：先用 knowledge_get（aiops 的用 aiops_get_knowledge）取出来，再用 knowledge_propose_archive 发归档的确认卡片。要更新一条经验，起草新的时带上 replaces=旧编号，保存后自动归档旧的。",
     "- 群成员说「记住……」的团队约定、决定和偏好照旧记进群记忆；问题和答案、排查结论、口径这类才进经验库。",
   );
   return lines;
+}
+
+/** 「把案例 #N 沉淀为经验」怎么起草：看 aiops 开了哪个工具（MCP_AIOPS_TOOLS 可能没开 promote_case） */
+function caseLine(toolNames: readonly string[]): string[] {
+  if (toolNames.includes("aiops_promote_case")) {
+    return ["- 「把案例 #N 沉淀为经验」：先用 aiops_promote_case 拿草稿，补全以后再调 knowledge_propose，带上 case_id。"];
+  }
+  if (toolNames.includes("aiops_get_case")) {
+    return ["- 「把案例 #N 沉淀为经验」：用 aiops_get_case 取出案例，自己整理成草稿再调 knowledge_propose，带上 case_id。"];
+  }
+  return [];
 }
 
 function memorySection({ text, omitted }: { text: string; omitted: number }): string[] {

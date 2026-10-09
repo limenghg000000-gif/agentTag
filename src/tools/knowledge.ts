@@ -228,7 +228,7 @@ export class KnowledgeDesk {
       describe: (args) => `查经验库：${preview(args.query)}`,
       run: async (args, { signal }) => {
         const query = typeof args.query === "string" ? args.query : "";
-        const category = typeof args.category === "string" && args.category in KNOWLEDGE_CATEGORIES ? (args.category as KnowledgeCategory) : undefined;
+        const category = typeof args.category === "string" && Object.hasOwn(KNOWLEDGE_CATEGORIES, args.category) ? (args.category as KnowledgeCategory) : undefined;
         // 读表格的接口不认中止信号：任务停了就不等它
         const hits = await raceAbort(
           base.search(query, { limit: 5, includeArchived: args.include_archived === true, signal, ...(category ? { category } : {}) }),

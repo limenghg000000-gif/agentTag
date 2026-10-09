@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -383,4 +383,44 @@ test("KNOWLEDGE_BITABLE 要填打开数据表时浏览器里的链接", () => {
   assert.throws(() => parseBitableUrl("AbCd123"), /要填多维表格的链接/);
   assert.throws(() => parseBitableUrl("https://example.feishu.cn/base/AbCd123"), /\?table=tbl/);
   assert.throws(() => parseBitableUrl("https://example.feishu.cn/wiki/AbCd123?table=tblX"), /\/base\/<app_token>/);
+});
+
+test("两次读表格同时进行：先开始的读后回来时不覆盖新写的行，记 aiops 编号照样找得到", async () => {
+  const { api, tables } = fakeBitable();
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "overlap.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  tables.set("tblX", { fields: [], records: [] });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(dau);
+
+  // 回答前检索超时、还在后台读的那次：拿到的是保存新经验之前的表格
+  const list = api.listRecords.bind(api);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  api.listRecords = async (app, table) => {
+    const snapshot = await list(app, table);
+    api.listRecords = list;
+    await gate;
+    return snapshot;
+  };
+  const stale = backend.list();
+  await new Promise((resolve) => setImmediate(resolve));
+  const fresh = new KnowledgeBase(backend, { logger: quiet });
+  const entry = await fresh.save({ ...dau, title: "月活的口径", keywords: "月活,MAU" });
+  assert.equal(entry.id, "K2");
+  release();
+  assert.equal((await stale).length, 1);
+  await fresh.linkAiops("K2", 31);
+  assert.equal(tables.get("tblX")!.records[1].fields["aiops 经验编号"], "31");
+});
+
+test("读数据目录里记的表格出错时不记住，下次再读", async () => {
+  const stateFile = path.join(dir, "flaky", "bitable.json");
+  // 先让它读不了：路径是个目录
+  await mkdir(stateFile, { recursive: true });
+  const { api } = fakeBitable();
+  const backend = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: [], editors: [] }, logger: quiet });
+  await assert.rejects(backend.location());
+  await rm(stateFile, { recursive: true });
+  await writeFile(stateFile, JSON.stringify({ appToken: "app1", tableId: "tbl1", url: "https://example.feishu.cn/base/app1?table=tbl1", shared: [] }));
+  assert.equal(await backend.location(), "https://example.feishu.cn/base/app1?table=tbl1");
 });

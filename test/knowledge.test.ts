@@ -12,6 +12,8 @@ import {
   renderHitsForPrompt,
 } from "../src/knowledge.js";
 import { AiopsLessons, type LessonsMcp, renderAiopsHitsForPrompt } from "../src/knowledge-aiops.js";
+import { readFile } from "node:fs/promises";
+import { buildSystemPrompt } from "../src/prompt.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
@@ -942,4 +944,29 @@ test("不是经验库的卡片、不在白名单里的群，经验库不处理",
   assert.equal(await desk.handleCardAction({ ...click((sent[0].input as { card: any }).card, "save"), chatId: "oc_other" }), true);
   await desk.idle();
   assert.equal(backend.entries.length, 0);
+});
+
+test("类别只认经验库的几类：constructor、toString、__proto__ 这类名字不算", async () => {
+  for (const category of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    assert.throws(() => normalizeDraft({ ...dau, category }), /category 只能是/, category);
+  }
+  const { base, tool } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  assert.match(await tool("knowledge_search").run({ query: "日活", category: "toString" }, { signal }), /K1/, "不认的类别不拿来过滤");
+});
+
+test("「把案例 #N 沉淀为经验」按 aiops 开了的工具说：有 promote_case 用它，没有就用 get_case 自己整理", () => {
+  const prompt = (toolNames: string[]) => buildSystemPrompt({ botName: "飞书 CLI", now: new Date(0), toolNames, knowledge: { hits: "" } });
+  const promote = prompt(["knowledge_propose", "aiops_get_case", "aiops_promote_case"]);
+  assert.match(promote, /先用 aiops_promote_case 拿草稿/);
+  const getCase = prompt(["knowledge_propose", "aiops_get_case"]);
+  assert.doesNotMatch(getCase, /aiops_promote_case/);
+  assert.match(getCase, /用 aiops_get_case 取出案例，自己整理成草稿再调 knowledge_propose，带上 case_id/);
+  assert.doesNotMatch(prompt(["knowledge_propose"]), /「把案例 #N 沉淀为经验」：/);
+});
+
+test("aiops 的说明在经验库关掉时也成立：只在有起草工具时让模型用，没有时直说做不了", async () => {
+  const text = await readFile(new URL("../prompts/mcp/aiops.md", import.meta.url), "utf8");
+  assert.match(text, /你的工具里有 knowledge_propose、knowledge_propose_archive 时，沉淀经验、归档经验用它们起草/);
+  assert.match(text, /没有这两个工具时（经验库没开），有人要沉淀或归档经验，直说现在做不了/);
 });

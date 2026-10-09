@@ -453,7 +453,7 @@ const SECRET_PATTERNS: [RegExp, string][] = [
 /** 去掉首尾空白、检查必填、长度和密钥 */
 export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
   const category = draft.category;
-  if (typeof category !== "string" || !(category in KNOWLEDGE_CATEGORIES)) {
+  if (typeof category !== "string" || !Object.hasOwn(KNOWLEDGE_CATEGORIES, category)) {
     throw new KnowledgeError(`category 只能是 ${Object.keys(KNOWLEDGE_CATEGORIES).join("、")} 之一`);
   }
   const field = (key: string, name: string, limit: number, required: boolean): string | undefined => {
