@@ -224,7 +224,17 @@ async function runTask(
         ...tool,
         run: async (args, ctx) => {
           attempted.add(tool.spec.name);
-          const output = await tool.run(args, ctx);
+          let output: string;
+          try {
+            output = await tool.run(args, ctx);
+          } catch (err) {
+            // 读到了文件、只是读不了（太大、二进制）的报错说明这个文件是有的，算查到了路径，不算查到哪一行
+            const message = err instanceof Error ? err.message : String(err);
+            if (EXISTING_FILE_ERROR.test(message)) {
+              evidence.push(message);
+            }
+            throw err;
+          }
           succeeded.add(tool.spec.name);
           // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到
           evidence.push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS).replace(SEARCH_ECHO, "$1$2"));
@@ -485,8 +495,8 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
  * 按这次的工具结果认引用：路径、提交号出现在结果里就算；带行号的还要那一行真在结果里：搜索结果、报错堆栈里的「路径:行号」，
  * 读这个文件时读到了那一行（「35| …」），或者改文件的结果里写的行（「已修改 src/foo.ts 第 35 行起的内容」、新建的文件）。
  * 只列过文件、读了别的段落，编一个行号照样不认。路径要整段对上：结果里只有 src/index.tsx，不能认 src/index.ts。
- * 工具报的错（「没有这个文件：src/foo.ts」）不算：从回答的字面上分不清是在说「它不存在」，还是读失败以后照样讲它写了什么。
- * 照实说读不到的回答，打回重做时会被告知别写这个路径；路径是群成员自己问的，重做以后照着复述也不拦（见 runTask）。
+ * 没查到的（「没有这个文件：src/foo.ts」、没搜到、没有匹配的文件）不算：从回答的字面上分不清是在说「它不存在」，
+ * 还是没查到以后照样讲它写了什么。照实说找不到的回答，打回重做时会被告知别写这个路径；路径是群成员自己问的，重做以后照着复述也不拦（见 runTask）。
  * 回答里写成「./路径」或「仓库名/路径」（ai/aiops-mcp/internal/x.go）时，去掉前缀再找
  */
 export function codeEvidence(repos: readonly string[], outputs: readonly string[]): CitationCheck {
@@ -506,13 +516,18 @@ function mentions(text: string, cite: string): boolean {
 }
 
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
+/** src/repo.ts 读、改文件时，文件在但读不了、改不了的报错（「src/a.ts 有 2048 KB，太大了不读」） */
+const EXISTING_FILE_ERROR = /^\S+ (?:有 \d+ KB，太大了|是二进制文件|是子模块|是符号链接|是目录|太大了|里没找到 old_text|里 old_text 出现了)/;
 /**
  * code_search 没搜到时，结果开头把搜的内容照抄了一遍（「没有搜到「src/foo.ts」（master 分支 @ 1a2b3c4）」）。
  * 搜的是文件内容，没搜到既不说明有这个文件，也不说明没有，所以抄的这段不算查到；后面的分支和提交号照样算
  */
 const SEARCH_ECHO = /^(没有搜到「|在这 \d+ 个分支上都没有搜到「)[\s\S]*?(」[（：])/;
-/** 路径前后不能紧挨着别的路径字符（mysrc/a.ts、src/a.tsx 都不是 src/a.ts）；前面是 / 的算，报错堆栈里常写全路径 /app/src/a.ts */
-const PATH_START = "(?<![\\w.-])";
+/**
+ * 路径前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、src/a.tsx 都不是 src/a.ts）。
+ * 前面是绝对路径的算：报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）
+ */
+const PATH_START = "(?:(?<![\\w./-])|(?<=(?:^|[\\s\"'(（=])/(?:[\\w.-]+/)*))";
 const PATH_END = "(?![\\w/-]|\\.\\w)";
 
 function escapeRegExp(text: string): string {

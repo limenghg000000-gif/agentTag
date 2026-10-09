@@ -1194,18 +1194,24 @@ test("代码引用的路径要整段对上，改文件的结果里写的行也�
     [],
     [
       "共 3 个文件（master 分支 @ 3f2a1c9）：\nsrc/index.tsx\npkg/mysrc/util.ts\nsrc/app.ts.map",
+      "共 1 处（master 分支 @ 3f2a1c9）：\npkg/src/nested.ts:12: export const x = 1",
       "已修改 src/foo.ts 第 10 行起的内容。",
       "已新建 src/util/new.ts（12 行）。",
       "goroutine 1 [running]:\n/app/internal/logic/order.go:88 +0x1d",
+      "Error: boom\n    at start (/app/src/server.ts:12:5)",
     ],
   );
-  // 结果里只有 src/index.tsx、pkg/mysrc/util.ts、src/app.ts.map，不能认 src/index.ts、src/util.ts、src/app.ts
+  // 结果里只有 src/index.tsx、pkg/mysrc/util.ts、src/app.ts.map、pkg/src/nested.ts，不能认 src/index.ts、src/util.ts、src/app.ts、src/nested.ts
   assert.equal(seen("src/index.tsx"), true);
   assert.equal(seen("src/index.ts"), false);
   assert.equal(seen("src/util.ts"), false);
   assert.equal(seen("src/app.ts"), false);
-  // 堆栈里写的全路径（前面是 /）照样认
+  assert.equal(seen("pkg/src/nested.ts", 12), true);
+  assert.equal(seen("src/nested.ts"), false);
+  assert.equal(seen("src/nested.ts", 12), false);
+  // 堆栈里写的全路径（绝对路径）照样认
   assert.equal(seen("internal/logic/order.go", 88), true);
+  assert.equal(seen("src/server.ts", 12), true);
   assert.equal(seen("src/foo.ts", 10), true);
   assert.equal(seen("src/foo.ts", 11), false);
   assert.equal(seen("src/util/new.ts", 12), true);
@@ -1248,6 +1254,13 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     maxOutputChars: 50,
     run: async () => `共 2 个文件（master 分支 @ 1a2b3c4）：\nsrc/index.ts\n${"x".repeat(60)}\nsrc/hidden/tail.ts`,
   };
+  const readBig: Tool = {
+    spec: { name: "code_read_big", description: "读大文件", parameters: { type: "object", properties: {} } },
+    describe: () => "读大文件",
+    run: async () => {
+      throw new Error("src/generated.ts 有 2048 KB，太大了不读，用 code_search 搜需要的部分");
+    },
+  };
   const searchPath: Tool = {
     spec: { name: "code_find", description: "按路径搜", parameters: { type: "object", properties: {} } },
     describe: () => "按路径搜",
@@ -1264,7 +1277,7 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     const warnings: string[] = [];
     const { sent, handle } = setup({
       model,
-      taskTools: () => [codeSearch, codeRead, longList, searchPath],
+      taskTools: () => [codeSearch, codeRead, longList, searchPath, readBig],
       codeRepos: ["ai/aiops-mcp", "ai/agent-tag"],
       logger: { ...quiet, warn: (line: string) => warnings.push(line) },
     });
@@ -1307,6 +1320,13 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     assert.match(String(failedRead.requests[2].messages.at(-1)?.content), /src\/legacy\/user\.ts/);
     assert.deepEqual(failedRead.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], claim);
   }
+  // 文件太大读不了：报错说明文件是有的，说它太大不算编；编它第几行写了什么照样拦
+  const tooBig = await ask(["src/generated.ts 太大，读不了"], { tool: "code_read_big" });
+  assert.equal(tooBig.requests.length, 2);
+  assert.deepEqual(tooBig.replies, ["src/generated.ts 太大，读不了"]);
+  const bigLine = await ask(["src/generated.ts:10 初始化配置", "src/generated.ts:10 初始化配置"], { tool: "code_read_big" });
+  assert.deepEqual(bigLine.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
+
   // code_search 搜的是文件内容：没搜到这个路径，不能拿来说没有这个文件
   const notSearched = await ask(["实现在 src/legacy/user.ts 里", "仓库里不存在 src/legacy/user.ts"], { tool: "code_find" });
   assert.equal(notSearched.requests.length, 3);
