@@ -17,7 +17,7 @@ import {
   unverifiedOpsAnswer,
 } from "../src/bot.js";
 import type { ThreadContext } from "../src/history.js";
-import { type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
+import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION } from "../src/progress.js";
 import { TaskRegistry } from "../src/tasks.js";
@@ -631,24 +631,70 @@ test("没说要文档时不给新建文档的工具，提示词让它直接写�
     describe: () => name,
     run: async () => "",
   });
-  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_create", true), tool("feishu_doc_edit", true)];
-  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
-  const { handle } = setup({ model, taskTools });
+  const ask = async (question: string, history: ChatMessage[] = []) => {
+    const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+    const context = fakeContext({ history, source: history.length > 0 ? "feishu" : "none" });
+    const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_create", true), tool("feishu_doc_edit", true)];
+    const { handle } = setup({ model, taskTools, context: context.source });
+    await handle(message(question));
+    return { tools: requests[0].tools?.map((t) => t.name), system: requests[0].system };
+  };
+  const withCreate = ["feishu_doc_read", "feishu_doc_create", "feishu_doc_edit"];
+  const withoutCreate = ["feishu_doc_read", "feishu_doc_edit"];
 
-  await handle(message("把上面的排查结果总结一下"));
-  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"]);
-  assert.match(requests[0].system, /这次没说要写文档，所以没有新建文档的工具：总结、整理这类内容直接写在回答里/);
+  const summary = await ask("把上面的排查结果总结一下");
+  assert.deepEqual(summary.tools, withoutCreate);
+  assert.match(summary.system, /看起来没说要新建文档，所以没有新建文档的工具：总结、整理这类内容直接写在回答里/);
 
-  for (const [index, question] of ["把上面的排查结果写成文档", "整理成飞书文档发我", "建个 doc 记一下"].entries()) {
-    await handle(message(question, { messageId: `om_doc_${index}` }));
-    assert.deepEqual(requests[index + 1].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_create", "feishu_doc_edit"], question);
-    assert.doesNotMatch(requests[index + 1].system, /没有新建文档的工具/, question);
+  for (const question of [
+    "把上面的排查结果写成文档",
+    "整理成飞书文档发我",
+    "建个 doc 记一下",
+    "把上面的内容整理到飞书文档里",
+    "帮我起草一份文档",
+    "新建文档，标题叫周报",
+    "帮我写文档",
+    "写到一个新的飞书文档里",
+  ]) {
+    const { tools, system } = await ask(question);
+    assert.deepEqual(tools, withCreate, question);
+    assert.doesNotMatch(system, /没有新建文档的工具/, question);
   }
-  // 读文档、docker 都不算要写文档
-  for (const [index, question] of ["总结一下这篇文档 https://example.feishu.cn/docx/abc", "总结一下 docker 的用法"].entries()) {
-    await handle(message(question, { messageId: `om_read_${index}` }));
-    assert.deepEqual(requests[index + 4].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"], question);
+  // 说的是已有的文档、或者 docker，不算要新建文档
+  for (const question of [
+    "总结一下这篇文档 https://example.feishu.cn/docx/abc",
+    "写一下这篇文档的摘要",
+    "写出这篇文档的问题",
+    "整理一下这几篇文档",
+    "写文档的人是谁",
+    "总结一下 docker 的用法",
+  ]) {
+    assert.deepEqual((await ask(question)).tools, withoutCreate, question);
   }
+
+  // 话题里刚问过要不要建文档、或者问的是文档标题：接着回的「好」「叫周报」也给
+  assert.deepEqual(
+    (await ask("好，那就建一个吧", [
+      { role: "user", content: "[张三] 把上面的排查结果总结一下" },
+      { role: "assistant", content: "总结如下……要我整理成飞书文档吗？" },
+    ])).tools,
+    withCreate,
+  );
+  assert.deepEqual(
+    (await ask("叫周报", [
+      { role: "user", content: "[张三] 把这周的进展写成文档" },
+      { role: "assistant", content: "好的，文档标题叫什么？" },
+    ])).tools,
+    withCreate,
+  );
+  // 上一条已经建好了文档，不是在问话：这次只说总结，不给
+  assert.deepEqual(
+    (await ask("把上面的排查结果总结一下", [
+      { role: "user", content: "[张三] 写成文档" },
+      { role: "assistant", content: "已整理成文档：https://example.feishu.cn/docx/new" },
+    ])).tools,
+    withoutCreate,
+  );
 });
 
 test("有代码工具时，没读代码就说仓库内容的回答被打回去，查过之后才发出", async () => {
