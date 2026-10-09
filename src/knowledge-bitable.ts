@@ -509,6 +509,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
    * 再拿白名单群（默认只读）和写权限名单里的人（可编辑）要有的权限，和机器人已经共享出去的比：
    * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
    * 加协作者之前先把它记进数据目录：加上了却没来得及记下就退出的话，以后移出名单时就不知道要撤它。
+ * 撤之前也记成结果不明：撤掉了却没来得及记下的，以后加回名单时会重新加，不会以为它还有权限。
    * 失败不影响保存，记一条警告，下次启动或保存时再试
    */
   private async reconcile(target: BitableState): Promise<void> {
@@ -595,8 +596,16 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
       }
     }
     for (const [key, { member }] of [...granted]) {
+      if (wanted.has(key)) {
+        continue;
+      }
+      // 撤之前也先记成结果不明：撤掉了却没来得及记下就退出的话，以后再加回名单时按结果不明重新加一次，不会当成它还有权限。
+      // 没记下来也照样撤，撤权限要紧
+      if (!pending.has(key)) {
+        pending.add(key);
+        await persist().catch((err: unknown) => this.logger.warn(`经验库：撤 ${member.id} 的权限之前没能记进数据目录`, err));
+      }
       if (
-        !wanted.has(key) &&
         (
           await attempt(`撤掉 ${member.id} 对多维表格的权限（已不在白名单群或写权限名单里）`, "docs:permission.member:delete", () =>
             api.removeCollaborator(target.appToken, member),

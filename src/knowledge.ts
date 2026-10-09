@@ -512,26 +512,32 @@ const VALUE_CHAR = String.raw`[^\s"'\`,;*()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\u
 const VALUE_END = String.raw`(?=$|[\s"'\`,;*)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
 const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}${ASSIGN}(?:${quotedValue(8)}|["']?(${VALUE_CHAR}{8,})${VALUE_END})`, "gi");
 /**
- * .env、shell 里的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）：不带引号的值也可以有空格（process.loadEnvFile 认到行尾），
- * 所以取到行尾。中文、反引号、行内注释（空格加 #）、同一行的下一个赋值（, refresh_token=…）前面截断，那是说明不是值；
+ * .env、shell、YAML 里不带引号的值也可以有空格（process.loadEnvFile 认到行尾，YAML 的普通标量也是），所以取到行尾。
+ * 中文、反引号、行内注释（空格加 #）、同一行的下一个赋值（, refresh_token=…）前面截断，那是说明不是值；
  * 带 * 的是打了码的，不算。值短于 8 个字符的不算（token=xxx），在 findSecret 里筛
  */
-const ENV_VALUE = String.raw`[ \t]*=[ \t]*(?!["'])([^\n*\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
-/** 大写的变量名在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；单独的 PWD 是当前目录，前面带别的词的（MYSQL_PWD）才是密码 */
+const LINE_VALUE = String.raw`[ \t]*(?!["'])([^\n*\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
+/** 大写的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；单独的 PWD 是当前目录，前面带别的词的（MYSQL_PWD）才是密码 */
 const ENV_ASSIGNMENT = new RegExp(
-  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+PWD)(?:_[A-Z0-9]+)*${ENV_VALUE}`,
+  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+PWD)(?:_[A-Z0-9]+)*[ \t]*=${LINE_VALUE}`,
   "gm",
 );
-/** 小写的变量名（db_password=…）只认一行开头的，句子里的 token=… 是报错原文 */
+/**
+ * 一行开头的配置项，大小写都算：db_password=…、export api_key=…、YAML 的 api_key: …、- token: …、spring.datasource.password=…。
+ * 名字要以密钥的词结尾（token_ttl、tokenizer 说的不是密钥）；句子中间小写的 token=…、token: … 是报错原文，不在这里认
+ */
 const LINE_ASSIGNMENT = new RegExp(
-  String.raw`^[ \t]*(?:export[ \t]+)?(?:\w*(?:secret|token|api_?key|access_?key|private_?key|password|passwd)|\w+_pwd)\w*${ENV_VALUE}`,
+  String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?[\w.-]*(?:${SECRET_LABEL}|password|passwd|[_.-]pwd)\d*[ \t]*(?:=|:(?!:))${LINE_VALUE}`,
   "gim",
 );
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
 const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
-/** 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here）；夹着别的词的照样算（prod-secret-abcdefghijkl） */
+/**
+ * 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here、token: signature is invalid）；
+ * 夹着别的词的照样算（prod-secret-abcdefghijkl、my correct horse battery staple）
+ */
 const PLACEHOLDER_WORD =
-  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|placeholder|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
+  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|placeholder|is|are|was|were|be|been|has|have|had|do|does|did|no|cannot|can|could|the|a|an|of|for|to|from|in|on|with|by|and|or|please|again|login|relogin|retry|provided|given|received|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
 /** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
 const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
 /** 整个值是 a.b.c 这样的属性引用 */
@@ -549,7 +555,7 @@ function isPlaceholder(raw: string): boolean {
   if (PROPERTY_PATH.test(value) && (CREDENTIAL_NAME.test(last) || ENV_NAME.test(last))) {
     return true;
   }
-  return ENV_NAME.test(value) || value.split(/[\s_+/~=.-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
+  return ENV_NAME.test(value) || value.split(/[\s_+/~=.,;:!?-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
 }
 
 /** HTTP Basic 认证（Authorization: Basic …）：后面是「用户名:密码」的 base64 */

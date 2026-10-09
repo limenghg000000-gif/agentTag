@@ -290,6 +290,37 @@ test("加协作者前先记进数据目录：加上了但结果没传回来时�
   assert.equal(state.pending, undefined);
 });
 
+test("撤权限前也先记成不确定：撤掉了但结果没传回来、以后再撤说找不到时，加回名单后重新加上", async () => {
+  const stateFile = path.join(dir, "journal-remove", "bitable.json");
+  const { api, calls, shared } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  const remove = api.removeCollaborator.bind(api);
+  const recorded: unknown[] = [];
+  // 飞书撤掉了，但结果没传回来
+  api.removeCollaborator = async (app, member) => {
+    recorded.push(JSON.parse(await readFile(stateFile, "utf8")).pending);
+    await remove(app, member);
+    throw new Error("socket hang up");
+  };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(recorded, [["openid:ou_old"]], "调接口之前已经记下了");
+
+  // 以后再撤，飞书说没有这个协作者
+  api.removeCollaborator = async () => {
+    throw new FeishuApiError(1, "飞书说没有这个协作者");
+  };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+
+  // ou_old 又加回写权限名单：重新加上，不当成还有权限
+  api.removeCollaborator = remove;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }).syncSharing();
+  assert.equal(shared.filter(([member]) => member.id === "ou_old").length, 2);
+  assert.equal(calls.filter((call) => call.startsWith("update ou_old")).length, 0);
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.deepEqual(state.shared, ["openchat:oc_1:view", "openid:ou_old:edit"]);
+  assert.equal(state.pending, undefined);
+});
+
 test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {
   const { api, tables, tokens } = fakeBitable();
   tables.set("tblX", { fields: [], records: [] });

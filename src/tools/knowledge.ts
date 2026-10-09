@@ -147,6 +147,8 @@ export class KnowledgeDesk {
   private readonly running = new Set<Promise<void>>();
   /** 取代旧经验的保存排队进行 */
   private replacing: Promise<unknown> = Promise.resolve();
+  /** 同一个话题里发确认卡片排队进行，键是群和话题 */
+  private readonly publishing = new Map<string, Promise<void>>();
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly lookupMs: number;
@@ -316,15 +318,19 @@ export class KnowledgeDesk {
         const similar = replaces ? undefined : await this.findSimilar(draft, signal);
         // 任务停了就不发卡片：停掉的任务发出去的卡片还能被点保存
         signal.throwIfAborted();
-        return this.open(ctx, {
-          kind: "save",
-          draft,
-          syncAiops: draft.category === "incident" && withAiops,
-          requestId: randomUUID(),
-          ...(caseId === undefined ? {} : { caseId }),
-          ...(replaces ? { replaces } : {}),
-          ...(similar ? { similar: { id: similar.entry.id, title: similar.entry.title } } : {}),
-        });
+        return this.open(
+          ctx,
+          {
+            kind: "save",
+            draft,
+            syncAiops: draft.category === "incident" && withAiops,
+            requestId: randomUUID(),
+            ...(caseId === undefined ? {} : { caseId }),
+            ...(replaces ? { replaces } : {}),
+            ...(similar ? { similar: { id: similar.entry.id, title: similar.entry.title } } : {}),
+          },
+          signal,
+        );
       },
     };
     const archive: Tool = {
@@ -355,7 +361,7 @@ export class KnowledgeDesk {
             ? { type: "team" as const, entry: await raceAbort(this.activeEntry(id), signal) }
             : { type: "aiops" as const, lesson: await this.activeLesson(aiopsId!, ctx, signal) };
         signal.throwIfAborted();
-        return this.open(ctx, { kind: "archive", target, ...(reason ? { reason } : {}) });
+        return this.open(ctx, { kind: "archive", target, ...(reason ? { reason } : {}) }, signal);
       },
     };
     return [search, get, propose, archive];
@@ -564,7 +570,7 @@ export class KnowledgeDesk {
       return `经验 ${entry.id} 在表格里已经改成「${KNOWLEDGE_CATEGORIES[entry.category]}」，不是排查经验了`;
     }
     if (this.options.aiops?.lacksWriteTools) {
-      return "aiops 没有保存经验的工具（save_lesson、archive_lesson）";
+      return lacksToolsNote(this.options.aiops);
     }
     return undefined;
   }
@@ -673,7 +679,7 @@ export class KnowledgeDesk {
     const { aiops } = this.options;
     try {
       if (!aiops?.writable) {
-        throw new KnowledgeError(aiops?.lacksWriteTools ? "aiops 没有归档经验的工具（archive_lesson）" : "aiops 现在连不上");
+        throw new KnowledgeError(aiops?.lacksWriteTools ? lacksToolsNote(aiops) : "aiops 现在连不上");
       }
       await aiops.archive(aiopsId, confirmedBy, task);
       out.done.push(`aiops 经验库里同步的经验 #${aiopsId} 也已归档。`);
@@ -697,7 +703,7 @@ export class KnowledgeDesk {
   private async activeLesson(id: number, ctx: KnowledgeTaskContext, signal: AbortSignal): Promise<AiopsLesson> {
     const { aiops } = this.options;
     if (!aiops?.writable) {
-      throw new KnowledgeError("aiops 没连上或者没有归档工具，现在不能归档 aiops 经验库里的经验");
+      throw new KnowledgeError(`${aiops?.lacksWriteTools ? lacksToolsNote(aiops) : "aiops 现在连不上"}，现在不能归档 aiops 经验库里的经验`);
     }
     const lesson = await aiops.get(id, { chatId: ctx.chatId, senderId: ctx.senderId, messageId: ctx.messageId }, signal);
     if (lesson.status !== "active") {
@@ -725,11 +731,38 @@ export class KnowledgeDesk {
     }
   }
 
-  /** 新建草稿、发确认卡片，卡片发出去以后再作废这个话题里还没确认的旧草稿；返回给模型的说明 */
-  private async open(
+  /**
+   * 同一个话题里的确认卡片一张一张发：模型一次回复里同时起草两条时，两张同时发的话，前一张发出去后被点了确认、后一张还在发，
+   * 后一张发完作废旧卡片时就漏了前一张，两条都会存。排队以后后一张发的时候前一张已经登记好，先不让点，发出去就作废它
+   */
+  private open(
     ctx: KnowledgeTaskContext,
     detail: Omit<SaveProposal, keyof ProposalBase> | Omit<ArchiveProposal, keyof ProposalBase>,
+    signal: AbortSignal,
   ): Promise<string> {
+    const key = `${ctx.chatId}\n${ctx.threadKey}`;
+    const run = (this.publishing.get(key) ?? Promise.resolve()).then(() => this.publish(ctx, detail, signal));
+    const settled = run.then(
+      () => {},
+      () => {},
+    );
+    this.publishing.set(key, settled);
+    void settled.then(() => {
+      if (this.publishing.get(key) === settled) {
+        this.publishing.delete(key);
+      }
+    });
+    return run;
+  }
+
+  /** 新建草稿、发确认卡片，卡片发出去以后再作废这个话题里还没确认的旧草稿；返回给模型的说明 */
+  private async publish(
+    ctx: KnowledgeTaskContext,
+    detail: Omit<SaveProposal, keyof ProposalBase> | Omit<ArchiveProposal, keyof ProposalBase>,
+    signal: AbortSignal,
+  ): Promise<string> {
+    // 排队的时候任务可能停了
+    signal.throwIfAborted();
     const proposal = {
       ...detail,
       id: randomUUID().slice(0, 8),
@@ -755,6 +788,14 @@ export class KnowledgeDesk {
       }
     }
     proposal.cardMessageId = messageId;
+    // 卡片发的时候任务停了：卡片已经发出去，作废它、不登记，停掉的任务发的卡片不能再点保存；旧卡片照旧能用
+    if (signal.aborted) {
+      proposal.state = "cancelled";
+      proposal.result = ["任务已经停了，这张卡片作废，没有改动经验库"];
+      this.logger.info(`经验库卡片 发出时任务已经停了，作废 proposal=${proposal.id} chat=${ctx.chatId} message=${ctx.messageId}`);
+      await this.render(proposal);
+      signal.throwIfAborted();
+    }
     const replaced = [...this.proposals.values()].filter((old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending");
     for (const old of replaced) {
       old.state = "superseded";
@@ -937,4 +978,9 @@ function preview(value: unknown): string {
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** aiops 少了同步、归档要用的哪些工具 */
+function lacksToolsNote(aiops: AiopsLessons): string {
+  return `aiops 少了同步、归档经验要用的工具（${aiops.missingWriteTools.join("、")}）`;
 }

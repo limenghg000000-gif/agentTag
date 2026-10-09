@@ -150,6 +150,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "  export api_key=correct horse battery staple",
     // YAML 里换行缩进着写的值
     "aiops:\n  token:\n    correcthorsebatterystaple",
+    // 一行开头的 YAML、properties 配置项，不带引号、中间有空格的值也取到行尾
+    "api_key: my correct horse battery staple",
+    "aiops:\n  api_key: my correct horse battery staple  # 换过",
+    "- token: my correct horse battery staple",
+    "spring.datasource.password=my correct horse battery",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -184,6 +189,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 空着的 .env 配置项：下一行是别的配置，不是它的值；同一行的下一个赋值也不是
     "需要在 .env 里加：\nMCP_AIOPS_TOKEN=\nKNOWLEDGE=off\nKNOWLEDGE_TTL=3600",
     "MCP_AIOPS_TOKEN=null, FEISHU_APP_SECRET=undefined\naccess_token=null, refresh_token=undefined",
+    // 一行开头的报错原文、名字不以密钥的词结尾的配置项
+    "token: signature is invalid\nToken: has expired, please login again\ntoken_ttl: 3600 seconds\ntokenizer: bert base uncased",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -390,7 +397,8 @@ function deskSetup({
   saveLesson?: (args: Record<string, unknown>) => string;
   searchLessons?: (args: Record<string, unknown>) => string;
 } = {}) {
-  const control: { failSend: boolean; hold?: Promise<void> } = { failSend: false };
+  // holds：按发送的先后，每次发送等对应的一个；用完了等 hold
+  const control: { failSend: boolean; hold?: Promise<void>; holds?: Promise<void>[] } = { failSend: false };
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 200 });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
@@ -406,7 +414,7 @@ function deskSetup({
     base,
     ...(aiops ? { aiops: new AiopsLessons(mcp, "aiops", quiet) } : {}),
     send: async (to, input, opts) => {
-      await control.hold;
+      await (control.holds?.shift() ?? control.hold);
       if (control.failSend) {
         throw new Error("飞书发送失败");
       }
@@ -603,6 +611,59 @@ test("改草稿时新卡片还在发：这时点旧卡片不算，发出去以�
   );
 });
 
+test("一次回复里同时起草两条：第二张等第一张登记好再发；第二张在发的时候点第一张不算，发出去以后第一张作废，只存一条", async () => {
+  const { backend, desk, sent, updates, click, tool, control } = deskSetup();
+  let release1!: () => void;
+  let release2!: () => void;
+  control.holds = [new Promise((resolve) => (release1 = resolve)), new Promise((resolve) => (release2 = resolve))];
+  const first = tool("knowledge_propose").run(dau, { signal });
+  const second = tool("knowledge_propose").run({ ...dau, title: "日活的口径（另一版）" }, { signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  release1();
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 0, "第二张发的时候点第一张不存");
+  release2();
+  await second;
+  assert.equal(updates.filter((u) => u.messageId === "om_card_1").at(-1)!.card.header.title.content, "已换成新的草稿");
+  await desk.handleCardAction({ ...click((sent[1].input as { card: any }).card, "save"), messageId: "om_card_2" });
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => e.title),
+    ["日活的口径（另一版）"],
+  );
+});
+
+test("卡片发的时候任务停了：发出去的卡片作废、点了不存，话题里之前的卡片照旧能用", async () => {
+  const { backend, desk, sent, updates, click, tool, control } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  const stop = new AbortController();
+  let release!: () => void;
+  control.hold = new Promise((resolve) => (release = resolve));
+  const revising = tool("knowledge_propose").run({ ...dau, title: "日活的口径（改）" }, { signal: stop.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  stop.abort();
+  control.hold = undefined;
+  release();
+  await assert.rejects(revising, (err: Error) => err.name === "AbortError");
+  assert.equal(sent.length, 2, "卡片已经发出去了");
+  const voided = updates.filter((u) => u.messageId === "om_card_2").at(-1)!.card;
+  assert.equal(voided.header.title.content, "已取消");
+  assert.match(cardText(voided), /任务已经停了，这张卡片作废，没有改动经验库/);
+  await desk.handleCardAction({ ...click((sent[1].input as { card: any }).card, "save"), messageId: "om_card_2" });
+  await desk.idle();
+  assert.equal(backend.entries.length, 0);
+  assert.ok(!updates.some((u) => u.messageId === "om_card_1" && u.card.header.title.content === "已换成新的草稿"));
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => e.title),
+    ["日活的口径"],
+  );
+});
+
 test("任务停了就不发确认卡片：起草时查很像的经验、取要归档的经验时停止都不发", async () => {
   const { base, backend, sent, tool } = deskSetup();
   await base.save(normalizeDraft(dau));
@@ -734,19 +795,22 @@ test("取代旧的排查经验：aiops 不认 force、强制保存还说重复�
   assert.equal(setup.backend.entries.find((e) => e.id === "K2")!.aiopsId, undefined);
 });
 
-test("aiops 连上了却没有保存、归档经验的工具：起草时不答应同步，保存不调 aiops；起草后才发现没有的，保存时说明没同步，卡片照常做完", async () => {
-  const missing = deskSetup();
-  delete missing.handlers.save_lesson;
-  delete missing.handlers.archive_lesson;
-  const propose = missing.tool("knowledge_propose");
-  assert.doesNotMatch(propose.spec.description, /aiops/);
-  await propose.run(code8, { signal });
-  const card = (missing.sent[0].input as { card: any }).card;
-  assert.doesNotMatch(cardText(card), /排查经验会同时存一份到 aiops 经验库/);
-  await missing.desk.handleCardAction(missing.click(card, "save"));
-  await missing.desk.idle();
-  assert.equal(missing.lastCard().header.title.content, "已存进经验库");
-  assert.equal(missing.calls.filter((call) => call.tool === "save_lesson").length, 0);
+test("aiops 连上了却少了同步、归档经验要用的工具（存、归档，或者再试时要用的检索、取详情）：起草时不答应同步，保存不调 aiops；起草后才发现没有的，保存时说明没同步，卡片照常做完", async () => {
+  for (const tools of [["save_lesson", "archive_lesson"], ["search_knowledge"], ["get_knowledge"]]) {
+    const missing = deskSetup();
+    for (const tool of tools) {
+      delete missing.handlers[tool];
+    }
+    const propose = missing.tool("knowledge_propose");
+    assert.doesNotMatch(propose.spec.description, /aiops/, tools.join());
+    await propose.run(code8, { signal });
+    const card = (missing.sent[0].input as { card: any }).card;
+    assert.doesNotMatch(cardText(card), /排查经验会同时存一份到 aiops 经验库/);
+    await missing.desk.handleCardAction(missing.click(card, "save"));
+    await missing.desk.idle();
+    assert.equal(missing.lastCard().header.title.content, "已存进经验库");
+    assert.equal(missing.calls.filter((call) => call.tool === "save_lesson").length, 0);
+  }
 
   // 还没连上时照样答应，连上了再同步
   const later = deskSetup();
@@ -760,7 +824,7 @@ test("aiops 连上了却没有保存、归档经验的工具：起草时不答�
   await dropped.desk.handleCardAction(dropped.click((dropped.sent[0].input as { card: any }).card, "save"));
   await dropped.desk.idle();
   assert.equal(dropped.lastCard().header.title.content, "已存进经验库");
-  assert.match((dropped.sent.at(-1)!.input as { markdown: string }).markdown, /aiops 没有保存经验的工具（save_lesson、archive_lesson），没有同步到 aiops 经验库/);
+  assert.match((dropped.sent.at(-1)!.input as { markdown: string }).markdown, /aiops 少了同步、归档经验要用的工具（save_lesson），没有同步到 aiops 经验库/);
 });
 
 test("同步到 aiops 没做成，再试一次前有人在表格里归档了这一行或者改了类别：不再同步过去", async () => {

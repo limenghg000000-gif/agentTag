@@ -50,6 +50,11 @@ export interface LessonsMcp {
 }
 
 /**
+ * 同步、归档要用的 aiops 工具：存和归档；存的结果没传回来时再试要先检索找那一条；归档报错时、起草归档 aiops 经验时要取详情看状态
+ */
+const WRITE_TOOLS = ["save_lesson", "archive_lesson", "search_knowledge", "get_knowledge"];
+
+/**
  * aiops 自带的经验库（MySQL），告警自动排查和 Open WebUI 也在用，只存排查经验。
  * 团队经验库里的排查经验保存时同步一份过去，回答前也在这里查一次
  */
@@ -69,12 +74,17 @@ export class AiopsLessons {
     return this.mcp.hasTool(this.server, "search_knowledge");
   }
 
-  /** aiops 有保存和归档工具 */
-  get writable(): boolean {
-    return this.mcp.hasTool(this.server, "save_lesson") && this.mcp.hasTool(this.server, "archive_lesson");
+  /** 同步、归档要用的工具里 aiops 没有的 */
+  get missingWriteTools(): string[] {
+    return WRITE_TOOLS.filter((tool) => !this.mcp.hasTool(this.server, tool));
   }
 
-  /** aiops 连上了，却没有保存或归档经验的工具（版本旧、没配 MySQL）：再试也存不进去，不能答应同步。还没连上时不算 */
+  /** aiops 有同步、归档要用的全部工具 */
+  get writable(): boolean {
+    return this.missingWriteTools.length === 0;
+  }
+
+  /** aiops 连上了，却少了同步、归档要用的工具（版本旧、没配 MySQL）：再试也做不成，不能答应同步。还没连上时不算 */
   get lacksWriteTools(): boolean {
     return this.mcp.connected(this.server) && !this.writable;
   }
