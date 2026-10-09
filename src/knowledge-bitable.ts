@@ -30,11 +30,13 @@ const FIELDS = {
   confirmedBy: "确认人",
   source: "来源",
   aiopsId: "aiops 经验编号",
+  requestId: "草稿编号",
   createdAt: "保存时间",
   updatedAt: "修改时间",
 } as const;
 
 const STATUS_LABELS = { active: "有效", archived: "已归档" } as const;
+const PERM_LABELS = { view: "只读", edit: "可编辑", full_access: "可管理" } as const;
 const APP_NAME = "AgentTag 经验库";
 const TABLE_NAME = "经验库";
 
@@ -63,7 +65,8 @@ export interface BitableApi {
   createTable(appToken: string, name: string, fields: readonly BitableField[]): Promise<string>;
   deleteTable(appToken: string, tableId: string): Promise<void>;
   listRecords(appToken: string, tableId: string): Promise<BitableRecord[]>;
-  createRecord(appToken: string, tableId: string, fields: Record<string, unknown>): Promise<string>;
+  /** clientToken（UUID）相同的请求飞书只建一行，结果没传回来时可以放心重试 */
+  createRecord(appToken: string, tableId: string, fields: Record<string, unknown>, clientToken?: string): Promise<string>;
   updateRecord(appToken: string, tableId: string, recordId: string, fields: Record<string, unknown>): Promise<void>;
   addCollaborator(appToken: string, member: BitableMember, perm: "view" | "edit" | "full_access"): Promise<void>;
   getUrl(appToken: string): Promise<string | undefined>;
@@ -120,9 +123,13 @@ export function createBitableApi(client: Client): BitableApi {
       return records;
     },
 
-    async createRecord(appToken, tableId, fields) {
+    async createRecord(appToken, tableId, fields, clientToken) {
       const data = await call(() =>
-        client.bitable.v1.appTableRecord.create({ path: { app_token: appToken, table_id: tableId }, data: { fields: fields as never } }),
+        client.bitable.v1.appTableRecord.create({
+          path: { app_token: appToken, table_id: tableId },
+          ...(clientToken ? { params: { client_token: clientToken } } : {}),
+          data: { fields: fields as never },
+        }),
       );
       return data?.record?.record_id ?? "";
     },
@@ -195,14 +202,21 @@ export interface BitableBackendOptions {
   logger?: Logger;
 }
 
+/** 机器人自己建的表记在数据目录里：表在哪，已经共享给了谁 */
+interface BitableState extends BitableTarget {
+  /** 共享成功的「类型:id:权限」 */
+  shared?: string[];
+}
+
 /**
  * 经验存在飞书多维表格里：大家在飞书里能直接看、筛选和修改，机器人每分钟重新读一次。
  * 没指定表时，第一次保存经验时机器人自己建一张，共享给白名单群（只读）和写权限名单里的人（可管理）。
+ * 共享没成功的（比如还没开通权限）、后来加进白名单的群，下次保存经验时再共享。
  * 有人在表格里手动加的行没有编号时，用行的 record_id 当编号，照样能检索到
  */
 export class BitableKnowledgeBackend implements KnowledgeBackend {
-  private target?: Promise<BitableTarget | undefined>;
-  private creating?: Promise<BitableTarget>;
+  private target?: Promise<BitableState | undefined>;
+  private creating?: Promise<BitableState>;
   /** 编号 → 行 id，update 时用 */
   private readonly rows = new Map<string, string>();
   private readonly logger: Logger;
@@ -236,7 +250,10 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
 
   async add(entry: KnowledgeEntry): Promise<void> {
     const target = (await this.current()) ?? (await this.create());
-    const recordId = await this.explain(() => this.options.api.createRecord(target.appToken, target.tableId, toFields(entry)));
+    if (!this.options.target) {
+      await this.share(target);
+    }
+    const recordId = await this.explain(() => this.options.api.createRecord(target.appToken, target.tableId, toFields(entry), entry.requestId));
     if (recordId) {
       this.rows.set(entry.id.toUpperCase(), recordId);
     }
@@ -258,15 +275,19 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     await this.explain(() => this.options.api.updateRecord(target.appToken, target.tableId, recordId, fields));
   }
 
-  private current(): Promise<BitableTarget | undefined> {
+  private current(): Promise<BitableState | undefined> {
     this.target ??= this.options.target ? Promise.resolve(this.options.target) : this.readState();
     return this.target;
   }
 
-  private async readState(): Promise<BitableTarget | undefined> {
+  private async readState(): Promise<BitableState | undefined> {
     try {
-      const data = JSON.parse(await readFile(this.options.stateFile, "utf8")) as Partial<BitableTarget>;
-      return data.appToken && data.tableId ? { appToken: data.appToken, tableId: data.tableId, ...(data.url ? { url: data.url } : {}) } : undefined;
+      const data = JSON.parse(await readFile(this.options.stateFile, "utf8")) as Partial<BitableState>;
+      if (!data.appToken || !data.tableId) {
+        return undefined;
+      }
+      const shared = Array.isArray(data.shared) ? data.shared.filter((key): key is string => typeof key === "string") : [];
+      return { appToken: data.appToken, tableId: data.tableId, ...(data.url ? { url: data.url } : {}), shared };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return undefined;
@@ -275,16 +296,16 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     }
   }
 
-  /** 建表：新建多维表格，加一张带好列的数据表，删掉自带的空表，共享出去，记进数据目录 */
-  private create(): Promise<BitableTarget> {
+  /** 建表：新建多维表格，加一张带好列的数据表，删掉自带的空表，记进数据目录（共享在 add 里做） */
+  private create(): Promise<BitableState> {
     this.creating ??= this.doCreate().finally(() => {
       this.creating = undefined;
     });
     return this.creating;
   }
 
-  private async doCreate(): Promise<BitableTarget> {
-    const { api, share } = this.options;
+  private async doCreate(): Promise<BitableState> {
+    const { api } = this.options;
     const app = await this.explain(() => api.createApp(APP_NAME));
     const tableId = await this.explain(() => api.createTable(app.appToken, TABLE_NAME, TABLE_FIELDS));
     if (app.defaultTableId && app.defaultTableId !== tableId) {
@@ -292,31 +313,58 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         this.logger.warn("经验库：删掉多维表格自带的空数据表失败，不影响使用", err);
       });
     }
-    const members: [BitableMember, "view" | "edit" | "full_access"][] = [
-      ...share.chatIds.map((id): [BitableMember, "view" | "edit"] => [{ type: "openchat", id }, share.chatPerm ?? "view"]),
-      ...share.editors.map((id): [BitableMember, "full_access"] => [{ type: "openid", id }, "full_access"]),
-    ];
-    for (const [member, perm] of members) {
-      await api.addCollaborator(app.appToken, member, perm).catch((err: unknown) => {
-        this.logger.warn(`经验库：没能把多维表格共享给 ${member.id}`, err);
-      });
-    }
     const base = app.url ?? (await api.getUrl(app.appToken).catch(() => undefined));
-    const target: BitableTarget = { appToken: app.appToken, tableId, ...(base ? { url: `${base.split("?")[0]}?table=${tableId}` } : {}) };
+    const target: BitableState = { appToken: app.appToken, tableId, ...(base ? { url: `${base.split("?")[0]}?table=${tableId}` } : {}), shared: [] };
+    // 先记下来再共享：共享到一半出错或者进程退出，下次也不会再建一张
+    await this.writeState(target);
+    this.target = Promise.resolve(target);
+    this.logger.info(`经验库：新建了多维表格 ${target.url ?? target.appToken}`);
+    return target;
+  }
+
+  /**
+   * 共享给白名单群（默认只读）和写权限名单里的人（可管理）。只做还没成功的：上次失败的、后来加进名单的。
+   * 共享失败不影响保存，记一条警告，下次保存时再试
+   */
+  private async share(target: BitableState): Promise<void> {
+    const { api, share } = this.options;
+    const wanted: [string, BitableMember, "view" | "edit" | "full_access"][] = [
+      ...share.chatIds.map((id): [string, BitableMember, "view" | "edit"] => [`openchat:${id}:${share.chatPerm ?? "view"}`, { type: "openchat", id }, share.chatPerm ?? "view"]),
+      ...share.editors.map((id): [string, BitableMember, "full_access"] => [`openid:${id}:full_access`, { type: "openid", id }, "full_access"]),
+    ];
+    const shared = new Set(target.shared ?? []);
+    const missing = wanted.filter(([key]) => !shared.has(key));
+    if (missing.length === 0) {
+      return;
+    }
+    let changed = false;
+    for (const [key, member, perm] of missing) {
+      try {
+        await api.addCollaborator(target.appToken, member, perm);
+        shared.add(key);
+        changed = true;
+        this.logger.info(`经验库：多维表格已共享给 ${member.id}（${PERM_LABELS[perm]}）`);
+      } catch (err) {
+        // 不用 describeBitableError：它把缺权限都说成缺 bitable:app，共享要的是另外的权限，原文里有权限名
+        this.logger.warn(`经验库：没能把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}），下次保存经验时再试：${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (changed) {
+      target.shared = [...shared];
+      await this.writeState(target).catch((err: unknown) => this.logger.warn("经验库：共享结果没能记进数据目录，下次保存时会再共享一次", err));
+    }
+  }
+
+  private async writeState(state: BitableState): Promise<void> {
     await mkdir(path.dirname(this.options.stateFile), { recursive: true, mode: 0o700 });
     const tmp = `${this.options.stateFile}.tmp`;
     try {
-      await writeFile(tmp, `${JSON.stringify(target, null, 2)}\n`, { mode: 0o600 });
+      await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       await rename(tmp, this.options.stateFile);
     } catch (err) {
       await rm(tmp, { force: true });
       throw err;
     }
-    this.target = Promise.resolve(target);
-    this.logger.info(
-      `经验库：新建了多维表格 ${target.url ?? target.appToken}，已共享给白名单群（${share.chatPerm === "edit" ? "可编辑" : "只读"}）和写权限名单里的人（可管理）`,
-    );
-    return target;
   }
 
   private async explain<T>(run: () => Promise<T>): Promise<T> {
@@ -349,6 +397,7 @@ const TABLE_FIELDS: BitableField[] = [
   { field_name: FIELDS.confirmedBy, type: TEXT },
   { field_name: FIELDS.source, type: TEXT },
   { field_name: FIELDS.aiopsId, type: TEXT },
+  { field_name: FIELDS.requestId, type: TEXT },
   { field_name: FIELDS.createdAt, type: CREATED_TIME, property: { date_formatter: "yyyy/MM/dd HH:mm" } },
   { field_name: FIELDS.updatedAt, type: MODIFIED_TIME, property: { date_formatter: "yyyy/MM/dd HH:mm" } },
 ];
@@ -373,6 +422,7 @@ function toFields(entry: KnowledgeEntry): Record<string, unknown> {
     [FIELDS.confirmedBy, entry.confirmedBy],
     [FIELDS.source, entry.source],
     [FIELDS.aiopsId, entry.aiopsId === undefined ? undefined : String(entry.aiopsId)],
+    [FIELDS.requestId, entry.requestId],
   ];
   for (const [name, value] of optional) {
     if (value) {
@@ -395,7 +445,9 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
   const aiopsId = Number.parseInt(text(FIELDS.aiopsId) ?? "", 10);
   const createdAt = timeOf(fields[FIELDS.createdAt]);
   const updatedAt = timeOf(fields[FIELDS.updatedAt]);
-  const optional = (key: "scope" | "handling" | "basis" | "keywords" | "errorCodes" | "alertname" | "proposedBy" | "confirmedBy" | "source") => {
+  const optional = (
+    key: "scope" | "handling" | "basis" | "keywords" | "errorCodes" | "alertname" | "proposedBy" | "confirmedBy" | "source" | "requestId",
+  ) => {
     const value = text(FIELDS[key]);
     return value ? { [key]: value } : {};
   };
@@ -415,6 +467,7 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
     ...optional("proposedBy"),
     ...optional("confirmedBy"),
     ...optional("source"),
+    ...optional("requestId"),
     ...(Number.isFinite(aiopsId) ? { aiopsId } : {}),
     createdAt: createdAt ?? new Date(0).toISOString(),
     ...(updatedAt && updatedAt !== createdAt ? { updatedAt } : {}),

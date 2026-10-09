@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { CardActionEvent, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
+import { isTimeout, raceAbort, timeoutSignal } from "../abort.js";
 import type { Logger } from "../history.js";
 import {
   fieldLines,
@@ -10,6 +11,7 @@ import {
   type KnowledgeDraft,
   type KnowledgeEntry,
   KnowledgeError,
+  type KnowledgeHit,
   normalizeDraft,
   renderHitsForPrompt,
 } from "../knowledge.js";
@@ -23,6 +25,10 @@ export const KNOWLEDGE_ACTION = "knowledge";
 export const PROPOSAL_TTL_MS = 24 * 60 * 60_000;
 /** 回答前检索时每个库最多写进提示词几条 */
 const LOOKUP_HITS = 3;
+/** 回答前检索每个库最多等多久，没查完的那边这次不用（比 bot.ts 里整个检索的上限短，查完的那边来得及用上） */
+const LOOKUP_MS = 7000;
+/** 检索时算向量最多等多久，到了只按关键词（比上面短，留出读表格和按关键词打分的时间） */
+const SEMANTIC_MS = 5000;
 /** 起草时查「很像的已有经验」最多等多久 */
 const SIMILAR_TIMEOUT_MS = 8000;
 
@@ -35,10 +41,12 @@ export interface KnowledgeTaskContext {
   messageId: string;
 }
 
-/** 回答前检索的结果：写进提示词的文字（没查到相近的为空字符串）和查到的编号 */
+/** 回答前检索的结果：写进提示词的文字（没查到相近的为空字符串）、查到的编号和没查成的库 */
 export interface KnowledgeLookup {
   text: string;
   ids: string[];
+  /** 超时或出错、这次没查成的库（「团队经验库」「aiops 经验库」） */
+  missed?: string[];
 }
 
 interface Person {
@@ -76,6 +84,8 @@ interface SaveProposal extends ProposalBase {
   similar?: { id: string; title: string };
   /** 排查经验，而且接了 aiops：保存时同步一份过去 */
   syncAiops: boolean;
+  /** 写多维表格用的幂等编号（UUID）：点保存失败后再点，已经写进去的不会再写一行 */
+  requestId: string;
 }
 
 interface ArchiveProposal extends ProposalBase {
@@ -97,6 +107,9 @@ export interface KnowledgeDeskOptions {
   allowedChatIds: ReadonlySet<string>;
   logger?: Logger;
   now?: () => number;
+  /** 回答前检索每个库最多等多久、算向量最多等多久（测试时调短） */
+  lookupMs?: number;
+  semanticMs?: number;
 }
 
 /**
@@ -110,47 +123,65 @@ export class KnowledgeDesk {
   private readonly running = new Set<Promise<void>>();
   private readonly logger: Logger;
   private readonly now: () => number;
+  private readonly lookupMs: number;
+  private readonly semanticMs: number;
 
   constructor(private readonly options: KnowledgeDeskOptions) {
     this.logger = options.logger ?? console;
     this.now = options.now ?? Date.now;
+    this.lookupMs = options.lookupMs ?? LOOKUP_MS;
+    this.semanticMs = options.semanticMs ?? SEMANTIC_MS;
   }
 
   /**
-   * 回答前检索：团队经验库和 aiops 经验库一起查，够相近的写进提示词。
-   * 已经同步到 aiops 的排查经验只列团队经验库那一条。一边超时或出错时用另一边的，两边都没查成时返回 undefined
+   * 回答前检索：团队经验库和 aiops 经验库一起查，够相近的写进提示词。已经同步到 aiops 的排查经验只列团队经验库那一条。
+   * 每个库最多等 lookupMs（飞书接口不认中止信号，到时间就不等了），向量没算完时团队经验库只按关键词。
+   * 一边没查成时用另一边的，查了的都没查成时返回 undefined。用户停止任务时抛出中止错误
    */
   async lookup(query: string, task: McpTaskContext, signal?: AbortSignal): Promise<KnowledgeLookup | undefined> {
     const { base, aiops } = this.options;
-    const [team, lessons] = await Promise.allSettled([
-      base.search(query, { limit: LOOKUP_HITS, ...(signal ? { signal } : {}) }),
-      aiops?.searchable ? aiops.search(query, task, signal) : Promise.resolve([]),
-    ]);
-    for (const [name, result] of [
-      ["团队经验库", team],
-      ["aiops 经验库", lessons],
-    ] as const) {
-      if (result.status === "rejected") {
-        this.logger.warn(`查${name}失败 message=${task.messageId}：${describe(result.reason)}`);
+    const timeout = timeoutSignal(this.lookupMs);
+    const semantic = timeoutSignal(this.semanticMs);
+    const deadline = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+    try {
+      const queryAiops = aiops?.searchable === true;
+      const [team, lessons] = await Promise.allSettled([
+        raceAbort(base.search(query, { limit: LOOKUP_HITS, semanticDeadline: semantic.signal, ...(signal ? { signal } : {}) }), deadline),
+        queryAiops ? raceAbort(aiops.search(query, task, deadline), deadline) : Promise.resolve([]),
+      ]);
+      signal?.throwIfAborted();
+      const missed: string[] = [];
+      for (const [name, result] of [["团队经验库", team], ...(queryAiops ? [["aiops 经验库", lessons] as const] : [])] as const) {
+        if (result.status === "rejected") {
+          missed.push(name);
+          const why = isTimeout(result.reason) ? `超过 ${this.lookupMs / 1000} 秒没查完` : describe(result.reason);
+          this.logger.warn(`查${name}没查成 message=${task.messageId}：${why}`);
+        }
       }
+      // 没接 aiops 时不算 aiops 查成了：团队经验库没查成就是都没查成
+      if (team.status === "rejected" && (!queryAiops || lessons.status === "rejected")) {
+        return undefined;
+      }
+      const teamHits = team.status === "fulfilled" ? team.value : [];
+      let aiopsHits = lessons.status === "fulfilled" ? lessons.value : [];
+      if (aiopsHits.length > 0) {
+        const entries = await raceAbort(base.entries(), deadline).catch(() => []);
+        const synced = new Set(entries.flatMap((entry) => (entry.aiopsId === undefined ? [] : [entry.aiopsId])));
+        aiopsHits = aiopsHits.filter((hit) => !synced.has(hit.id)).slice(0, LOOKUP_HITS);
+      }
+      const parts = [
+        teamHits.length > 0 ? renderHitsForPrompt(teamHits) : "",
+        aiopsHits.length > 0 ? renderAiopsHitsForPrompt(aiopsHits) : "",
+      ].filter(Boolean);
+      return {
+        text: parts.join("\n\n"),
+        ids: [...teamHits.map((hit) => hit.entry.id), ...aiopsHits.map((hit) => `aiops#${hit.id}`)],
+        missed,
+      };
+    } finally {
+      timeout.clear();
+      semantic.clear();
     }
-    if (team.status === "rejected" && lessons.status === "rejected") {
-      return undefined;
-    }
-    const teamHits = team.status === "fulfilled" ? team.value : [];
-    let aiopsHits = lessons.status === "fulfilled" ? lessons.value : [];
-    if (aiopsHits.length > 0) {
-      const synced = new Set((await base.entries().catch(() => [])).flatMap((entry) => (entry.aiopsId === undefined ? [] : [entry.aiopsId])));
-      aiopsHits = aiopsHits.filter((hit) => !synced.has(hit.id)).slice(0, LOOKUP_HITS);
-    }
-    const parts = [
-      teamHits.length > 0 ? renderHitsForPrompt(teamHits) : "",
-      aiopsHits.length > 0 ? renderAiopsHitsForPrompt(aiopsHits) : "",
-    ].filter(Boolean);
-    return {
-      text: parts.join("\n\n"),
-      ids: [...teamHits.map((hit) => hit.entry.id), ...aiopsHits.map((hit) => `aiops#${hit.id}`)],
-    };
   }
 
   /** 查经验、看经验、起草保存和归档的工具 */
@@ -230,16 +261,19 @@ export class KnowledgeDesk {
         },
       },
       describe: (args) => `起草经验：${preview(args.title)}`,
-      run: async (args) => {
+      run: async (args, { signal }) => {
         const draft = normalizeDraft(args);
         const caseId = optionalInteger(args.case_id, "case_id");
         const replacesId = typeof args.replaces === "string" && args.replaces.trim() ? args.replaces : undefined;
-        const replaces = replacesId === undefined ? undefined : await this.activeEntry(replacesId);
-        const similar = replaces ? undefined : await base.similar(draft, AbortSignal.timeout(SIMILAR_TIMEOUT_MS)).catch(() => undefined);
+        const replaces = replacesId === undefined ? undefined : await raceAbort(this.activeEntry(replacesId), signal);
+        const similar = replaces ? undefined : await this.findSimilar(draft, signal);
+        // 任务停了就不发卡片：停掉的任务发出去的卡片还能被点保存
+        signal.throwIfAborted();
         return this.open(ctx, {
           kind: "save",
           draft,
           syncAiops: draft.category === "incident" && this.options.aiops !== undefined,
+          requestId: randomUUID(),
           ...(caseId === undefined ? {} : { caseId }),
           ...(replaces ? { replaces } : {}),
           ...(similar ? { similar: { id: similar.entry.id, title: similar.entry.title } } : {}),
@@ -262,14 +296,18 @@ export class KnowledgeDesk {
         },
       },
       describe: (args) => `起草归档经验 ${args.id ? String(args.id) : `aiops #${String(args.aiops_id ?? "")}`}`,
-      run: async (args) => {
+      run: async (args, { signal }) => {
         const id = typeof args.id === "string" && args.id.trim() ? args.id : undefined;
         const aiopsId = optionalInteger(args.aiops_id, "aiops_id");
         if ((id === undefined) === (aiopsId === undefined)) {
           throw new KnowledgeError("id 和 aiops_id 填一个：团队经验库的填 id（如 K3），aiops 经验库的填 aiops_id");
         }
         const reason = typeof args.reason === "string" && args.reason.trim() ? args.reason.trim().slice(0, 300) : undefined;
-        const target = id !== undefined ? { type: "team" as const, entry: await this.activeEntry(id) } : { type: "aiops" as const, lesson: await this.activeLesson(aiopsId!, ctx) };
+        const target =
+          id !== undefined
+            ? { type: "team" as const, entry: await raceAbort(this.activeEntry(id), signal) }
+            : { type: "aiops" as const, lesson: await this.activeLesson(aiopsId!, ctx, signal) };
+        signal.throwIfAborted();
         return this.open(ctx, { kind: "archive", target, ...(reason ? { reason } : {}) });
       },
     };
@@ -367,6 +405,7 @@ export class KnowledgeDesk {
       proposedBy: proposal.proposer.name ?? proposal.proposer.openId,
       confirmedBy,
       source: `飞书群 ${proposal.chatId} 的话题（消息 ${proposal.sourceMessageId}）`,
+      requestId: proposal.requestId,
     });
     const lines = [`已存进团队经验库：经验 ${entry.id}「${draft.title}」，确认人 ${confirmedBy}。`];
     if (proposal.syncAiops && !aiops?.writable) {
@@ -448,19 +487,38 @@ export class KnowledgeDesk {
     return entry;
   }
 
-  private async activeLesson(id: number, ctx: KnowledgeTaskContext): Promise<AiopsLesson> {
+  private async activeLesson(id: number, ctx: KnowledgeTaskContext, signal: AbortSignal): Promise<AiopsLesson> {
     const { aiops } = this.options;
     if (!aiops?.writable) {
       throw new KnowledgeError("aiops 没连上或者没有归档工具，现在不能归档 aiops 经验库里的经验");
     }
-    const lesson = await aiops.get(id, { chatId: ctx.chatId, senderId: ctx.senderId, messageId: ctx.messageId });
+    const lesson = await aiops.get(id, { chatId: ctx.chatId, senderId: ctx.senderId, messageId: ctx.messageId }, signal);
     if (lesson.status !== "active") {
       throw new KnowledgeError(`aiops 经验 #${id} 已经归档了`);
     }
     return lesson;
   }
 
-  /** 新建草稿、作废这个话题里还没确认的旧草稿、发确认卡片，返回给模型的说明 */
+  /** 经验库里和草稿很像的一条；没查成（超时、出错）时卡片上不提示。用户停止任务时抛出中止错误 */
+  private async findSimilar(draft: KnowledgeDraft, signal: AbortSignal): Promise<KnowledgeHit | undefined> {
+    const timeout = timeoutSignal(SIMILAR_TIMEOUT_MS);
+    const semantic = timeoutSignal(this.semanticMs);
+    try {
+      return await raceAbort(
+        this.options.base.similar(draft, { signal, semanticDeadline: semantic.signal }),
+        AbortSignal.any([signal, timeout.signal]),
+      );
+    } catch (err) {
+      signal.throwIfAborted();
+      this.logger.warn(`经验库：起草时没查成有没有很像的经验，卡片上不提示：${isTimeout(err) ? "超时" : describe(err)}`);
+      return undefined;
+    } finally {
+      timeout.clear();
+      semantic.clear();
+    }
+  }
+
+  /** 新建草稿、发确认卡片，卡片发出去以后再作废这个话题里还没确认的旧草稿；返回给模型的说明 */
   private async open(
     ctx: KnowledgeTaskContext,
     detail: Omit<SaveProposal, keyof ProposalBase> | Omit<ArchiveProposal, keyof ProposalBase>,
@@ -475,18 +533,21 @@ export class KnowledgeDesk {
       createdAt: this.now(),
       state: "pending",
     } as Proposal;
-    for (const old of this.proposals.values()) {
-      if (old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending") {
-        old.state = "superseded";
-        old.result = ["已换成新的草稿，以下面的卡片为准"];
-        this.proposals.delete(old.id);
-        await this.render(old);
-      }
-    }
     this.sweep();
+    // 新卡片发失败时旧卡片还能用
     const { messageId } = await this.options.send(ctx.chatId, { card: renderProposalCard(proposal) }, { replyTo: ctx.messageId, replyInThread: true });
     proposal.cardMessageId = messageId;
+    const replaced = [...this.proposals.values()].filter((old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending");
+    for (const old of replaced) {
+      old.state = "superseded";
+      old.result = ["已换成新的草稿，以下面的卡片为准"];
+      this.proposals.delete(old.id);
+    }
+    // 先登记新卡片再去改旧卡片：改卡片要调接口，这期间点新卡片也认
     this.proposals.set(proposal.id, proposal);
+    for (const old of replaced) {
+      await this.render(old);
+    }
     this.logger.info(
       `经验库卡片 发出 proposal=${proposal.id} ${proposal.kind === "save" ? `保存「${proposal.draft.title}」` : `归档 ${targetLabel(proposal.target)}`} ` +
         `chat=${ctx.chatId} sender=${ctx.senderId} message=${ctx.messageId}`,

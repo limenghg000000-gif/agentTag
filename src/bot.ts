@@ -1,4 +1,5 @@
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
+import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { imageKeysOf } from "./feishu.js";
@@ -108,6 +109,8 @@ export interface BotDeps {
   images?: { read(refs: readonly ImageRef[], signal?: AbortSignal): Promise<ReadonlyMap<string, string>> };
   /** 团队经验库：回答前先检索，起草后发确认卡片。不传时没有这些 */
   knowledge?: Pick<KnowledgeDesk, "lookup" | "tools">;
+  /** 回答前查经验库最多等多久，不填 8 秒（测试时调短） */
+  knowledgeLookupMs?: number;
   /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
   mcp?: {
     /** 配置的 MCP 服务名（如 aiops），工具名以「服务名_」开头 */
@@ -278,7 +281,7 @@ async function runTask(
         memory: memory?.prompt,
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
-        ...(deps.knowledge ? { knowledge: knowledge ? { hits: knowledge.text } : {} } : {}),
+        ...(deps.knowledge ? { knowledge: knowledge ? { hits: knowledge.text, ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}) } : {} } : {}),
       }),
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
@@ -407,8 +410,10 @@ async function lookupKnowledge(
   }
   const root = history.find((m) => m.role === "user")?.content;
   const query = root && root !== asked ? `${root}\n${asked}` : asked;
+  // 经验库自己按库限时；这里再给整个检索一个上限：飞书接口不认中止信号，卡住了也不能拖住回答
+  const timeout = timeoutSignal(deps.knowledgeLookupMs ?? KNOWLEDGE_LOOKUP_MS);
   try {
-    const found = await knowledge.lookup(query, task, AbortSignal.any([signal, AbortSignal.timeout(KNOWLEDGE_LOOKUP_MS)]));
+    const found = await raceAbort(knowledge.lookup(query, task, signal), AbortSignal.any([signal, timeout.signal]));
     if (!found) {
       return undefined;
     }
@@ -424,6 +429,8 @@ async function lookupKnowledge(
     }
     logger.warn(`查经验库失败，这次不带经验 message=${task.messageId}：${err instanceof Error ? err.message : String(err)}`);
     return undefined;
+  } finally {
+    timeout.clear();
   }
 }
 

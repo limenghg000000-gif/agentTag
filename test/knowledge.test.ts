@@ -173,6 +173,30 @@ test("有向量模型时按意思检索：向量按内容缓存，列表一分�
   assert.equal(calls.length, failed, "出错后 10 分钟内不再调向量模型");
 });
 
+test("向量没在期限内算完：这次只按关键词，下次照常调向量模型；用户停止任务时整个检索中止", async () => {
+  const backend = new MemoryBackend();
+  const { embedder, calls } = fakeEmbedder(["降载"]);
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet });
+  await base.save(normalizeDraft(code8));
+  const embed = embedder.embed;
+  // 向量服务卡住，也不认中止信号
+  embedder.embed = () => new Promise(() => {});
+  const deadline = new AbortController();
+  const searching = base.search("code=8 ResourceExhausted", { semanticDeadline: deadline.signal });
+  deadline.abort(new DOMException("超时", "TimeoutError"));
+  assert.equal((await searching)[0]?.entry.id, "K1", "按关键词照样查到");
+
+  embedder.embed = embed;
+  assert.equal((await base.search("user-rpc 降载了吗"))[0]?.semantic !== undefined, true, "期限到了不算向量服务出错，下次照常按意思检索");
+  assert.ok(calls.length > 0);
+
+  embedder.embed = () => new Promise(() => {});
+  const stop = new AbortController();
+  const cancelled = base.search("今天降载了吗", { signal: stop.signal });
+  stop.abort();
+  await assert.rejects(cancelled, (err: Error) => err.name === "AbortError");
+});
+
 test("起草时找很像的已有经验", async () => {
   const backend = new MemoryBackend();
   const { embedder } = fakeEmbedder(["降载", "日活"]);
@@ -231,6 +255,7 @@ test("aiops 经验库：检索只留够相近的；排查经验同步过去时�
 });
 
 function deskSetup({ aiops = true, approvers = new Set(["ou_admin"]) }: { aiops?: boolean; approvers?: ReadonlySet<string> } = {}) {
+  const control = { failSend: false };
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
@@ -246,6 +271,9 @@ function deskSetup({ aiops = true, approvers = new Set(["ou_admin"]) }: { aiops?
     base,
     ...(aiops ? { aiops: new AiopsLessons(mcp, "aiops", quiet) } : {}),
     send: async (to, input, opts) => {
+      if (control.failSend) {
+        throw new Error("飞书发送失败");
+      }
       sent.push({ to, input, opts });
       return { messageId: `om_card_${sent.length}` };
     },
@@ -266,7 +294,7 @@ function deskSetup({ aiops = true, approvers = new Set(["ou_admin"]) }: { aiops?
     return { messageId: "om_card_1", chatId: "oc_1", operator: { openId, name }, action: { tag: "button", value } };
   };
   const lastCard = () => updates.at(-1)!.card;
-  return { backend, base, desk, sent, updates, calls, tool, click, lastCard, advance: (ms: number) => (now += ms) };
+  return { backend, base, desk, sent, updates, calls, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
 }
 
 const cardText = (card: any) => JSON.stringify(card);
@@ -383,6 +411,53 @@ test("保存失败时卡片回到待确认，写上原因，可以再点", async
   assert.equal(backend.entries.length, 1);
 });
 
+test("保存的结果没传回来、再点一次：同一张卡片不会存两遍", async () => {
+  const { backend, desk, sent, click, tool, lastCard } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  const add = backend.add.bind(backend);
+  backend.add = async (entry) => {
+    await add(entry);
+    throw new KnowledgeError("飞书接口超时");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /上次点确认没成功：飞书接口超时/);
+
+  backend.add = add;
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 1);
+  assert.ok(backend.entries[0].requestId);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已存进团队经验库：经验 K1「日活的口径」/);
+});
+
+test("改草稿时新卡片没发出去，旧卡片还能用", async () => {
+  const { backend, desk, sent, updates, click, tool, control } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  control.failSend = true;
+  await assert.rejects(tool("knowledge_propose").run({ ...dau, title: "日活的口径（改）" }, { signal }), /飞书发送失败/);
+  control.failSend = false;
+  assert.ok(!updates.some((u) => u.card.header.title.content === "已换成新的草稿"));
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.equal(backend.entries[0]?.title, "日活的口径");
+});
+
+test("任务停了就不发确认卡片：起草时查很像的经验、取要归档的经验时停止都不发", async () => {
+  const { base, backend, sent, tool } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  // 表格读不出来，卡住
+  backend.list = () => new Promise(() => {});
+  const stop = new AbortController();
+  const proposing = tool("knowledge_propose").run(code8, { signal: stop.signal });
+  const archiving = tool("knowledge_propose_archive").run({ id: "K1" }, { signal: stop.signal });
+  stop.abort();
+  await assert.rejects(proposing, (err: Error) => err.name === "AbortError");
+  await assert.rejects(archiving, (err: Error) => err.name === "AbortError");
+  assert.equal(sent.length, 0);
+});
+
 test("发起人可以取消，别人不行；同一个话题再起草时旧卡片作废；超过 24 小时点了提示失效", async () => {
   const { backend, desk, sent, updates, click, tool, lastCard, advance } = deskSetup();
   await tool("knowledge_propose").run(dau, { signal });
@@ -465,7 +540,7 @@ test("回答前检索：两个库一起查，已同步到 aiops 的只列团队�
   assert.doesNotMatch(found!.text, /aiops 经验 #31/);
 
   const none = deskSetup({ aiops: false });
-  assert.deepEqual(await none.desk.lookup("今天中午吃什么", task), { text: "", ids: [] });
+  assert.deepEqual(await none.desk.lookup("今天中午吃什么", task), { text: "", ids: [], missed: [] });
 
   const broken = new KnowledgeDesk({
     base: new KnowledgeBase({ location: async () => undefined, list: async () => Promise.reject(new Error("飞书接口限流")), add: async () => {}, update: async () => {} }, { logger: quiet }),
@@ -485,6 +560,33 @@ test("回答前检索：两个库一起查，已同步到 aiops 的只列团队�
     logger: quiet,
   });
   assert.equal(await broken.lookup("code=8", task), undefined);
+});
+
+test("回答前检索每个库限时：表格卡住了照样用 aiops 的结果；没接 aiops、aiops 没连上时团队经验库没查成就返回空", async () => {
+  const hanging: KnowledgeBackend = { location: async () => undefined, list: () => new Promise(() => {}), add: async () => {}, update: async () => {} };
+  const lessons = new AiopsLessons(fakeMcp({ search_knowledge: () => JSON.stringify({ hits: [{ id: 40, title: "Open WebUI 存的", score: 8 }] }) }).mcp, "aiops", quiet);
+  const make = (aiops?: AiopsLessons) =>
+    new KnowledgeDesk({
+      base: new KnowledgeBase(hanging, { logger: quiet }),
+      ...(aiops ? { aiops } : {}),
+      send: async () => ({ messageId: "x" }),
+      updateCard: async () => {},
+      allowedChatIds: new Set(["oc_1"]),
+      logger: quiet,
+      lookupMs: 20,
+    });
+  const found = await make(lessons).lookup("code=8", task);
+  assert.deepEqual(found?.ids, ["aiops#40"]);
+  assert.deepEqual(found?.missed, ["团队经验库"]);
+
+  assert.equal(await make().lookup("code=8", task), undefined);
+  const disconnected = new AiopsLessons({ hasTool: () => false, callDirect: async () => "" }, "aiops", quiet);
+  assert.equal(await make(disconnected).lookup("code=8", task), undefined);
+
+  const stop = new AbortController();
+  const pending = make(lessons).lookup("code=8", task, stop.signal);
+  stop.abort();
+  await assert.rejects(pending, (err: Error) => err.name === "AbortError");
 });
 
 test("不是经验库的卡片、不在白名单里的群，经验库不处理", async () => {

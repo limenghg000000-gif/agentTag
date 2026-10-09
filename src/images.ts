@@ -1,3 +1,4 @@
+import { raceAbort } from "./abort.js";
 import type { DownloadedImage } from "./feishu.js";
 import { describeFeishuError, type ImageRef, type Logger } from "./history.js";
 import type { VisionModel } from "./llm.js";
@@ -148,24 +149,3 @@ function clipText(text: string): string {
   return text.length > MAX_IMAGE_TEXT_CHARS ? `${text.slice(0, MAX_IMAGE_TEXT_CHARS)}\n（图片文字太长，后面省略）` : text;
 }
 
-/** 下载不认中止信号：中止或超时就不再等它。下载之后再失败也有人接着，不会变成未处理的 Promise 拒绝（那会让进程退出） */
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    if (signal.aborted) {
-      onAbort();
-    } else {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (err) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
-      },
-    );
-  });
-}

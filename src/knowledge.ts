@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { anySignal, raceAbort } from "./abort.js";
 import type { Logger } from "./history.js";
 
 /**
@@ -75,6 +76,8 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   source?: string;
   /** 排查经验同步到 aiops 经验库后的编号（aiops 的「经验 #N」） */
   aiopsId?: number;
+  /** 哪张确认卡片存的：保存的结果没传回来、再点一次时，靠它认出已经存过 */
+  requestId?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -83,6 +86,18 @@ export interface KnowledgeMeta {
   proposedBy?: string;
   confirmedBy?: string;
   source?: string;
+  /** 确认卡片的草稿编号（UUID）。同一个编号只存一次 */
+  requestId?: string;
+}
+
+export interface SearchOptions {
+  limit?: number;
+  category?: KnowledgeCategory;
+  includeArchived?: boolean;
+  /** 用户停止任务：整个检索都中止 */
+  signal?: AbortSignal;
+  /** 算向量的期限：到了就不等向量，这次只按关键词（不算向量服务出错） */
+  semanticDeadline?: AbortSignal;
 }
 
 /** 存经验的地方（飞书多维表格）。编号由 KnowledgeBase 分配 */
@@ -170,10 +185,7 @@ export class KnowledgeBase {
   }
 
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
-  async search(
-    query: string,
-    { limit = 3, category, includeArchived = false, signal }: { limit?: number; category?: KnowledgeCategory; includeArchived?: boolean; signal?: AbortSignal } = {},
-  ): Promise<KnowledgeHit[]> {
+  async search(query: string, { limit = 3, category, includeArchived = false, signal, semanticDeadline }: SearchOptions = {}): Promise<KnowledgeHit[]> {
     const text = query.trim().slice(0, QUERY_CHARS);
     if (!text) {
       return [];
@@ -184,7 +196,7 @@ export class KnowledgeBase {
     if (candidates.length === 0) {
       return [];
     }
-    const semantic = await this.similarities(text, candidates, signal);
+    const semantic = await this.similarities(text, candidates, signal, semanticDeadline);
     return candidates
       .map((entry, i) => scoreEntry(entry, text, semantic?.[i]))
       .filter((hit): hit is KnowledgeHit => hit !== undefined)
@@ -193,18 +205,23 @@ export class KnowledgeBase {
   }
 
   /** 和草稿很像的已有经验（起草时在卡片上提示，免得存重复的） */
-  async similar(draft: KnowledgeDraft, signal?: AbortSignal): Promise<KnowledgeHit | undefined> {
-    const [hit] = await this.search(indexText(draft), { limit: 1, signal });
+  async similar(draft: KnowledgeDraft, options: Pick<SearchOptions, "signal" | "semanticDeadline"> = {}): Promise<KnowledgeHit | undefined> {
+    const [hit] = await this.search(indexText(draft), { ...options, limit: 1 });
     if (!hit) {
       return undefined;
     }
     return (hit.semantic ?? 0) >= NEAR_DUPLICATE_SEMANTIC || (hit.semantic === undefined && hit.score >= NEAR_DUPLICATE_KEYWORD) ? hit : undefined;
   }
 
-  /** 存一条新经验，返回带编号的条目 */
+  /** 存一条新经验，返回带编号的条目。同一个 requestId 已经存过时不再存，返回存过的那条 */
   save(draft: KnowledgeDraft, meta: KnowledgeMeta = {}): Promise<KnowledgeEntry> {
     return this.exclusive(async () => {
       const entries = await this.entries(true);
+      const saved = meta.requestId ? entries.find((entry) => entry.requestId === meta.requestId) : undefined;
+      if (saved) {
+        this.logger.info(`经验库 ${saved.id}「${saved.title}」上次已经存进去了（草稿 ${meta.requestId}），不重复保存`);
+        return saved;
+      }
       const next = Math.max(0, ...entries.map((entry) => numberOf(entry.id))) + 1;
       const entry: KnowledgeEntry = {
         ...draft,
@@ -213,6 +230,7 @@ export class KnowledgeBase {
         ...(meta.proposedBy ? { proposedBy: meta.proposedBy } : {}),
         ...(meta.confirmedBy ? { confirmedBy: meta.confirmedBy } : {}),
         ...(meta.source ? { source: meta.source } : {}),
+        ...(meta.requestId ? { requestId: meta.requestId } : {}),
         createdAt: this.now().toISOString(),
       };
       await this.backend.add(entry);
@@ -253,12 +271,22 @@ export class KnowledgeBase {
     return result;
   }
 
-  /** 提问和每条经验的余弦相似度；没配向量模型或者向量服务出错时返回 undefined，只按关键词 */
-  private async similarities(query: string, entries: readonly KnowledgeEntry[], signal?: AbortSignal): Promise<number[] | undefined> {
+  /**
+   * 提问和每条经验的余弦相似度；没配向量模型、向量服务出错或者到了期限时返回 undefined，只按关键词。
+   * 到期限前算好的经验向量留在缓存里，下次接着算
+   */
+  private async similarities(
+    query: string,
+    entries: readonly KnowledgeEntry[],
+    signal?: AbortSignal,
+    deadline?: AbortSignal,
+  ): Promise<number[] | undefined> {
     const { embedder } = this;
     if (!embedder || (this.embedFailedAt !== undefined && this.now().getTime() - this.embedFailedAt < EMBED_RETRY_MS)) {
       return undefined;
     }
+    const stop = anySignal(signal, deadline);
+    const embed = (texts: string[]) => (stop ? raceAbort(embedder.embed(texts, stop), stop) : embedder.embed(texts));
     try {
       const texts = entries.map(indexText);
       const keys = texts.map((text) => createHash("sha256").update(`${embedder.model}\n${text}`).digest("hex"));
@@ -266,17 +294,18 @@ export class KnowledgeBase {
       const missing = [...byKey.keys()].filter((key) => !this.vectors.has(key));
       for (let i = 0; i < missing.length; i += EMBED_BATCH) {
         const batch = missing.slice(i, i + EMBED_BATCH);
-        const vectors = await embedder.embed(
-          batch.map((key) => byKey.get(key)!),
-          signal,
-        );
+        const vectors = await embed(batch.map((key) => byKey.get(key)!));
         batch.forEach((key, j) => this.vectors.set(key, vectors[j]));
       }
-      const [queryVector] = await embedder.embed([query], signal);
+      const [queryVector] = await embed([query]);
       return keys.map((key) => cosine(queryVector, this.vectors.get(key)!));
     } catch (err) {
       if (signal?.aborted) {
         throw err;
+      }
+      if (deadline?.aborted) {
+        this.logger.warn(`经验库：向量没在期限内算完，这次只按关键词检索`);
+        return undefined;
       }
       this.embedFailedAt = this.now().getTime();
       this.logger.warn(`经验库：向量模型 ${embedder.model} 出错，${EMBED_RETRY_MS / 60_000} 分钟内只按关键词检索`, err);

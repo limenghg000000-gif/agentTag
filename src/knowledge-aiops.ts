@@ -94,8 +94,8 @@ export class AiopsLessons {
     });
   }
 
-  async get(id: number, task: McpTaskContext): Promise<AiopsLesson> {
-    const raw = await this.mcp.callDirect(this.server, "get_knowledge", { id }, task);
+  async get(id: number, task: McpTaskContext, signal?: AbortSignal): Promise<AiopsLesson> {
+    const raw = await this.mcp.callDirect(this.server, "get_knowledge", { id }, task, signal);
     const data = parseJson(raw) as Record<string, unknown> | undefined;
     // get_knowledge 有的版本把条目放在 knowledge 字段里
     const item = (data && typeof data.knowledge === "object" && data.knowledge !== null ? data.knowledge : data) as Record<string, unknown> | undefined;

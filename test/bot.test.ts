@@ -378,6 +378,21 @@ test("回答前先查经验库：查到的写进提示词，进度卡片多一�
   assert.deepEqual(markdowns(failed.sent), ["好"]);
 });
 
+test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有一边没查成时提示词里说明", async () => {
+  const hung = { lookup: () => new Promise<undefined>(() => {}), tools: () => [] };
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle, sent } = setup({ model, knowledge: hung, knowledgeLookupMs: 20 });
+  await handle(message("code=8 是怎么回事"));
+  assert.deepEqual(markdowns(sent), ["好"]);
+  assert.doesNotMatch(requests[0].system, /没查到相近的经验|这次提问可能相关的经验/);
+
+  const partial = { lookup: async () => ({ text: "", ids: [], missed: ["团队经验库"] }), tools: () => [] };
+  const second = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: second.model, knowledge: partial }).handle(message("code=8 是怎么回事"));
+  assert.match(second.requests[0].system, /回答前团队经验库没查成（超时或出错），另一边没查到相近的/);
+  assert.doesNotMatch(second.requests[0].system, /这次提问在经验库里没查到相近的经验/);
+});
+
 test("同一话题里的追问排队，等上一个回答发出后再处理", async () => {
   const order: string[] = [];
   let release!: () => void;

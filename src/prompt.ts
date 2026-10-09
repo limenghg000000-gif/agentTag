@@ -16,8 +16,8 @@ export interface PromptContext {
   readOnly?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
   extra?: string;
-  /** 团队经验库。hits 是回答前自动查到的相近经验（已排好版）：空字符串表示查了没有相近的，没有这一项表示这次没查成 */
-  knowledge?: { hits?: string };
+  /** 团队经验库。hits 是回答前自动查到的相近经验（已排好版）：空字符串表示查了没有相近的，没有这一项表示这次没查成；missed 是一边查成、另一边没查成时没查成的库 */
+  knowledge?: { hits?: string; missed?: readonly string[] };
 }
 
 export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, knowledge }: PromptContext): string {
@@ -83,7 +83,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
   return lines.join("\n");
 }
 
-function knowledgeSection({ hits }: { hits?: string }, canPropose: boolean): string[] {
+function knowledgeSection({ hits, missed }: { hits?: string; missed?: readonly string[] }, canPropose: boolean): string[] {
   const lines = [
     "## 团队经验库",
     "团队经验库存在飞书多维表格里，所有群共用，存的是有人确认过的结论，编号写成「经验 K3」（和群记忆的 #N、aiops 的「案例 #N」「经验 #N」都不是一套编号，不要混）。" +
@@ -101,8 +101,13 @@ function knowledgeSection({ hits }: { hits?: string }, canPropose: boolean): str
       "- 相关的用来定方向、少走弯路：先按经验里的排查路径和结论去核对。但线上现状、数据和代码的结论这次仍要重新查证，不能照搬经验里的数字和结论。",
       "- 用到了就在回答里写「参考经验 K3」或「参考 aiops 经验 #N」；这次查到的和经验对不上时，以这次的为准，说明哪里不一样，提醒大家这条经验可能过时了。",
     );
-  } else if (hits === "") {
+  } else if (hits === "" && !missed?.length) {
     lines.push("- 这次提问在经验库里没查到相近的经验。查到新线索（报错原文、错误码、服务名）后可以用 knowledge_search 再查。");
+  }
+  if (missed?.length) {
+    lines.push(
+      `- 回答前${missed.join("和")}没查成（超时或出错），${hits ? "上面只有查成的那边的结果" : "另一边没查到相近的"}。需要时自己再查：团队经验库用 knowledge_search，aiops 经验库用 aiops_search_knowledge。`,
+    );
   }
   if (!canPropose) {
     return lines;

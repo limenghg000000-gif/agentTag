@@ -22,8 +22,9 @@ function fakeBitable() {
   const calls: string[] = [];
   const tables = new Map<string, { fields: BitableField[]; records: BitableRecord[] }>();
   const shared: [BitableMember, string][] = [];
+  const tokens: (string | undefined)[] = [];
   let next = 0;
-  const api: BitableApi & { fail?: Error } = {
+  const api: BitableApi & { fail?: Error; failShare?: (member: BitableMember) => boolean } = {
     async createApp(name) {
       calls.push(`createApp ${name}`);
       tables.set("tbl_default", { fields: [], records: [] });
@@ -44,7 +45,8 @@ function fakeBitable() {
       }
       return structuredClone(tables.get(tableId)?.records ?? []);
     },
-    async createRecord(_app, tableId, fields) {
+    async createRecord(_app, tableId, fields, clientToken) {
+      tokens.push(clientToken);
       const recordId = `rec${++next}`;
       tables.get(tableId)!.records.push({ recordId, fields: { ...fields, 保存时间: 1_760_000_000_000 } });
       return recordId;
@@ -53,13 +55,16 @@ function fakeBitable() {
       Object.assign(tables.get(tableId)!.records.find((r) => r.recordId === recordId)!.fields, fields);
     },
     async addCollaborator(_app, member, perm) {
+      if (api.failShare?.(member)) {
+        throw new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[docs:permission.member:create]");
+      }
       shared.push([member, perm]);
     },
     async getUrl() {
       return undefined;
     },
   };
-  return { api, calls, tables, shared };
+  return { api, calls, tables, shared, tokens };
 }
 
 const dau = normalizeDraft({ category: "metric", title: "日活的口径", question: "日活怎么统计", conclusion: "当天打开过 App 的去重用户数", keywords: "日活,DAU" });
@@ -97,7 +102,12 @@ test("第一次保存时建多维表格：只留经验库这张表，共享给�
     来源: "飞书群 oc_1",
     保存时间: 1_760_000_000_000,
   });
-  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), { appToken: "app1", tableId: "tbl1", url: "https://example.feishu.cn/base/app1?table=tbl1" });
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), {
+    appToken: "app1",
+    tableId: "tbl1",
+    url: "https://example.feishu.cn/base/app1?table=tbl1",
+    shared: ["openchat:oc_1:view", "openid:ou_admin:full_access"],
+  });
 
   // 重启：读数据目录里记的表，不再建
   const again = new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: [], editors: [] }, logger: quiet }), { logger: quiet });
@@ -135,6 +145,50 @@ test("没配写权限名单时群也给可编辑；用 KNOWLEDGE_BITABLE 指定�
   assert.equal(target.calls.length, 0);
   assert.equal(await fixed.location(), "https://example.feishu.cn/base/appX?table=tblX");
   assert.equal(calls.length, 3);
+});
+
+test("共享失败的下次保存时再试，后来加进白名单的群也补上；共享失败不影响保存", async () => {
+  const stateFile = path.join(dir, "share", "bitable.json");
+  const { api, shared } = fakeBitable();
+  api.failShare = (member) => member.type === "openchat";
+  const first = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_admin"] }, logger: quiet });
+  assert.equal((await new KnowledgeBase(first, { logger: quiet }).save(dau)).id, "K1");
+  assert.deepEqual(shared, [[{ type: "openid", id: "ou_admin" }, "full_access"]]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:full_access"]);
+
+  // 开通权限、重启，白名单里又加了一个群：下次保存时补上没共享成的，已经共享过的不再调
+  api.failShare = undefined;
+  const again = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: ["ou_admin"] }, logger: quiet });
+  assert.equal((await new KnowledgeBase(again, { logger: quiet }).save(dau)).id, "K2");
+  assert.deepEqual(shared.slice(1), [
+    [{ type: "openchat", id: "oc_1" }, "view"],
+    [{ type: "openchat", id: "oc_2" }, "view"],
+  ]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:full_access", "openchat:oc_1:view", "openchat:oc_2:view"]);
+  await new KnowledgeBase(again, { logger: quiet }).save(dau);
+  assert.equal(shared.length, 3, "都共享过了就不再调");
+});
+
+test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {
+  const { api, tables, tokens } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "token.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] } });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const requestId = "0f8e2a3c-7a51-4b8e-9d0c-1f2e3d4c5b6a";
+  // 第一次：飞书写进去了，但结果没传回来
+  const create = api.createRecord.bind(api);
+  api.createRecord = async (...args) => {
+    await create(...args);
+    throw new FeishuApiError(0, "socket hang up");
+  };
+  await assert.rejects(base.save(dau, { requestId }), /socket hang up/);
+  api.createRecord = create;
+  const retried = await base.save(dau, { requestId });
+  assert.equal(retried.id, "K1");
+  assert.equal(tables.get("tblX")!.records.length, 1);
+  assert.deepEqual(tokens, [requestId]);
+  assert.equal(tables.get("tblX")!.records[0].fields["草稿编号"], requestId);
+  assert.equal((await backend.list())[0].requestId, requestId);
 });
 
 test("表格里有人手动加的行：文本列是分段数组也能读，没编号的用行号，没有标题或结论的跳过；类别认不出算其他", async () => {
