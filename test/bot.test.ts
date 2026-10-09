@@ -852,6 +852,9 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   assert.equal(block("排查 gateway-api 最近一小时的报错并总结原因", made), true);
   assert.equal(block("总结 gateway-api 的报错原因", made), true);
   assert.equal(block("把上面 gateway-api 的排查结果总结一下", made), false);
+  assert.equal(block("把上面的排查结果重新整理一下", made), false);
+  assert.equal(block("现在把上面的排查结果翻译成英文", made), false);
+  assert.equal(block("gateway-api 现在怎么样了，总结一下", made), true);
   assert.equal(block("翻译成英文", "Conclusion: 50 errors since 2026-10-08 17:03:26"), false);
   assert.equal(block("总结以上内容", made), false);
   assert.equal(block("总结一下 gateway-api 5 分钟以上的慢请求", made), true);
