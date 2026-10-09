@@ -3,6 +3,7 @@ import type { CardActionEvent, SendInput, SendOptions, SendResult } from "@larks
 import { isTimeout, raceAbort, timeoutSignal } from "../abort.js";
 import type { Logger } from "../history.js";
 import {
+  containsSecret,
   draftOf,
   fieldLines,
   formatKnowledge,
@@ -19,7 +20,7 @@ import {
   StaleProposalError,
   usable,
 } from "../knowledge.js";
-import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, renderAiopsHitsForPrompt } from "../knowledge-aiops.js";
+import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, renderAiopsHitsForPrompt, syncedFrom } from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { Tool } from "./tool.js";
 
@@ -190,7 +191,8 @@ export class KnowledgeDesk {
   /**
    * 回答前检索：团队经验库和 aiops 经验库一起查，够相近的写进提示词。已经同步到 aiops 的排查经验只列团队经验库那一条。
    * 每个库最多等 lookupMs（飞书接口不认中止信号，到时间就不等了），向量没算完时团队经验库只按关键词。
-   * 一边没查成时用另一边的，查了的都没查成时返回 undefined。用户停止任务时抛出中止错误
+   * 一边没查成时用另一边的，查了的都没查成时返回 undefined。用户停止任务时抛出中止错误。
+   * 提问（连同话题里前几次的提问）里像是有密钥时不拿去查 aiops：查询会发到 aiops、记进 MCP 审计日志
    */
   async lookup(query: string, task: McpTaskContext, signal?: AbortSignal): Promise<KnowledgeLookup | undefined> {
     const { base, aiops } = this.options;
@@ -198,7 +200,11 @@ export class KnowledgeDesk {
     const semantic = timeoutSignal(this.semanticMs);
     const deadline = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
     try {
-      const queryAiops = aiops?.searchable === true;
+      const secret = aiops?.searchable === true && containsSecret(query);
+      if (secret) {
+        this.logger.warn(`提问里像是有密钥，这次不拿它去查 aiops 经验库 message=${task.messageId}`);
+      }
+      const queryAiops = aiops?.searchable === true && !secret;
       const [team, lessons] = await Promise.allSettled([
         raceAbort(base.search(query, { limit: LOOKUP_HITS, semanticDeadline: semantic.signal, ...(signal ? { signal } : {}) }), deadline),
         queryAiops ? raceAbort(aiops.search(query, task, deadline), deadline) : Promise.resolve([]),
@@ -217,9 +223,11 @@ export class KnowledgeDesk {
         return undefined;
       }
       const teamHits = team.status === "fulfilled" ? team.value : [];
-      // 只去掉团队经验库这次也查到了的：两边检索方式不一样，团队经验库没查到的那条 aiops 查到了，就用 aiops 的
-      const synced = new Set(teamHits.flatMap((hit) => (hit.entry.aiopsId === undefined ? [] : [hit.entry.aiopsId])));
-      const aiopsHits = (lessons.status === "fulfilled" ? lessons.value : []).filter((hit) => !synced.has(hit.id)).slice(0, LOOKUP_HITS);
+      // 只去掉从团队经验库这次也查到了的那条同步过去的（排查过程最后一行是那一条的出处）：两边检索方式不一样，团队经验库没查到的那条 aiops 查到了，
+      // 就用 aiops 的。不按表格里记的 aiops 编号认：那一列能在表格里改，改错了会把不相干的 aiops 经验去掉
+      const aiopsHits = (lessons.status === "fulfilled" ? lessons.value : [])
+        .filter((hit) => !teamHits.some((team) => syncedFrom(hit.diagnosis_path, team.entry.id)))
+        .slice(0, LOOKUP_HITS);
       const parts = [
         teamHits.length > 0 ? renderHitsForPrompt(teamHits) : "",
         aiopsHits.length > 0 ? renderAiopsHitsForPrompt(aiopsHits) : "",
@@ -573,7 +581,7 @@ export class KnowledgeDesk {
     }
     // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "keep";
-    if (replaced) {
+    if (replaced && (await this.replacementReady(proposal, entry.id, replaced.id, out))) {
       await this.archiveReplaced(replaced, proposal.replaces!, confirmedBy, task, oldLesson, out);
     }
     const location = await base.location().catch(() => undefined);
@@ -818,6 +826,33 @@ export class KnowledgeDesk {
    * 保存新经验后归档被取代的旧经验；它在 aiops 里同步的那条按 oldLesson 归档或者留着。
    * 旧的按卡片上的样子核对（seen）：存好新的以后、归档旧的之前（比如同步 aiops 的时候）有人在表格里改了它，就不归档改过的
    */
+  /**
+   * 归档旧经验前重新读一遍新的这条：再试一次前、同步 aiops 的时候有人在表格里把它归档了、清空了标题结论、写进了密钥，
+   * 它就检索不到了，这时归档旧的，这个问题在团队经验库里一条能查到的都没有了。新的归档了就不再归档旧的；改坏了的等改好了再试
+   */
+  private async replacementReady(proposal: SaveProposal, newId: string, oldId: string, out: Outcome): Promise<boolean> {
+    let current: KnowledgeEntry | undefined;
+    try {
+      current = await this.options.base.saved(proposal.requestId, newId);
+    } catch (err) {
+      out.unfinished.push(`没能重新读取新的经验 ${newId}：${describe(err)}。旧的经验 ${oldId} 先没归档`);
+      return false;
+    }
+    if (!current) {
+      out.unfinished.push(`新的经验 ${newId} 在表格里找不到了，旧的经验 ${oldId} 先没归档。请在表格里改回来后再点「再试一次」，不需要了就点「不用了」`);
+      return false;
+    }
+    if (current.status !== "active") {
+      out.done.push(`新的经验 ${current.id} 在表格里已经归档了，旧的经验 ${oldId} 没有归档，aiops 里同步的那条也没动。`);
+      return false;
+    }
+    if (!usable(current)) {
+      out.unfinished.push(`新的经验 ${current.id} 在表格里${current.incomplete ?? current.unsafe}，旧的经验 ${oldId} 先没归档。请在表格里改好后再点「再试一次」`);
+      return false;
+    }
+    return true;
+  }
+
   private async archiveReplaced(
     old: KnowledgeEntry,
     seen: KnowledgeEntry,

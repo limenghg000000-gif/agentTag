@@ -236,6 +236,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "AccessKeySecret: Ab*cdefghijklmnopqrst",
     "这次 token: Ab*cd1234efgh 过期了",
     "api_key: |-\n  Ab*correct horse battery",
+    // XML 注释把值拆开的，YAML 引号里折到下一行的
+    "<password>ab<!-- split -->correcthorsebatterystaple</password>",
+    '<entry key="token">abc<!-- x -->defghijk</entry>',
+    'password: "ab\n  correcthorsebatterystaple"',
+    "aiops:\n  api_key: 'correct horse\n    battery staple'",
+    '- token: "correct\\\n    horsebatterystaple"',
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -298,6 +304,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "token=ab***cd；MCP_AIOPS_TOKEN=sk-****wxyz；password: ab***cdef；这次 token: sk-****1234 过期了",
     'api_key: "**********"\nAccessKeySecret: ****************\ntoken: **expired**\napi_key: |-\n  ********\nsecret = """sk-****wxyz"""',
     '<password>sk-****wxyz</password>；deployctl --token "****abcd"',
+    // 连接地址里打了码的密码；注释后面是变量的 XML；YAML 引号折行里是报错词、中文说明的
+    "postgres://deploy:******@db.example/app；redis://:***@cache:6379",
+    "<!-- 说明 --><password>${DB_PASSWORD}</password>",
+    'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
     "<password><!-- 找管理员要 --></password><token>\n  <!-- 放在 vault 里 -->\n</token>",
   ]) {
@@ -1358,6 +1368,42 @@ test("没做成的卡片：写权限名单里的人点「不用了」或者超�
   assert.equal(late.calls.filter((call) => call.tool === "save_lesson").length, 1);
 });
 
+test("取代旧经验、归档旧的没做成，再试一次前新的在表格里改坏了或者归档了：旧的不归档，改坏的改好后再试才归档", async () => {
+  const { backend, base, desk, sent, click, tool, lastCard } = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
+  await base.save(normalizeDraft(code8));
+  await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  const update = backend.update.bind(backend);
+  let limited = true;
+  backend.update = async (id, changes) => {
+    if (id === "K1" && limited) {
+      throw new KnowledgeError("飞书接口限流");
+    }
+    return update(id, changes);
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /旧的经验 K1 没能归档：飞书接口限流/);
+  limited = false;
+
+  // 新的结论被清空：检索不到它了，旧的先留着
+  const conclusion = backend.entries[1].conclusion;
+  backend.entries[1].conclusion = "";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "active");
+  assert.equal(lastCard().header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(lastCard()), /新的经验 K2 在表格里.*旧的经验 K1 先没归档。请在表格里改好后再点「再试一次」/);
+
+  // 新的被归档了：旧的不再归档，卡片做完
+  backend.entries[1].conclusion = conclusion;
+  backend.entries[1].status = "archived";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "active");
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /新的经验 K2 在表格里已经归档了，旧的经验 K1 没有归档/);
+});
+
 test("两张卡片取代同一条经验：先点的存好并归档旧的，后点的不再存（同时点也一样）", async () => {
   for (const together of [false, true]) {
     const { backend, base, desk, sent, updates, click } = deskSetup();
@@ -1933,6 +1979,29 @@ test("归档时表格改成功了、结果没传回来：再点一次照常完�
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档经验 K1.*\naiops 经验库里同步的经验 #31 也已归档/);
 });
 
+/** aiops 检索结果里 #31 的排查过程末尾写着是 K1 同步过去的 */
+const syncedHits = () =>
+  JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9, diagnosis_path: "看了 Pod 连接数\n（来自飞书团队经验库 K1）" }, { id: 40, title: "Open WebUI 存的", score: 8 }] });
+
+test("回答前检索：按 aiops 经验排查过程末尾的出处去重，表格里的 aiops 编号改错了也不会去掉不相干的那条", async () => {
+  const { base, desk } = deskSetup({ searchLessons: syncedHits });
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 40);
+  const found = await desk.lookup("gateway-api 报 code=8 ResourceExhausted", task);
+  assert.deepEqual(found?.ids, ["K1", "aiops#40"], "#31 是 K1 同步过去的，去掉；#40 是 Open WebUI 存的，表格里记成了 K1 的也列出");
+});
+
+test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发到 aiops、记进审计日志），团队经验库照样查", async () => {
+  const { base, desk, calls } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  const found = await desk.lookup(["gateway-api 报 code=8，配置是 MCP_AIOPS_TOKEN", "correcthorsebatterystaple"].join("="), task);
+  assert.deepEqual(found?.ids, ["K1"]);
+  assert.deepEqual(found?.missed, []);
+  assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
+  assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
+  assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);
+});
+
 test("回答前检索：团队经验库这次没查到的，aiops 查到了它同步过去的那条照样列出", async () => {
   const { base, desk } = deskSetup();
   await base.save(normalizeDraft(code8));
@@ -1942,7 +2011,7 @@ test("回答前检索：团队经验库这次没查到的，aiops 查到了它�
 });
 
 test("回答前检索：两个库一起查，已同步到 aiops 的只列团队经验库那条；一个库出错不影响另一个，都出错时返回空", async () => {
-  const { base, desk } = deskSetup();
+  const { base, desk } = deskSetup({ searchLessons: syncedHits });
   await base.save(normalizeDraft(code8));
   await base.linkAiops("K1", 31);
 

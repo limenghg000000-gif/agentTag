@@ -248,7 +248,7 @@ function teamSourceNote(teamId: string): string {
  * aiops 里这条经验是不是从团队经验库的这一条同步过去的：排查过程的最后一行正好是出处。
  * 只是在中间引用了别的经验出处的（排查过程里贴了另一条经验）不算
  */
-function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean {
+export function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean {
   return diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() === teamSourceNote(teamId);
 }
 

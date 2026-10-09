@@ -565,11 +565,12 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b[rs]k_live_[A-Za-z0-9]{16,}/, "Stripe 密钥"],
   [/\beyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}/, "JWT 令牌"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
-  [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
 ];
 
 /** 写明了是密钥、密码的名字后面的值（取出来的组里有一个是值），整个打了码的（isMasked）不算 */
 const LABELED_SECRETS: [RegExp, string][] = [
+  // 连接地址里的密码（postgres://deploy:…@db）；打了码的（postgres://deploy:******@db）不算
+  [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:([^\s@/]+)@/gi, "带密码的连接地址"],
   // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
   [
     new RegExp(String.raw`(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)[^\S\r\n]*[:=：]${BEFORE_VALUE}([^\s,，;；\u4e00-\u9fff]{16,})`, "gi"),
@@ -647,6 +648,31 @@ function blockValues(text: string): string[] {
     return value.length >= 8 && !isMasked(value) ? [value] : [];
   });
 }
+/**
+ * YAML 里引号里的值折到下面几行的（password: "correct horse\n  battery staple"）：下面的行要缩进，折行的地方算一个空格；
+ * 双引号里行尾的 \ 也是续行。只在一行里的由 quotedValue 取。第 1 组是双引号里的，第 2 组是单引号里的
+ */
+const YAML_FOLDED_QUOTE = new RegExp(
+  String.raw`^[ \t]*(?:-[ \t]+)?["']?${CONFIG_KEY}["']?[ \t]*:[ \t]*` +
+    String.raw`(?:"((?:[^"\\\r\n]|\\(?:[^\r\n]|\r?\n[ \t]*(?![ \t]))|\r?\n[ \t]+(?![ \t]))*)"|'((?:[^'\r\n]|''|\r?\n[ \t]+(?![ \t]))*)')`,
+  "gim",
+);
+
+/** 折到下面几行的 YAML 引号里的值，连成一行。有中文的是说明，不算 */
+function foldedQuotedValues(text: string): string[] {
+  return [...text.matchAll(YAML_FOLDED_QUOTE)].flatMap(([, double, single]) => {
+    const raw = double ?? single;
+    if (!raw.includes("\n")) {
+      return [];
+    }
+    const value = raw
+      .replace(/\\\r?\n[ \t]*/g, "")
+      .replace(/[ \t]*\r?\n[ \t]*/g, " ")
+      .trim();
+    return value.length >= 6 && !/[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/.test(value) ? [value] : [];
+  });
+}
+
 /**
  * 命令行里写在密钥选项后面、隔着空格的值：deployctl --password correcthorsebatterystaple、--api-key "…"、Go 的 -token …；
  * 也算 exec 数组（["deployctl", "--token", "…"]）、YAML 的 args 列表（- --token 下一行 - …）、行尾 \ 续到下一行的，
@@ -731,16 +757,11 @@ function tripleQuotedValues(text: string): string[] {
   });
 }
 
-/** 值前后可以有空白和 XML 注释（<!-- 生产库 -->） */
-const XML_GAP = String.raw`(?:\s|<!--[\s\S]*?-->)*`;
 /**
  * XML 配置里名字是密钥的元素（Maven settings.xml 的 <password>…</password>、<api-key><![CDATA[…]]></api-key>），可以带命名空间和属性。
  * 第 2 组是 CDATA 里的，第 3 组是直接写的
  */
-const XML_ELEMENT = new RegExp(
-  String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>]*)?>${XML_GAP}(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))${XML_GAP}</\1\s*>`,
-  "gi",
-);
+const XML_ELEMENT = new RegExp(String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*</\1\s*>`, "gi");
 /**
  * 连在一起的一串「名字="值"」属性（一个 XML 标签里的全部属性）。属性的先后不限，值里可以有 >、可以换行，所以一个个属性往后接，不靠 > 断开
  */
@@ -753,7 +774,7 @@ const XML_OPEN_TAG = /<[\w.:-]+((?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))+)\s*(\
  * 第 1 到 4 组，有一个是值
  */
 const XML_BODY = new RegExp(
-  String.raw`${XML_GAP}(?:<!\[CDATA\[([\s\S]*?)\]\]>|<(?:[\w.-]+:)?value(?:\s[^<>]*)?>${XML_GAP}(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))|([^<]*))`,
+  String.raw`\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|<(?:[\w.-]+:)?value(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))|([^<]*))`,
   "iy",
 );
 const CONFIG_NAME = new RegExp(String.raw`^${CONFIG_KEY}$`, "i");
@@ -799,12 +820,25 @@ function xmlNamedValues(text: string): string[] {
   return values;
 }
 
-/** XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，整个打了码的，不算 */
+/** XML 注释（<!-- 生产库 -->） */
+const XML_COMMENT = /<!--[\s\S]*?-->/g;
+
+/**
+ * XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，整个打了码的，不算。
+ * 去掉注释再看一遍：值前面、中间夹着注释的（<password>ab<!-- x -->cd</password>）连起来才是值；原文也看，注释掉的配置里的密钥照样算
+ */
 function xmlValues(text: string): string[] {
-  return [...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlNamedValues(text)].flatMap((raw) => {
+  const texts = text.includes("<!--") ? [text, text.replace(XML_COMMENT, "")] : [text];
+  const raws = texts.flatMap((xml) => [...[...xml.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlNamedValues(xml)]);
+  return raws.flatMap((raw) => {
     const value = raw.replace(/\s+/g, " ").trim();
     return value.length >= 6 && !/[　-〿一-鿿＀-￯]/.test(value) && !isMasked(value) ? [value] : [];
   });
+}
+
+/** 这段文字里是不是像有密钥（拦草稿、表格里的行用的同一套规则） */
+export function containsSecret(text: string): boolean {
+  return findSecret(text) !== undefined;
 }
 
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
@@ -822,6 +856,7 @@ function findSecret(text: string): string | undefined {
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
     ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
     ...blockValues(text),
+    ...foldedQuotedValues(text),
     ...tripleQuotedValues(text),
     ...xmlValues(text),
     // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
