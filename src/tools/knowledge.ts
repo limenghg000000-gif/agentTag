@@ -14,6 +14,7 @@ import {
   type KnowledgeEntry,
   KnowledgeError,
   type KnowledgeHit,
+  MAX_TITLE_CHARS,
   MissingEntryError,
   normalizeDraft,
   normalizeId,
@@ -22,7 +23,16 @@ import {
   StaleProposalError,
   usable,
 } from "../knowledge.js";
-import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, type AiopsSent, lessonHasSecret, renderAiopsHitsForPrompt, syncedFrom } from "../knowledge-aiops.js";
+import {
+  type AiopsLesson,
+  type AiopsLessons,
+  type AiopsSaveResult,
+  type AiopsSent,
+  clip,
+  lessonHasSecret,
+  renderAiopsHitsForPrompt,
+  syncedFrom,
+} from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { Tool } from "./tool.js";
 
@@ -878,7 +888,8 @@ export class KnowledgeDesk {
     if (target.type === "aiops") {
       await this.options.aiops!.archiveSeen(target.lesson, confirmedBy, task);
       return {
-        done: [`已归档 aiops 经验 #${target.lesson.id}「${target.lesson.title}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`],
+        // 标题是 aiops 那边的，可能很长：只列开头，卡片太大飞书不收
+        done: [`已归档 aiops 经验 #${target.lesson.id}「${clip(target.lesson.title, MAX_TITLE_CHARS)}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`],
         unfinished: [],
       };
     }
@@ -935,7 +946,7 @@ export class KnowledgeDesk {
   private async linkAiops(entry: KnowledgeEntry, aiopsId: number): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       try {
-        await this.options.base.linkAiops(entry.id, aiopsId);
+        await this.options.base.linkAiops(entry, aiopsId);
         return;
       } catch (err) {
         if (attempt >= LINK_ATTEMPTS) {

@@ -305,13 +305,9 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   private sharing: Promise<void> = Promise.resolve();
   /** 补齐列：每次启动后第一次写表格前做一次 */
   private schema?: Promise<void>;
-  /** 编号 → 行 id，update 时用 */
-  private rows = new Map<string, string>();
-  /** 表格里不止一行用的编号（有人复制了行）：改这些编号时不知道该改哪行，不改 */
-  private ambiguous = new Set<string>();
   /**
-   * 每开始读一次表格、每写进一行加一。读完时这个数变了，说明读的时候又有了更新的读或者新写的行
-   * （比如回答前检索超时、还在后台读的那次），这次读到的比现在记的旧，不拿来换编号 → 行 id 的对照
+   * 每开始读一次表格加一。读完时这个数变了，说明读的时候又有了更新的读（比如回答前检索超时、还在后台读的那次），
+   * 这次读到的比较旧，编号重复的警告不按它来
    */
   private generation = 0;
   private warnedAmbiguous = "";
@@ -333,7 +329,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     }
     const generation = ++this.generation;
     const records = await this.explain(() => this.options.api.listRecords(target.appToken, target.tableId));
-    const rows = new Map<string, string>();
+    const seen = new Set<string>();
     const ambiguous = new Set<string>();
     // 编号里写着密钥的（有人把密钥贴进了编号那一列、又复制了这一行）：警告里不写出来。按表格里的原样查，统一写法后大小写变了可能认不出
     const leaked = new Set<string>();
@@ -343,56 +339,46 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
       if (entry) {
         // 编号按「#K12」「K 12」「k12」都是 K12 来认，和经验库里查重、按编号找一样
         const key = normalizeId(entry.id);
-        if (rows.has(key)) {
+        if (seen.has(key)) {
           ambiguous.add(key);
-        } else {
-          rows.set(key, record.recordId);
         }
+        seen.add(key);
         if (containsSecret(entry.id)) {
           leaked.add(key);
         }
-        entries.push(entry);
+        // 改这一行时按读到它的这次的行 id 改：之后再读一次表格，这个编号可能已经是别的行了
+        entries.push({ ...entry, rowId: record.recordId });
       }
     }
     if (generation === this.generation) {
-      this.rows = rows;
-      this.ambiguous = ambiguous;
-      this.warnAmbiguous(leaked);
+      this.warnAmbiguous(ambiguous, leaked);
     }
     return entries;
   }
 
-  private warnAmbiguous(leaked: ReadonlySet<string>): void {
-    const ambiguous = [...this.ambiguous].join(" ");
-    if (ambiguous && ambiguous !== this.warnedAmbiguous) {
-      const shown = [...this.ambiguous].map((id) => (leaked.has(id) ? "（像是密钥的编号，不写出来）" : id)).join(" ");
+  private warnAmbiguous(ambiguous: ReadonlySet<string>, leaked: ReadonlySet<string>): void {
+    const ids = [...ambiguous].join(" ");
+    if (ids && ids !== this.warnedAmbiguous) {
+      const shown = [...ambiguous].map((id) => (leaked.has(id) ? "（像是密钥的编号，不写出来）" : id)).join(" ");
       this.logger.warn(`经验库：表格里有不止一行用了同一个编号：${shown}。归档这些编号前请先在表格里把重复的改掉`);
     }
-    this.warnedAmbiguous = ambiguous;
+    this.warnedAmbiguous = ids;
   }
 
-  async add(entry: KnowledgeEntry): Promise<void> {
+  async add(entry: KnowledgeEntry): Promise<string | undefined> {
     const target = (await this.current()) ?? (await this.create());
     if (!this.options.target) {
       await this.share(target);
     }
     await this.ensureColumns(target);
-    const recordId = await this.explain(() => this.options.api.createRecord(target.appToken, target.tableId, toFields(entry), entry.requestId));
-    // 写之前开始的读还没回来的话，回来时不再用它换掉对照，不然会把这一行丢掉
-    this.generation++;
-    if (recordId) {
-      this.rows.set(normalizeId(entry.id), recordId);
-    }
+    return (await this.explain(() => this.options.api.createRecord(target.appToken, target.tableId, toFields(entry), entry.requestId))) || undefined;
   }
 
-  async update(id: string, changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>): Promise<void> {
+  async update(row: Pick<KnowledgeEntry, "id" | "rowId">, changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>): Promise<void> {
     const target = await this.current();
-    const recordId = this.rows.get(normalizeId(id));
+    const recordId = row.rowId;
     if (!target || !recordId) {
-      throw new KnowledgeError(`多维表格里找不到 ${id} 这一行`);
-    }
-    if (this.ambiguous.has(normalizeId(id))) {
-      throw new KnowledgeError(`多维表格里不止一行的编号是 ${id}，不知道该改哪一行。请先在表格里把重复的编号改掉再试`);
+      throw new KnowledgeError(`多维表格里找不到 ${row.id} 这一行`);
     }
     await this.ensureColumns(target);
     const fields: Record<string, unknown> = {};

@@ -1,5 +1,5 @@
 import type { Logger } from "./history.js";
-import { containsSecret, type KnowledgeDraft, KnowledgeError, normalizeId, StaleProposalError } from "./knowledge.js";
+import { containsSecret, type KnowledgeDraft, KnowledgeError, MAX_TITLE_CHARS, normalizeId, StaleProposalError } from "./knowledge.js";
 import type { McpTaskContext } from "./mcp.js";
 
 /** 回答前检索时，提问最多取多少字 */
@@ -12,6 +12,8 @@ const MIN_PROMPT_SCORE = 5.5;
 /** 写进提示词时每条经验最多多少字、每一项最多多少字 */
 const PROMPT_HIT_CHARS = 1200;
 const PROMPT_FIELD_CHARS = 400;
+/** aiops 说重复时那一条的原因最多留多少字（标题按起草时的上限） */
+const DUPLICATE_WHY_CHARS = 300;
 
 /** aiops 检索返回的一条经验 */
 export interface AiopsLessonHit {
@@ -190,14 +192,18 @@ export class AiopsLessons {
     const duplicate = data?.duplicate_of as Record<string, unknown> | undefined;
     const duplicateId = lessonId(duplicate?.id);
     if (data?.saved === false && duplicate && duplicateId !== undefined) {
-      // 那一条可能是别的地方（Open WebUI）存的、写进了密钥：标题、原因要列在卡片上给群里看，像有密钥的不要
+      // 那一条可能是别的地方（Open WebUI）存的、写进了密钥：标题、原因要列在卡片上给群里看，像有密钥的不要。
+      // 也可能很长：只留开头（先查密钥再截，截断处不会把密钥切成认不出的两半），卡片太大飞书不收，就一直停在「正在存进经验库…」
       const title = String(duplicate.title ?? "");
       const leaked = containsSecret(title);
       if (leaked) {
         this.logger.warn(`aiops 经验 #${duplicateId} 的标题里像是写进了密钥，卡片上不列它的标题。请 aiops 的管理员删掉密钥`);
       }
       const why = typeof duplicate.why === "string" && !containsSecret(duplicate.why) ? duplicate.why : undefined;
-      return { saved: false, duplicate: { id: duplicateId, title: leaked ? "" : title, ...(why !== undefined ? { why } : {}) } };
+      return {
+        saved: false,
+        duplicate: { id: duplicateId, title: leaked ? "" : clip(title, MAX_TITLE_CHARS), ...(why !== undefined ? { why: clip(why, DUPLICATE_WHY_CHARS) } : {}) },
+      };
     }
     throw new KnowledgeError(`aiops 没有说存没存成功：${excerpt(raw, 300)}`);
   }
@@ -356,6 +362,12 @@ export function lessonHasSecret(lesson: AiopsLessonHit | AiopsLesson): boolean {
   return [title, symptom, root_cause, solution, diagnosis_path, service, keywords, error_codes, alertname].some(
     (value) => value !== undefined && containsSecret(value),
   );
+}
+
+/** 别处来的一段文字放进卡片：换行和连续空白并成一个空格，超过 chars 字的截掉 */
+export function clip(text: string, chars: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > chars ? `${flat.slice(0, chars)}…` : flat;
 }
 
 /** 报错里带上 aiops 返回的原文（前 chars 个字符）：报错会列在卡片上给群里看，原文里像有密钥的不带 */

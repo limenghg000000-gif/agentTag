@@ -138,7 +138,7 @@ test("第一次保存时建多维表格：只留经验库这张表，先设成�
   const [hit] = await again.search("DAU 怎么算");
   assert.equal(hit.entry.id, "K1");
   assert.equal(hit.entry.createdAt, new Date(1_760_000_000_000).toISOString());
-  await again.linkAiops("K1", 31);
+  await again.linkAiops(hit.entry, 31);
   await again.archive("K1");
   assert.equal(fields["aiops 经验编号"], "31");
   assert.equal(fields["状态"], "已归档");
@@ -615,8 +615,47 @@ test("两次读表格同时进行：先开始的读后回来时不覆盖新写�
   assert.equal(entry.id, "K2");
   release();
   assert.equal((await stale).length, 1);
-  await fresh.linkAiops("K2", 31);
+  await fresh.linkAiops(entry, 31);
   assert.equal(tables.get("tblX")!.records[1].fields["aiops 经验编号"], "31");
+});
+
+test("归档、记 aiops 编号按核对时读到的那一行改：这期间编号改给了别的行、另一次读表格先读完，也不改错行", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: "K1" } },
+      { recordId: "recB", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K2" } },
+    ],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "bound-row", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const seen = (await base.get("K1", { fresh: true }))!;
+
+  // 归档时读的那次表格回来得晚；这期间有人把 K1 改成 K9、K2 改成 K1，回答前检索又读了一次，先读完
+  const list = api.listRecords.bind(api);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  api.listRecords = async (app, table) => {
+    const snapshot = await list(app, table);
+    api.listRecords = list;
+    await gate;
+    return snapshot;
+  };
+  const archiving = base.archive("K1", { seen });
+  await new Promise((resolve) => setImmediate(resolve));
+  const [a, b] = tables.get("tblX")!.records;
+  a.fields["编号"] = "K9";
+  b.fields["编号"] = "K1";
+  await backend.list();
+  release();
+  await archiving;
+  assert.equal(a.fields["状态"], "已归档");
+  assert.equal(b.fields["状态"], undefined);
+
+  await base.linkAiops(seen, 31);
+  assert.equal(a.fields["aiops 经验编号"], "31");
+  assert.equal(b.fields["aiops 经验编号"], undefined);
 });
 
 test("读数据目录里记的表格出错时不记住，下次再读", async () => {

@@ -106,6 +106,11 @@ export interface KnowledgeEntry extends KnowledgeDraft {
    * 和 incomplete 一样编号照常算，这几行都不拿来检索、给模型看、同步、归档
    */
   conflict?: string;
+  /**
+   * 后端里这一行的行 id（多维表格的 record_id），读表、写进去时带上。归档、记 aiops 编号时按它改读表时核对过的那一行：
+   * 不按编号再查一遍，编号随时可能在表格里被改给了别的行
+   */
+  rowId?: string;
 }
 
 export interface KnowledgeMeta {
@@ -138,8 +143,10 @@ export interface KnowledgeBackend {
   /** 给人看的位置：多维表格链接；还没建好时为空 */
   location(): Promise<string | undefined>;
   list(): Promise<KnowledgeEntry[]>;
-  add(entry: KnowledgeEntry): Promise<void>;
-  update(id: string, changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>): Promise<void>;
+  /** 写进一行，返回这一行的行 id（后端不给时为空） */
+  add(entry: KnowledgeEntry): Promise<string | void>;
+  /** 改读表时核对过的那一行（按它的 rowId，不按编号重新查） */
+  update(row: Pick<KnowledgeEntry, "id" | "rowId">, changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>): Promise<void>;
   /** 发出过的最大编号，表格里删掉的行也算。不记的后端不实现，编号只按表格里现有的往后排 */
   issued?(): Promise<number>;
   /** 写进表格之前先记下要发的编号 */
@@ -285,12 +292,11 @@ export class KnowledgeBase {
 
   /**
    * 之前存进去的那一行（再试一次时用）：先按草稿编号找，找不到再按编号找。两列都能在表格里改，改了其中一列也认得出来，
-   * 不会当成没存过再存一行（飞书按 client_token 认出是同一次写入、不建新行，新编号就对不上表格里的那一行了）
+   * 不会当成没存过再存一行（飞书按 client_token 认出是同一次写入、不建新行，新编号就对不上表格里的那一行了）。
+   * 按编号找到的行带着别的草稿编号时不算（见 byRequestOrId）
    */
   async saved(requestId: string, id: string): Promise<KnowledgeEntry | undefined> {
-    const entries = await this.entries(true);
-    const wanted = normalizeId(id);
-    return byRequestId(entries, requestId) ?? entries.find((entry) => normalizeId(entry.id) === wanted);
+    return byRequestOrId(await this.entries(true), requestId, id);
   }
 
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
@@ -386,10 +392,10 @@ export class KnowledgeBase {
         ...(replacesRequestId ? { replacesRequestId } : {}),
         createdAt: this.now().toISOString(),
       };
-      await this.backend.add(entry);
+      const rowId = await this.backend.add(entry);
       this.cached = undefined;
       this.logger.info(`经验库 新增 ${entry.id}「${entry.title}」 类别=${entry.category} 发起人=${meta.proposedBy ?? "未知"} 确认人=${meta.confirmedBy ?? "未知"}`);
-      return entry;
+      return rowId ? { ...entry, rowId } : entry;
     });
   }
 
@@ -419,19 +425,30 @@ export class KnowledgeBase {
         this.logger.info(`经验库 归档 ${entry.id}：已经是归档状态，不用再改`);
         return entry;
       }
-      await this.backend.update(entry.id, { status: "archived" });
+      await this.updateRow(entry, { status: "archived" });
       this.cached = undefined;
       this.logger.info(`经验库 归档 ${entry.id} 确认人=${meta.confirmedBy ?? "未知"}`);
       return { ...entry, status: "archived" };
     });
   }
 
-  /** 记下同步到 aiops 后的编号 */
-  linkAiops(id: string, aiopsId: number): Promise<void> {
+  /** 在 entry 这一行（读表时核对过的那一行）记下同步到 aiops 后的编号 */
+  linkAiops(entry: Pick<KnowledgeEntry, "id" | "rowId" | "conflict">, aiopsId: number): Promise<void> {
     return this.exclusive(async () => {
-      await this.backend.update(id, { aiopsId });
+      await this.updateRow(entry, { aiopsId });
       this.cached = undefined;
     });
+  }
+
+  /** 编号和别的行重复的不改：说「经验 K3」时分不清是哪一行 */
+  private async updateRow(
+    entry: Pick<KnowledgeEntry, "id" | "rowId" | "conflict">,
+    changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>,
+  ): Promise<void> {
+    if (entry.conflict) {
+      throw new KnowledgeError(`表格里不止一行的编号是 ${entry.id}，不知道该改哪一行。请先在表格里把重复的编号改掉再试`);
+    }
+    await this.backend.update(entry, changes);
   }
 
   private exclusive<T>(run: () => Promise<T>): Promise<T> {
@@ -1514,7 +1531,7 @@ function checkSeen(entry: KnowledgeEntry, seen: KnowledgeEntry | undefined): voi
  * 好几行一样分不清时报错。都找不到返回 undefined
  */
 function cardTarget(entries: readonly KnowledgeEntry[], id: string, seen: KnowledgeEntry | undefined): KnowledgeEntry | undefined {
-  const found = (seen?.requestId ? byRequestId(entries, seen.requestId) : undefined) ?? entries.find((entry) => normalizeId(entry.id) === normalizeId(id));
+  const found = byRequestOrId(entries, seen?.requestId, id);
   if (found || !seen || seen.requestId) {
     return found;
   }
@@ -1526,6 +1543,18 @@ function cardTarget(entries: readonly KnowledgeEntry[], id: string, seen: Knowle
     );
   }
   return same[0];
+}
+
+/**
+ * 草稿编号是 requestId 的那一行，没有草稿编号或者找不到时按编号找。按编号找到的行带着别的草稿编号时不算：
+ * 那是另一次保存的行，后来被改成了这个编号（原来那行删了），拿它接着同步、归档就做到别的经验上了
+ */
+function byRequestOrId(entries: readonly KnowledgeEntry[], requestId: string | undefined, id: string): KnowledgeEntry | undefined {
+  const wanted = normalizeId(id);
+  return (
+    (requestId ? byRequestId(entries, requestId) : undefined) ??
+    entries.find((entry) => normalizeId(entry.id) === wanted && (!requestId || !entry.requestId))
+  );
 }
 
 /**

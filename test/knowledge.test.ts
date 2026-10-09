@@ -8,6 +8,7 @@ import {
   KnowledgeBase,
   type KnowledgeEntry,
   KnowledgeError,
+  MissingEntryError,
   normalizeDraft,
   renderHitsForPrompt,
 } from "../src/knowledge.js";
@@ -56,12 +57,12 @@ class MemoryBackend implements KnowledgeBackend {
     this.entries.push(structuredClone(entry));
   }
 
-  async update(id: string, changes: Partial<KnowledgeEntry>) {
+  async update(row: Pick<KnowledgeEntry, "id">, changes: Partial<KnowledgeEntry>) {
     if (this.failUpdates > 0) {
       this.failUpdates--;
       throw new KnowledgeError("飞书接口限流");
     }
-    Object.assign(this.entries.find((entry) => entry.id === id)!, changes);
+    Object.assign(this.entries.find((entry) => entry.id === row.id)!, changes);
     if (this.lostUpdates > 0) {
       this.lostUpdates--;
       throw new KnowledgeError("socket hang up");
@@ -717,6 +718,17 @@ function fakeMcp(handlers: Record<string, (args: Record<string, unknown>) => str
 
 const task = { chatId: "oc_1", senderId: "ou_1", messageId: "om_1" };
 
+test("aiops 说重复时那一条的标题、原因很长：卡片上只列开头，换行并成空格", async () => {
+  const { mcp } = fakeMcp({
+    save_lesson: () => JSON.stringify({ saved: false, duplicate_of: { id: 12, title: `user-rpc\n降载 ${"很长".repeat(5000)}`, why: "原因".repeat(5000) } }),
+  });
+  const result = await new AiopsLessons(mcp, "aiops", quiet).save(normalizeDraft(code8), { confirmedBy: "ML", teamId: "K1" }, task);
+  assert.deepEqual(result, {
+    saved: false,
+    duplicate: { id: 12, title: `${`user-rpc 降载 ${"很长".repeat(5000)}`.slice(0, 80)}…`, why: `${"原因".repeat(150)}…` },
+  });
+});
+
 test("aiops 经验库：检索只留够相近的；排查经验同步过去时字段对上，注明出自团队经验库；疑似重复时不存", async () => {
   const { mcp, calls } = fakeMcp({
     search_knowledge: () =>
@@ -1233,7 +1245,7 @@ test("发起人可以取消，别人不行；同一个话题再起草时旧卡�
 test("起草时经验库里有很像的，卡片上提示；带 replaces 时保存后归档旧的，连同 aiops 里同步的那条", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
 
   await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（第二次）" }, { signal });
   assert.match(cardText((sent[0].input as { card: any }).card), /经验库里已有很像的经验 K1/);
@@ -1257,7 +1269,7 @@ test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一�
   const replace = async (saveLesson: (args: Record<string, unknown>) => string) => {
     const setup = deskSetup({ saveLesson });
     await setup.base.save(normalizeDraft(code8));
-    await setup.base.linkAiops("K1", 31);
+    await setup.base.linkAiops({ id: "K1" }, 31);
     await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
     await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
     await setup.desk.idle();
@@ -1314,7 +1326,7 @@ test("取代旧的排查经验、新的还没进 aiops 时旧的那一行被删�
     },
   });
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -1340,7 +1352,7 @@ test("取代旧的排查经验：再试一次前有人在表格里改了旧的�
     },
   });
   await setup.base.save(normalizeDraft(code8), { requestId: "req-old" });
-  await setup.base.linkAiops("K1", 31);
+  await setup.base.linkAiops({ id: "K1" }, 31);
   await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
   await setup.desk.idle();
@@ -1359,7 +1371,7 @@ test("取代旧的排查经验：再试一次前有人在表格里改了旧的�
 test("取代旧的排查经验：aiops 不认 force、强制保存还说重复时不算进了 aiops，旧的在 aiops 里那条留着，卡片可以再试一次", async () => {
   const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: false, duplicate_of: { id: 31, title: "旧的", why: "错误码相同" } }) });
   await setup.base.save(normalizeDraft(code8));
-  await setup.base.linkAiops("K1", 31);
+  await setup.base.linkAiops({ id: "K1" }, 31);
   await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
   await setup.desk.idle();
@@ -1494,15 +1506,15 @@ test("同步到 aiops 时结果没传回来，再试一次前表格改了标题�
 test("取代旧经验时归档旧的失败：卡片留着再试一次，新的不会存两遍，aiops 也不再存一条", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   const update = backend.update.bind(backend);
   let limited = true;
-  backend.update = async (id, changes) => {
-    if (id === "K1" && limited) {
+  backend.update = async (row, changes) => {
+    if (row.id === "K1" && limited) {
       throw new KnowledgeError("飞书接口限流");
     }
-    return update(id, changes);
+    return update(row, changes);
   };
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -1954,11 +1966,11 @@ test("取代旧经验、归档旧的没做成，再试一次前新的在表格�
   await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   const update = backend.update.bind(backend);
   let limited = true;
-  backend.update = async (id, changes) => {
-    if (id === "K1" && limited) {
+  backend.update = async (row, changes) => {
+    if (row.id === "K1" && limited) {
       throw new KnowledgeError("飞书接口限流");
     }
-    return update(id, changes);
+    return update(row, changes);
   };
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -2025,11 +2037,11 @@ test("取代旧经验时归档旧的没做成：别的卡片不能再取代那�
   const [first, second] = sent.map((s) => (s.input as { card: any }).card);
   const update = backend.update.bind(backend);
   let limited = true;
-  backend.update = async (id, changes) => {
-    if (id === "K1" && limited) {
+  backend.update = async (row, changes) => {
+    if (row.id === "K1" && limited) {
       throw new KnowledgeError("飞书接口限流");
     }
-    return update(id, changes);
+    return update(row, changes);
   };
   await desk.handleCardAction(click(first, "save"));
   await desk.idle();
@@ -2062,7 +2074,7 @@ test("取代旧经验时归档旧的没做成：别的卡片不能再取代那�
   );
   // 取代它的那条归档了，旧的又能被取代
   await base.archive("K2");
-  await update("K1", { status: "active" });
+  await update({ id: "K1" }, { status: "active" });
   const again = await base.save(normalizeDraft({ ...dau, title: "日活的口径（王五改的）" }), { replaces: "k1" });
   assert.deepEqual([again.id, again.replaces], ["K3", "K1"]);
 });
@@ -2072,11 +2084,11 @@ test("取代旧经验时归档旧的没做成，之后旧的那一行在表格�
   await base.save(normalizeDraft(dau), { requestId: "req-0" });
   await tool("knowledge_propose").run({ ...dau, title: "日活的口径（张三改的）", replaces: "K1" }, { signal });
   const update = backend.update.bind(backend);
-  backend.update = async (id, changes) => {
-    if (id === "K1") {
+  backend.update = async (row, changes) => {
+    if (row.id === "K1") {
       throw new KnowledgeError("飞书接口限流");
     }
-    return update(id, changes);
+    return update(row, changes);
   };
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -2105,11 +2117,11 @@ test("取代旧经验：归档旧的之前新的那条在表格里改过（和�
   await tool("knowledge_propose").run({ ...dau, title: "日活的口径（改过）", replaces: "K1" }, { signal });
   const update = backend.update.bind(backend);
   let limited = true;
-  backend.update = async (id, changes) => {
-    if (id === "K1" && limited) {
+  backend.update = async (row, changes) => {
+    if (row.id === "K1" && limited) {
       throw new KnowledgeError("飞书接口限流");
     }
-    return update(id, changes);
+    return update(row, changes);
   };
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -2133,7 +2145,7 @@ test("取代旧经验：归档旧的之前新的那条在表格里改过（和�
 test("归档、取代时用表格里现在的 aiops 编号：卡片发出后编号换成了这一条同步过去的另一条，归档换过的那条", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup();
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
   backend.entries[0].aiopsId = 35;
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
@@ -2142,7 +2154,7 @@ test("归档、取代时用表格里现在的 aiops 编号：卡片发出后编�
 
   const replace = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
   await replace.base.save(normalizeDraft(code8));
-  await replace.base.linkAiops("K1", 31);
+  await replace.base.linkAiops({ id: "K1" }, 31);
   await replace.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   replace.backend.entries[0].aiopsId = 35;
   await replace.desk.handleCardAction(replace.click((replace.sent[0].input as { card: any }).card, "save"));
@@ -2157,7 +2169,7 @@ test("取代旧经验、存好后重新读旧的那条失败：不拿卡片上�
   });
   const { backend, base, desk, sent, calls, click, tool, lastCard } = setup;
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   // 卡片发出后 K1 的 aiops 编号换成了 35（也是从 K1 同步过去的）；存好新的以后读表格失败一次
   backend.entries[0].aiopsId = 35;
@@ -2203,7 +2215,7 @@ test("取代旧经验、存好后重新读旧的那条失败：不拿卡片上�
 test("归档、取代时表格里的 aiops 编号被改成了别的经验（不是从这一条同步过去的）：不归档那条，卡片说明原因，表格改正后再试一次才归档", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
   backend.entries[0].aiopsId = 40;
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
@@ -2219,7 +2231,7 @@ test("归档、取代时表格里的 aiops 编号被改成了别的经验（不�
 
   const replace = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
   await replace.base.save(normalizeDraft(code8));
-  await replace.base.linkAiops("K1", 31);
+  await replace.base.linkAiops({ id: "K1" }, 31);
   await replace.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   replace.backend.entries[0].aiopsId = 40;
   await replace.desk.handleCardAction(replace.click((replace.sent[0].input as { card: any }).card, "save"));
@@ -2244,7 +2256,7 @@ test("取代旧经验：存好新的以后、归档旧的之前有人在表格�
   });
   const { backend, base, desk, sent, calls, click, tool, lastCard } = setup;
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -2599,7 +2611,7 @@ test("同步到 aiops 时有人在表格里归档或者删了这一行：归档�
 test("取代旧的排查经验、新的不同步到 aiops（改成了别的类别）：aiops 里旧的那条留着", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup();
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose").run({ ...code8, category: "answer", title: "用户反馈接口返回空时怎么回复", replaces: "K1" }, { signal });
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -2729,10 +2741,23 @@ test("归档 aiops 经验：点归档时重新取一遍，卡片发出后在 aio
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档 aiops 经验 #40/);
 });
 
+test("归档 aiops 经验：标题很长时，归档好的消息和卡片上只列标题开头", async () => {
+  const title = `user-rpc 降载 ${"很长".repeat(5000)}`;
+  const { desk, sent, click, tool, lastCard, handlers } = deskSetup();
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, title, status: "active", root_cause: "单 Pod 被打满" });
+  await tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal });
+  await desk.handleCardAction(click((sent.at(-1)!.input as { card: any }).card, "archive"));
+  await desk.idle();
+  const message = (sent.at(-1)!.input as { markdown: string }).markdown;
+  assert.match(message, /已归档 aiops 经验 #40/);
+  assert.ok(message.includes(`「${title.slice(0, 80)}…」`));
+  assert.ok(!cardText(lastCard()).includes(title.slice(0, 2000)));
+});
+
 test("归档时表格改成功了、结果没传回来：再点一次照常完成，aiops 里同步的那条也归档", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
   const card = (sent[0].input as { card: any }).card;
   backend.lostUpdates = 1;
@@ -2751,7 +2776,7 @@ test("归档时表格改成功了、结果没传回来：再点一次照常完�
 test("归档：表格里归档了、aiops 那步没做成，再试之前有人删了这一行：不再报找不到，aiops 里同步的那条核对出处后照样归档；卡片发出后改了编号的按草稿编号认", async () => {
   const { backend, base, desk, sent, click, tool, lastCard, handlers } = deskSetup();
   await base.save(normalizeDraft(code8), { requestId: "req-0" });
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
   const archiveLesson = handlers.archive_lesson;
   handlers.archive_lesson = () => {
@@ -2773,7 +2798,7 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
 
   const renamed = deskSetup();
   await renamed.base.save(normalizeDraft(code8), { requestId: "req-1" });
-  await renamed.base.linkAiops("K1", 31);
+  await renamed.base.linkAiops({ id: "K1" }, 31);
   await renamed.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
   renamed.backend.entries[0].id = "K9";
   await renamed.desk.handleCardAction(renamed.click((renamed.sent[0].input as { card: any }).card, "archive"));
@@ -2785,7 +2810,7 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
 test("归档：表格里归档了、aiops 那步没做成，再试之前有人改了这一行的内容：照样接着归档 aiops 里同步的那条", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup();
   await base.save(normalizeDraft(code8), { requestId: "req-0" });
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
   const archiveLesson = handlers.archive_lesson;
   handlers.archive_lesson = () => {
@@ -2808,7 +2833,7 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
   // 再试之前有人复制了这一行（草稿编号一样、按草稿编号分不清）：按归档时记下的 aiops 编号接着做
   const copied = deskSetup();
   await copied.base.save(normalizeDraft(code8), { requestId: "req-1" });
-  await copied.base.linkAiops("K1", 31);
+  await copied.base.linkAiops({ id: "K1" }, 31);
   await copied.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
   copied.handlers.archive_lesson = () => {
     throw new Error("aiops 现在连不上");
@@ -2827,7 +2852,7 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
 test("归档：表格里归档了、aiops 那步没做成，再试之前这一行被删了、编号给了别的有效的行：不按那一行记的 aiops 编号归档，按归档时记下的", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup();
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
   const archiveLesson = handlers.archive_lesson;
   handlers.archive_lesson = () => {
@@ -2854,7 +2879,7 @@ test("取代旧经验：旧的在表格里归档了、它在 aiops 里那条没�
   for (const change of ["edit", "copy"] as const) {
     const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 33 }) });
     await setup.base.save(normalizeDraft(code8), { requestId: "req-0" });
-    await setup.base.linkAiops("K1", 31);
+    await setup.base.linkAiops({ id: "K1" }, 31);
     await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
     const archiveLesson = setup.handlers.archive_lesson;
     setup.handlers.archive_lesson = () => {
@@ -2921,7 +2946,7 @@ const syncedHits = () =>
 test("回答前检索：按 aiops 经验排查过程末尾的出处去重（编号不分大小写），表格里的 aiops 编号改错了也不会去掉不相干的那条", async () => {
   const { backend, base, desk } = deskSetup({ searchLessons: syncedHits });
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 40);
+  await base.linkAiops({ id: "K1" }, 40);
   const found = await desk.lookup("gateway-api 报 code=8 ResourceExhausted", task);
   assert.deepEqual(found?.ids, ["K1", "aiops#40"], "#31 是 K1 同步过去的，去掉；#40 是 Open WebUI 存的，表格里记成了 K1 的也列出");
   // 表格里只把编号改成了小写：还是同一条，照样认出 #31 是它同步过去的
@@ -2961,7 +2986,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
 test("回答前检索：团队经验库这次没查到的，aiops 查到了它同步过去的那条照样列出", async () => {
   const { base, desk } = deskSetup();
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
   const found = await desk.lookup("完全不相干的一句话", task);
   assert.deepEqual(found?.ids, ["aiops#31", "aiops#40"]);
 });
@@ -2969,7 +2994,7 @@ test("回答前检索：团队经验库这次没查到的，aiops 查到了它�
 test("回答前检索：两个库一起查，已同步到 aiops 的只列团队经验库那条；一个库出错不影响另一个，都出错时返回空", async () => {
   const { base, desk } = deskSetup({ searchLessons: syncedHits });
   await base.save(normalizeDraft(code8));
-  await base.linkAiops("K1", 31);
+  await base.linkAiops({ id: "K1" }, 31);
 
   const found = await desk.lookup("gateway-api 报 code=8 ResourceExhausted", task);
   assert.deepEqual(found?.ids, ["K1", "aiops#40"]);
@@ -3418,4 +3443,24 @@ test("aiops 里别处存的经验写进了密钥：回答前检索不给模型�
   handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", keywords: token });
   await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal }), /aiops 经验 #40 里像是写进了密钥，不能列在卡片上/);
   assert.equal(sent.length, 0);
+});
+
+test("按编号找到的行带着别的草稿编号时不算：原来那行删了、另一次保存的行改成了这个编号，不拿它接着同步、取代、归档", async () => {
+  const backend = new MemoryBackend();
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const first = await base.save(normalizeDraft(dau), { requestId: "req-1" });
+  await base.save(normalizeDraft({ ...dau, title: "月活的口径", keywords: "月活,MAU" }), { requestId: "req-2" });
+  // K1 那一行被删了，K2 那一行改成了 K1
+  backend.entries = backend.entries.filter((entry) => entry.id !== "K1");
+  backend.entries[0].id = "K1";
+
+  assert.equal(await base.saved("req-1", "K1"), undefined, "再试一次时找不到原来那行，不拿 K2 存的那行接着同步");
+  await assert.rejects(base.save(normalizeDraft({ ...dau, title: "日活的口径（改过）" }), { replaces: "K1", seen: first }), /不在经验库里了/);
+  await assert.rejects(base.archive("K1", { seen: first }), MissingEntryError);
+  assert.equal(backend.entries[0].status, "active");
+  assert.equal(backend.entries.length, 1);
+
+  // 草稿编号被清空了的行（表格里能改）照样按编号认
+  delete backend.entries[0].requestId;
+  assert.equal((await base.saved("req-1", "K1"))?.title, "月活的口径");
 });
