@@ -340,6 +340,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // OpenPGP 私钥（gpg --export-secret-keys --armor），base64 编码过的也算
     `${["-----BEGIN PGP PRIVATE", "KEY BLOCK-----"].join(" ")}\n\n${base64(Buffer.alloc(96, 5))}\n=AbCd\n${["-----END PGP PRIVATE", "KEY BLOCK-----"].join(" ")}`,
     `key: ${base64(`${["-----BEGIN PGP PRIVATE", "KEY BLOCK-----"].join(" ")}\n\n${base64(Buffer.alloc(96, 5))}`)}`,
+    // PuTTY 的私钥文件（.ppk），加了密码的也算
+    ["PuTTY-User-Key-File-3: ssh-ed25519", "Encryption: none", "Comment: eddsa-key-20261009", "Public-Lines: 2", base64(Buffer.alloc(51, 1)).replace(/.{64}/, "$&\n"), ["Private", "Lines: 1"].join("-"), base64(Buffer.alloc(36, 2)), `Private-MAC: ${"ab".repeat(32)}`].join("\n"),
+    ["PuTTY-User-Key-File-2: ssh-rsa", "Encryption: aes256-cbc", ["Private", "Lines: 14"].join("-"), base64(Buffer.alloc(48, 3)), base64(Buffer.alloc(48, 4))].join("\r\n"),
+    // 字符串里套着转义过的 JSON，转义了几层都算
+    `payload="{\\"password\\":\\"${["CorrectHorse", "BatteryStaple9"].join("")}\\"}"`,
+    `{"body":"{\\"config\\":\\"{\\\\\\"api_key\\\\\\":\\\\\\"${["correct", "horse", "battery", "staple"].join("")}\\\\\\"}\\"}"}`,
     // base64 编码的别的密钥（名字不像密钥的也算）：Secret 的 data 下、kubectl 取出来的 JSON、环境变量、echo … | base64 -d
     `apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ntype: Opaque\ndata:\n  DATABASE_URL: ${base64(dbUrl)}\n  username: ${base64("app")}`,
     `kubectl get secret db -o jsonpath='{.data}'\n{"DATABASE_URL":"${base64(dbUrl)}"}`,
@@ -445,6 +451,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host, Signature=<signature>；Digest 里 response=\"see above\"",
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
+    // PuTTY 私钥文件只说了格式、没贴私钥的；转义过的 JSON 里是占位、打了码的
+    "PuTTY 的 .ppk 文件里 Private-Lines: 14 后面那几行就是私钥，不要贴到群里；PuTTY-User-Key-File-3 是新格式",
+    'payload="{\\"token\\":\\"${MCP_AIOPS_TOKEN}\\",\\"password\\":\\"******\\"}"；路径 C:\\new\\tmp\\report.txt',
     // OpenPGP 公钥、签名
     `-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n${base64(Buffer.alloc(96, 5))}\n-----END PGP PUBLIC KEY BLOCK-----\n-----BEGIN PGP SIGNATURE-----\n${base64(Buffer.alloc(48, 6))}\n-----END PGP SIGNATURE-----`,
     `encrypted: ${base64(rsaKeys.privateKey.export({ type: "pkcs8", format: "der", cipher: "aes-256-cbc", passphrase: "x" }))}；sha512: ${base64(Buffer.alloc(64, 7))}`,
@@ -2930,6 +2939,39 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   assert.equal(desk.sent.length, 0);
   // 新存的不会占掉 K2 到 K8
   assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K9");
+});
+
+test("有人在表格里把某一项改得比起草时的上限还长：这一行不拿来检索、不给模型看，也不能起草归档卡片；编号里贴了密钥的，日志里不写编号", async () => {
+  const { base, backend } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（App 端）", keywords: "日活,App" }));
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（小程序）", keywords: "日活,小程序" }));
+  backend.entries[1].conclusion = `日活按设备去重。${"补充说明。".repeat(400)}`;
+  backend.entries[2].title = `日活的口径${"（很长的标题）".repeat(12)}`;
+  const leakedId = ["token", "CorrectHorseBatteryStaple9"].join("=");
+  backend.entries.push({ ...structuredClone(backend.entries[0]), id: leakedId, requestId: undefined, title: "日活的口径（复制）" });
+  const warnings: string[] = [];
+  const fresh = new KnowledgeBase(backend, { logger: { ...quiet, warn: (line: string) => warnings.push(line) } });
+  assert.deepEqual(
+    (await fresh.search("日活")).map((hit) => hit.entry.id),
+    ["K1"],
+  );
+  assert.ok(warnings.some((line) => /表格里 K2 的结论超过了 2000 字，请在表格里改好/.test(line)), warnings.join("\n"));
+  assert.ok(warnings.some((line) => /表格里 K3 的标题超过了 80 字，请在表格里改好/.test(line)), warnings.join("\n"));
+  assert.ok(warnings.some((line) => /表格里 有一行（编号不写出来） 的编号里像是有密码或令牌/.test(line)), warnings.join("\n"));
+  assert.ok(!warnings.some((line) => line.includes("CorrectHorse")));
+
+  const desk = deskSetup();
+  desk.backend.entries = structuredClone(backend.entries);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|补充说明|很长的标题/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里结论超过了 2000 字，先不用它。请群里有写权限的人在经验库表格里改好/);
+  await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /结论超过了 2000 字/);
+  await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K3" }, { signal }), /标题超过了 80 字/);
+  assert.equal(desk.sent.length, 0);
+  // 改回上限以内就照常用
+  backend.entries[1].conclusion = "日活按设备去重。";
+  await fresh.entries(true);
+  assert.deepEqual((await fresh.search("日活", { limit: 5 })).map((hit) => hit.entry.id).sort(), ["K1", "K2"]);
 });
 
 test("表格里不止一行用了同一个编号（有人复制了行）：这几行都不拿来检索、看全文、起草归档，新编号照常往后排", async () => {

@@ -208,6 +208,24 @@ test("报错只放在 structuredContent 里、没有文字时：照样认出服�
   assert.match(log.find(/MCP 调用 aiops\.archive_lesson/)!.text, /出错 结果=\d+字：\{"error":"经验 #9 不存在"\}/);
 });
 
+test("程序自己调用：报错原文里像有密钥时，报错（会列在卡片上）和审计日志里都不带原文；模型调用的报错照常给原文", async () => {
+  const leaked = `连接失败：mysql://aiops:${["Correct", "Horse", "Battery9"].join("")}@db:3306/aiops`;
+  const server = await fake({ call: () => text(leaked, true) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+
+  const err = await hub.callDirect("aiops", "archive_lesson", { id: 9 }, task).then(
+    () => assert.fail("应该报错"),
+    (error: Error) => error,
+  );
+  assert.equal(err.message, "aiops 返回错误：（报错原文里像是有密钥，不列出来）");
+  const audit = log.find(/MCP 调用 aiops\.archive_lesson/)!.text;
+  assert.match(audit, /出错 结果=\d+字：（报错原文里像是有密钥，不列出来）/);
+  assert.ok(!audit.includes("CorrectHorse"));
+
+  await assert.rejects(toolOf(hub, "aiops_query_logs").run({ logql: "{app=\"x\"}" }, { signal }), (error: Error) => error.message.includes(leaked));
+});
+
 test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
   let busy = 2;
   const server = await fake({

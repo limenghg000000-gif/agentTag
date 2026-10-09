@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontex
 import { type CallToolResult, ErrorCode, McpError, type Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
+import { containsSecret } from "./knowledge.js";
 import { RESULT_NOTES } from "./mcp-notes.js";
 import { formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
 import type { Tool } from "./tools/tool.js";
@@ -33,6 +34,8 @@ const RESYNC_GAP_MS = 30_000;
 const MAX_INSTRUCTIONS_CHARS = 8000;
 
 const BUSY = /服务繁忙|server (is )?busy|too many (concurrent )?requests/i;
+/** 程序调用的报错原文里像有密钥时，报错和审计日志里换成这句 */
+const HIDDEN = "（报错原文里像是有密钥，不列出来）";
 /** 名字里带这些动词的工具算「会写东西」，宁可多拦 */
 const WRITE_VERB =
   /(^|_)(create|save|update|delete|remove|archive|restart|scale|exec|apply|patch|rollback|silence|set|put|write|edit|deploy|kill|drain|cordon|evict|upsert|insert)(_|$)/;
@@ -194,7 +197,7 @@ export class McpHub {
     }
     const timeout = server.config.timeoutsMs[tool] ?? DEFAULT_MCP_TIMEOUT_MS;
     // 程序要解析结果：有 structuredContent 时用它的 JSON（文字部分可能是给人看的说明），没有时用文字
-    const { result, raw, audit } = await this.request(server, tool, args, task, signal, timeout, "程序调用");
+    const { result, raw, audit } = await this.request(server, tool, args, task, signal, timeout, true);
     const data = result.structuredContent ? JSON.stringify(result.structuredContent) : raw;
     audit(`结果=${data.length}字`);
     return data;
@@ -423,7 +426,10 @@ export class McpHub {
     return text;
   }
 
-  /** 调一次工具：服务繁忙时退避重试，失败和出错记审计日志并抛错；成功时返回结果，审计日志由调用方补上结果大小 */
+  /**
+   * 调一次工具：服务繁忙时退避重试，失败和出错记审计日志并抛错；成功时返回结果，审计日志由调用方补上结果大小。
+   * direct 是程序自己调的：报错会列在群里的卡片上，原文里像有密钥的不带（审计日志里也不记）
+   */
   private async request(
     server: ServerState,
     tool: string,
@@ -431,14 +437,14 @@ export class McpHub {
     task: McpTaskContext,
     signal: AbortSignal,
     timeout: number,
-    caller?: string,
+    direct = false,
   ): Promise<{ result: CallToolResult; raw: string; audit: (outcome: string) => void }> {
     const { name } = server.config;
     const startedAt = this.now();
     let retries = 0;
     const audit = (outcome: string, failed = false) => {
       const line =
-        `MCP 调用 ${name}.${tool}${caller ? `（${caller}）` : ""} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
+        `MCP 调用 ${name}.${tool}${direct ? "（程序调用）" : ""} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
         `参数=${clip(JSON.stringify(args), 300)} ${outcome} 用时=${this.now() - startedAt}ms${retries > 0 ? ` 繁忙重试=${retries}` : ""}`;
       if (failed) {
         this.logger.warn(line);
@@ -466,17 +472,19 @@ export class McpHub {
       if (!(err instanceof McpError) && !signal.aborted) {
         this.resyncSoon(server);
       }
-      const message = describeCallError(err, server.config, tool, timeout);
+      const described = describeCallError(err, server.config, tool, timeout);
+      const message = direct && containsSecret(described) ? `调用 ${name} 的 ${tool} 失败${HIDDEN}` : described;
       audit(`失败：${message}`, true);
       throw new Error(message);
     }
 
     const raw = resultText(result);
     if (result.isError) {
+      const shown = (chars: number) => (direct && containsSecret(raw) ? HIDDEN : clip(raw, chars));
       const message = BUSY.test(raw)
-        ? `${name} 服务繁忙（并发满了），重试 ${retries} 次还是不行：${clip(raw, 300)}。可以稍后再试，或者先按已有的证据回答`
-        : `${name} 返回错误：${clip(raw, 2000)}`;
-      audit(`出错 结果=${raw.length}字：${clip(raw, 200)}`, true);
+        ? `${name} 服务繁忙（并发满了），重试 ${retries} 次还是不行：${shown(300)}。可以稍后再试，或者先按已有的证据回答`
+        : `${name} 返回错误：${shown(2000)}`;
+      audit(`出错 结果=${raw.length}字：${shown(200)}`, true);
       throw new Error(message);
     }
     return { result, raw, audit: (outcome) => audit(outcome) };

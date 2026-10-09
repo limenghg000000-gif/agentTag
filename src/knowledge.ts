@@ -92,7 +92,10 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   updatedAt?: string;
   /** 有人直接在表格里写进了像密钥的东西（哪一项里像是有什么）：不拿来检索，也不给模型看 */
   unsafe?: string;
-  /** 表格里这一行缺了标题或结论（写到一半、有人清空了）：编号、去重照常算它，不拿来检索，也不拿它同步、归档 */
+  /**
+   * 表格里这一行缺了标题或结论（写到一半、有人清空了），或者哪一项比起草时的字数上限还长（有人在表格里加长了）：
+   * 编号、去重照常算它，不拿来检索，也不拿它同步、归档
+   */
   incomplete?: string;
   /**
    * 表格里不止一行用了这个编号（有人复制了行、改错了编号）：说「经验 K3」时分不清是哪一行。
@@ -234,7 +237,7 @@ export class KnowledgeBase {
 
   /**
    * 读整张表，超过 readTimeoutMs 就不等了、报错（还在读的那次回来了也不用）。
-   * 表格能直接改：缺了标题或结论的行（incomplete）、有人写进了密钥的行（unsafe）记下来，编号、去重照常算它们，检索、给模型看时跳过
+   * 表格能直接改：缺了标题或结论、改得超长的行（incomplete）、有人写进了密钥的行（unsafe）记下来，编号、去重照常算它们，检索、给模型看时跳过
    */
   private read(): Promise<KnowledgeEntry[]> {
     const timeout = timeoutSignal(this.readTimeoutMs);
@@ -250,15 +253,21 @@ export class KnowledgeBase {
 
   private checkRow(entry: KnowledgeEntry): KnowledgeEntry {
     const missing = [entry.title ? "" : "标题", entry.conclusion ? "" : "结论"].filter(Boolean);
-    const incomplete = missing.length > 0 ? `${missing.join("、")}是空的` : undefined;
+    // 字数上限和起草时一样：表格里改得超长的行放不进卡片和提示词
+    const tooLong = draftFields(entry)
+      .filter(([, text, limit]) => text !== undefined && text.trim().length > limit)
+      .map(([name, , limit]) => `${name}超过了 ${limit} 字`);
+    const incomplete = [missing.length > 0 ? `${missing.join("、")}是空的` : "", ...tooLong].filter(Boolean).join("，") || undefined;
     const unsafe = entrySecret(entry);
-    const warning = [incomplete && `${incomplete}，请在表格里补上`, unsafe && `${unsafe}，请在表格里删掉`].filter(Boolean).join("；");
+    const warning = [incomplete && `${incomplete}，请在表格里改好`, unsafe && `${unsafe}，请在表格里删掉`].filter(Boolean).join("；");
     if (!warning) {
       return entry;
     }
     if (!this.warned.has(`${entry.id}\n${warning}`)) {
       this.warned.add(`${entry.id}\n${warning}`);
-      this.logger.warn(`经验库：表格里 ${entry.id} 的${warning}。这一行先不拿来检索、也不给模型看`);
+      // 编号里就写着密钥时日志里不写编号
+      const row = findSecret(entry.id) ? "有一行（编号不写出来）" : entry.id;
+      this.logger.warn(`经验库：表格里 ${row} 的${warning}。这一行先不拿来检索、也不给模型看`);
     }
     return { ...entry, ...(incomplete ? { incomplete } : {}), ...(unsafe ? { unsafe } : {}) };
   }
@@ -618,6 +627,8 @@ const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
 
 const SECRET_PATTERNS: [RegExp, string][] = [
   [PRIVATE_KEY_HEADER, "私钥"],
+  // PuTTY 的私钥文件（.ppk）：Private-Lines 后面跟的就是私钥（加了密码的也算）。只有开头一行、没有私钥那几行的不算
+  [/\bPrivate-Lines:[^\S\r\n]*\d+\s+[A-Za-z0-9+/]{16,}/, "私钥"],
   [/\bglpat-[\w-]{16,}/, "GitLab 令牌"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, "GitHub 令牌"],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/, "GitHub 令牌"],
@@ -1253,6 +1264,9 @@ export function containsSecret(text: string): boolean {
   return findSecret(text) !== undefined;
 }
 
+/** 转义的换行、回车、制表符；引号、反斜杠、斜杠去掉反斜杠就是它自己 */
+const ESCAPED: Record<string, string> = { n: "\n", r: "\r", t: "\t" };
+
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
 function findSecret(text: string): string | undefined {
   const known =
@@ -1305,7 +1319,13 @@ function findSecret(text: string): string | undefined {
       bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],
     ),
   ];
-  return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
+  if (values.some((value) => !isPlaceholder(value))) {
+    return "密码或令牌";
+  }
+  // 字符串里套着转义过的 JSON（payload="{\"password\":\"…\"}"）：反斜杠夹在名字、引号和值中间，上面的规则都对不上。
+  // 去掉一层转义再看一遍，套了几层就递归几次（每次都变短，会停下来）
+  const unescaped = text.replace(/\\(["'\\/nrt])/g, (_, char: string) => ESCAPED[char] ?? char);
+  return unescaped === text ? undefined : findSecret(unescaped);
 }
 
 /** 表格里这一行哪一项里像是有密钥；没有时返回 undefined。编号、确认人这些也会写进检索结果，有编辑权限的人也能改，一起查 */
@@ -1333,6 +1353,21 @@ function entrySecret(entry: KnowledgeEntry): string | undefined {
     }
   }
   return undefined;
+}
+
+/** 起草时有字数上限的那几项：[名字, 内容, 上限]。表格里读到的行也按它查 */
+function draftFields(draft: KnowledgeDraft): [string, string | undefined, number][] {
+  return [
+    ["标题", draft.title, MAX_TITLE_CHARS],
+    ["适用范围", draft.scope, MAX_FIELD_CHARS],
+    ["问题或场景", draft.question, MAX_FIELD_CHARS],
+    ["结论", draft.conclusion, MAX_FIELD_CHARS],
+    ["怎么处理", draft.handling, MAX_FIELD_CHARS],
+    ["依据或排查过程", draft.basis, MAX_FIELD_CHARS],
+    ["关键词", draft.keywords, MAX_FIELD_CHARS],
+    ["错误码", draft.errorCodes, MAX_FIELD_CHARS],
+    ["告警名", draft.alertname, MAX_FIELD_CHARS],
+  ];
 }
 
 /** 去掉首尾空白、检查必填、长度和密钥 */

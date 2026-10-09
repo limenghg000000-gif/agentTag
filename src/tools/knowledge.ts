@@ -1356,7 +1356,7 @@ function rowDraft(entry: KnowledgeEntry): KnowledgeDraft | undefined {
   }
 }
 
-/** 表格里有人写进了密钥、缺了标题或结论的那一条：不给模型看，让人去表格里改 */
+/** 表格里有人写进了密钥、缺了标题或结论、改得超长的那一条：不给模型看，让人去表格里改 */
 function unusableNote(entry: KnowledgeEntry): string {
   if (entry.unsafe) {
     return `经验 ${entry.id} 在表格里被改过，${entry.unsafe}，先不给你看。请群里有写权限的人直接在经验库表格里删掉密钥，回答里不要猜它的内容`;
@@ -1364,5 +1364,5 @@ function unusableNote(entry: KnowledgeEntry): string {
   if (entry.conflict) {
     return `经验 ${entry.id} 在表格里${entry.conflict}，分不清是哪一行，先不用它。请群里有写权限的人在经验库表格里把重复的编号改掉，回答里不要猜它的内容`;
   }
-  return `经验 ${entry.id} 在表格里${entry.incomplete}，先不用它。请群里有写权限的人在经验库表格里补上`;
+  return `经验 ${entry.id} 在表格里${entry.incomplete}，先不用它。请群里有写权限的人在经验库表格里改好`;
 }
