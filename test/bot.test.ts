@@ -1197,6 +1197,22 @@ test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号�
   assert.equal(seen("src/legacy/user.ts"), false);
 });
 
+test("读失败的文件只认说它不存在的那几句话，同一句里转折以后、别的引用后面说的不算", () => {
+  const seen = codeEvidence([], [], ["没有这个文件：src/a.ts", "没有这个文件：src/b.ts", "没有这个文件：src/foo.ts"]);
+  const unseen = (answer: string) => unseenCodeCitations(answer, seen).map((cite) => cite.text);
+  assert.deepEqual(unseen("没找到 src/a.ts，但 src/b.ts:10 初始化配置"), ["src/b.ts:10"]);
+  assert.deepEqual(unseen("没找到 src/a.ts，src/b.ts:10 初始化配置"), ["src/b.ts:10"]);
+  assert.deepEqual(unseen("虽然没找到 src/foo.ts，但 src/foo.ts:10 初始化配置"), ["src/foo.ts:10"]);
+  assert.deepEqual(unseen("一开始没找到，不过 src/foo.ts:10 初始化配置"), ["src/foo.ts:10"]);
+  assert.deepEqual(unseen("src/a.ts:3 初始化配置。src/b.ts 不存在"), ["src/a.ts:3"]);
+  assert.deepEqual(unseen("src/a.ts:3 初始化配置，src/b.ts 不存在"), ["src/a.ts:3"]);
+  // 并列写的几处共用前后的话
+  assert.deepEqual(unseen("src/a.ts 和 src/b.ts 都不存在"), []);
+  assert.deepEqual(unseen("仓库里没找到 src/a.ts 和 src/b.ts"), []);
+  assert.deepEqual(unseen("`src/a.ts`、`src/b.ts:3` 在仓库里都找不到"), []);
+  assert.deepEqual(unseen("你问的 src/foo.ts:10，在仓库里找不到"), []);
+});
+
 test("代码引用的路径要整段对上，改文件的结果里写的行也认", () => {
   const seen = codeEvidence(
     [],
@@ -1312,9 +1328,14 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     assert.match(String(failedRead.requests[2].messages.at(-1)?.content), /src\/legacy\/user\.ts:10/);
     assert.deepEqual(failedRead.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], tool);
   }
-  const notSearched = await ask(["实现在 src/legacy/user.ts 里", "仓库里没搜到 src/legacy/user.ts"], { tool: "code_find" });
+  // code_search 搜的是文件内容：没搜到这个路径，不能拿来说没有这个文件
+  const notSearched = await ask(["实现在 src/legacy/user.ts 里", "仓库里不存在 src/legacy/user.ts"], { tool: "code_find" });
   assert.equal(notSearched.requests.length, 3);
-  assert.deepEqual(notSearched.replies, ["仓库里没搜到 src/legacy/user.ts"]);
+  assert.deepEqual(notSearched.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
+  // 没搜到时结果里的分支和提交号照样算查到的
+  const emptySearch = await ask(["查的是 master 分支 @ 1a2b3c4。没有找到 getUserCenterFromRemote。"]);
+  assert.equal(emptySearch.requests.length, 2);
+  assert.deepEqual(emptySearch.replies, ["查的是 master 分支 @ 1a2b3c4。没有找到 getUserCenterFromRemote。"]);
 
   // 结果里被截掉、模型没看到的路径不算查到
   const clipped = await ask(["入口在 src/index.ts，另外 src/hidden/tail.ts 里有初始化", "入口在 src/index.ts"], { tool: "code_list_files" });

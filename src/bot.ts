@@ -234,9 +234,8 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
-          // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到。
-          // 没搜到的结果会带上搜的内容（「没有搜到「src/foo.ts」」），和报错一样只说明查过、没查到
-          (NOTHING_FOUND.test(output) ? failures : evidence).push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
+          // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到
+          evidence.push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS).replace(SEARCH_ECHO, "$1$2"));
           return output;
         },
       }),
@@ -304,7 +303,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, deps.codeRepos ?? []);
-      const unseen = unseenCodeCitations(result.text, (text, line, sentence) => seen(text, line, sentence) || mentions(userText, text)).filter(
+      const unseen = unseenCodeCitations(result.text, (text, line, claim) => seen(text, line, claim) || mentions(userText, text)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -463,8 +462,8 @@ export interface CodeCitation {
   located: boolean;
 }
 
-/** 认不认得回答里的路径、提交号；line 是路径后面写的行号，sentence 是回答里引用它的那句话 */
-export type CitationCheck = (text: string, line?: number, sentence?: string) => boolean;
+/** 认不认得回答里的路径、提交号；line 是路径后面写的行号，claim 是回答里说这处引用的那几句话（见 claimAbout） */
+export type CitationCheck = (text: string, line?: number, claim?: string) => boolean;
 
 /**
  * 回答里引用、但 seen 认不出来的代码位置（文件路径、行号和提交号）。
@@ -472,54 +471,88 @@ export type CitationCheck = (text: string, line?: number, sentence?: string) => 
  * 和 userlogic.go:35 这些仓库里根本没有的提交和文件，把握写高
  */
 export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCitation[] {
-  const cites = new Map<string, CodeCitation>();
+  const found: Cited[] = [];
   for (const match of answer.matchAll(CODE_PATHS)) {
     const path = match[1];
-    const at = LINE_AFTER_PATH.exec(answer.slice(match.index + match[0].length));
+    const start = match.index + match[0].length - path.length;
+    const at = LINE_AFTER_PATH.exec(answer.slice(start + path.length));
     const line = at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
-    if (!seen(path, line, sentenceAt(answer, match.index + match[0].length - path.length))) {
-      const text = line === undefined ? path : `${path}:${line}`;
-      cites.set(text, { text, located: line !== undefined });
-    }
+    found.push({ text: path, line, start, end: start + path.length + (at?.[0].length ?? 0) });
   }
+  const paths = found.length;
   for (const match of answer.matchAll(COMMIT_REFS)) {
-    if (!seen(match[1], undefined, sentenceAt(answer, match.index))) {
-      cites.set(match[1], { text: match[1], located: true });
-    }
+    const start = match.index + match[0].length - match[1].length;
+    found.push({ text: match[1], start, end: start + match[1].length });
   }
+  const cites = new Map<string, CodeCitation>();
+  found.forEach((cite, i) => {
+    if (!seen(cite.text, cite.line, claimAbout(answer, cite, found))) {
+      const text = cite.line === undefined ? cite.text : `${cite.text}:${cite.line}`;
+      cites.set(text, { text, located: i >= paths || cite.line !== undefined });
+    }
+  });
   return [...cites.values()];
 }
 
-/** 回答里 index 处所在的那句话（按句号、问号、分号、换行断句，路径里的点不算） */
-function sentenceAt(text: string, index: number): string {
-  const ends = /[。！？!?；;\n]/;
-  let start = index;
-  while (start > 0 && !ends.test(text[start - 1])) {
-    start--;
-  }
-  let end = index;
-  while (end < text.length && !ends.test(text[end])) {
-    end++;
-  }
-  return text.slice(start, end);
+/** 回答里的一处引用：路径（带行号的连行号一起）或提交号，start、end 是它在回答里的位置 */
+interface Cited {
+  text: string;
+  line?: number;
+  start: number;
+  end: number;
 }
+
+/**
+ * 回答里说这处引用的那几句话：在同一句话里，到前后别的引用为止，碰到「但」「不过」这类转折也停；
+ * 「src/a.ts 和 src/b.ts 都不存在」这样并列写的几处共用前后的话。
+ * 用来看这句话说的是不是它不存在：「没找到 src/a.ts，但 src/b.ts:10 初始化配置」里，src/b.ts:10 不算说了不存在
+ */
+function claimAbout(text: string, cite: Cited, all: readonly Cited[]): string {
+  const spans = [...all].sort((a, b) => a.start - b.start);
+  let first = spans.indexOf(cite);
+  let last = first;
+  while (first > 0 && JOINED.test(text.slice(spans[first - 1].end, spans[first].start))) {
+    first--;
+  }
+  while (last < spans.length - 1 && JOINED.test(text.slice(spans[last].end, spans[last + 1].start))) {
+    last++;
+  }
+  let left = spans[first].start;
+  while (left > (first > 0 ? spans[first - 1].end : 0) && !SENTENCE_END.test(text[left - 1])) {
+    left--;
+  }
+  let right = spans[last].end;
+  while (right < (last < spans.length - 1 ? spans[last + 1].start : text.length) && !SENTENCE_END.test(text[right])) {
+    right++;
+  }
+  const before = text.slice(left, spans[first].start).split(TURN).at(-1) ?? "";
+  const after = text.slice(spans[last].end, right).split(TURN)[0];
+  return `${before}${after}`;
+}
+
+/** 断句：句号、问号、分号、换行（路径里的点不算） */
+const SENTENCE_END = /[。！？!?；;\n]/;
+/** 两处引用之间只隔着「和」「、」这类并列的词 */
+const JOINED = /^[\s`'"、/]*(?:和|及|与|或|以及|and|or)?[\s`'"、/]*$/i;
+/** 转折：前后说的不是一回事 */
+const TURN = /但|不过|然而|可是|\bbut\b|\bhowever\b/i;
 
 /**
  * 按这次的工具结果认引用：路径、提交号出现在结果里就算；带行号的还要那一行真在结果里：搜索结果、报错堆栈里的「路径:行号」，
  * 读这个文件时读到了那一行（「35| …」），或者改文件的结果里写的行（「已修改 src/foo.ts 第 35 行起的内容」、新建的文件）。
  * 只列过文件、读了别的段落，编一个行号照样不认。路径要整段对上：结果里只有 src/index.tsx，不能认 src/index.ts。
- * 工具报的错、没搜到的结果只说明查过、没查到（「没有这个文件：src/foo.ts」），所以只认回答里那句话说的就是不存在或读不到的；
+ * 工具报的错只说明查过、没查到（「没有这个文件：src/foo.ts」），所以只认回答里说的就是它不存在、读不到的；
  * 读失败以后照样讲这个文件、这一行写了什么，不认。
  * 回答里写成「./路径」或「仓库名/路径」（ai/aiops-mcp/internal/x.go）时，去掉前缀再找
  */
 export function codeEvidence(repos: readonly string[], outputs: readonly string[], failures: readonly string[] = []): CitationCheck {
-  return (cite, line, sentence = "") => {
+  return (cite, line, claim = "") => {
     const text = cite.replace(/^\.\//, "");
     const forms = [
       text,
       ...repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => text.slice(repo.length + 1)),
     ];
-    const missing = SAYS_MISSING.test(sentence);
+    const missing = SAYS_MISSING.test(claim);
     return forms.some(
       (form) =>
         (missing && failures.some((failure) => mentions(failure, form))) ||
@@ -536,8 +569,11 @@ function mentions(text: string, cite: string): boolean {
 /** 回答里说这个文件、提交不存在或者读不到 */
 const SAYS_MISSING = /不存在|没有(?:这个|该|此|找到|搜到)|没找到|没搜到|没读到|找不到|搜不到|读不到|读取失败|无法读取|打不开|不在(?:仓库|代码|机器人)|not found|n[o']t exist|no such|missing/i;
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
-/** code_search 没搜到时的结果（src/repo.ts 的 search） */
-const NOTHING_FOUND = /^(?:没有搜到「|在这 \d+ 个分支上都没有搜到「)/;
+/**
+ * code_search 没搜到时，结果开头把搜的内容照抄了一遍（「没有搜到「src/foo.ts」（master 分支 @ 1a2b3c4）」）。
+ * 搜的是文件内容，没搜到既不说明有这个文件，也不说明没有，所以抄的这段不算查到；后面的分支和提交号照样算
+ */
+const SEARCH_ECHO = /^(没有搜到「|在这 \d+ 个分支上都没有搜到「)[\s\S]*?(」[（：])/;
 /** 路径前后不能紧挨着别的路径字符（mysrc/a.ts、src/a.tsx 都不是 src/a.ts）；前面是 / 的算，报错堆栈里常写全路径 /app/src/a.ts */
 const PATH_START = "(?<![\\w.-])";
 const PATH_END = "(?![\\w/-]|\\.\\w)";
