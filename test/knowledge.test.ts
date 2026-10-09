@@ -166,6 +166,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "api_key:\n  my correct horse battery staple",
     "api_key: |-\n  my correct horse battery staple",
     "aiops:\n  token: >\n    correct horse\n    battery staple\n  url: https://aiops.example",
+    // 值前面、中间有注释行的（缩进多少都行）
+    "password:\n  # production\n  correcthorsebatterystaple",
+    "aiops:\n  token:\n# 2026-10 换过\n\n    correct horse\n    # 第二段\n    battery staple",
     // 一行开头的 YAML、properties 配置项，不带引号、中间有空格的值也取到行尾
     "api_key: my correct horse battery staple",
     "aiops:\n  api_key: my correct horse battery staple  # 换过",
@@ -213,9 +216,14 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '{"db_pass": "correct horse battery"}',
     "deployctl --db-pass correcthorsebatterystaple",
     '<entry key="redis_pass">correcthorsebatterystaple</entry>',
+    // 值是 a.b.c 这样、最后一段只是以 pass 结尾的（compass、bypass），不是读配置
+    "设置 DB_PASS=correct.horse.compass 后重启",
+    "smtp_pass: battery.staple.bypass",
     // 值前面有 XML 注释的
     '<property name="password"><!-- 生产库 --><value>correcthorsebatterystaple</value></property>',
     '<entry key="token">\n  <!-- rotated monthly -->\n  correcthorsebatterystaple\n</entry>',
+    "<password><!-- 生产库 -->correcthorsebatterystaple</password>",
+    "<api-key>\n  <!-- rotated -->\n  <![CDATA[correct horse battery staple]]>\n  <!-- 下次换 -->\n</api-key>",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -254,6 +262,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "token: signature is invalid\nToken: has expired, please login again\ntoken_ttl: 3600 seconds\ntokenizer: bert base uncased",
     // 冒号后面空着、下面是嵌套的子项（k8s 的 secret: 下面写 secretName），不是它的值；块写法里是变量引用的也不算
     "volumes:\n  - name: tok\n    secret:\n      secretName: aiops-secrets\napi_key: |-\n  ${MODEL_API_KEY}",
+    // 注释行后面才是嵌套子项的也不算；只有注释行、下面没有值的也不算
+    "secret:\n  # k8s 的写法\n  secretName: aiops-secrets\ntoken:\n  # 找管理员要\nurl: https://aiops.example",
     // 命令行：选项名不以密钥的词结尾的、值是下一个选项、变量、占位、打码、文件路径、另一个赋值的，和说选项本身的话
     "docker login --password-stdin < pw.txt；kubectl --token-file /var/run/token；app --no-password --verbose",
     'deployctl --token $MCP_AIOPS_TOKEN；deployctl --token "${MCP_AIOPS_TOKEN}"；deployctl --token <your-token> --password ******',
@@ -271,7 +281,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<entry key="password">${DB_PASSWORD}</entry><entry key="timeout">correcthorsebatterystaple</entry><property name="password"><value>******</value></property>',
     '<property name="password"><description>找管理员要</description></property><entry key="token"/>',
     // _PASS 后面是变量、占位、读配置的，名字里 pass 前面没有分隔符的（bypass），值太短的
-    "bypass: correcthorsebatterystaple\nDB_PASS=${DB_PASS}\nsmtp_pass: <your-smtp-pass>\nredis_pass=cfg.redis_pass\nfirst_pass: done",
+    "bypass: correcthorsebatterystaple\nDB_PASS=${DB_PASS}\nsmtp_pass: <your-smtp-pass>\nredis_pass=cfg.redis_pass\nfirst_pass: done\nDB_PASS=settings.smtp.pass",
+    // XML 元素里只有注释的
+    "<password><!-- 找管理员要 --></password><token>\n  <!-- 放在 vault 里 -->\n</token>",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }

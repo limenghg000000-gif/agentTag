@@ -605,7 +605,9 @@ const LINE_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?${
  */
 const BLOCK_KEY = new RegExp(String.raw`^([ \t]*)(?:-[ \t]+)?["']?${CONFIG_KEY}["']?[ \t]*:[ \t]*([|>][1-9+-]{0,2})?[ \t]*(?:#.*)?$`, "i");
 /** 冒号后面空着时，下面缩进的是一个子项（name: …）或者列表（- …）就不是它的值，是嵌套的配置（k8s 的 secret: 下面写 secretName），子项各自按行检查 */
-const NESTED_LINE = /^[ \t]*(?:-(?:[ \t]|$)|["']?[\w.-]+["']?[ \t]*:(?:[ \t]|$)|#)/;
+const NESTED_LINE = /^[ \t]*(?:-(?:[ \t]|$)|["']?[\w.-]+["']?[ \t]*:(?:[ \t]|$))/;
+/** 整行是注释（# 生产库）。冒号后面空着时，值前面、中间的注释行跳过（YAML 里注释行不是值的一部分，缩进多少都行）；块写法（|、>）里的 # 是值本身 */
+const COMMENT_LINE = /^[ \t]*#/;
 /** 值里中文、反引号、行内注释以后是说明 */
 const NOTE_START = /[`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|[ \t]#/;
 
@@ -619,7 +621,7 @@ function blockValues(text: string): string[] {
     }
     const body: string[] = [];
     for (const next of lines.slice(i + 1)) {
-      if (next.trim() === "") {
+      if (next.trim() === "" || (!key[2] && COMMENT_LINE.test(next))) {
         continue;
       }
       if (/^[ \t]*/.exec(next)![0].length <= key[1].length || (body.length === 0 && !key[2] && NESTED_LINE.test(next))) {
@@ -645,8 +647,11 @@ const CLI_OPTION = new RegExp(
 );
 /** 选项后面是 name=… 的（docker build --secret id=npmrc,src=…）是另一个赋值，里面的密钥由别的规则拦；base64 结尾补的 = 不算 */
 const OPTION_SPEC = /^[A-Za-z_][\w.-]*=(?!=|$)/;
-/** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
-const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|pass|${SECRET_LABEL})$`, "i");
+/**
+ * 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY、cfg.redis_pass）：说的是值从哪读，不是值本身。
+ * pass 和 PASS_ALIAS 一样要用 _ 隔开或者就是这一段（compass、bypass 不是，correct.horse.compass 是密码）
+ */
+const CREDENTIAL_NAME = new RegExp(String.raw`^(?:\w*(?:password|passwd|pwd|${SECRET_LABEL})|(?:\w*_)?pass)$`, "i");
 /**
  * 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here、token: signature is invalid）；
  * 夹着别的词的照样算（prod-secret-abcdefghijkl、my correct horse battery staple）
@@ -709,11 +714,16 @@ function tripleQuotedValues(text: string): string[] {
   });
 }
 
+/** 值前后可以有空白和 XML 注释（<!-- 生产库 -->） */
+const XML_GAP = String.raw`(?:\s|<!--[\s\S]*?-->)*`;
 /**
  * XML 配置里名字是密钥的元素（Maven settings.xml 的 <password>…</password>、<api-key><![CDATA[…]]></api-key>），可以带命名空间和属性。
  * 第 2 组是 CDATA 里的，第 3 组是直接写的
  */
-const XML_ELEMENT = new RegExp(String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*</\1\s*>`, "gi");
+const XML_ELEMENT = new RegExp(
+  String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>]*)?>${XML_GAP}(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))${XML_GAP}</\1\s*>`,
+  "gi",
+);
 /**
  * 连在一起的一串「名字="值"」属性（一个 XML 标签里的全部属性）。属性的先后不限，值里可以有 >、可以换行，所以一个个属性往后接，不靠 > 断开
  */
@@ -721,8 +731,6 @@ const XML_ATTRIBUTES = /[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*')(?:\s+[\w.:-]+\s*=\s*(
 const XML_ATTRIBUTE = /([\w.:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 /** 带属性的开始标签。第 1 组是全部属性，第 2 组是自闭合的 / */
 const XML_OPEN_TAG = /<[\w.:-]+((?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))+)\s*(\/?)>/g;
-/** 值前面可以有空白和 XML 注释（<!-- 生产库 -->） */
-const XML_GAP = String.raw`(?:\s|<!--[\s\S]*?-->)*`;
 /**
  * 开始标签后面紧跟的内容（从 lastIndex 开始匹配）：CDATA 里的、Spring 的 <value> 子元素里的（CDATA 或直接写的），或者直接写的文字。
  * 第 1 到 4 组，有一个是值
