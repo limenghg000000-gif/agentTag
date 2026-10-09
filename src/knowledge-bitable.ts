@@ -369,9 +369,10 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     await this.explain(() => this.options.api.updateRecord(target.appToken, target.tableId, recordId, fields));
   }
 
-  /** 启动时调：机器人自己建的表按现在的名单调整共享。还没建表、用的是 KNOWLEDGE_BITABLE 指定的表时什么也不做 */
+  /** 启动时调：机器人自己建的表按现在的名单调整共享。还没建表时什么也不做；用的是 KNOWLEDGE_BITABLE 指定的表时只在日志里提醒一句 */
   async syncSharing(): Promise<void> {
     if (this.options.target) {
+      this.logger.info("经验库：用的是 KNOWLEDGE_BITABLE 指定的表，机器人不管它的共享。白名单群和写权限名单变了，请在飞书里自己调整这张表的协作者");
       return;
     }
     const target = await this.current().catch((err: unknown) => {
