@@ -244,7 +244,7 @@ async function runTask(
       },
     });
     answer = toReply(result.text, result.finish);
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(question, deps.mcp.names, succeeded, result.text)) {
+    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(question, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
@@ -363,19 +363,22 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
  * 带单位的数量（47 条、93 个 Pod、95%、120ms、3.1 cores）、就绪数（1/1 就绪、ready 2/3）、「没有报错」「无异常」「没有 error 级别日志」这类结论。
  * 就绪数：2026-10-08 复测时，模型没调工具就照着话题里前两次的定位结果，编出 network-tester 在三个命名空间「1/1 就绪」让用户选
  */
-const OPS_DATA = new RegExp(
-  [
-    String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
-    String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
-    String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
-    String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
-    // 中间可能夹着 Markdown 的加粗、行内代码：**1/1** 就绪、Ready: `4/4`
-    String.raw`\d+\s*/\s*\d+[*_\x60\s]*(?:就绪|ready|running|副本)`,
-    String.raw`(?:就绪|ready)[*_\x60\s]*[:：]?[*_\x60\s]*\d+\s*/\s*\d+`,
-    String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?\s*(?:报错|错误|异常|告警|重启|error|exception|panic|fatal)`,
-  ].join("|"),
-  "gi",
-);
+const OPS_FACT_PATTERNS = [
+  String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
+  String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
+  String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
+  String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
+  // 中间可能夹着 Markdown 的加粗、行内代码：**1/1** 就绪、Ready: `4/4`
+  String.raw`\d+\s*/\s*\d+[*_\x60\s]*(?:就绪|ready|running|副本)`,
+  String.raw`(?:就绪|ready)[*_\x60\s]*[:：]?[*_\x60\s]*\d+\s*/\s*\d+`,
+  // 定位结果：「在多个命名空间都有部署」「default、kube-system 都有部署」「已自动定位到 prod」
+  String.raw`多个命名空间|都有部署|自动定位到`,
+];
+/** 「没有报错」「无异常」「没有 error 级别日志」这类结论。英文要带上级别、日志这类词，「Rust 没有 exception 机制」不算 */
+const OPS_NEGATIVE = String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?\s*(?:报错|错误|异常|告警|重启|(?:error|exception|panic|fatal)\s*(?:级别|日志|记录))`;
+const OPS_DATA = new RegExp([...OPS_FACT_PATTERNS, OPS_NEGATIVE].join("|"), "gi");
+const OPS_FACTS = new RegExp(OPS_FACT_PATTERNS.join("|"), "gi");
+const OPS_NEGATIVE_ONLY = new RegExp(OPS_NEGATIVE, "gi");
 
 /**
  * 提问像是在问线上服务：带连字符的服务名（network-tester、product-service-api），或者说到日志、告警、Pod、重启、指标这类。
@@ -407,12 +410,15 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
     if (checkedLive(servers, succeeded)) {
       return undefined;
     }
-    return OPS_QUESTION.test(question) || hasUnverifiedData(question, answer) ? unverifiedOpsAnswer(servers) : undefined;
+    return OPS_QUESTION.test(question) || hasUnverified(OPS_DATA, question, answer) ? unverifiedOpsAnswer(servers) : undefined;
   };
 }
 
-/** 整理、润色这类请求：内容来自话题里之前的回答或用户给的文字，不用重新查 */
+/** 整理、润色这类请求：内容来自话题里之前的回答或用户给的文字，不用重新查。带着「重新」「现在」这类词的还是要查（「别总结旧的，重新排查」） */
 const REWRITE_REQUEST = /总结|整理|汇总|归纳|概括|润色|翻译|改写|复述/;
+const LIVE_REQUEST = /重新|再查|再看|现在|目前|最新|实时|查一下|查查/;
+/** 回答在说工具调用失败了（这时的次数、时间说的是调用本身） */
+const TOOL_FAILURE = /超时|失败|连不上|查不了|无法确认|没法确认|繁忙|出错/;
 
 export const BLOCKED_OPS_ANSWER =
   "这次没能给出结论：回答里有线上的数据，但这次一个工具都没有成功调用过，这些数据没有经过查证，为免误导没有发出来。请再问一次。";
@@ -420,10 +426,24 @@ export const BLOCKED_OPS_ANSWER =
 /**
  * 打回重做以后还是没查证就给出线上数据时，这个回答不发出去，换成 BLOCKED_OPS_ANSWER。
  * 2026-10-08 复测：用户回了「prod」以后模型两次都没调工具，第二次打回重做后照样编出了三次查询的结果。
- * 整理、润色这类请求放行，数据来自话题里之前的回答
+ * 放行：整理、润色这类请求（数据来自话题里之前的回答）；调过工具都失败了、回答在说失败的；
+ * 「没有报错」这类说法只在带「把握」的线上结论里才拦，概念解释（「Go 没有异常机制」）照常发。
+ * attempted 是这次有没有调过工具，不管成没成功
  */
-export function blockUnverifiedOps(question: string, servers: readonly string[], succeeded: ReadonlySet<string>, answer: string): boolean {
-  return !checkedLive(servers, succeeded) && !REWRITE_REQUEST.test(question) && hasUnverifiedData(question, answer);
+export function blockUnverifiedOps(
+  question: string,
+  servers: readonly string[],
+  succeeded: ReadonlySet<string>,
+  answer: string,
+  attempted = false,
+): boolean {
+  if (checkedLive(servers, succeeded) || (REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question))) {
+    return false;
+  }
+  if (attempted && TOOL_FAILURE.test(answer)) {
+    return false;
+  }
+  return hasUnverified(OPS_FACTS, question, answer) || (answer.includes("把握") && hasUnverified(OPS_NEGATIVE_ONLY, question, answer));
 }
 
 /** 成功调过 MCP 工具，或者成功调过群记忆以外的别的工具，都算有依据 */
@@ -432,8 +452,8 @@ function checkedLive(servers: readonly string[], succeeded: ReadonlySet<string>)
   return [...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)));
 }
 
-function hasUnverifiedData(question: string, answer: string): boolean {
-  return [...answer.matchAll(OPS_DATA)].some((match) => !inQuestion(question, match[0]));
+function hasUnverified(pattern: RegExp, question: string, answer: string): boolean {
+  return [...answer.matchAll(pattern)].some((match) => !inQuestion(question, match[0]));
 }
 
 /** 提问里本来就有的说法：不分大小写、不管空格；就绪数只看比值（问「READY 1/2 是什么意思」，答「1/2 Ready 表示…」） */

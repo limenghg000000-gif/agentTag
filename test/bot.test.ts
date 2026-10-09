@@ -6,6 +6,7 @@ import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
   BLOCKED_OPS_ANSWER,
+  blockUnverifiedOps,
   type BotDeps,
   createCardActionHandler,
   createMessageHandler,
@@ -743,7 +744,9 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
     "93 个 Pod 都在运行",
     "无明显异常",
     "最近 1 小时没有 error 级别日志",
-    "未发现 panic",
+    "未发现 panic 日志",
+    "network-tester 在 default、kube-system 都有部署，查哪个？",
+    "已自动定位到 prod",
     "default：1/1 就绪（Deployment）",
     "prod：Ready 4/4",
     "3/3 Running",
@@ -761,6 +764,7 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
   assert.equal(ok()("要查哪个服务？"), undefined);
   assert.equal(ok()("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存"), undefined);
   assert.equal(ok()("kubectl get pods 里 READY 列的 1/2 表示两个容器只有一个就绪"), undefined);
+  assert.equal(ok()("Rust 没有 exception 机制，用 Result 返回错误"), undefined);
   // 提问里本来就有的数字不算
   const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
   assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
@@ -822,6 +826,27 @@ test("打回重做以后没再给线上数据、查过工具、或者是整理�
   );
   // 整理话题里之前的回答
   assert.deepEqual(await ask("总结一下上面查到的情况", [{ text: withData, finish: "stop" }, { text: withData, finish: "stop" }]), [withData]);
+});
+
+test("重做以后的最后一道检查：哪些回答不发出去", () => {
+  const block = (question: string, answer: string, attempted = false, succeeded: string[] = []) =>
+    blockUnverifiedOps(question, ["aiops"], new Set(succeeded), answer, attempted);
+  // 编出来的数据、定位候选、带把握的「没有报错」
+  assert.equal(block("prod", "宽泛关键词查到 50 条，时间 2026-10-08 17:03～18:03"), true);
+  assert.equal(block("诊断一下 network-tester", "network-tester 在 default、kube-system、monitoring 都有部署，请选择命名空间"), true);
+  assert.equal(block("prod", "结论：最近 1 小时没有报错（把握：中）"), true);
+  // 查过就放行；只调了群记忆不算
+  assert.equal(block("prod", "宽泛关键词查到 50 条", true, ["aiops_query_logs"]), false);
+  assert.equal(block("prod", "宽泛关键词查到 50 条", true, ["memory_search"]), true);
+  // 整理之前的内容放行；要求重新查的不放行
+  assert.equal(block("总结一下上面查到的情况", "最近 1 小时有 27 条报错"), false);
+  assert.equal(block("不要总结旧结果，重新排查 gateway-api 的告警", "最近 1 小时有 27 条报错"), true);
+  // 调过工具都失败了，回答在说失败
+  assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 连续 3 次查询都超时，无法确认线上状态", true), false);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 连续 3 次查询都超时，无法确认线上状态"), true);
+  // 概念解释：没有「把握」的「没有异常」、反问
+  assert.equal(block("Go 有异常机制吗", "Go 没有异常机制，错误靠返回值"), false);
+  assert.equal(block("Pod 重启一般什么原因", "常见原因是 OOM、探针失败、镜像拉取失败"), false);
 });
 
 test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
