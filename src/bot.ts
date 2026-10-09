@@ -17,6 +17,7 @@ import {
 } from "./progress.js";
 import { buildSystemPrompt } from "./prompt.js";
 import type { TaskRegistry } from "./tasks.js";
+import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import type { Tool } from "./tools/tool.js";
 
@@ -31,9 +32,11 @@ const FALLBACK_BOT_NAME = "AI 助手";
 const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
 /** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
 export const DEEP_THINKING = /深度思考|仔细(想|思考|分析)|认真(想|思考|分析)/;
-const DOC_TARGET = String.raw`(?:飞书|云)?\s*(?:文档|docx|docs?\b|wiki|知识库)`;
+// 只说「知识库」「经验库」指的是团队经验库（knowledge_propose 起草、确认后存进多维表格），说「飞书知识库」才是飞书文档
+const DOC_TARGET = String.raw`(?:(?:飞书|云)?\s*(?:文档|docx|docs?\b|wiki)|飞书\s*知识库)`;
 /**
- * 要新建文档：「写成文档」「整理到飞书文档里」「起草一份文档」「建个 doc」「新建文档」「写文档」「记到知识库」。没说的不给新建文档的工具。
+ * 要新建文档：「写成文档」「整理到飞书文档里」「起草一份文档」「建个 doc」「新建文档」「写文档」「记到飞书知识库」。没说的不给新建文档的工具。
+ * 「沉淀到知识库」「记到经验库」说的是团队经验库，不给新建文档的工具，免得模型建一篇文档了事
  * 说的是已有的文档不算：「总结一下这篇文档」「写一下这篇文档的摘要」「写文档的人是谁」「整理一下这几篇文档」
  */
 const DOC_REQUEST = new RegExp(
@@ -103,6 +106,8 @@ export interface BotDeps {
   writeAllowed?: ReadonlySet<string>;
   /** 把提问和话题里的图片识别成文字。不传时图片换成「没能看到」的说明 */
   images?: { read(refs: readonly ImageRef[], signal?: AbortSignal): Promise<ReadonlyMap<string, string>> };
+  /** 团队经验库：回答前先检索，起草后发确认卡片。不传时没有这些 */
+  knowledge?: Pick<KnowledgeDesk, "lookup" | "tools">;
   /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
   mcp?: {
     /** 配置的 MCP 服务名（如 aiops），工具名以「服务名_」开头 */
@@ -213,6 +218,7 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
+    const knowledge = await lookupKnowledge(deps, taskContext, asked, history, task.signal, state, () => card?.update(render()));
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要在这些结果里出现过（代码工具读到的，或者 aiops 查到的报错堆栈），才算查证过
     const succeeded = new Set<string>();
@@ -220,7 +226,8 @@ async function runTask(
     const evidence: string[] = [];
     const failures: string[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
+    const knowledgeTools = deps.knowledge?.tools(taskContext) ?? [];
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...knowledgeTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
@@ -271,6 +278,7 @@ async function runTask(
         memory: memory?.prompt,
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
+        ...(deps.knowledge ? { knowledge: knowledge ? { hits: knowledge.text } : {} } : {}),
       }),
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
@@ -381,6 +389,45 @@ async function readImages(
 }
 
 /**
+ * 回答前先在团队经验库（和 aiops 经验库）里查一次，由程序保证查，不靠模型自觉：提问原文（话题里的追问带上话题的第一个问题）去检索，
+ * 够相近的几条写进提示词。查到了在进度卡片上多一步「查经验库」。返回 undefined 表示没查成（超时、出错），不耽误回答
+ */
+async function lookupKnowledge(
+  deps: BotDeps,
+  task: TaskToolContext,
+  asked: string,
+  history: readonly ChatMessage[],
+  signal: AbortSignal,
+  state: ProgressState,
+  refresh: () => void,
+): Promise<KnowledgeLookup | undefined> {
+  const { knowledge, logger = console } = deps;
+  if (!knowledge) {
+    return undefined;
+  }
+  const root = history.find((m) => m.role === "user")?.content;
+  const query = root && root !== asked ? `${root}\n${asked}` : asked;
+  try {
+    const found = await knowledge.lookup(query, task, AbortSignal.any([signal, AbortSignal.timeout(KNOWLEDGE_LOOKUP_MS)]));
+    if (!found) {
+      return undefined;
+    }
+    logger.info(`查经验库 message=${task.messageId} 相近的 ${found.ids.length} 条${found.ids.length > 0 ? `：${found.ids.join(" ")}` : ""}`);
+    if (found.ids.length > 0) {
+      state.steps.push({ id: "knowledge", label: `查经验库（找到 ${found.ids.length} 条相近的经验）`, status: "ok" });
+      refresh();
+    }
+    return found;
+  } catch (err) {
+    if (signal.aborted) {
+      throw err;
+    }
+    logger.warn(`查经验库失败，这次不带经验 message=${task.messageId}：${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+/**
  * 读出这个群的记忆写进提示词，并给这次任务配一套只能读写这个群记忆的工具。
  * 读失败（比如磁盘出错）时这次任务不带记忆，照常回答。
  */
@@ -423,6 +470,9 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
     }
   }
 }
+
+/** 回答前查经验库最多等多久，查不完就先不带经验回答 */
+const KNOWLEDGE_LOOKUP_MS = 8000;
 
 const CODE_TOOL_PREFIX = "code_";
 /** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
@@ -737,12 +787,17 @@ function applyEvent(state: ProgressState, event: Extract<AgentEvent, { type: "to
 export interface CardActionDeps {
   tasks: TaskRegistry;
   allowedChatIds: ReadonlySet<string>;
+  /** 经验库的确认卡片 */
+  knowledge?: Pick<KnowledgeDesk, "handleCardAction">;
   logger?: Logger;
 }
 
-/** 处理进度卡片上的按钮。停止后卡片由任务自己更新成「已停止」。 */
-export function createCardActionHandler({ tasks, allowedChatIds, logger = console }: CardActionDeps) {
+/** 处理卡片上的按钮：进度卡片的「停止」（停止后卡片由任务自己更新成「已停止」），经验库确认卡片的「保存」「归档」「取消」 */
+export function createCardActionHandler({ tasks, allowedChatIds, knowledge, logger = console }: CardActionDeps) {
   return async (evt: CardActionEvent): Promise<void> => {
+    if (await knowledge?.handleCardAction(evt)) {
+      return;
+    }
     const value = evt.action.value as { action?: unknown; task?: unknown } | undefined;
     if (value?.action !== STOP_ACTION || typeof value.task !== "string" || !allowedChatIds.has(evt.chatId)) {
       return;

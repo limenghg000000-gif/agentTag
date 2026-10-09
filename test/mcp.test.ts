@@ -159,6 +159,25 @@ test("服务端返回 isError 时把错误原文交给模型，审计日志记�
   assert.match(log.find(/MCP 调用 aiops\.query_logs/)!.text, /出错/);
 });
 
+test("程序自己调用（经验库检索和同步）：没开给模型的工具也能调，审计日志注明是程序调用；工具报错、没有这个工具时抛错", async () => {
+  const server = await fake({ call: (name) => (name === "archive_lesson" ? text("经验 #9 不存在", true) : text(JSON.stringify({ saved: true, id: 31 }))) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+
+  assert.ok(hub.hasTool("aiops", "save_lesson"));
+  assert.ok(!hub.hasTool("aiops", "no_such_tool"));
+  assert.ok(!hub.hasTool("other", "save_lesson"));
+  assert.ok(!hub.tools(task).some((tool) => tool.spec.name === "aiops_save_lesson"), "写工具不给模型");
+
+  assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+  assert.deepEqual(server.calls.at(-1), { name: "save_lesson", args: { title: "t" } });
+  assert.match(log.find(/MCP 调用 aiops\.save_lesson/)!.text, /（程序调用） chat=oc_1 sender=ou_1 .*结果=\d+字/);
+
+  await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /aiops 返回错误：经验 #9 不存在/);
+  await assert.rejects(hub.callDirect("aiops", "no_such_tool", {}, task), /aiops 没有 no_such_tool 这个工具/);
+  await assert.rejects(hub.callDirect("other", "save_lesson", {}, task), /other 现在连不上/);
+});
+
 test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
   let busy = 2;
   const server = await fake({

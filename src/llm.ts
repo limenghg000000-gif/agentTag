@@ -225,6 +225,28 @@ export function createOpenAICompatibleVisionModel(config: Pick<LlmConfig, "baseU
   };
 }
 
+/** 把文字转成向量的模型，团队经验库按意思检索时用 */
+export interface EmbeddingModel {
+  readonly model: string;
+  embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]>;
+}
+
+/** OpenAI 兼容接口（/embeddings）的向量模型，百炼的 text-embedding-v4 等都提供这种接口 */
+export function createOpenAICompatibleEmbedder(config: Pick<LlmConfig, "baseURL" | "apiKey" | "model">): EmbeddingModel {
+  const client = new OpenAI({ baseURL: config.baseURL, apiKey: config.apiKey });
+  return {
+    model: config.model,
+    async embed(texts, signal) {
+      try {
+        const res = await client.embeddings.create({ model: config.model, input: [...texts], encoding_format: "float" }, { signal });
+        return [...res.data].sort((a, b) => a.index - b.index).map((item) => item.embedding);
+      } catch (err) {
+        throw toLlmError(err);
+      }
+    },
+  };
+}
+
 /**
  * 千问多轮调工具时偶尔把思考漏进正文（aiops 的模型代理也专门处理过），发到群里前去掉：
  * 正文以一段思考开头、以 </think> 结束（开头的 <think> 有时在模板里，正文里看不到），后面还有正文时，去掉这段思考；

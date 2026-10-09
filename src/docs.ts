@@ -106,7 +106,7 @@ interface ApiResponse<T> {
 }
 
 /** 调飞书接口：接口直接返回 4xx 时 SDK 会抛 axios 的异常，统一换成带 code 和 msg 的 FeishuApiError */
-async function call<T>(request: () => Promise<ApiResponse<T>>): Promise<T | undefined> {
+export async function call<T>(request: () => Promise<ApiResponse<T>>): Promise<T | undefined> {
   let res: ApiResponse<T>;
   try {
     res = await request();

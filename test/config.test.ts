@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { Domain } from "@larksuiteoapi/node-sdk";
 import {
   AIOPS_DEFAULT_TOOLS,
+  DEFAULT_EMBEDDING_MODEL,
   DEFAULT_MODEL_BASE_URL,
   DEFAULT_MODEL_ID,
   DEFAULT_THINKING_BUDGET,
@@ -177,7 +178,7 @@ test("MODEL_THINKING_BUDGET 限制思考长度：百炼默认 4000，0 表示不
   assert.throws(() => loadConfig({ ...base, MODEL_THINKING_BUDGET: "-1" }), /MODEL_THINKING_BUDGET/);
 });
 
-test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开第一批 19 个只读工具，令牌从 MCP_AIOPS_TOKEN 读", () => {
+test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开 20 个只读工具（含 promote_case），令牌从 MCP_AIOPS_TOKEN 读", () => {
   assert.deepEqual(loadConfig(base).mcp, []);
   const [aiops, ...rest] = loadConfig({ ...base, MCP_SERVERS: " aiops=https://aiops.example.com/mcp ", MCP_AIOPS_TOKEN: " t0k " }).mcp;
   assert.equal(rest.length, 0);
@@ -185,10 +186,13 @@ test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开第一
   assert.equal(aiops.url, "https://aiops.example.com/mcp");
   assert.equal(aiops.token, "t0k");
   assert.deepEqual(aiops.tools, AIOPS_DEFAULT_TOOLS);
-  assert.equal(aiops.tools.length, 19);
+  assert.equal(aiops.tools.length, 20);
   assert.ok(aiops.tools.includes("find_service"));
-  // promote_case 名字里没有写操作动词，但它是沉淀经验的第一步，默认当写工具
-  assert.deepEqual(aiops.writeTools, ["promote_case"]);
+  // promote_case 只生成经验草稿、不落库，模型能直接用；真正写经验库要走确认卡片
+  assert.ok(aiops.tools.includes("promote_case"));
+  assert.deepEqual(aiops.writeTools, []);
+  assert.ok(!(aiops.tools as readonly string[]).includes("save_lesson"));
+  assert.ok(!(aiops.tools as readonly string[]).includes("archive_lesson"));
   assert.equal(aiops.timeoutsMs.diagnose_service, 120_000);
   assert.equal(aiops.labels.diagnose_service, "诊断");
   // 默认的使用说明文件在项目里
@@ -206,7 +210,7 @@ test("MCP 服务的工具名单、写工具、说明文件都能用 MCP_<名字>
     MCP_OTHER_TOOLS: "*",
   }).mcp;
   assert.deepEqual(aiops.tools, ["diagnose_service", "get_dashboard"]);
-  assert.deepEqual(aiops.writeTools, ["promote_case", "get_dashboard"]);
+  assert.deepEqual(aiops.writeTools, ["get_dashboard"]);
   assert.equal(aiops.promptFile, path.resolve("custom/aiops.md"));
   assert.equal(other.name, "other");
   assert.equal(other.tools, "*");
@@ -231,4 +235,32 @@ test("MCP_SERVERS 写错时报错：格式不对、名字重复、地址带令�
   }
   // 参数名里只是含有 key 这几个字母的不算令牌
   assert.equal(loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp?monkey=1" }).mcp[0].url, "https://a.example.com/mcp?monkey=1");
+});
+
+test("团队经验库：默认打开，表记在 data/knowledge 下，百炼上用 text-embedding-v4；可以指定多维表格、换或关掉向量模型、整个关掉", () => {
+  assert.deepEqual(loadConfig(base).knowledge, {
+    stateFile: path.resolve("data", "knowledge", "bitable.json"),
+    embeddingModel: DEFAULT_EMBEDDING_MODEL,
+  });
+  assert.equal(loadConfig({ ...base, KNOWLEDGE: "off" }).knowledge, undefined);
+  assert.equal(loadConfig({ ...base, KNOWLEDGE: " ON " }).knowledge?.embeddingModel, "text-embedding-v4");
+  assert.throws(() => loadConfig({ ...base, KNOWLEDGE: "false" }), /KNOWLEDGE 只能是 on 或 off/);
+
+  const custom = loadConfig({
+    ...base,
+    DATA_DIR: "/srv/agenttag",
+    KNOWLEDGE_BITABLE: "https://example.feishu.cn/base/AbC123?table=tblX1&view=vew1",
+    KNOWLEDGE_EMBEDDING_MODEL: "text-embedding-v3",
+  }).knowledge;
+  assert.deepEqual(custom, {
+    bitable: { appToken: "AbC123", tableId: "tblX1", url: "https://example.feishu.cn/base/AbC123?table=tblX1" },
+    stateFile: "/srv/agenttag/knowledge/bitable.json",
+    embeddingModel: "text-embedding-v3",
+  });
+  assert.throws(() => loadConfig({ ...base, KNOWLEDGE_BITABLE: "https://example.feishu.cn/base/AbC123" }), /KNOWLEDGE_BITABLE/);
+  assert.equal(loadConfig({ ...base, KNOWLEDGE_EMBEDDING_MODEL: "off" }).knowledge?.embeddingModel, undefined);
+  // 别家模型服务不知道有什么向量模型，不配就只按关键词
+  assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).knowledge?.embeddingModel, undefined);
+  // knowledge_ 是经验库工具的前缀，MCP 服务不能叫这个名字
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "knowledge=https://kb.example.com/mcp", MCP_KNOWLEDGE_TOOLS: "*" }), /和内置工具的前缀/);
 });

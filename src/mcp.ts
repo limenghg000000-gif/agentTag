@@ -84,6 +84,8 @@ interface ServerState {
   conn: McpConnection;
   /** 开给模型的工具（服务端的原始定义） */
   enabled: RemoteTool[];
+  /** 服务端的全部工具，程序自己调用（callDirect）时用 */
+  catalog: Map<string, RemoteTool>;
   instructions?: string;
   /** 飞书这边的补充说明（promptFile 的内容） */
   prompt?: string;
@@ -130,6 +132,7 @@ export class McpHub {
       config,
       conn: new McpConnection(config, this.logger),
       enabled: [],
+      catalog: new Map(),
       synced: false,
       syncedAt: 0,
       failures: 0,
@@ -159,6 +162,39 @@ export class McpHub {
       const budget: TaskBudget = { calls: 0, chars: 0, results: new Map() };
       return server.enabled.map((remote) => this.wrap(server, remote, task, budget));
     });
+  }
+
+  /** 服务端有没有这个工具（不管开没开给模型）。没连上时为 false */
+  hasTool(serverName: string, tool: string): boolean {
+    return this.find(serverName)?.catalog.has(tool) ?? false;
+  }
+
+  /**
+   * 程序自己调服务端的工具，不经过模型：回答前检索 aiops 经验库、有人在确认卡片上点了保存后同步到 aiops 经验库。
+   * 不受「只开只读工具」的限制（写操作的确认由调用方负责），不占模型的调用次数，照样记审计日志。返回结果原文，工具报错时抛错
+   */
+  async callDirect(
+    serverName: string,
+    tool: string,
+    args: Record<string, unknown>,
+    task: McpTaskContext,
+    signal: AbortSignal = AbortSignal.timeout(DEFAULT_MCP_TIMEOUT_MS),
+  ): Promise<string> {
+    const server = this.find(serverName);
+    if (!server?.synced) {
+      throw new Error(`${serverName} 现在连不上`);
+    }
+    if (!server.catalog.has(tool)) {
+      throw new Error(`${serverName} 没有 ${tool} 这个工具`);
+    }
+    const timeout = server.config.timeoutsMs[tool] ?? DEFAULT_MCP_TIMEOUT_MS;
+    const { raw, audit } = await this.request(server, tool, args, task, signal, timeout, "程序调用");
+    audit(`结果=${raw.length}字`);
+    return raw;
+  }
+
+  private find(name: string): ServerState | undefined {
+    return this.servers.find((server) => server.config.name === name);
   }
 
   /**
@@ -238,6 +274,7 @@ export class McpHub {
       server.prompt = await this.readPrompt(server.config);
       const picked = pickTools(server.config, synced.tools);
       server.enabled = picked.enabled;
+      server.catalog = new Map(synced.tools.map((tool) => [tool.name, tool]));
       server.synced = true;
       server.failures = 0;
       const key = JSON.stringify([synced.version, picked, server.instructions?.length, server.prompt?.length]);
@@ -371,11 +408,29 @@ export class McpHub {
     limit: number,
   ): Promise<string> {
     const { name } = server.config;
+    const { result, raw, audit } = await this.request(server, tool, args, task, signal, timeout);
+    const note = RESULT_NOTES[name]?.[tool]?.(args, raw);
+    const text = note ? `${note}\n${formatToolResult(result, limit - note.length - 1)}` : formatToolResult(result, limit);
+    audit(`结果=${raw.length}字${text.length !== raw.length ? `→${text.length}字` : ""}${note ? " 加了机器人注" : ""}`);
+    return text;
+  }
+
+  /** 调一次工具：服务繁忙时退避重试，失败和出错记审计日志并抛错；成功时返回结果，审计日志由调用方补上结果大小 */
+  private async request(
+    server: ServerState,
+    tool: string,
+    args: Record<string, unknown>,
+    task: McpTaskContext,
+    signal: AbortSignal,
+    timeout: number,
+    caller?: string,
+  ): Promise<{ result: CallToolResult; raw: string; audit: (outcome: string) => void }> {
+    const { name } = server.config;
     const startedAt = this.now();
     let retries = 0;
     const audit = (outcome: string, failed = false) => {
       const line =
-        `MCP 调用 ${name}.${tool} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
+        `MCP 调用 ${name}.${tool}${caller ? `（${caller}）` : ""} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
         `参数=${clip(JSON.stringify(args), 300)} ${outcome} 用时=${this.now() - startedAt}ms${retries > 0 ? ` 繁忙重试=${retries}` : ""}`;
       if (failed) {
         this.logger.warn(line);
@@ -395,12 +450,12 @@ export class McpHub {
         await delay(this.busyRetryMs[retries++], undefined, { signal });
       }
     } catch (err) {
-      if (signal.aborted) {
+      if (signal.aborted && !isTimeoutAbort(signal)) {
         audit("已停止");
         throw err;
       }
       // HTTP 层或网络的错误（服务端重启、会话失效、令牌改了）马上重连；工具自己的报错和超时不用
-      if (!(err instanceof McpError)) {
+      if (!(err instanceof McpError) && !signal.aborted) {
         this.resyncSoon(server);
       }
       const message = describeCallError(err, server.config, tool, timeout);
@@ -416,11 +471,13 @@ export class McpHub {
       audit(`出错 结果=${raw.length}字：${clip(raw, 200)}`, true);
       throw new Error(message);
     }
-    const note = RESULT_NOTES[name]?.[tool]?.(args, raw);
-    const text = note ? `${note}\n${formatToolResult(result, limit - note.length - 1)}` : formatToolResult(result, limit);
-    audit(`结果=${raw.length}字${text.length !== raw.length ? `→${text.length}字` : ""}${note ? " 加了机器人注" : ""}`);
-    return text;
+    return { result, raw, audit: (outcome) => audit(outcome) };
   }
+}
+
+/** 程序调用时用 AbortSignal.timeout 限时，超时的中止不算用户点了停止 */
+function isTimeoutAbort(signal: AbortSignal): boolean {
+  return signal.reason instanceof DOMException && signal.reason.name === "TimeoutError";
 }
 
 interface SyncResult {

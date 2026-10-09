@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
-import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel, LlmError, stripThinkTags } from "../src/llm.js";
+import { createOpenAICompatibleEmbedder, createOpenAICompatibleModel, createOpenAICompatibleVisionModel, LlmError, stripThinkTags } from "../src/llm.js";
 
 // 本地假 OpenAI 兼容接口：记录收到的请求，按队列返回预设的状态码和响应
 const requests: { url: string; headers: IncomingHttpHeaders; body: any }[] = [];
@@ -313,4 +313,34 @@ test("看图关掉思考；模型不认 enable_thinking 时去掉重试，之后
   assert.equal(requests.at(-1)!.body.enable_thinking, undefined);
   assert.equal(await vision.describe(image, "原样抄文字"), "第三张");
   assert.equal(requests.at(-1)!.body.enable_thinking, undefined);
+});
+
+test("向量模型：按 OpenAI 兼容的 /embeddings 调，结果按 index 排好；Key 无效时抛 auth 类错误", async () => {
+  const embedder = createOpenAICompatibleEmbedder({
+    baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+    apiKey: "sk-test",
+    model: "text-embedding-v4",
+  });
+  responses.push({
+    status: 200,
+    body: {
+      object: "list",
+      model: "text-embedding-v4",
+      data: [
+        { object: "embedding", index: 1, embedding: [0, 1] },
+        { object: "embedding", index: 0, embedding: [1, 0] },
+      ],
+      usage: { prompt_tokens: 4, total_tokens: 4 },
+    },
+  });
+  assert.deepEqual(await embedder.embed(["日活", "降载"]), [
+    [1, 0],
+    [0, 1],
+  ]);
+  const request = requests.at(-1)!;
+  assert.equal(request.url, "/compatible-mode/v1/embeddings");
+  assert.deepEqual(request.body, { model: "text-embedding-v4", input: ["日活", "降载"], encoding_format: "float" });
+
+  responses.push({ status: 401, body: { error: { message: "Incorrect API key", type: "invalid_request_error" } } });
+  await assert.rejects(embedder.embed(["x"]), (err: unknown) => err instanceof LlmError && err.kind === "auth");
 });
