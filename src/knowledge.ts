@@ -35,8 +35,8 @@ const READ_TIMEOUT_MS = 15_000;
 const EMBED_BATCH = 10;
 /** 算向量时每条最多多少字 */
 const EMBED_TEXT_CHARS = 2000;
-/** 检索用的文字里，问题和结论各最多取多少字：问题写得很长时结论也要留在里面 */
-const INDEX_FIELD_CHARS = 800;
+/** 检索用的文字里，结论、处理办法、问题、排查过程各最多取多少字：哪一项写得很长，别的也要留在里面 */
+const INDEX_FIELD_CHARS = 450;
 /** 提问最多取多少字去检索 */
 const QUERY_CHARS = 1000;
 /** 语义相似度到这个数才算相近 */
@@ -379,7 +379,9 @@ function indexText(entry: KnowledgeDraft): string {
     entry.errorCodes,
     entry.alertname,
     entry.conclusion.slice(0, INDEX_FIELD_CHARS),
+    entry.handling?.slice(0, INDEX_FIELD_CHARS),
     entry.question.slice(0, INDEX_FIELD_CHARS),
+    entry.basis?.slice(0, INDEX_FIELD_CHARS),
   ]
     .filter(Boolean)
     .join("\n")
@@ -489,19 +491,27 @@ const SECRET_PATTERNS: [RegExp, string][] = [
 ];
 
 /**
- * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=…，这些配置什么样的值都能填）。
- * 值后面紧跟着代码符号的不算（cfg.Token、getToken()、${MCP_AIOPS_TOKEN}、<token>）
+ * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=correct.horse.battery.staple，
+ * 这些配置什么样的值都能填）。值后面紧跟着代码符号的不算（getToken()、${MCP_AIOPS_TOKEN}、<token>、os.environ["X"]）
  */
-const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?([\w+/~=-]{8,})(?![\w+/~=(\[{<$@:\\-]|\.\S)`, "gi");
+const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?([\w+/~=.-]{8,})(?![\w+/~=.(\[{<$@:\\-])`, "gi");
+/** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
+const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
 /** 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here）；夹着别的词的照样算（prod-secret-abcdefghijkl） */
 const PLACEHOLDER_WORD =
   /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|placeholder|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
 /** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
 const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
 
-/** 写在密钥名字后面的值是不是占位：环境变量名，或者整个由报错、占位用词组成 */
-function isPlaceholder(value: string): boolean {
-  return ENV_NAME.test(value) || value.split(/[_+/~=-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
+/** 写在密钥名字后面的值是不是占位：环境变量名、读密钥的属性引用，或者整个由报错、占位用词组成 */
+function isPlaceholder(raw: string): boolean {
+  // 句末的点不算值的一部分（token: expired.）
+  const value = raw.replace(/\.+$/, "");
+  const last = value.slice(value.lastIndexOf(".") + 1);
+  if (value.includes(".") && (CREDENTIAL_NAME.test(last) || ENV_NAME.test(last))) {
+    return true;
+  }
+  return ENV_NAME.test(value) || value.split(/[_+/~=.-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
 }
 
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */

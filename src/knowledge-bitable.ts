@@ -701,7 +701,9 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
   }
   const categoryLabel = text(FIELDS.category);
   const category = (Object.entries(KNOWLEDGE_CATEGORIES).find(([, label]) => label === categoryLabel)?.[0] ?? "other") as KnowledgeCategory;
-  const aiopsId = Number.parseInt(text(FIELDS.aiopsId) ?? "", 10);
+  // 这一列有人能改：只认整个是正整数的（「31-old」「31,32」「0」都当没填），免得归档时归档了 aiops 里别的经验
+  const aiopsText = text(FIELDS.aiopsId) ?? "";
+  const aiopsId = /^\d+$/.test(aiopsText) ? Number(aiopsText) : Number.NaN;
   const createdAt = timeOf(fields[FIELDS.createdAt]);
   const updatedAt = timeOf(fields[FIELDS.updatedAt]);
   const optional = (
@@ -728,7 +730,7 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
     ...optional("source"),
     ...optional("requestId"),
     ...optional("replaces"),
-    ...(Number.isFinite(aiopsId) ? { aiopsId } : {}),
+    ...(Number.isSafeInteger(aiopsId) && aiopsId > 0 ? { aiopsId } : {}),
     createdAt: createdAt ?? new Date(0).toISOString(),
     ...(updatedAt && updatedAt !== createdAt ? { updatedAt } : {}),
   };

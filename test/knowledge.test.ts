@@ -127,6 +127,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 夹着 token、secret 这类词的照样算，只有整个值都是报错、占位用词才不算
     "MCP_AIOPS_TOKEN=prod-secret-abcdefghijkl",
     "token=my-token-value-abcdef",
+    // 带点的也算，只有读密钥的属性引用（cfg.Token、process.env.MODEL_API_KEY）不算
+    "MODEL_API_KEY=correct.horse.battery.staple",
+    "token: correct.horse.battery.staple.",
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -147,6 +150,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "MODEL_API_KEY=${MODEL_API_KEY}，api_key: your_api_key_here",
     "代码里 token := cfg.Token，token = getToken()，secret: config.secret",
     "token: expired. 重新登录就好",
+    "api_key=process.env.MODEL_API_KEY，apiKey: settings.apiKey",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -208,6 +212,15 @@ test("没有向量模型时按关键词检索：关键词、错误码命中加�
   assert.deepEqual(await base.search("今天中午吃什么"), []);
   assert.deepEqual(await base.search("   "), []);
   assert.equal((await base.search("code=8", { category: "metric" })).length, 0);
+});
+
+test("只写在处理办法、排查过程里的说法也能检索到", async () => {
+  const backend = new MemoryBackend();
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(normalizeDraft({ ...code8, keywords: "", error_codes: "", handling: "user-rpc 改成 headless Service，客户端按 Pod 建连接" }));
+  await base.save(normalizeDraft({ ...dau, keywords: "", basis: "查了埋点表 app_open 和登录日志，对不上的是内部测试账号" }));
+  assert.equal((await base.search("headless Service 建连接"))[0]?.entry.id, "K1");
+  assert.equal((await base.search("登录日志 埋点表 对不上"))[0]?.entry.id, "K2");
 });
 
 test("问题写得很长时，只在结论里出现的说法也能检索到", async () => {
@@ -342,7 +355,7 @@ function deskSetup({
   saveLesson?: (args: Record<string, unknown>) => string;
   searchLessons?: (args: Record<string, unknown>) => string;
 } = {}) {
-  const control = { failSend: false };
+  const control: { failSend: boolean; hold?: Promise<void> } = { failSend: false };
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 200 });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
@@ -358,6 +371,7 @@ function deskSetup({
     base,
     ...(aiops ? { aiops: new AiopsLessons(mcp, "aiops", quiet) } : {}),
     send: async (to, input, opts) => {
+      await control.hold;
       if (control.failSend) {
         throw new Error("飞书发送失败");
       }
@@ -530,6 +544,28 @@ test("改草稿时新卡片没发出去，旧卡片还能用", async () => {
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
   assert.equal(backend.entries[0]?.title, "日活的口径");
+});
+
+test("改草稿时新卡片还在发：这时点旧卡片不算，发出去以后旧卡片作废，只存新的", async () => {
+  const { backend, desk, sent, updates, click, tool, control } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  let release!: () => void;
+  control.hold = new Promise((resolve) => (release = resolve));
+  const revising = tool("knowledge_propose").run({ ...dau, title: "日活的口径（改）" }, { signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 0, "新卡片发的时候点旧卡片不存");
+  control.hold = undefined;
+  release();
+  await revising;
+  assert.equal(updates.filter((u) => u.messageId === "om_card_1").at(-1)!.card.header.title.content, "已换成新的草稿");
+  await desk.handleCardAction({ ...click((sent[1].input as { card: any }).card, "save"), messageId: "om_card_2" });
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => e.title),
+    ["日活的口径（改）"],
+  );
 });
 
 test("任务停了就不发确认卡片：起草时查很像的经验、取要归档的经验时停止都不发", async () => {

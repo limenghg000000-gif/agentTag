@@ -78,6 +78,8 @@ interface ProposalBase {
   result?: string[];
   /** 没做成的步骤（partial 时有），再点一次补上 */
   unfinished?: string[];
+  /** 同一个话题里有几张新草稿的卡片正在发：发的时候点这张不算，免得新旧两张都存了 */
+  revising?: number;
 }
 
 interface SaveProposal extends ProposalBase {
@@ -373,6 +375,10 @@ export class KnowledgeDesk {
       return true;
     }
     if (proposal.state !== "pending" && proposal.state !== "partial") {
+      return true;
+    }
+    if (proposal.revising) {
+      this.logger.info(`经验库卡片 新草稿正在发，这张先不处理 proposal=${proposal.id} operator=${operator.openId}`);
       return true;
     }
     if (this.now() - proposal.createdAt > PROPOSAL_TTL_MS) {
@@ -696,8 +702,19 @@ export class KnowledgeDesk {
       state: "pending",
     } as Proposal;
     this.sweep();
-    // 新卡片发失败时旧卡片还能用
-    const { messageId } = await this.options.send(ctx.chatId, { card: renderProposalCard(proposal) }, { replyTo: ctx.messageId, replyInThread: true });
+    // 新卡片发的时候旧卡片先不让点，发出去了旧卡片作废；发失败时旧卡片还能用
+    const holding = [...this.proposals.values()].filter((old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending");
+    for (const old of holding) {
+      old.revising = (old.revising ?? 0) + 1;
+    }
+    let messageId: string;
+    try {
+      ({ messageId } = await this.options.send(ctx.chatId, { card: renderProposalCard(proposal) }, { replyTo: ctx.messageId, replyInThread: true }));
+    } finally {
+      for (const old of holding) {
+        old.revising = (old.revising ?? 1) - 1;
+      }
+    }
     proposal.cardMessageId = messageId;
     const replaced = [...this.proposals.values()].filter((old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending");
     for (const old of replaced) {

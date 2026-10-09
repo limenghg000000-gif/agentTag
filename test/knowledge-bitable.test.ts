@@ -389,6 +389,27 @@ test("表格里有人手动加的行：文本列是分段数组也能读，没�
   assert.equal((await new KnowledgeBase(backend, { logger: quiet }).save(dau)).id, "K6");
 });
 
+test("表格里 aiops 经验编号写得不对（不是整个正整数）时当成没填，免得归档 aiops 里别的经验", async () => {
+  const { api, tables } = fakeBitable();
+  const row = (id: string, aiops: string) => ({ recordId: `rec${id}`, fields: { 标题: id, 结论: "结论", 编号: id, "aiops 经验编号": aiops } });
+  tables.set("tblX", {
+    fields: [],
+    records: [row("K1", "31-old"), row("K2", "31,32"), row("K3", "0"), row("K4", "-1"), row("K5", "32"), row("K6", " 33 ")],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "aiops-id.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] } });
+  assert.deepEqual(
+    (await backend.list()).map((e) => [e.id, e.aiopsId]),
+    [
+      ["K1", undefined],
+      ["K2", undefined],
+      ["K3", undefined],
+      ["K4", undefined],
+      ["K5", 32],
+      ["K6", 33],
+    ],
+  );
+});
+
 test("表格里有两行编号相同（有人复制了行）时不去改它们，免得改错行", async () => {
   const { api, tables } = fakeBitable();
   tables.set("tblX", {
