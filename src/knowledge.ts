@@ -514,11 +514,22 @@ function isPlaceholder(raw: string): boolean {
   return ENV_NAME.test(value) || value.split(/[_+/~=.-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
 }
 
+/** HTTP Basic 认证（Authorization: Basic …）：后面是「用户名:密码」的 base64 */
+const BASIC_AUTH = /\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})(?![\w+/=])/gi;
+
+/** 解出来是「用户名:密码」才算，「Basic configuration」这类英文解出来是乱码 */
+function isBasicCredential(value: string): boolean {
+  return /^[^\x00-\x1f\x7f\ufffd:]+:[^\x00-\x1f\x7f\ufffd]+$/.test(Buffer.from(value, "base64").toString("utf8"));
+}
+
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
 function findSecret(text: string): string | undefined {
   const known = SECRET_PATTERNS.find(([pattern]) => pattern.test(text));
   if (known) {
     return known[1];
+  }
+  if ([...text.matchAll(BASIC_AUTH)].some(([, value]) => isBasicCredential(value))) {
+    return "HTTP Basic 认证的用户名和密码";
   }
   return [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, value]) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }
@@ -574,6 +585,25 @@ export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
     ...(errorCodes ? { errorCodes: splitList(errorCodes).join(",") } : {}),
     ...(alertname ? { alertname } : {}),
   };
+}
+
+/**
+ * 表格里现在这一条的内容，按起草的规则再检查一遍（必填、长度、密钥）。同步到 aiops 用它：
+ * 卡片没做完时可能有人在表格里直接改过这一行，同步过去的要和表格一致，改进去的密钥也不能带过去
+ */
+export function draftOf(entry: KnowledgeEntry): KnowledgeDraft {
+  return normalizeDraft({
+    category: entry.category,
+    title: entry.title,
+    scope: entry.scope,
+    question: entry.question,
+    conclusion: entry.conclusion,
+    handling: entry.handling,
+    basis: entry.basis,
+    keywords: entry.keywords,
+    error_codes: entry.errorCodes,
+    alertname: entry.alertname,
+  });
 }
 
 const DATE_FORMAT = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "numeric", day: "numeric" });

@@ -380,6 +380,36 @@ test("回答前先查经验库：查到的写进提示词，进度卡片多一�
   assert.deepEqual(markdowns(failed.sent), ["好"]);
 });
 
+test("话题里第三轮以后的追问：查经验库带上最近几轮提问（新的在前）和第一个问题，中间几轮限长", async () => {
+  const queries: string[] = [];
+  const knowledge = {
+    async lookup(query: string) {
+      queries.push(query);
+      return { text: "", ids: [] };
+    },
+    tools: () => [],
+  };
+  const { model } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history: ChatMessage[] = [
+    { role: "user", content: "[张三] 帮我看下这个线上报警" },
+    { role: "assistant", content: "需要更多信息" },
+    { role: "user", content: "[张三] 报错是 code=8 ResourceExhausted，服务 gateway-api" },
+    { role: "assistant", content: "查到了……" },
+    { role: "user", content: `[李四] ${"日志很长".repeat(100)}` },
+    { role: "assistant", content: "看了日志……" },
+  ];
+  const { handle } = setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source });
+  await handle(message("怎么修？"));
+  const lines = queries[0].split("\n");
+  // 这次的提问在最前，然后是最近的一轮，再往前一轮，最后是第一个问题
+  assert.equal(lines[0], "怎么修？");
+  assert.match(lines[1], /^\[李四\] 日志很长/);
+  assert.equal(lines[1].length, 200, "中间几轮每轮限长");
+  assert.equal(lines[2], "[张三] 报错是 code=8 ResourceExhausted，服务 gateway-api");
+  assert.equal(lines[3], "[张三] 帮我看下这个线上报警");
+  assert.equal(lines.length, 4);
+});
+
 test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有一边没查成时提示词里说明", async () => {
   const hung = { lookup: () => new Promise<undefined>(() => {}), tools: () => [] };
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));

@@ -3,6 +3,7 @@ import type { CardActionEvent, SendInput, SendOptions, SendResult } from "@larks
 import { isTimeout, raceAbort, timeoutSignal } from "../abort.js";
 import type { Logger } from "../history.js";
 import {
+  draftOf,
   fieldLines,
   formatKnowledge,
   KNOWLEDGE_CATEGORIES,
@@ -497,7 +498,7 @@ export class KnowledgeDesk {
     });
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号
     const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
-    const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
+    const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
     // aiops 里有没有这条经验（新存的或者已有相近的）。没有时不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     const inAiops = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : true;
     if (replaced) {
@@ -545,7 +546,10 @@ export class KnowledgeDesk {
     return true;
   }
 
-  /** 写进 aiops。上次调用出错了（可能已经存进去，只是结果没传回来）时，先找这条团队经验同步过去的，找到了就不再存 */
+  /**
+   * 写进 aiops。写的是表格里现在这一行（再试一次前可能有人在表格里改过），不是卡片上的草稿。
+   * 上次调用出错了（可能已经存进去，只是结果没传回来）时，先找这条团队经验同步过去的，找到了就不再存
+   */
   private async saveLesson(
     proposal: SaveProposal,
     entry: KnowledgeEntry,
@@ -557,16 +561,17 @@ export class KnowledgeDesk {
     if (!aiops?.writable) {
       throw new KnowledgeError("aiops 现在连不上");
     }
+    const draft = draftOf(entry);
     try {
-      const existing = proposal.aiopsUnsure ? await aiops.findSynced(proposal.draft, entry.id, task) : undefined;
+      const existing = proposal.aiopsUnsure ? await aiops.findSynced(draft, entry.id, task) : undefined;
       if (existing !== undefined) {
         return { saved: true, id: existing };
       }
       const options = { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
-      const synced = await aiops.save(proposal.draft, options, task);
+      const synced = await aiops.save(draft, options, task);
       if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
         // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的后面归档
-        return await aiops.save(proposal.draft, { ...options, force: true }, task);
+        return await aiops.save(draft, { ...options, force: true }, task);
       }
       return synced;
     } catch (err) {

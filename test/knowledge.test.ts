@@ -130,6 +130,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 带点的也算，只有读密钥的属性引用（cfg.Token、process.env.MODEL_API_KEY）不算
     "MODEL_API_KEY=correct.horse.battery.staple",
     "token: correct.horse.battery.staple.",
+    // HTTP Basic 认证：后面是「用户名:密码」的 base64
+    `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
+    `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -151,6 +154,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "代码里 token := cfg.Token，token = getToken()，secret: config.secret",
     "token: expired. 重新登录就好",
     "api_key=process.env.MODEL_API_KEY，apiKey: settings.apiKey",
+    "接口要 Basic authentication，Authorization: Basic *** 或者 Basic <base64>，Basic configuration 不对时报 401",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -753,6 +757,46 @@ test("同步到 aiops 时结果没传回来：再试一次先找到已经存进�
   assert.equal(backend.entries[0].aiopsId, 31);
   assert.equal(lastCard().header.title.content, "已存进经验库");
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已同步到 aiops 经验库（经验 #31）/);
+});
+
+test("同步到 aiops 没做成、有人在表格里改了这一行再点再试一次：同步过去的是表格里现在的内容；改进去的密钥不带过去", async () => {
+  let down = true;
+  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+  });
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /没能同步到 aiops 经验库：aiops 现在连不上/);
+
+  // 卡片没做完时有人在表格里改了这一行，改进去一个密钥
+  const row = backend.entries[0];
+  row.title = "gateway-api 报 code=8：user-rpc 只连一个 Pod";
+  row.conclusion = "user-rpc 走 ClusterIP，gRPC 长连接只连到一个 Pod，单 Pod 被打满后降载";
+  row.basis = `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`;
+  down = false;
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /没能同步到 aiops 经验库：依据或排查过程（basis）里像是有HTTP Basic 认证的用户名和密码/);
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1, "带密钥的这一行没有同步过去");
+
+  row.basis = "看了 user-rpc 每个 Pod 的连接数";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  const saves = calls.filter((call) => call.tool === "save_lesson");
+  assert.equal(saves.length, 2);
+  assert.equal(saves[1].args.title, row.title);
+  assert.equal(saves[1].args.root_cause, row.conclusion);
+  assert.match(String(saves[1].args.diagnosis_path), /^看了 user-rpc 每个 Pod 的连接数\n（来自飞书团队经验库 K1）$/);
+  assert.equal(backend.entries.length, 1);
+  assert.equal(backend.entries[0].aiopsId, 31);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1「gateway-api 报 code=8：user-rpc 只连一个 Pod」/);
 });
 
 test("没做成的卡片：点「不用了」或者超过 24 小时就不再试，结果里写上没做成的", async () => {

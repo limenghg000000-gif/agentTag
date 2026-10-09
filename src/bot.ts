@@ -398,7 +398,18 @@ async function readImages(
 }
 
 /**
- * 回答前先在团队经验库（和 aiops 经验库）里查一次，由程序保证查，不靠模型自觉：提问原文（话题里的追问带上话题的第一个问题）去检索，
+ * 自动查经验库用的文字：这次的提问，话题里最近几轮提问（新的在前），最后是话题的第一个问题。
+ * 两个库都只取前面一段去查，所以这次的提问放最前面；中间几轮每轮限长，第一个问题不会被挤出去。
+ * 只追问一句「怎么修？」时，上一轮给的错误码、服务名也能带上
+ */
+function lookupQuery(asked: string, history: readonly ChatMessage[]): string {
+  const asks = history.flatMap((m) => (m.role === "user" ? [m.content] : []));
+  const recent = asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse().map((text) => text.slice(0, LOOKUP_TURN_CHARS));
+  return [...new Set([asked, ...recent, ...asks.slice(0, 1)])].join("\n");
+}
+
+/**
+ * 回答前先在团队经验库（和 aiops 经验库）里查一次，由程序保证查，不靠模型自觉：提问原文（话题里的追问带上前几轮和第一个问题）去检索，
  * 够相近的几条写进提示词。查到了在进度卡片上多一步「查经验库」。返回 undefined 表示没查成（超时、出错），不耽误回答
  */
 async function lookupKnowledge(
@@ -414,9 +425,7 @@ async function lookupKnowledge(
   if (!knowledge) {
     return undefined;
   }
-  const root = history.find((m) => m.role === "user")?.content;
-  // 追问放前面：两个库都只取前面一段去查，第一个问题很长时，追问里新给的错误码、服务名不能被截掉
-  const query = root && root !== asked ? `${asked}\n${root}` : asked;
+  const query = lookupQuery(asked, history);
   // 经验库自己按库限时；这里再给整个检索一个上限：飞书接口不认中止信号，卡住了也不能拖住回答
   const timeout = timeoutSignal(deps.knowledgeLookupMs ?? KNOWLEDGE_LOOKUP_MS);
   try {
@@ -487,6 +496,10 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 
 /** 回答前查经验库最多等多久，查不完就先不带经验回答 */
 const KNOWLEDGE_LOOKUP_MS = 8000;
+/** 查经验库时除了第一个问题，再带上话题里最近几轮提问 */
+const LOOKUP_RECENT_TURNS = 3;
+/** 带上的每轮提问最多取多少字 */
+const LOOKUP_TURN_CHARS = 200;
 
 const CODE_TOOL_PREFIX = "code_";
 /** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
