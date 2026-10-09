@@ -19,6 +19,8 @@ export type KnowledgeCategory = keyof typeof KNOWLEDGE_CATEGORIES;
 
 /** 标题的字数上限 */
 export const MAX_TITLE_CHARS = 80;
+/** 表格里编号那一列写进了像密钥的东西时，读出来的编号换成这个 */
+const HIDDEN_ID = "（编号里像是有密钥）";
 /** 正文每个字段的字数上限 */
 export const MAX_FIELD_CHARS = 2000;
 /** 写进系统提示词时每条经验最多多少字 */
@@ -263,13 +265,14 @@ export class KnowledgeBase {
     if (!warning) {
       return entry;
     }
+    // 编号里就写着密钥的：编号换成 HIDDEN_ID，日志、卡片、报错里写到这一行时都不会写出来。
+    // 这一行不检索、不同步、不归档，用不着原来的编号；编号也不是 K 加数字，不影响发新编号
+    const id = findSecret(entry.id) ? HIDDEN_ID : entry.id;
     if (!this.warned.has(`${entry.id}\n${warning}`)) {
       this.warned.add(`${entry.id}\n${warning}`);
-      // 编号里就写着密钥时日志里不写编号
-      const row = findSecret(entry.id) ? "有一行（编号不写出来）" : entry.id;
-      this.logger.warn(`经验库：表格里 ${row} 的${warning}。这一行先不拿来检索、也不给模型看`);
+      this.logger.warn(`经验库：表格里 ${id} 的${warning}。这一行先不拿来检索、也不给模型看`);
     }
-    return { ...entry, ...(incomplete ? { incomplete } : {}), ...(unsafe ? { unsafe } : {}) };
+    return { ...entry, id, ...(incomplete ? { incomplete } : {}), ...(unsafe ? { unsafe } : {}) };
   }
 
   /** 按编号取一条；fresh 时不用缓存，重新读表格 */
@@ -325,7 +328,8 @@ export class KnowledgeBase {
       const entries = await this.entries(true);
       const saved = meta.requestId ? byRequestId(entries, meta.requestId) : undefined;
       if (saved) {
-        this.logger.info(`经验库 ${saved.id}「${saved.title}」上次已经存进去了（草稿 ${meta.requestId}），不重复保存`);
+        // 后来在表格里写进了密钥的不写标题
+        this.logger.info(`经验库 ${saved.id}${saved.unsafe ? "" : `「${saved.title}」`}上次已经存进去了（草稿 ${meta.requestId}），不重复保存`);
         return saved;
       }
       let replaces: string | undefined;
@@ -343,7 +347,7 @@ export class KnowledgeBase {
         const successor = entries.find((entry) => entry.status === "active" && entry.replaces !== undefined && oldIds.has(normalizeId(entry.replaces)));
         if (successor) {
           throw new StaleProposalError(
-            `经验 ${old.id} 已经有取代它的新经验 ${successor.id}「${successor.title}」，只是旧的还没归档，这张卡片不能再保存。要改的话请在 ${successor.id} 的基础上重新起草，或者直接归档 ${old.id}`,
+            `经验 ${old.id} 已经有取代它的新经验 ${successor.id}${successor.unsafe ? "" : `「${successor.title}」`}，只是旧的还没归档，这张卡片不能再保存。要改的话请在 ${successor.id} 的基础上重新起草，或者直接归档 ${old.id}`,
           );
         }
         checkSeen(old, meta.seen);

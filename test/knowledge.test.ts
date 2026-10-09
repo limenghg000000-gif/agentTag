@@ -2963,6 +2963,32 @@ test("归档、取代卡片发出后有人在表格里改了那一条：点确�
   assert.match(cardText(replacing.lastCard()), /经验 K1 在卡片发出后在表格里改过/);
 });
 
+test("归档、取代卡片发出后有人把那一行的编号改成了密钥：卡片作废，卡片上、报错里都不写出这个编号", async () => {
+  const leaked = ["token", "CorrectHorseBatteryStaple9"].join("=");
+  // 卡片存的（带草稿编号，按草稿编号认出）和表格里手动加的（没有草稿编号，按内容认出）
+  for (const meta of [{ requestId: "req-1" }, {}]) {
+    const archiving = deskSetup();
+    await archiving.base.save(normalizeDraft(dau), meta);
+    await archiving.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+    archiving.backend.entries[0].id = leaked;
+    await archiving.desk.handleCardAction(archiving.click((archiving.sent[0].input as { card: any }).card, "archive"));
+    await archiving.desk.idle();
+    assert.equal(archiving.backend.entries[0].status, "active");
+    assert.match(cardText(archiving.lastCard()), /经验 （编号里像是有密钥） 在卡片发出后在表格里改过/);
+    assert.ok(!JSON.stringify([archiving.sent, archiving.updates]).includes("CorrectHorse"), JSON.stringify(meta));
+  }
+
+  const replacing = deskSetup();
+  await replacing.base.save(normalizeDraft(dau), { requestId: "req-1" });
+  await replacing.tool("knowledge_propose").run({ ...dau, title: "日活的口径（新）", replaces: "K1" }, { signal });
+  replacing.backend.entries[0].id = leaked;
+  await replacing.desk.handleCardAction(replacing.click((replacing.sent[0].input as { card: any }).card, "save"));
+  await replacing.desk.idle();
+  assert.equal(replacing.backend.entries.length, 1);
+  assert.match(cardText(replacing.lastCard()), /经验 （编号里像是有密钥） 在卡片发出后在表格里改过/);
+  assert.ok(!JSON.stringify([replacing.sent, replacing.updates]).includes("CorrectHorse"));
+});
+
 test("有人直接在表格里写进了密钥：这一行不拿来检索、不给模型看，也不能起草归档卡片；编号照常算它", async () => {
   const { base, backend } = deskSetup();
   await base.save(normalizeDraft(dau));
@@ -3026,7 +3052,7 @@ test("有人在表格里把某一项改得比起草时的上限还长：这一�
   );
   assert.ok(warnings.some((line) => /表格里 K2 的结论超过了 2000 字，请在表格里改好/.test(line)), warnings.join("\n"));
   assert.ok(warnings.some((line) => /表格里 K3 的标题超过了 80 字，请在表格里改好/.test(line)), warnings.join("\n"));
-  assert.ok(warnings.some((line) => /表格里 有一行（编号不写出来） 的编号里像是有密码或令牌/.test(line)), warnings.join("\n"));
+  assert.ok(warnings.some((line) => /表格里 （编号里像是有密钥） 的编号里像是有密码或令牌/.test(line)), warnings.join("\n"));
   assert.ok(!warnings.some((line) => line.includes("CorrectHorse")));
 
   const desk = deskSetup();
