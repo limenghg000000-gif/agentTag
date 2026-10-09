@@ -10,6 +10,7 @@ import {
   type KnowledgeCategory,
   type KnowledgeEntry,
   KnowledgeError,
+  normalizeId,
 } from "./knowledge.js";
 
 /** 多维表格的列名。第一列是标题（多维表格的主字段） */
@@ -336,7 +337,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     for (const record of records) {
       const entry = toEntry(record);
       if (entry) {
-        const key = entry.id.toUpperCase();
+        // 编号按「#K12」「K 12」「k12」都是 K12 来认，和经验库里查重、按编号找一样
+        const key = normalizeId(entry.id);
         if (rows.has(key)) {
           ambiguous.add(key);
         } else {
@@ -371,17 +373,17 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     // 写之前开始的读还没回来的话，回来时不再用它换掉对照，不然会把这一行丢掉
     this.generation++;
     if (recordId) {
-      this.rows.set(entry.id.toUpperCase(), recordId);
+      this.rows.set(normalizeId(entry.id), recordId);
     }
   }
 
   async update(id: string, changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>): Promise<void> {
     const target = await this.current();
-    const recordId = this.rows.get(id.toUpperCase());
+    const recordId = this.rows.get(normalizeId(id));
     if (!target || !recordId) {
       throw new KnowledgeError(`多维表格里找不到 ${id} 这一行`);
     }
-    if (this.ambiguous.has(id.toUpperCase())) {
+    if (this.ambiguous.has(normalizeId(id))) {
       throw new KnowledgeError(`多维表格里不止一行的编号是 ${id}，不知道该改哪一行。请先在表格里把重复的编号改掉再试`);
     }
     await this.ensureColumns(target);

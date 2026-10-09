@@ -193,10 +193,11 @@ export class McpHub {
       throw new Error(`${serverName} 没有 ${tool} 这个工具`);
     }
     const timeout = server.config.timeoutsMs[tool] ?? DEFAULT_MCP_TIMEOUT_MS;
-    // 只放在 structuredContent 里、没有文字的结果，raw 是它的 JSON（见 resultText），调用方照样解析
-    const { raw, audit } = await this.request(server, tool, args, task, signal, timeout, "程序调用");
-    audit(`结果=${raw.length}字`);
-    return raw;
+    // 程序要解析结果：有 structuredContent 时用它的 JSON（文字部分可能是给人看的说明），没有时用文字
+    const { result, raw, audit } = await this.request(server, tool, args, task, signal, timeout, "程序调用");
+    const data = result.structuredContent ? JSON.stringify(result.structuredContent) : raw;
+    audit(`结果=${data.length}字`);
+    return data;
   }
 
   private find(name: string): ServerState | undefined {

@@ -266,7 +266,7 @@ export class KnowledgeBase {
   /** 按编号取一条；fresh 时不用缓存，重新读表格 */
   async get(id: string, { fresh = false }: { fresh?: boolean } = {}): Promise<KnowledgeEntry | undefined> {
     const wanted = normalizeId(id);
-    return (await this.entries(fresh)).find((entry) => entry.id.toUpperCase() === wanted);
+    return (await this.entries(fresh)).find((entry) => normalizeId(entry.id) === wanted);
   }
 
   /**
@@ -276,7 +276,7 @@ export class KnowledgeBase {
   async saved(requestId: string, id: string): Promise<KnowledgeEntry | undefined> {
     const entries = await this.entries(true);
     const wanted = normalizeId(id);
-    return byRequestId(entries, requestId) ?? entries.find((entry) => entry.id.toUpperCase() === wanted);
+    return byRequestId(entries, requestId) ?? entries.find((entry) => normalizeId(entry.id) === wanted);
   }
 
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
@@ -322,14 +322,18 @@ export class KnowledgeBase {
       let replaces: string | undefined;
       if (meta.replaces) {
         const wanted = normalizeId(meta.replaces);
-        const old = entries.find((entry) => entry.id.toUpperCase() === wanted);
+        // 先按卡片上那条的草稿编号找：卡片发出后有人复制了这一行、又把原来那行改了编号时，复制出来的那行占着旧编号、内容也一样，
+        // 按编号找会取代（归档）复制出来的那行、原来那行还有效
+        const old = (meta.seen?.requestId ? byRequestId(entries, meta.seen.requestId) : undefined) ?? entries.find((entry) => normalizeId(entry.id) === wanted);
         if (old?.status !== "active") {
           throw new StaleProposalError(
             `要取代的经验 ${meta.replaces} ${old ? "已经归档了（可能已经被别的卡片取代）" : "不在经验库里了"}，这张卡片不能再保存。需要的话请重新起草`,
           );
         }
         // 别的卡片已经存了取代它的新经验、只是归档旧的那步没做成：再存一条，就会有两条新的同时有效
-        const successor = entries.find((entry) => entry.status === "active" && entry.replaces !== undefined && normalizeId(entry.replaces) === wanted);
+        // 取代它的新经验记的是当时的编号：卡片上的编号、它现在的编号都算
+        const oldIds = new Set([wanted, normalizeId(old.id)]);
+        const successor = entries.find((entry) => entry.status === "active" && entry.replaces !== undefined && oldIds.has(normalizeId(entry.replaces)));
         if (successor) {
           throw new StaleProposalError(
             `经验 ${old.id} 已经有取代它的新经验 ${successor.id}「${successor.title}」，只是旧的还没归档，这张卡片不能再保存。要改的话请在 ${successor.id} 的基础上重新起草，或者直接归档 ${old.id}`,
@@ -370,13 +374,14 @@ export class KnowledgeBase {
   /**
    * 归档一条经验：不再被检索到，表格里还留着，改回「有效」就恢复。
    * 已经归档了的直接返回：上次点确认时表格改成功了、结果没传回来，再点一次要能接着做后面的（归档 aiops 里那条）。
-   * 卡片发出后编号被改了的，按卡片上那条的草稿编号认；两个都对不上时抛 MissingEntryError
+   * 先按卡片上那条的草稿编号认（卡片发出后编号被改了、或者复制出来的行占着旧编号也认得对），没有草稿编号或者找不到时按编号认；
+   * 两个都对不上时抛 MissingEntryError
    */
   archive(id: string, meta: KnowledgeMeta = {}): Promise<KnowledgeEntry> {
     return this.exclusive(async () => {
       const entries = await this.entries(true);
       const entry =
-        entries.find((e) => e.id.toUpperCase() === normalizeId(id)) ?? (meta.seen?.requestId ? byRequestId(entries, meta.seen.requestId) : undefined);
+        (meta.seen?.requestId ? byRequestId(entries, meta.seen.requestId) : undefined) ?? entries.find((e) => normalizeId(e.id) === normalizeId(id));
       if (!entry) {
         throw new MissingEntryError(`经验库里没有 ${id}`);
       }
@@ -563,7 +568,7 @@ function cosine(a: readonly number[], b: readonly number[]): number {
 }
 
 function numberOf(id: string): number {
-  const match = /^K(\d+)$/i.exec(id);
+  const match = /^K(\d+)$/.exec(normalizeId(id));
   const number = match ? Number(match[1]) : 0;
   // 表格里有人填了大得离谱的编号（超出能精确表示的整数）：不算，不然加一还是它自己（编号重复）或者变成 KInfinity
   return Number.isSafeInteger(number + 1) ? number : 0;
@@ -876,28 +881,49 @@ const AUTHORIZATION_VALUE = new RegExp(String.raw`^(${VALUE_CHAR}+)(?:[^\S\r\n]+
  * 凭据带数字的都算；不带数字的，要整个头只有「认证方式 凭据」（后面是行尾、引号、逗号分号、中文），认证方式也不是报错里的词
  * （Authorization: invalid credentials、failed verification 是说明，Token、Key 是真的认证方式）。
  * 没写认证方式直接写的令牌，要不短于 16 个字符、带数字和小写字母（Authorization: Negotiate、SCRAM-SHA-256 说的是认证方式）。
- * Basic 由 BASIC_AUTH 解开看；认证参数（Digest username="…"、AWS4-HMAC-SHA256 Credential=…）里写明了是密钥的由别的规则拦；
- * 后面紧跟着 ( [ { < \ 的是代码、占位（Bearer {access_token}、SSWS {{apiToken}}）
+ * Basic 由 BASIC_AUTH 解开看；带认证参数的（Signature keyId="…",signature="…"、Digest … response="…"、AWS4-HMAC-SHA256 … Signature=…）
+ * 看 authorizationParams；后面紧跟着 ( [ { < \ 的是代码、占位（Bearer {access_token}、SSWS {{apiToken}}）
  */
 function authorizationCredentials(text: string): string[] {
-  return [...text.matchAll(AUTHORIZATION_HEADER)].flatMap(([, line]) => {
-    const parts = AUTHORIZATION_VALUE.exec(line);
-    if (!parts) {
-      return [];
-    }
-    const [, first, second, rest] = parts;
-    const scheme = second === undefined ? undefined : first;
-    const value = second ?? first;
-    if (/^basic$/i.test(scheme ?? "") || /=(?!=*$)/.test(value) || /^(?:["'`][^\s"'`,;)\]}>\\]|[([{<]|\\(?!["']))/.test(rest)) {
-      return [];
-    }
-    if (scheme === undefined) {
-      return value.length >= 16 && /\d/.test(value) && /[a-z]/.test(value) ? [value] : [];
-    }
-    const whole = /^(?:\\?["'`]|[^\S\r\n]*(?:$|[,;)\]}\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))/.test(rest);
-    const prose = PLACEHOLDER_WORD.test(scheme) && !/^(?:token|key)$/i.test(scheme);
-    return value.length >= 8 && (/\d/.test(value) || (whole && !prose)) ? [value] : [];
+  return [...text.matchAll(AUTHORIZATION_HEADER)].flatMap(([, line]) => [...authorizationParams(line), ...schemeCredential(line)]);
+}
+
+/**
+ * 认证参数里本身就是凭据的：签名（HTTP Signature 的 signature、AWS 的 Signature、OAuth 1.0 的 oauth_signature、sig）、Digest 的 response、
+ * Hawk 的 mac，和写明是令牌、密钥、密码的（oauth_token、access_token、client_secret、api_key、x-api-key）。拿到它们就能重放请求、离线猜密码或者直接调接口。
+ * keyId、Credential（AWS 的访问密钥 ID）、nonce、realm、algorithm 这些不是
+ */
+const AUTHORIZATION_PARAM_NAME =
+  /^(?:(?:oauth_)?signature|sig|response|mac|[\w.-]*(?:token|secret|secret[_-]?key|password|passwd|pwd|api[_-]?key|private[_-]?key))$/i;
+/** 认证参数 name="value"、name=value（JSON 里转义的 name=\"value\" 也算，不带引号的到空白、逗号分号、中文为止）：第 1 组是名字，第 2、3、4 组是值 */
+const AUTHORIZATION_PARAM = /(?<![\w.-])([A-Za-z][\w.-]*)[^\S\r\n]*=[^\S\r\n]*(?:\\?"([^"\\\r\n]*)\\?"|'([^'\r\n]*)'|([^\s,;"'\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+))/g;
+
+/** Authorization 头这一行里是凭据的认证参数的值：不短于 8 个字符、中间没有空格（"see above" 这种是说明）、不是占位 */
+function authorizationParams(line: string): string[] {
+  return [...line.matchAll(AUTHORIZATION_PARAM)].flatMap(([, name, doubled, single, bare]) => {
+    const value = doubled ?? single ?? bare ?? "";
+    return AUTHORIZATION_PARAM_NAME.test(name) && value.length >= 8 && !/\s/.test(value) && !isPlaceholder(value) ? [value] : [];
   });
+}
+
+/** Authorization 头的「认证方式 凭据」或者只有凭据的那种（见 authorizationCredentials） */
+function schemeCredential(line: string): string[] {
+  const parts = AUTHORIZATION_VALUE.exec(line);
+  if (!parts) {
+    return [];
+  }
+  const [, first, second, rest] = parts;
+  const scheme = second === undefined ? undefined : first;
+  const value = second ?? first;
+  if (/^basic$/i.test(scheme ?? "") || /=(?!=*$)/.test(value) || /^(?:["'`][^\s"'`,;)\]}>\\]|[([{<]|\\(?!["']))/.test(rest)) {
+    return [];
+  }
+  if (scheme === undefined) {
+    return value.length >= 16 && /\d/.test(value) && /[a-z]/.test(value) ? [value] : [];
+  }
+  const whole = /^(?:\\?["'`]|[^\S\r\n]*(?:$|[,;)\]}\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))/.test(rest);
+  const prose = PLACEHOLDER_WORD.test(scheme) && !/^(?:token|key)$/i.test(scheme);
+  return value.length >= 8 && (/\d/.test(value) || (whole && !prose)) ? [value] : [];
 }
 
 /**
@@ -1267,7 +1293,7 @@ function byRequestId(entries: readonly KnowledgeEntry[], requestId: string): Kno
     // 编号里写进了密钥的不列出来，卡片上群里人人都看得到
     const ids = rows.map((row) => row.id).filter((rowId) => !containsSecret(rowId));
     throw new KnowledgeError(
-      `表格里有 ${rows.length} 行的「草稿编号」一样${ids.length > 0 ? `（经验 ${ids.join("、")}）` : ""}，多半是复制出来的行，分不清哪一行是这张卡片存的。请把复制出来的那几行的草稿编号清空后再点「再试一次」`,
+      `表格里有 ${rows.length} 行的「草稿编号」一样${ids.length > 0 ? `（经验 ${ids.join("、")}）` : ""}，多半是复制出来的行，分不清哪一行是卡片上的那条。请把复制出来的那几行的草稿编号清空后再点一次卡片上的按钮`,
     );
   }
   return rows[0];
@@ -1278,14 +1304,14 @@ export function usable(entry: KnowledgeEntry): boolean {
   return !entry.unsafe && !entry.incomplete && !entry.conflict;
 }
 
-/** 表格里编号重复的几行（不分大小写）都标上 conflict */
+/** 表格里编号重复的几行（不分大小写，「#K12」「K 12」和「K12」也算同一个）都标上 conflict */
 function markConflicts(entries: KnowledgeEntry[]): KnowledgeEntry[] {
   const counts = new Map<string, number>();
   for (const entry of entries) {
-    const key = entry.id.toUpperCase();
+    const key = normalizeId(entry.id);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  return entries.map((entry) => (counts.get(entry.id.toUpperCase())! > 1 ? { ...entry, conflict: "和别的行用了同一个编号" } : entry));
+  return entries.map((entry) => (counts.get(normalizeId(entry.id))! > 1 ? { ...entry, conflict: "和别的行用了同一个编号" } : entry));
 }
 
 /** 卡片上给大家看的那些内容（类别、标题、问题、结论这些）和表格里现在的一样不一样；aiops 编号、状态不算 */

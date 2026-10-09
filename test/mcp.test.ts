@@ -178,10 +178,14 @@ test("程序自己调用（经验库检索和同步）：没开给模型的工�
   await assert.rejects(hub.callDirect("other", "save_lesson", {}, task), /other 现在连不上/);
 });
 
-test("程序自己调用：结果只放在 structuredContent 里、没有文字时按 JSON 返回", async () => {
+test("程序自己调用：有 structuredContent 时按它的 JSON 返回，文字部分是给人看的说明也一样；没有文字时也是", async () => {
   const server = await fake({ call: () => ({ content: [], structuredContent: { saved: true, id: 31 } }) });
   const hub = await hubFor([config(server.url)], { logger: recorder().logger });
   assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+
+  const both = await fake({ call: () => ({ content: [{ type: "text", text: "已存为经验 #31" }], structuredContent: { saved: true, id: 31 } }) });
+  const hub2 = await hubFor([config(both.url)], { logger: recorder().logger });
+  assert.equal(await hub2.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
 });
 
 test("报错只放在 structuredContent 里、没有文字时：照样认出服务繁忙去重试，报错和审计日志里带上它", async () => {

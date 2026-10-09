@@ -316,6 +316,15 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 句子中间的，凭据带数字的
     ["用 Authorization: Token abc123def", "456ghi 调接口"].join(""),
     ["call it with Authorization: Token abc123", "def456 and retry"].join(""),
+    // 带认证参数的：HTTP Signature 的 signature（JSON 里转义的也算）、Digest 的 response、AWS 的 Signature、OAuth 1.0 的 oauth_signature 和 oauth_token、Hawk 的 mac
+    `Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",headers="(request-target) date",signature="${base64(Buffer.alloc(32, 9))}"`,
+    `{"Authorization": "Signature keyId=\\"rsa-key-1\\",algorithm=\\"rsa-sha256\\",signature=\\"${base64(Buffer.alloc(32, 9))}\\""}`,
+    ['Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", qop=auth, nc=00000001, response="6629fae49393a053', '97450978507c4ef1"'].join(""),
+    `Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host;x-amz-date, Signature=${Buffer.alloc(32, 7).toString("hex")}`,
+    `Authorization: OAuth oauth_consumer_key="xvz1evFS4wEEPTGEFPHBog", oauth_signature="${base64(Buffer.alloc(20, 5))}"`,
+    ['Authorization: OAuth oauth_consumer_key="xvz1evFS4wEEPTGEFPHBog", oauth_token="370773112-GmHxMAgYyLbNEt', 'IKZeRNFsMKPR9EyMZeS9weJAEb"'].join(""),
+    `Authorization: Hawk id="dh37fgj492je", ts="1353832234", nonce="j4h3g2", mac="${base64(Buffer.alloc(32, 3))}"`,
+    ['Authorization: Custom keyId="partner-7", x-api-key="correcthorse', 'batterystaple"'].join(""),
     // base64 编码的私钥：kubeconfig 的 client-key-data、Secret 里的 tls.key、ssh-privatekey（PEM 编成 base64，YAML 里折成几行的也算），DER 编码的 RSA、EC、PKCS#8
     `users:\n- name: admin\n  user:\n    client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`,
     `data:\n  tls.key: ${base64(ecKeys.privateKey.export({ type: "pkcs8", format: "pem" }))}`,
@@ -406,11 +415,13 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
     "<password><!-- 找管理员要 --></password><token>\n  <!-- 放在 vault 里 -->\n</token>",
-    // Authorization 头的报错、凭据是变量、占位、模板、打码的，只写了认证方式的，Digest 的认证参数，代码里拼的
+    // Authorization 头的报错、凭据是变量、占位、模板、打码的，只写了认证方式的，认证参数里不是凭据的、凭据是占位或者说明的，代码里拼的
     "Authorization: invalid credentials\nAuthorization: failed verification\nAuthorization: Token expired\nAuthorization: Bearer undefined\nAuthorization: missing bearer token\nAuthorization: Token required, please login",
     "Authorization: Token ${OKTA_TOKEN}\nAuthorization: SSWS {{apiToken}}\nAuthorization: Bearer {access_token}\nAuthorization: Token <your-token>\nAuthorization: token YOUR_API_TOKEN\nAuthorization: Token abcd****wxyz",
     'Authorization: Negotiate；Authorization: SCRAM-SHA-256；Authorization: 需要登录；Authorization header is missing；headers = {"Authorization": f"Token {token}"}',
-    'Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", qop=auth, nc=00000001, response="6629fae49393a05397450978507c4ef1"',
+    'Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", qop=auth, nc=00000001, response="<response>"',
+    'Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${SIGNATURE}"；Authorization: Signature keyId="rsa-key-1",signature="invalid"',
+    "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host, Signature=<signature>；Digest 里 response=\"see above\"",
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
     `encrypted: ${base64(rsaKeys.privateKey.export({ type: "pkcs8", format: "der", cipher: "aes-256-cbc", passphrase: "x" }))}；sha512: ${base64(Buffer.alloc(64, 7))}`,
@@ -2468,6 +2479,10 @@ test("回答前检索：按 aiops 经验排查过程末尾的出处去重（编�
   await base.entries(true);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8 ResourceExhausted", task))?.ids, ["k1", "aiops#40"]);
   assert.equal(syncedFrom("看了 Pod 连接数\n（来自飞书团队经验库 K1）", "k1"), true);
+  // 表格里编号写成 #K1、K 1 的，按 K1 认
+  assert.equal(syncedFrom("看了 Pod 连接数\n（来自飞书团队经验库 K1）", "#K1"), true);
+  assert.equal(syncedFrom("看了 Pod 连接数\n（来自飞书团队经验库 K 1）", "K1"), true);
+  assert.equal(syncedFrom("看了 Pod 连接数\n（来自飞书团队经验库 K11）", "K1"), false);
   assert.equal(syncedFrom("（来自飞书团队经验库 K1）\n后面又写了一行", "K1"), false);
 });
 
@@ -2483,6 +2498,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="), task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Authorization: SSWS 00QCjAl4MlV-WPXM", "-ABCDEFGHIJKLMNOPQRSTUVWX"].join(""), task);
   await desk.lookup(`gateway-api 报 code=8，kubeconfig 里 client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`, task);
+  await desk.lookup(`gateway-api 报 code=8，请求头 Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${base64(Buffer.alloc(32, 9))}"`, task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);
@@ -2795,6 +2811,74 @@ test("表格里不止一行用了同一个编号（有人复制了行）：这�
   backend.entries[2].id = "K9";
   await base.entries(true);
   assert.deepEqual((await desk.lookup("日活怎么算", task))?.ids.sort(), ["K1", "K2", "K9"]);
+});
+
+test("表格里的编号写成「#K12」「K 12」「k12」：都按 K12 认，取全文、归档都找得到，新编号接着往后排；和写成 K12 的行算同一个编号", async () => {
+  const { base, backend, desk, sent, click, tool } = deskSetup({ aiops: false });
+  await base.save(normalizeDraft(dau));
+  backend.entries[0].id = "#K12";
+  await base.entries(true);
+  assert.equal((await base.get("K12"))?.id, "#K12");
+  assert.match(await tool("knowledge_get").run({ id: "k12" }, { signal }), /日活的口径/);
+  assert.equal((await base.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K13");
+
+  backend.entries[0].id = "K 12";
+  await base.entries(true);
+  await tool("knowledge_propose_archive").run({ id: "K12" }, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+
+  // 有人复制了 K13 这一行，编号写成了 #K13：两行都不拿来用
+  backend.entries.push({ ...structuredClone(backend.entries[1]), id: "#K13", requestId: undefined });
+  await base.entries(true);
+  await assert.rejects(tool("knowledge_get").run({ id: "K13" }, { signal }), /和别的行用了同一个编号/);
+});
+
+test("归档、取代卡片发出后有人复制了那一行、又改了原来那行的编号（复制的占着旧编号、内容一样）：按卡片上那条的草稿编号认出原来那行；复制的也带着草稿编号时分不清，哪行都不动", async () => {
+  // 归档：复制出来的那行清掉了草稿编号
+  const archiving = deskSetup({ aiops: false });
+  await archiving.base.save(normalizeDraft(dau), { requestId: "req-1" });
+  await archiving.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  archiving.backend.entries.push({ ...structuredClone(archiving.backend.entries[0]), requestId: undefined });
+  archiving.backend.entries[0].id = "K9";
+  await archiving.desk.handleCardAction(archiving.click((archiving.sent[0].input as { card: any }).card, "archive"));
+  await archiving.desk.idle();
+  assert.deepEqual(
+    archiving.backend.entries.map((entry) => [entry.id, entry.status]),
+    [
+      ["K9", "archived"],
+      ["K1", "active"],
+    ],
+  );
+
+  // 取代
+  const replacing = deskSetup({ aiops: false });
+  await replacing.base.save(normalizeDraft(dau), { requestId: "req-1" });
+  await replacing.tool("knowledge_propose").run({ ...dau, title: "日活的口径（排除机器人账号）", replaces: "K1" }, { signal });
+  replacing.backend.entries.push({ ...structuredClone(replacing.backend.entries[0]), requestId: undefined });
+  replacing.backend.entries[0].id = "K9";
+  await replacing.desk.handleCardAction(replacing.click((replacing.sent[0].input as { card: any }).card, "save"));
+  await replacing.desk.idle();
+  assert.deepEqual(
+    replacing.backend.entries.map((entry) => [entry.id, entry.status, entry.replaces]),
+    [
+      ["K9", "archived", undefined],
+      ["K1", "active", undefined],
+      ["K10", "active", "K9"],
+    ],
+  );
+
+  // 复制出来的那行也带着草稿编号：分不清，不归档哪一行，卡片可以清掉后再点
+  const ambiguous = deskSetup({ aiops: false });
+  await ambiguous.base.save(normalizeDraft(dau), { requestId: "req-1" });
+  await ambiguous.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  ambiguous.backend.entries.push(structuredClone(ambiguous.backend.entries[0]));
+  ambiguous.backend.entries[0].id = "K9";
+  await ambiguous.desk.handleCardAction(ambiguous.click((ambiguous.sent[0].input as { card: any }).card, "archive"));
+  await ambiguous.desk.idle();
+  assert.ok(ambiguous.backend.entries.every((entry) => entry.status === "active"));
+  assert.match(cardText(ambiguous.lastCard()), /表格里有 2 行的「草稿编号」一样（经验 K9、K1），多半是复制出来的行，分不清哪一行是卡片上的那条/);
 });
 
 test("aiops 里别处存的经验写进了密钥：回答前检索不给模型看，也不能起草归档卡片列出来", async () => {

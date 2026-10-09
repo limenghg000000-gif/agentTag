@@ -527,6 +527,24 @@ test("表格里有两行编号相同（有人复制了行）时不去改它们�
   assert.equal(tables.get("tblX")!.records[2].fields["状态"], "已归档");
 });
 
+test("表格里的编号写成「#K3」「K 3」：按 K3 认，改得到那一行；写法不同、编号一样的两行（K 5 和 k5）算重复，不去改", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: "#K3" } },
+      { recordId: "recB", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K 5" } },
+      { recordId: "recC", fields: { 标题: "留存的口径（副本）", 结论: "次日还打开", 编号: "k5" } },
+    ],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "normalized", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.archive("K3");
+  assert.equal(tables.get("tblX")!.records[0].fields["状态"], "已归档");
+  await assert.rejects(base.archive("K5"), /不止一行的编号是 K 5/);
+  assert.equal(tables.get("tblX")!.records[1].fields["状态"], undefined);
+});
+
 test("飞书接口的错误翻译成能转告的话：缺权限时说要开 bitable:app", async () => {
   const { api } = fakeBitable();
   api.fail = new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[bitable:app]");

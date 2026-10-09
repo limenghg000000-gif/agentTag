@@ -1,5 +1,5 @@
 import type { Logger } from "./history.js";
-import { containsSecret, type KnowledgeDraft, KnowledgeError, StaleProposalError } from "./knowledge.js";
+import { containsSecret, type KnowledgeDraft, KnowledgeError, normalizeId, StaleProposalError } from "./knowledge.js";
 import type { McpTaskContext } from "./mcp.js";
 
 /** 回答前检索时，提问最多取多少字 */
@@ -343,9 +343,9 @@ function teamSourceNote(teamId: string): string {
  */
 export function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean {
   const last = diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
-  // 编号不分大小写，和团队经验库里一样（表格里把 K1 改成 k1 还是同一条）
-  const id = /^（来自飞书团队经验库 (\S+)）$/.exec(last)?.[1];
-  return id !== undefined && id.toUpperCase() === teamId.toUpperCase();
+  // 编号按团队经验库里的规则比（表格里把 K1 改成 k1、#K1、K 1 还是同一条）
+  const id = /^（来自飞书团队经验库 ([^）]+)）$/.exec(last)?.[1];
+  return id !== undefined && normalizeId(id) === normalizeId(teamId);
 }
 
 /**
