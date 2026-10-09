@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Readable } from "node:stream";
 import { test } from "node:test";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { createFeishuApi, FeishuApiError } from "../src/feishu.js";
@@ -152,4 +153,62 @@ test("读群或话题里最近的消息：群按时间过滤，话题不传时�
   assert.equal(ping.message.createTime, 2000);
   assert.equal(answer.fromBot, true);
   assert.equal(answer.message.mentionedBot, false);
+});
+
+test("话题消息里的图片记下 image_key；下载图片读出整个文件，按返回头或文件头认出类型", async () => {
+  const { client } = fakeClient([
+    {
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_1",
+            msg_type: "post",
+            create_time: "1000",
+            sender: { id: "ou_zhang", id_type: "open_id", sender_type: "user", sender_name: "张三" },
+            body: {
+              content: JSON.stringify({
+                title: "",
+                content: [[{ tag: "img", image_key: "img_v3_a" }], [{ tag: "text", text: "这个线上报警是咋回事" }]],
+              }),
+            },
+          },
+        ],
+      },
+    },
+  ]);
+  const [first] = await createFeishuApi(client, "cli_app", () => bot).listThreadMessages("omt_1", 10);
+  assert.deepEqual(first.images, ["img_v3_a"]);
+  assert.match(first.content, /!\[image\]\(img_v3_a\)/);
+
+  const calls: any[] = [];
+  const files = [
+    { headers: { "content-type": "image/jpeg; charset=binary" }, chunks: [Buffer.from([0xff, 0xd8]), Buffer.from("rest")] },
+    { headers: {}, chunks: [Buffer.from([0xff, 0xd8, 0xff])] },
+    { headers: { "content-type": "application/octet-stream" }, chunks: [Buffer.from("\x89PNG")] },
+  ];
+  const download = createFeishuApi(
+    {
+      im: {
+        v1: {
+          messageResource: {
+            get: async (payload: any) => {
+              calls.push(payload);
+              const file = files.shift()!;
+              return { headers: file.headers, getReadableStream: () => Readable.from(file.chunks), writeFile: async () => {} };
+            },
+          },
+        },
+      },
+    } as unknown as Client,
+    "cli_app",
+    () => bot,
+  );
+
+  const jpeg = await download.downloadImage("om_1", "img_v3_a");
+  assert.deepEqual(calls[0], { path: { message_id: "om_1", file_key: "img_v3_a" }, params: { type: "image" } });
+  assert.equal(jpeg.mimeType, "image/jpeg");
+  assert.equal(jpeg.data.length, 6);
+  assert.equal((await download.downloadImage("om_1", "img_b")).mimeType, "image/jpeg");
+  assert.equal((await download.downloadImage("om_1", "img_c")).mimeType, "image/png");
 });

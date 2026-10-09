@@ -9,7 +9,8 @@ import { loadConfig } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
-import { createOpenAICompatibleModel } from "./llm.js";
+import { ImageReader } from "./images.js";
+import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "./llm.js";
 import { McpHub } from "./mcp.js";
 import { MemoryStore } from "./memory.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
@@ -60,6 +61,13 @@ const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefin
 // MCP 服务在后台连接，连上之前（或连不上时）的提问没有它的工具，不耽误机器人启动
 const mcp = config.mcp.length > 0 ? new McpHub(config.mcp) : undefined;
 void mcp?.start();
+// 提问里的截图先交给看图模型转成文字
+const images = config.vision
+  ? new ImageReader({
+      download: (messageId, imageKey) => feishuApi.downloadImage(messageId, imageKey),
+      vision: createOpenAICompatibleVisionModel({ baseURL: config.llm.baseURL, apiKey: config.llm.apiKey, ...config.vision }),
+    })
+  : undefined;
 const handleMessage = createMessageHandler({
   model: createOpenAICompatibleModel(config.llm),
   tools,
@@ -74,6 +82,7 @@ const handleMessage = createMessageHandler({
   ...(workspaces ? { codeRepos: workspaces.repos } : {}),
   ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
   ...(mcp ? { mcp } : {}),
+  ...(images ? { images } : {}),
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
   memory,
@@ -121,6 +130,11 @@ console.log(
   `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
     `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, ...(workspaces ? CODE_TOOL_NAMES : [])].join(", ")}，` +
     `群记忆存放在 ${config.memoryDir}`,
+);
+console.log(
+  images
+    ? `看图：提问里的图片先用 ${images.model} 识别成文字（MODEL_VISION_ID=off 可以关掉）`
+    : "看图：没配看图模型，提问里的图片模型看不到，会请对方贴文字（MODEL_VISION_ID 填能看图的模型就能打开）",
 );
 if (config.llm.thinking !== undefined) {
   const budget = config.llm.thinkingBudget ? `，打开时最多想 ${config.llm.thinkingBudget} token` : "";

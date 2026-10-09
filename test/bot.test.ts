@@ -16,7 +16,8 @@ import {
   UNVERIFIED_CODE_ANSWER,
   unverifiedOpsAnswer,
 } from "../src/bot.js";
-import type { ThreadContext } from "../src/history.js";
+import type { ImageRef, ThreadContext } from "../src/history.js";
+import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION } from "../src/progress.js";
@@ -622,6 +623,82 @@ test("配了写权限名单：名单外的人只拿到读的工具，提示词�
   await setup({ model: open.model, taskTools }).handle(message("改一下", { senderId: "ou_guest" }));
   assert.equal(open.requests[0].tools?.length, 4);
   assert.doesNotMatch(open.requests[0].system, /WRITE_ALLOWED_USERS/);
+});
+
+test("提问里的截图先识别成文字再交给模型，进度卡片上多一步「识别图片」", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const read: ImageRef[][] = [];
+  const { updates, handle } = setup({
+    model,
+    images: {
+      read: async (refs) => {
+        read.push([...refs]);
+        return new Map([["img_a", "服务名称：prod/gateway-api\n请求requestId：179152518627422277"]]);
+      },
+    },
+  });
+
+  await handle(message("![image](img_a)\n这个线上报警是咋回事", { resources: [{ type: "image", fileKey: "img_a" }] }));
+
+  assert.deepEqual(read, [[{ messageId: "om_1", imageKey: "img_a" }]]);
+  const prompt = requests[0].messages.at(-1)!.content;
+  assert.match(prompt, /^\[群成员\] \n\[图片内容：机器人用看图模型识别的文字，个别字可能识别错\]\n服务名称：prod\/gateway-api\n请求requestId：179152518627422277\n\[图片内容结束\]\n\n这个线上报警是咋回事$/);
+  assert.match(cardText(updates.map((u) => u.card)), /识别图片（1 张）/);
+});
+
+test("没配看图模型、或者图片没识别出来时，图片换成「没能看到」的说明，不让模型照着图片编号猜", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const infos: string[] = [];
+  const { handle } = setup({ model, logger: { ...quiet, info: (line: string) => infos.push(line) } });
+  const screenshot = () => message("![image](img_a)\n这个线上报警是咋回事", { resources: [{ type: "image", fileKey: "img_a" }] });
+
+  await handle(screenshot());
+  assert.equal(requests[0].messages.at(-1)!.content, `[群成员] ${UNREAD_IMAGE}\n这个线上报警是咋回事`);
+  assert.match(infos.join("\n"), /提问或话题里有 1 张图片，没配看图模型（MODEL_VISION_ID）/);
+
+  const failed = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { updates, handle: handleFailed } = setup({ model: failed.model, images: { read: async () => new Map() } });
+  await handleFailed(screenshot());
+  assert.equal(failed.requests[0].messages.at(-1)!.content, `[群成员] ${UNREAD_IMAGE}\n这个线上报警是咋回事`);
+  assert.match(cardText(updates.at(-1)!.card), /识别图片（1 张）/);
+});
+
+test("提问里自己写的 Markdown 图片语法不是截图，原样交给模型", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, images: { read: async () => new Map() } });
+
+  await handle(message("README 里 ![image](https://example.com/a.png) 这行为啥不显示"));
+
+  assert.equal(requests[0].messages.at(-1)!.content, "[群成员] README 里 ![image](https://example.com/a.png) 这行为啥不显示");
+});
+
+test("话题第一条贴了截图，在话题里追问时上文里的截图也换成识别出的文字", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const read: ImageRef[][] = [];
+  const context = fakeContext({
+    history: [
+      { role: "user", content: "[张三] ![image](img_root)\n这个线上报警是咋回事" },
+      { role: "assistant", content: "结论：……" },
+    ],
+    images: [{ messageId: "om_root", imageKey: "img_root" }],
+    source: "feishu",
+  });
+  const { handle } = setup({
+    model,
+    context: context.source,
+    images: {
+      read: async (refs) => {
+        read.push([...refs]);
+        return new Map([["img_root", "服务名称：prod/gateway-api"]]);
+      },
+    },
+  });
+
+  await handle(message("你确定么？", { rootId: "om_root", threadId: "omt_1" }));
+
+  assert.deepEqual(read, [[{ messageId: "om_root", imageKey: "img_root" }]]);
+  assert.match(requests[0].messages[0].content, /^\[张三\] \n\[图片内容：[^\]]*\]\n服务名称：prod\/gateway-api\n\[图片内容结束\]\n\n这个线上报警是咋回事$/);
+  assert.equal(requests[0].messages.at(-1)!.content, "[群成员] 你确定么？");
 });
 
 test("没说要文档时不给新建文档的工具，提示词让它直接写在回答里；说了要文档才给", async () => {

@@ -8,6 +8,7 @@ import {
   DEFAULT_MODEL_BASE_URL,
   DEFAULT_MODEL_ID,
   DEFAULT_THINKING_BUDGET,
+  isMultimodalQwen,
   loadConfig,
 } from "../src/config.js";
 
@@ -93,6 +94,26 @@ test("联网搜索：百炼的兼容接口换成同域名的原生接口，可�
   assert.equal(loadConfig({ ...base, WEB_SEARCH: "off" }).webSearch, undefined);
   assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).webSearch, undefined);
   assert.throws(() => loadConfig({ ...base, WEB_SEARCH: "yes" }), /WEB_SEARCH 只能是 on 或 off/);
+});
+
+test("看图模型：百炼上默认用主模型（千问 3.5 以后是多模态），主模型不是千问时用千问旗舰；可以单独指定或关掉，别家服务要自己配", () => {
+  // 用百炼时看图关掉思考，主模型打开思考也一样
+  assert.deepEqual(loadConfig({ ...base, MODEL_THINKING: "on" }).vision, { model: DEFAULT_MODEL_ID, thinking: false });
+  assert.deepEqual(loadConfig({ ...base, MODEL_ID: "qwen3.7-plus" }).vision, { model: "qwen3.7-plus", thinking: false });
+  assert.deepEqual(loadConfig({ ...base, MODEL_ID: "kimi-k3" }).vision, { model: DEFAULT_MODEL_ID, thinking: false });
+  // 纯文本的千问不拿来看图
+  for (const text of ["qwen-plus", "qwen3-max", "qwen2.5-72b-instruct", "qwen3-coder-plus"]) {
+    assert.deepEqual(loadConfig({ ...base, MODEL_ID: text }).vision, { model: DEFAULT_MODEL_ID, thinking: false }, text);
+  }
+  for (const multimodal of ["qwen3.5-plus", "qwen3-vl-plus", "qwen-vl-max", "qwen3-omni-flash", "qwen3.8-max"]) {
+    assert.equal(isMultimodalQwen(multimodal), true, multimodal);
+  }
+  assert.deepEqual(loadConfig({ ...base, MODEL_VISION_ID: " qwen3-vl-plus " }).vision, { model: "qwen3-vl-plus", thinking: false });
+  assert.equal(loadConfig({ ...base, MODEL_VISION_ID: "OFF" }).vision, undefined);
+  assert.equal(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1" }).vision, undefined);
+  assert.deepEqual(loadConfig({ ...base, MODEL_BASE_URL: "https://llm.example.com/v1", MODEL_VISION_ID: "glm-5.3v" }).vision, {
+    model: "glm-5.3v",
+  });
 });
 
 test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层），否则 GITHUB_TOKEN 接 GitHub，缺令牌时报错", () => {

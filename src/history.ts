@@ -26,6 +26,21 @@ export interface ThreadContext {
   askerName?: string;
   /** feishu：从飞书读到了整个话题；local：只有机器人自己记下的问答；none：没有上文 */
   source: "feishu" | "local" | "none";
+  /** 上文里群成员发的图片，从早到晚。history 里对应的位置是 ![image](image_key) */
+  images?: ImageRef[];
+}
+
+/** 消息里的一张图片：下载时要同时给消息 id 和 image_key */
+export interface ImageRef {
+  messageId: string;
+  imageKey: string;
+}
+
+/** 群成员消息里的图片（机器人自己发的不算） */
+function imagesOf(messages: readonly ThreadMessage[]): ImageRef[] {
+  return messages
+    .filter((m) => !m.fromBot)
+    .flatMap((m) => (m.images ?? []).map((imageKey) => ({ messageId: m.messageId, imageKey })));
 }
 
 /**
@@ -53,12 +68,14 @@ export class ThreadContextLoader {
     }
 
     const history = [...(this.local.get(key) ?? [])];
+    let images: ImageRef[] = [];
     // 不在话题里、而是用「回复」引用了一条消息：把被回复的消息也带上
     if (!msg.threadId && msg.replyToMessageId && history.length === 0) {
       try {
         const quoted = await this.api.getMessage(msg.replyToMessageId);
         if (quoted) {
           history.push(...toChatMessages([quoted]));
+          images = imagesOf([quoted]);
         }
       } catch (err) {
         this.warnOnce(err);
@@ -66,7 +83,12 @@ export class ThreadContextLoader {
     }
     // 不在话题里时拿不到话题列表里的发言人名字，单独读一下这条消息。名字只是锦上添花，读不到就算了
     const askerName = (await this.api.getMessage(msg.messageId).catch(() => undefined))?.senderName;
-    return { history, ...(askerName ? { askerName } : {}), source: history.length > 0 ? "local" : "none" };
+    return {
+      history,
+      ...(askerName ? { askerName } : {}),
+      source: history.length > 0 ? "local" : "none",
+      ...(images.length > 0 ? { images } : {}),
+    };
   }
 
   /** 记下一轮问答，读不到飞书话题时用 */
@@ -98,7 +120,13 @@ export class ThreadContextLoader {
         earlier.unshift(root);
       }
     }
-    return { history: toChatMessages(earlier), askerName, source: earlier.length > 0 ? "feishu" : "none" };
+    const images = imagesOf(earlier);
+    return {
+      history: toChatMessages(earlier),
+      askerName,
+      source: earlier.length > 0 ? "feishu" : "none",
+      ...(images.length > 0 ? { images } : {}),
+    };
   }
 
   private warnOnce(err: unknown): void {

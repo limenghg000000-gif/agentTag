@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
-import { createOpenAICompatibleModel, LlmError, stripThinkTags } from "../src/llm.js";
+import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel, LlmError, stripThinkTags } from "../src/llm.js";
 
 // 本地假 OpenAI 兼容接口：记录收到的请求，按队列返回预设的状态码和响应
 const requests: { url: string; headers: IncomingHttpHeaders; body: any }[] = [];
@@ -266,4 +266,51 @@ test("回答里漏出来的 <think> 标签去掉：开头整段思考连同内�
   assert.equal(stripThinkTags("先说结论 <think>补充</think> 再说依据"), "先说结论 补充 再说依据");
   // 只有思考没有正文时保留文字，不发空回答
   assert.equal(stripThinkTags("<think>只有这段</think>"), "只有这段");
+});
+
+test("看图：图片用 base64 data URL 放在 image_url 里，后面跟要求；接口报错翻译成 LlmError", async () => {
+  const vision = createOpenAICompatibleVisionModel({
+    baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+    apiKey: "sk-test",
+    model: "qwen3.8-max",
+  });
+  responses.push(completion("<think>先看看</think>服务名称：prod/gateway-api"));
+  assert.equal(await vision.describe({ data: Buffer.from("png"), mimeType: "image/png" }, "原样抄文字"), "服务名称：prod/gateway-api");
+  assert.deepEqual(requests.at(-1)!.body, {
+    model: "qwen3.8-max",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from("png").toString("base64")}` } },
+          { type: "text", text: "原样抄文字" },
+        ],
+      },
+    ],
+  });
+
+  responses.push({ status: 400, body: { error: { message: "model does not support image input" } } });
+  await assert.rejects(
+    vision.describe({ data: Buffer.from("png"), mimeType: "image/png" }, "原样抄文字"),
+    (err: unknown) => err instanceof LlmError && err.kind === "api" && /image input/.test(err.message),
+  );
+});
+
+test("看图关掉思考；模型不认 enable_thinking 时去掉重试，之后都不再带", async () => {
+  const vision = createOpenAICompatibleVisionModel({
+    baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+    apiKey: "sk-test",
+    model: "qwen3-vl-plus",
+    thinking: false,
+  });
+  const image = { data: Buffer.from("png"), mimeType: "image/png" };
+  responses.push(completion("第一张"));
+  assert.equal(await vision.describe(image, "原样抄文字"), "第一张");
+  assert.equal(requests.at(-1)!.body.enable_thinking, false);
+
+  responses.push({ status: 400, body: { error: { message: "parameter enable_thinking is not supported" } } }, completion("第二张"), completion("第三张"));
+  assert.equal(await vision.describe(image, "原样抄文字"), "第二张");
+  assert.equal(requests.at(-1)!.body.enable_thinking, undefined);
+  assert.equal(await vision.describe(image, "原样抄文字"), "第三张");
+  assert.equal(requests.at(-1)!.body.enable_thinking, undefined);
 });
