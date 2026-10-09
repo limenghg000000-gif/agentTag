@@ -234,8 +234,9 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
-          // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到
-          evidence.push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
+          // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到。
+          // 没搜到的结果会带上搜的内容（「没有搜到「src/foo.ts」」），和报错一样只说明查过、没查到
+          (NOTHING_FOUND.test(output) ? failures : evidence).push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
           return output;
         },
       }),
@@ -303,7 +304,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, deps.codeRepos ?? []);
-      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || userText.includes(text)).filter(
+      const unseen = unseenCodeCitations(result.text, (text, line, sentence) => seen(text, line, sentence) || mentions(userText, text)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -462,8 +463,8 @@ export interface CodeCitation {
   located: boolean;
 }
 
-/** 认不认得回答里的路径、提交号；line 是路径后面写的行号 */
-export type CitationCheck = (text: string, line?: number) => boolean;
+/** 认不认得回答里的路径、提交号；line 是路径后面写的行号，sentence 是回答里引用它的那句话 */
+export type CitationCheck = (text: string, line?: number, sentence?: string) => boolean;
 
 /**
  * 回答里引用、但 seen 认不出来的代码位置（文件路径、行号和提交号）。
@@ -476,44 +477,89 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
     const path = match[1];
     const at = LINE_AFTER_PATH.exec(answer.slice(match.index + match[0].length));
     const line = at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
-    if (!seen(path, line)) {
+    if (!seen(path, line, sentenceAt(answer, match.index + match[0].length - path.length))) {
       const text = line === undefined ? path : `${path}:${line}`;
       cites.set(text, { text, located: line !== undefined });
     }
   }
   for (const match of answer.matchAll(COMMIT_REFS)) {
-    if (!seen(match[1])) {
+    if (!seen(match[1], undefined, sentenceAt(answer, match.index))) {
       cites.set(match[1], { text: match[1], located: true });
     }
   }
   return [...cites.values()];
 }
 
+/** 回答里 index 处所在的那句话（按句号、问号、分号、换行断句，路径里的点不算） */
+function sentenceAt(text: string, index: number): string {
+  const ends = /[。！？!?；;\n]/;
+  let start = index;
+  while (start > 0 && !ends.test(text[start - 1])) {
+    start--;
+  }
+  let end = index;
+  while (end < text.length && !ends.test(text[end])) {
+    end++;
+  }
+  return text.slice(start, end);
+}
+
 /**
  * 按这次的工具结果认引用：路径、提交号出现在结果里就算；带行号的还要那一行真在结果里：搜索结果、报错堆栈里的「路径:行号」，
- * 或者读这个文件时读到了那一行（「35| …」）。只列过文件、读了别的段落，编一个行号照样不认。
- * 工具报的错里提到的路径也认（「没有这个文件：src/foo.ts」以后说它不存在）。
+ * 读这个文件时读到了那一行（「35| …」），或者改文件的结果里写的行（「已修改 src/foo.ts 第 35 行起的内容」、新建的文件）。
+ * 只列过文件、读了别的段落，编一个行号照样不认。路径要整段对上：结果里只有 src/index.tsx，不能认 src/index.ts。
+ * 工具报的错、没搜到的结果只说明查过、没查到（「没有这个文件：src/foo.ts」），所以只认回答里那句话说的就是不存在或读不到的；
+ * 读失败以后照样讲这个文件、这一行写了什么，不认。
  * 回答里写成「./路径」或「仓库名/路径」（ai/aiops-mcp/internal/x.go）时，去掉前缀再找
  */
 export function codeEvidence(repos: readonly string[], outputs: readonly string[], failures: readonly string[] = []): CitationCheck {
-  return (cite, line) => {
+  return (cite, line, sentence = "") => {
     const text = cite.replace(/^\.\//, "");
     const forms = [
       text,
       ...repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => text.slice(repo.length + 1)),
     ];
+    const missing = SAYS_MISSING.test(sentence);
     return forms.some(
       (form) =>
-        failures.some((failure) => failure.includes(form)) ||
-        outputs.some((output) => (line === undefined ? output.includes(form) : hasLine(output, form, line))),
+        (missing && failures.some((failure) => mentions(failure, form))) ||
+        outputs.some((output) => (line === undefined ? mentions(output, form) : hasLine(output, form, line))),
     );
   };
 }
 
+/** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
+function mentions(text: string, cite: string): boolean {
+  return COMMIT_ID.test(cite) ? text.includes(cite) : containsPath(text, cite);
+}
+
+/** 回答里说这个文件、提交不存在或者读不到 */
+const SAYS_MISSING = /不存在|没有(?:这个|该|此|找到|搜到)|没找到|没搜到|没读到|找不到|搜不到|读不到|读取失败|无法读取|打不开|不在(?:仓库|代码|机器人)|not found|n[o']t exist|no such|missing/i;
+const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
+/** code_search 没搜到时的结果（src/repo.ts 的 search） */
+const NOTHING_FOUND = /^(?:没有搜到「|在这 \d+ 个分支上都没有搜到「)/;
+/** 路径前后不能紧挨着别的路径字符（mysrc/a.ts、src/a.tsx 都不是 src/a.ts）；前面是 / 的算，报错堆栈里常写全路径 /app/src/a.ts */
+const PATH_START = "(?<![\\w.-])";
+const PATH_END = "(?![\\w/-]|\\.\\w)";
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function containsPath(text: string, path: string): boolean {
+  return new RegExp(`${PATH_START}${escapeRegExp(path)}${PATH_END}`).test(text);
+}
+
 /** 这段工具结果里有没有 path 的第 line 行 */
 function hasLine(output: string, path: string, line: number): boolean {
-  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`${escaped}(?::|", line )${line}(?!\\d)`).test(output)) {
+  const escaped = escapeRegExp(path);
+  // 搜索结果、报错堆栈里的 path:35、Python 的 "path", line 35，改文件结果里的「path 第 35 行起」
+  if (new RegExp(`${PATH_START}${escaped}(?::|", line | 第 )${line}(?!\\d)`).test(output)) {
+    return true;
+  }
+  // 机器人新建、覆盖的文件（「已新建 path（12 行）」），第 1 到 12 行都是它自己写的
+  const written = new RegExp(`(?:已新建|已覆盖) ${escaped}（(\\d+) 行）`).exec(output);
+  if (written && line >= 1 && line <= Number(written[1])) {
     return true;
   }
   const read = output.startsWith(`${path}（`) || output.startsWith(`./${path}（`);
