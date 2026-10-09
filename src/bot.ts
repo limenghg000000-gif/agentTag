@@ -244,6 +244,10 @@ async function runTask(
       },
     });
     answer = toReply(result.text, result.finish);
+    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(question, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
+      logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
+      answer = BLOCKED_OPS_ANSWER;
+    }
     state.phase = "done";
     deps.context.remember(msg, prompt, answer);
   } catch (err) {
@@ -354,24 +358,58 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
   };
 }
 
+// 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
+// 重做后的最后一道检查（blockUnverifiedOps）：Pod 名、定位结果有就拦；时间一般也是有就拦，问的是时间本身（换算、时区、格式）时
+// 只在问线上服务、回答又写成线上结论时才拦；数量这类只在回答写成线上结论时才拦。
+// 定位结果和就绪数：2026-10-08 复测时，模型没调工具就照着话题里前两次的定位结果，编出 network-tester 在三个命名空间「1/1 就绪」让用户选
+
+/** 带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39） */
+const OPS_TIME_PATTERNS = [
+  String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
+  String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
+];
+/** 一般只在线上数据里出现的写法：K8s Pod 名（gateway-api-6978f9454f-tnc56）、「都有部署」「自动定位到」这类定位结果 */
+const OPS_STRONG_PATTERNS = [
+  String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
+  // 定位结果：「在多个命名空间都有部署」「default、kube-system 都有部署」「已自动定位到 prod」。要说到命名空间、列出名字，
+  // 或者定位到具体的名字：「DaemonSet 确保节点都有部署」「aiops 会自动定位到唯一的命名空间」是在讲概念
+  String.raw`(?:命名空间|namespace|、)[^。；;！!？?\n]*(?<!节点上?)都有部署|(?<!节点上?)都有部署[^。；;！!？?\n]*(?:命名空间|namespace)`,
+  String.raw`已自动定位到|自动定位到了?\s*[*\x60「“]*[a-z]`,
+];
+/** 概念解释、单位换算里也常见的写法：带单位的数量（47 条、95%、120ms、3.1 cores）、就绪数（1/1 就绪）、「多个命名空间」、「没有报错」「没有 error 级别日志」 */
+const OPS_WEAK_PATTERNS = [
+  String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
+  // 中间可能夹着 Markdown 的加粗、行内代码：**1/1** 就绪、Ready: `4/4`
+  String.raw`\d+\s*/\s*\d+[*_\x60\s]*(?:就绪|ready|running|副本)`,
+  String.raw`(?:就绪|ready)[*_\x60\s]*[:：]?[*_\x60\s]*\d+\s*/\s*\d+`,
+  String.raw`多个命名空间`,
+  // 英文要带上级别、日志这类词，「Rust 没有 exception 机制」不算
+  String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?\s*(?:报错|错误|异常|告警|重启|(?:error|exception|panic|fatal)\s*(?:级别|日志|记录))`,
+];
+const OPS_DATA = new RegExp([...OPS_TIME_PATTERNS, ...OPS_STRONG_PATTERNS, ...OPS_WEAK_PATTERNS].join("|"), "gi");
+const OPS_TIME = new RegExp(OPS_TIME_PATTERNS.join("|"), "gi");
+const OPS_STRONG = new RegExp(OPS_STRONG_PATTERNS.join("|"), "gi");
+const OPS_WEAK = new RegExp(OPS_WEAK_PATTERNS.join("|"), "gi");
 /**
- * 回答里像线上数据的写法：带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39）、K8s Pod 名（gateway-api-6978f9454f-tnc56）、
- * 带单位的数量（47 条、93 个 Pod、95%、120ms、3.1 cores）、就绪数（1/1 就绪、ready 2/3）、「没有报错」「无异常」这类结论。
- * 就绪数：2026-10-08 复测时，模型没调工具就照着话题里前两次的定位结果，编出 network-tester 在三个命名空间「1/1 就绪」让用户选
+ * 按提示词写成的线上结论带着把握：「结论：…（把握：中）」。只认把握：「先给结论」是所有回答的写法，
+ * 「结论：1GiB = 1024MiB」不算；「把握好内存 limit」「把握高峰期」这类说法也不算
  */
-const OPS_DATA = new RegExp(
+const OPS_CONCLUSION = /把握[*_\x60\s]*[:：]?[*_\x60\s]*[高中低]等?(?![\u4e00-\u9fff])/;
+/**
+ * 问的就是时间本身：提问里带着时间，问几点、几号、什么时候，问「一小时后」这类相对时间，或者说到换算、时区、时间戳、格式。
+ * 回答里的时间是算出来或者举例的（「UTC 08:00:00 是北京时间几点」答「16:00:00」）；现在几点模型从系统提示词里就知道
+ */
+const TIME_QUESTION = new RegExp(
   [
-    String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
-    String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
-    String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
-    String.raw`\d+(?:\.\d+)?\s*(?:条|次|%|ms|毫秒|cores?|核|[KMG]i?B|个?\s*(?:Pod|副本|实例|容器))`,
-    // 中间可能夹着 Markdown 的加粗、行内代码：**1/1** 就绪、Ready: `4/4`
-    String.raw`\d+\s*/\s*\d+[*_\x60\s]*(?:就绪|ready|running|副本)`,
-    String.raw`(?:就绪|ready)[*_\x60\s]*[:：]?[*_\x60\s]*\d+\s*/\s*\d+`,
-    String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?(?:报错|错误|异常|告警|重启)`,
+    String.raw`(?<!\d)\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}`,
+    String.raw`几点|几号|几月|几日|哪天|哪一天|星期几|周几|礼拜几|什么时[间候]|日期|多久|多长时间`,
+    String.raw`(?:\d+|[一二两三四五六七八九十半]+)\s*个?\s*(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月|年)(?:以?后|以?前|之后|之前)`,
+    String.raw`时间戳|timestamp|时区|time\s*zone|utc|gmt|换算|转换|格式|format|strftime|strptime`,
   ].join("|"),
-  "gi",
+  "i",
 );
+/** Go 的时间格式样例，讲时间格式时常出现，不是线上的时间 */
+const TIME_LAYOUT = /2006-01-02|15:04:05/;
 
 /**
  * 提问像是在问线上服务：带连字符的服务名（network-tester、product-service-api），或者说到日志、告警、Pod、重启、指标这类。
@@ -399,15 +437,90 @@ export function unverifiedOpsAnswer(servers: readonly string[]): string {
  * 提问里本来就有的数字和说法不算（比如让机器人润色一段带数字的文字）
  */
 export function reviewOpsAnswer(question: string, servers: readonly string[], succeeded: ReadonlySet<string>) {
-  const prefixes = servers.map((name) => `${name}_`);
   return (answer: string): string | undefined => {
-    // 成功调过 MCP 工具，或者成功调过群记忆以外的别的工具，都算有依据
-    if ([...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)))) {
+    if (checkedLive(servers, succeeded)) {
       return undefined;
     }
-    const unverified = OPS_QUESTION.test(question) || [...answer.matchAll(OPS_DATA)].some((match) => !inQuestion(question, match[0]));
-    return unverified ? unverifiedOpsAnswer(servers) : undefined;
+    return OPS_QUESTION.test(question) || hasUnverified(OPS_DATA, question, answer) ? unverifiedOpsAnswer(servers) : undefined;
   };
+}
+
+/**
+ * 只是整理话题里之前的回答（「总结一下上面查到的情况」「翻译成英文」），内容不用重新查。用户自己给的文字不用靠这条，提问里有的数字本来就不算。
+ * 要指着之前的内容，或者没提服务、日志这类线上对象；带着「重新」「现在」「排查」这类词的还是要查
+ * （「别总结旧的，重新排查」「排查 gateway-api 最近一小时的报错并总结原因」）。「排查结果」「查到的」这类说的是之前查过的，不算
+ */
+const REWRITE_REQUEST = /总结|整理|汇总|归纳|概括|润色|翻译|改写|复述/;
+// 「以上」「之前」「刚才」也用来说数量和时间（「5 分钟以上的慢请求」「刚才的报错」「这段时间」），要跟着内容、结果这类词才算
+const EARLIER_CONTENT =
+  /上面|上述|你的回答|这段(?!时间)|(?:以上|前面|之前|刚才|刚刚)(?:查到|说|聊|讲|提到|的(?:回答|结果|内容|情况|信息|结论)|内容|信息|结果|情况|结论)/;
+// 「重新整理」「现在把上面的翻译成英文」里的「重新」「现在」说的是改写这个动作，不算要重新查
+const LIVE_REQUEST =
+  /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
+/** 说工具调用失败的那一句（「aiops 连续 3 次查询都超时」），这句里的次数说的是调用本身 */
+const TOOL_FAILURE_CLAUSE = /(?:aiops|工具|调用|查询)[^，,。；;\n]{0,12}(?:超时|失败|出错|连不上|繁忙)/i;
+
+export const BLOCKED_OPS_ANSWER =
+  "这次没能给出结论：回答里有线上的数据，但这次一个工具都没有成功调用过，这些数据没有经过查证，为免误导没有发出来。请再问一次。";
+
+/**
+ * 打回重做以后还是没查证就给出线上数据时，这个回答不发出去，换成 BLOCKED_OPS_ANSWER。
+ * 2026-10-08 复测：用户回了「prod」以后模型两次都没调工具，第二次打回重做后照样编出了三次查询的结果。
+ * Pod 名、定位结果这类只在线上数据里出现的，有就拦（举例的句子除外）；带秒的时间也拦，问的是时间换算、时区、格式时，只在问线上服务又写成线上结论时才拦。
+ * 数量、就绪数、「没有报错」这类概念解释里也常见的，只在写成线上结论（带「把握：中」这类把握）时才拦，
+ * 「结论：1GiB = 1024MiB」「Go 没有异常机制」「北京时间为 16:00:00」照常发。
+ * 只是整理之前回答的请求放行（数据来自话题里之前的回答）。调过工具都失败了时，说调用失败的那一句不算，剩下的照样查。
+ * attempted 是这次有没有调过工具，不管成没成功
+ */
+export function blockUnverifiedOps(
+  question: string,
+  servers: readonly string[],
+  succeeded: ReadonlySet<string>,
+  answer: string,
+  attempted = false,
+): boolean {
+  if (checkedLive(servers, succeeded) || rewriteOnly(question)) {
+    return false;
+  }
+  const conclusion = OPS_CONCLUSION.test(answer);
+  const reported = attempted ? withoutToolFailures(answer) : answer;
+  // 举例的句子不算（「例如 gateway-api-6978f9454f-tnc56 中，6978f9454f 是模板哈希」）；写成线上结论的照样整段查
+  const text = conclusion ? reported : withoutExamples(reported);
+  const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
+  const liveTime = !TIME_QUESTION.test(question) || (conclusion && OPS_QUESTION.test(question));
+  return live(OPS_STRONG) || (liveTime && live(OPS_TIME)) || (conclusion && live(OPS_WEAK));
+}
+
+function rewriteOnly(question: string): boolean {
+  return REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question) && (EARLIER_CONTENT.test(question) || !OPS_QUESTION.test(question));
+}
+
+/** 举例的句子 */
+const EXAMPLE = /例如|比如|譬如|举例|举个例子|示例|样例|为例|假如|假设|e\.g\.|for example/i;
+
+function withoutExamples(text: string): string {
+  return text
+    .split(/(?<=[。；;！!？?\n])/)
+    .filter((sentence) => !EXAMPLE.test(sentence))
+    .join("");
+}
+
+/** 去掉说工具调用失败的分句；分句里除了「N 次」还有别的数据（「查询返回 50 条请求超时」）就留着 */
+function withoutToolFailures(answer: string): string {
+  return answer
+    .split(/(?<=[，,。；;\n])/)
+    .filter((clause) => !(TOOL_FAILURE_CLAUSE.test(clause) && !hasUnverified(OPS_DATA, "", clause.replace(/\d+\s*次/g, ""))))
+    .join("");
+}
+
+/** 成功调过 MCP 工具，或者成功调过群记忆以外的别的工具，都算有依据 */
+function checkedLive(servers: readonly string[], succeeded: ReadonlySet<string>): boolean {
+  const prefixes = servers.map((name) => `${name}_`);
+  return [...succeeded].some((name) => !name.startsWith("memory_") || prefixes.some((prefix) => name.startsWith(prefix)));
+}
+
+function hasUnverified(pattern: RegExp, question: string, answer: string): boolean {
+  return [...answer.matchAll(pattern)].some((match) => !inQuestion(question, match[0]) && !TIME_LAYOUT.test(match[0]));
 }
 
 /** 提问里本来就有的说法：不分大小写、不管空格；就绪数只看比值（问「READY 1/2 是什么意思」，答「1/2 Ready 表示…」） */

@@ -5,6 +5,8 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
+  BLOCKED_OPS_ANSWER,
+  blockUnverifiedOps,
   type BotDeps,
   createCardActionHandler,
   createMessageHandler,
@@ -741,6 +743,10 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
     "CPU 使用率 95%",
     "93 个 Pod 都在运行",
     "无明显异常",
+    "最近 1 小时没有 error 级别日志",
+    "未发现 panic 日志",
+    "network-tester 在 default、kube-system 都有部署，查哪个？",
+    "已自动定位到 prod",
     "default：1/1 就绪（Deployment）",
     "prod：Ready 4/4",
     "3/3 Running",
@@ -758,6 +764,7 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
   assert.equal(ok()("要查哪个服务？"), undefined);
   assert.equal(ok()("退出码 137 一般是 OOMKilled，下午 3:30 前后看看内存"), undefined);
   assert.equal(ok()("kubectl get pods 里 READY 列的 1/2 表示两个容器只有一个就绪"), undefined);
+  assert.equal(ok()("Rust 没有 exception 机制，用 Result 返回错误"), undefined);
   // 提问里本来就有的数字不算
   const polish = reviewOpsAnswer("把这句润色一下：本周发布 3 次，成功率 95%", ["aiops"], new Set());
   assert.equal(polish("本周共发布 3 次，成功率达到 95%。"), undefined);
@@ -768,6 +775,131 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
   assert.equal(concept("1 / 2 ready 表示两个容器里只有一个就绪"), undefined);
   assert.equal(concept("1/2 表示一个就绪，prod 那边现在是 4/4 就绪"), flagged);
   assert.equal(reviewOpsAnswer("READY 11/20 是什么意思", ["aiops"], new Set())("1/2 就绪"), flagged);
+});
+
+test("打回重做以后还是没查证就给出线上数据：不发出去，换成说明，话题里记下的也是说明", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  // 2026-10-08 复测：用户回了「prod」，模型两次都没调工具，第二次照样编出了查询结果
+  const results: ChatResult[] = [
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop" },
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）。按 detected_level 查询返回 0 条，宽泛关键词查到 50 条", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const context = fakeContext();
+  const { sent, handle } = setup({ model, context: context.source, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("prod"));
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
+  assert.deepEqual(context.remembered, [{ question: "[群成员] prod", answer: BLOCKED_OPS_ANSWER }]);
+});
+
+test("打回重做以后没再给线上数据、查过工具、或者是整理之前内容的请求时，照常发出", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const ask = async (question: string, answers: ChatResult[]) => {
+    const { model } = fakeModel(() => answers.shift()!);
+    const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+    await handle(message(question));
+    return markdowns(sent);
+  };
+  const withData = "最近 1 小时有 27 条报错，集中在 16:43:26";
+
+  // 重做以后改成反问
+  assert.deepEqual(await ask("prod", [{ text: withData, finish: "stop" }, { text: "要查哪个服务？", finish: "stop" }]), ["要查哪个服务？"]);
+  // 重做时查了
+  assert.deepEqual(
+    await ask("prod", [
+      { text: withData, finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+      { text: withData, finish: "stop" },
+    ]),
+    [withData],
+  );
+  // 整理话题里之前的回答
+  assert.deepEqual(await ask("总结一下上面查到的情况", [{ text: withData, finish: "stop" }, { text: withData, finish: "stop" }]), [withData]);
+});
+
+test("重做以后的最后一道检查：哪些回答不发出去", () => {
+  const block = (question: string, answer: string, attempted = false, succeeded: string[] = []) =>
+    blockUnverifiedOps(question, ["aiops"], new Set(succeeded), answer, attempted);
+  // 只在线上数据里出现的：带秒的时间、日期加时间、定位结果
+  assert.equal(block("prod", "宽泛关键词查到 50 条，时间 2026-10-08 17:03～18:03"), true);
+  assert.equal(block("诊断一下 network-tester", "network-tester 在 default、kube-system、monitoring 都有部署，请选择命名空间"), true);
+  assert.equal(block("诊断一下 network-tester", "network-tester 在 default、kube-system、monitoring 都有部署。请问查哪个？"), true);
+  assert.equal(block("gateway-api 呢", "已自动定位到 prod，gateway-api 运行正常"), true);
+  assert.equal(block("prod", "Pod gateway-api-6978f9454f-tnc56 重启了"), true);
+  // 写成线上结论的，举例的句子也照样查
+  assert.equal(block("prod", "结论：例如 gateway-api-6978f9454f-tnc56 已重启（把握：中）"), true);
+  // 数量、「没有报错」写成线上结论时拦
+  assert.equal(block("prod", "结论：最近 1 小时没有报错（把握：中）"), true);
+  assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）"), true);
+  // 查过就放行；只调了群记忆不算
+  assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）", true, ["aiops_query_logs"]), false);
+  assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）", true, ["memory_search"]), true);
+  // 整理之前的内容放行；要求重新查的不放行
+  assert.equal(block("总结一下上面查到的情况", "结论：最近 1 小时有 27 条报错（把握：中）"), false);
+  assert.equal(block("不要总结旧结果，重新排查 gateway-api 的告警", "结论：最近 1 小时有 27 条报错（把握：中）"), true);
+  const made = "结论：gateway-api 在 2026-10-08 17:03:26 出现 50 条报错（把握：中）";
+  assert.equal(block("排查 gateway-api 最近一小时的报错并总结原因", made), true);
+  assert.equal(block("总结 gateway-api 的报错原因", made), true);
+  assert.equal(block("把上面 gateway-api 的排查结果总结一下", made), false);
+  assert.equal(block("把上面的排查结果重新整理一下", made), false);
+  assert.equal(block("现在把上面的排查结果翻译成英文", made), false);
+  assert.equal(block("gateway-api 现在怎么样了，总结一下", made), true);
+  assert.equal(block("翻译成英文", "Conclusion: 50 errors since 2026-10-08 17:03:26"), false);
+  assert.equal(block("总结以上内容", made), false);
+  assert.equal(block("总结一下 gateway-api 5 分钟以上的慢请求", made), true);
+  assert.equal(block("这段时间 gateway-api 的报错总结一下", made), true);
+  // 调过工具都失败了：说调用失败的那句不算，剩下的照样查
+  assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 连续 3 次查询都超时，无法确认线上状态", true), false);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询 3 次都超时，无法确认（把握：低）", true), false);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：最近一小时有 50 条请求超时，CPU 使用率 95%（把握：中）", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询超时了，不过最近一小时有 50 条报错（把握：中）", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：日志查询返回 50 条请求超时（把握：中）", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 查询超时了（把握：中），不过最近一小时有 50 条报错", true), true);
+  // 没调过工具时说「查询 3 次都超时」也是编的
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询 3 次都超时（把握：低）"), true);
+  // 概念解释、单位换算、反问照常发
+  assert.equal(block("1GiB 是多少字节", "1GiB = 1024MiB = 1073741824 字节。"), false);
+  // 「先给结论」是所有回答的写法，只有带把握的才算线上结论
+  assert.equal(block("1GiB 是多少字节", "结论：1GiB = 1024MiB = 1073741824 字节。"), false);
+  assert.equal(block("Pod 内存 limit 怎么设", "要把握好余量：一般 512MiB 到 2GiB"), false);
+  assert.equal(block("Pod 副本数怎么定", "要把握高峰期流量：一般 3 个副本起步"), false);
+  assert.equal(block("prod", "结论：最近 1 小时 27 条报错（把握：中等）"), true);
+  assert.equal(block("prod", "**结论**：最近 1 小时 27 条报错（**把握**：中）"), true);
+  assert.equal(block("Go 有异常机制吗", "Go 没有异常机制，错误靠返回值"), false);
+  assert.equal(block("Go 的时间格式怎么写", "Go 用参考时间写格式：2006-01-02 15:04:05"), false);
+  // 问的是时间本身：回答里的时间是算出来、举例的，写成线上结论时才拦
+  assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "北京时间为 16:00:00。"), false);
+  assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "结论：北京时间为 16:00:00（把握：高）"), false);
+  assert.equal(block("现在是几月几日几点？", "现在是北京时间 2026-10-09 09:30。"), false);
+  assert.equal(block("一小时后是几点？", "一小时后是北京时间 10:30:00。"), false);
+  assert.equal(block("3 天后是星期几", "2026-10-12 00:00 是星期一"), false);
+  assert.equal(block("gateway-api 什么时候开始报错的", "结论：从 15:31:22 开始报错（把握：中）"), true);
+  assert.equal(block("时间戳 1696752000 是北京时间几点", "2023-10-08 16:00:00"), false);
+  assert.equal(block("Python 怎么格式化时间", "strftime('%Y-%m-%d %H:%M:%S') 输出类似 2024-01-01 12:00:00"), false);
+  assert.equal(block("gateway-api 15:30 以后有报错吗", "结论：15:31:22 起有 3 条 error 日志（把握：中）"), true);
+  assert.equal(block("prod", "15:31:22 起有 3 条 error 日志"), true);
+  assert.equal(block("命名空间有什么用", "可以把同一个服务部署在多个命名空间里，隔开测试和生产"), false);
+  assert.equal(block("Pod 内存 limit 一般设多少", "一般 512MiB 到 2GiB，CPU 0.5 核起步，看压测结果调"), false);
+  assert.equal(block("Pod 重启一般什么原因", "常见原因是 OOM、探针失败、镜像拉取失败"), false);
+  // 讲概念时举的 Pod 名、「节点都有部署」「会自动定位到」
+  assert.equal(
+    block("Deployment 的 Pod 名称是怎么生成的", "例如 gateway-api-6978f9454f-tnc56 中，gateway-api 是 Deployment 名，6978f9454f 是模板哈希，tnc56 是随机后缀"),
+    false,
+  );
+  assert.equal(block("DaemonSet 和 Deployment 有什么区别？", "DaemonSet 确保符合条件的节点都有部署；Deployment 则维护指定数量的副本"), false);
+  assert.equal(block("DaemonSet 是干什么的", "让 worker、master 节点上都有部署一份，比如日志采集"), false);
+  assert.equal(block("aiops 不写命名空间会怎样", "aiops 会自动定位到唯一的命名空间，有好几个时列出候选让你选"), false);
 });
 
 test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
