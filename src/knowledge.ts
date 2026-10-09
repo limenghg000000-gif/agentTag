@@ -1218,11 +1218,11 @@ function tripleQuotedValues(text: string): string[] {
 }
 
 /**
- * Terraform/HCL、shell、Ruby 的 heredoc（password = <<EOT … EOT、<<-EOT、<<~EOS、<<'EOF'），值写在下面几行，到单独一行的结束标记为止；
- * 后面截断了、没有结束标记的，到最后都算。第 2 组是结束标记，第 3 组是中间的内容
+ * Terraform/HCL、shell、Ruby 的 heredoc（password = <<EOT … EOT、<<-EOT、<<~EOS、<<'EOF'），值写在下面几行，到只有结束标记的那一行为止
+ * （EOT-not-the-end 这种以标记开头的行还是内容）；后面截断了、没有结束标记的，到最后都算。第 2 组是结束标记，第 3 组是中间的内容
  */
 const HEREDOC = new RegExp(
-  String.raw`${CONFIG_KEY}["']?[^\S\r\n]*[=:][^\S\r\n]*<<[-~]?(["']?)([A-Za-z_]\w*)\1[^\S\r\n]*\r?\n([\s\S]*?)(?:\r?\n[^\S\r\n]*\2(?!\w)|$)`,
+  String.raw`${CONFIG_KEY}["']?[^\S\r\n]*[=:][^\S\r\n]*<<[-~]?(["']?)([A-Za-z_]\w*)\1[^\S\r\n]*\r?\n([\s\S]*?)(?:\r?\n[^\S\r\n]*\2[^\S\r\n]*(?=\r?\n|$)|$)`,
   "gi",
 );
 

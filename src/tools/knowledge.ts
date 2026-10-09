@@ -975,6 +975,24 @@ export class KnowledgeDesk {
       out.unfinished.push(`新的经验 ${current.id} 在表格里${current.incomplete ?? current.unsafe ?? current.conflict}，旧的经验 ${oldId} 先没归档。请在表格里改好后再点「再试一次」`);
       return false;
     }
+    // 新的这条在表格里改过、和确认的内容不一样：确认的是按卡片上的内容取代旧的，改过的要写权限名单里的人核对过（卡片上列出来、点「再试一次」）才归档旧的。
+    // 旧的上次已经归档了的不再管：只差 aiops 那步，aiops 里新旧两条怎么办由同步那步决定
+    if (!proposal.replacedArchived) {
+      let edited: KnowledgeDraft;
+      try {
+        edited = draftOf(current);
+      } catch (err) {
+        out.unfinished.push(`新的经验 ${current.id} 在表格里的内容${describe(err)}，旧的经验 ${oldId} 先没归档。请在表格里改好后再点「再试一次」`);
+        return false;
+      }
+      if (!sameContent(edited, proposal.approved?.draft ?? proposal.draft)) {
+        proposal.reconfirm = edited;
+        out.unfinished.push(
+          `新的经验 ${current.id} 在表格里改过，和确认的内容不一样，旧的经验 ${oldId} 先没归档（改过的也取代它，要写权限名单里的人确认）。卡片上列出了表格里现在的内容，核对后点「再试一次」`,
+        );
+        return false;
+      }
+    }
     return true;
   }
 
@@ -1335,12 +1353,12 @@ export function renderProposalCard(proposal: Proposal): object {
     elements.push({ tag: "markdown", content: ["**没做成的**：", ...proposal.unfinished.map((line) => `- ${line}`)].join("\n") });
   }
   const reconfirm = proposal.kind === "save" && proposal.state === "partial" ? proposal.reconfirm : undefined;
-  if (reconfirm) {
+  if (reconfirm && proposal.kind === "save") {
     const lines = [["类别", KNOWLEDGE_CATEGORIES[reconfirm.category]], ["标题", reconfirm.title], ...fieldLines(reconfirm)];
     elements.push({
       tag: "markdown",
       content: [
-        `**表格里现在的内容**（和确认的不一样；点「再试一次」就按下面的同步到 aiops，不同意的话在表格里改回来或者点「不用了」）：`,
+        `**表格里现在的内容**（和确认的不一样；点「再试一次」就按下面的${[proposal.syncAiops ? "同步到 aiops" : "", proposal.replaces ? "取代旧经验" : ""].filter(Boolean).join("、")}，不同意的话在表格里改回来或者点「不用了」）：`,
         ...lines.map(([name, value]) => `**${name}**：${value}`),
       ].join("\n"),
     });

@@ -377,6 +377,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `config.api_token = <<~EOS\n  ${["correct", "horse", "battery", "staple"].join(" ")}\nEOS`,
     `db_password = <<'EOF'\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOF`,
     `password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`,
+    // 以结束标记开头、后面还有别的字的行（EOT-not-the-end）还是内容，不是结束
+    `password = <<EOT\n\${var.db_password}\nEOT-not-the-end\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOT`,
     // 字符串里套着转义过的 JSON，转义了几层都算
     `payload="{\\"password\\":\\"${["CorrectHorse", "BatteryStaple9"].join("")}\\"}"`,
     `{"body":"{\\"config\\":\\"{\\\\\\"api_key\\\\\\":\\\\\\"${["correct", "horse", "battery", "staple"].join("")}\\\\\\"}\\"}"}`,
@@ -2095,6 +2097,37 @@ test("取代旧经验时归档旧的没做成，之后旧的那一行在表格�
       ["K2", "active"],
     ],
   );
+});
+
+test("取代旧经验：归档旧的之前新的那条在表格里改过（和确认的不一样）：旧的先不归档，卡片列出改过的内容，写权限名单里的人核对后点「再试一次」才归档", async () => {
+  const { backend, base, desk, sent, click, tool, lastCard } = deskSetup({ aiops: false });
+  await base.save(normalizeDraft(dau));
+  await tool("knowledge_propose").run({ ...dau, title: "日活的口径（改过）", replaces: "K1" }, { signal });
+  const update = backend.update.bind(backend);
+  let limited = true;
+  backend.update = async (id, changes) => {
+    if (id === "K1" && limited) {
+      throw new KnowledgeError("飞书接口限流");
+    }
+    return update(id, changes);
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /旧的经验 K1 没能归档：飞书接口限流/);
+
+  limited = false;
+  backend.entries[1].conclusion = "有人在表格里改成了别的结论";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  const review = lastCard();
+  assert.equal(backend.entries[0].status, "active", "改过的新经验没人确认，旧的不归档");
+  assert.match(cardText(review), /新的经验 K2 在表格里改过，和确认的内容不一样，旧的经验 K1 先没归档/);
+  assert.match(cardText(review), /表格里现在的内容\*\*（和确认的不一样；点「再试一次」就按下面的取代旧经验.*有人在表格里改成了别的结论/);
+
+  await desk.handleCardAction(click(review, "save"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.equal(lastCard().header.title.content, "已存进经验库");
 });
 
 test("归档、取代时用表格里现在的 aiops 编号：卡片发出后编号换成了这一条同步过去的另一条，归档换过的那条", async () => {
