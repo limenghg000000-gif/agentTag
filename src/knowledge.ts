@@ -816,6 +816,11 @@ function isBasicCredential(value: string): boolean {
 }
 
 /**
+ * 带签名的临时访问地址（Azure SAS 的 sig=、AWS 预签名的 X-Amz-Signature=、阿里云 OSS 的 Signature=、x-oss-signature=）：
+ * 过期前谁拿到都能访问。参数名最后一段是 sig 或 signature，值不短于 16 个字符，到 &、空白、括号、中文为止；变量、占位（xxxx）、打了码的不算
+ */
+const SIGNED_URL = /[?&](?:[\w.-]*[_.-])?(?:sig|signature)=([^&\s#"'`<>()[\]\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{16,})/gi;
+/**
  * 名字以 auth 结尾的配置项：Docker config.json 的 "auth"、.npmrc 的 _auth、basicAuth 这些，值是「用户名:密码」的 base64；
  * Yarn 的 npmAuthIdent 也可以直接写「用户名:密码」。第 1 组是名字，第 2 组是值
  */
@@ -965,6 +970,9 @@ function findSecret(text: string): string | undefined {
     .find((label) => label !== undefined);
   if (dockerConfig) {
     return dockerConfig;
+  }
+  if ([...text.matchAll(SIGNED_URL)].some(([, value]) => !isPlaceholder(value))) {
+    return "带签名的临时访问地址";
   }
   const values = [
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
