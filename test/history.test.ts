@@ -93,6 +93,23 @@ test("从飞书读话题：去掉当前消息、之后的消息和机器人的�
   ]);
 });
 
+test("带出上文里群成员发的图片（机器人发的不算），引用的消息里的图片也带上", async () => {
+  const { api } = fakeApi(
+    [
+      item("om_root", { senderName: "张三", content: "![image](img_a)\n这个线上报警是咋回事", images: ["img_a"], createTime: 1000 }),
+      item("om_2", { fromBot: true, content: "![image](img_bot)", images: ["img_bot"], createTime: 2000 }),
+    ],
+    { om_q: item("om_q", { senderName: "李四", content: "![image](img_q)", images: ["img_q"] }) },
+  );
+  const loader = new ThreadContextLoader(api, quiet);
+
+  const inThread = await loader.load(message({ rootId: "om_root", threadId: "omt_1", createTime: 3000 }));
+  assert.deepEqual(inThread.images, [{ messageId: "om_root", imageKey: "img_a" }]);
+
+  const quoting = await loader.load(message({ messageId: "om_5", replyToMessageId: "om_q" }));
+  assert.deepEqual(quoting.images, [{ messageId: "om_q", imageKey: "img_q" }]);
+});
+
 test("话题列表里没有第一条消息时单独读出来补上", async () => {
   const { api, calls } = fakeApi([item("om_2", { fromBot: true, content: "回答" })], {
     om_root: item("om_root", { content: "原问题" }),

@@ -24,6 +24,12 @@ export interface Config {
   memoryBackupDir: string;
   /** 群记忆备份保留几天，0 表示不备份 */
   memoryBackupDays: number;
+  /** 看图片用的模型（和主模型同一个服务、同一个 Key）。关掉，或者模型服务不是百炼又没配 MODEL_VISION_ID 时为空 */
+  vision?: {
+    model: string;
+    /** 用百炼时关掉思考：抄图片里的文字用不着想，开着只会更慢 */
+    thinking?: false;
+  };
   /** 联网搜索：百炼原生接口地址和搜索用的模型。关掉或模型服务不是百炼时为空 */
   webSearch?: { url: string; model: string };
   /** 代码仓库：没配 CODE_REPOS 时为空 */
@@ -167,6 +173,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const baseURL = env.MODEL_BASE_URL || DEFAULT_MODEL_BASE_URL;
   const model = env.MODEL_ID || DEFAULT_MODEL_ID;
   const searchUrl = webSearch === "on" ? bailianGenerationUrl(baseURL) : undefined;
+  // 看图：千问 3.5 以后的模型是多模态的（联网搜索时 qwen3.8-max 只认多模态接口），百炼上默认用主模型看图；
+  // 主模型不是千问时用千问旗舰。别家服务要自己在 MODEL_VISION_ID 里写能看图的模型
+  const visionEnv = env.MODEL_VISION_ID?.trim();
+  const visionModel =
+    visionEnv?.toLowerCase() === "off"
+      ? undefined
+      : visionEnv || (isBailian(baseURL) ? (/^qwen/i.test(model) ? model : DEFAULT_MODEL_ID) : undefined);
 
   // 百炼默认关掉思考：同样的回答快一半左右。别家服务不传，用它的默认值
   const thinkingEnv = env.MODEL_THINKING?.trim().toLowerCase();
@@ -215,6 +228,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
     memoryBackupDays: backupDays,
+    ...(visionModel ? { vision: { model: visionModel, ...(isBailian(baseURL) ? { thinking: false as const } : {}) } } : {}),
     // 百炼的联网搜索只有千问模型支持：主模型换成 Kimi、GLM、DeepSeek 等时，搜索仍用千问旗舰
     webSearch: searchUrl
       ? { url: searchUrl, model: env.WEB_SEARCH_MODEL || (/^qwen/i.test(model) ? model : DEFAULT_MODEL_ID) }

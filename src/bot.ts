@@ -1,13 +1,16 @@
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { type AgentEvent, type AgentResult, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
-import { labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
+import { imageKeysOf } from "./feishu.js";
+import { type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
+import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError } from "./llm.js";
 import { splitMarkdown } from "./markdown.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   CardUpdater,
   type ProgressState,
+  type ProgressStep,
   renderPlainProgressCard,
   renderProgressCard,
   STOP_ACTION,
@@ -98,6 +101,8 @@ export interface BotDeps {
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
   writeAllowed?: ReadonlySet<string>;
+  /** 把提问和话题里的图片识别成文字。不传时图片换成「没能看到」的说明 */
+  images?: { read(refs: readonly ImageRef[], signal?: AbortSignal): Promise<ReadonlyMap<string, string>> };
   /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
   mcp?: {
     /** 配置的 MCP 服务名（如 aiops），工具名以「服务名_」开头 */
@@ -193,6 +198,11 @@ async function runTask(
 
     const context = await deps.context.load(msg);
     source = context.source;
+    // 主模型只看文字：图片先识别成文字再放进提问和上文。2026-10-09 有人贴告警截图问「这个线上报警是咋回事」，
+    // 模型只看到一行图片编号，自己挑了别的服务去查
+    const images = await readImages(deps, msg, context, task.signal, state, () => card?.update(render()));
+    const asked = inlineImages(question, images);
+    const history = context.history.map((m) => (m.role === "user" ? { ...m, content: inlineImages(m.content, images) } : m));
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
     const taskContext: TaskToolContext = {
@@ -229,7 +239,7 @@ async function runTask(
     if (readOnly) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
-    const prompt = labelUserMessage(context.askerName, question || "（@ 了你，没有写别的内容）");
+    const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
     if (deep) {
       logger.info(`这次打开深度思考 message=${msg.messageId}`);
@@ -237,10 +247,10 @@ async function runTask(
     const toolNames = taskTools.map((tool) => tool.spec.name);
     const reviews = [
       ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? [reviewCodeAnswer(question, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path)))]
+        ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path)))]
         : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
-      ...(deps.mcp?.names.length ? [reviewOpsAnswer(question, deps.mcp.names, succeeded)] : []),
+      ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
     ];
     result = await runAgent({
       model,
@@ -253,7 +263,7 @@ async function runTask(
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
       }),
-      messages: [...context.history, { role: "user", content: prompt }],
+      messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
       ...(reviews.length > 0
@@ -275,7 +285,7 @@ async function runTask(
       },
     });
     answer = toReply(result.text, result.finish);
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(question, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
+    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
@@ -312,6 +322,40 @@ async function runTask(
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
+}
+
+/**
+ * 识别提问和话题上文里的图片，返回 image_key → 文字。识别时进度卡片上多一步「识别图片」。
+ * 没配看图模型、或者一张都没识别出来时返回空的，图片在提问里换成「没能看到」的说明
+ */
+async function readImages(
+  deps: BotDeps,
+  msg: NormalizedMessage,
+  context: ThreadContext,
+  signal: AbortSignal,
+  state: ProgressState,
+  refresh: () => void,
+): Promise<ReadonlyMap<string, string>> {
+  const { logger = console, now = Date.now } = deps;
+  const asked = imageKeysOf(msg).map((imageKey) => ({ messageId: msg.messageId, imageKey }));
+  const historyText = context.history.flatMap((m) => (m.role === "user" ? [m.content] : [])).join("\n");
+  const refs = pickImages(asked, context.images ?? [], historyText);
+  if (refs.length === 0) {
+    return new Map();
+  }
+  if (!deps.images) {
+    logger.info(`提问或话题里有 ${refs.length} 张图片，没配看图模型（MODEL_VISION_ID），图片内容没有交给模型 message=${msg.messageId}`);
+    return new Map();
+  }
+  const step: ProgressStep = { id: "images", label: `识别图片（${refs.length} 张）`, status: "running" };
+  state.steps.push(step);
+  refresh();
+  const startedAt = now();
+  const results = await deps.images.read(refs, signal);
+  step.status = results.size > 0 ? "ok" : "error";
+  refresh();
+  logger.info(`识别图片 ${results.size}/${refs.length} 张 用时=${now() - startedAt}ms message=${msg.messageId}`);
+  return results;
 }
 
 /**

@@ -11,6 +11,8 @@ export interface ThreadMessage {
   msgType: string;
   content: string;
   createTime: number;
+  /** 消息里图片的 image_key，按出现的顺序。内容里对应的位置是 ![image](image_key) */
+  images?: string[];
 }
 
 /** 轮询读到的一条消息，已转成和事件一样的格式，可以直接交给消息处理函数 */
@@ -30,7 +32,18 @@ export interface FeishuApi {
    * sinceMs 只对群有效（飞书的话题列表不支持按时间过滤），调用方自己再按 createTime 筛一遍。
    */
   listRecentMessages(container: "chat" | "thread", id: string, limit: number, sinceMs?: number): Promise<RecentMessage[]>;
+  /** 下载消息里的一张图片（获取消息中的资源文件）。机器人得在这条消息所在的群里 */
+  downloadImage(messageId: string, imageKey: string): Promise<DownloadedImage>;
 }
+
+export interface DownloadedImage {
+  data: Buffer;
+  /** image/png、image/jpeg 等 */
+  mimeType: string;
+}
+
+/** 群里的截图一般几百 KB，超过这个就不下载了（飞书发图片的上限是 10 MB） */
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 /** 飞书接口返回的消息条目（获取会话历史消息 / 获取指定消息内容） */
 interface ApiItem {
@@ -102,6 +115,7 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       return undefined;
     }
     const normalized = await toNormalized({ ...item, message_id: item.message_id });
+    const images = imageKeysOf(normalized);
     return {
       messageId: item.message_id,
       fromBot: isFromBot(item),
@@ -109,6 +123,7 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       msgType: item.msg_type ?? "unknown",
       content: normalized.content,
       createTime: Number(item.create_time) || 0,
+      ...(images.length > 0 ? { images } : {}),
     };
   };
 
@@ -163,7 +178,46 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       const [first] = await convertAll(res.data?.items?.slice(0, 1) ?? []);
       return first;
     },
+
+    async downloadImage(messageId, imageKey) {
+      const res = await client.im.v1.messageResource.get({
+        path: { message_id: messageId, file_key: imageKey },
+        params: { type: "image" },
+      });
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const chunk of res.getReadableStream()) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += buffer.length;
+        if (size > MAX_IMAGE_BYTES) {
+          throw new Error(`图片超过 ${MAX_IMAGE_BYTES / 1024 / 1024} MB，没有下载`);
+        }
+        chunks.push(buffer);
+      }
+      const data = Buffer.concat(chunks);
+      const header = String(res.headers?.["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+      return { data, mimeType: header.startsWith("image/") ? header : sniffImageType(data) };
+    },
   };
+}
+
+/** 消息里图片的 image_key（SDK 转文本时记在 resources 里） */
+export function imageKeysOf(message: Pick<NormalizedMessage, "resources">): string[] {
+  return (message.resources ?? []).filter((resource) => resource.type === "image").map((resource) => resource.fileKey);
+}
+
+/** 接口没给出图片类型时按文件头认，认不出按 PNG */
+function sniffImageType(data: Buffer): string {
+  if (data[0] === 0xff && data[1] === 0xd8) {
+    return "image/jpeg";
+  }
+  if (data.subarray(0, 3).toString("latin1") === "GIF") {
+    return "image/gif";
+  }
+  if (data.subarray(0, 4).toString("latin1") === "RIFF" && data.subarray(8, 12).toString("latin1") === "WEBP") {
+    return "image/webp";
+  }
+  return "image/png";
 }
 
 /** 接口返回的用户 id 是 open_id 时才用（@ 机器人要按 open_id 比对）。个别返回没带 id_type，按 ou_ 前缀认 */

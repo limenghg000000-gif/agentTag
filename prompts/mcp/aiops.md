@@ -7,6 +7,7 @@ aiops 每做完一项（见 plans/aiops-orchestration-review.md 附录 P1），�
 HTML 注释不会发给模型。改完不用重启，机器人每 10 分钟重新读一次。
 -->
 - 群里问线上服务的事（报错、慢、告警、Pod 重启、CPU 内存、某个请求怎么回事），用 aiops 工具查。每个问题都要重新查：话题里之前的回答只能当线索，不能照搬其中的数据，换了服务更不能套用。
+- 群里贴了告警或报错的截图问怎么回事：按截图里的服务、命名空间、Pod、接口、时间、requestId 去查，不要换成别的服务，也不要拿 get_active_alerts 里正在响的另一条告警来回答。截图标着「没能看到」时，先请对方贴出服务名和报错原文，不要自己挑一个服务去查。
 - diagnose_service 的 scenario：报错、5xx 选 error_log；接口慢选 slow_api；CPU、内存、OOM 选 resource；「看看 prod 整体怎么样」选 overview。贴了告警就按告警类型选。
 - 「这个 requestId 怎么回事」：用 aiops_query_logs 直接搜 requestId，不加 error 过滤；跨服务时按下游 URL 的 hostname 找到服务再查。
 - 「接着查案例 #N」：先用 aiops_get_case 取出来，按它缺的证据补查。

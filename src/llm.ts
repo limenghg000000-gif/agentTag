@@ -176,6 +176,55 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   };
 }
 
+/** 看图片的模型：按要求把一张图片转成文字。主模型不一定能看图，所以单独配一个 */
+export interface VisionModel {
+  readonly model: string;
+  describe(image: { data: Buffer; mimeType: string }, instruction: string, signal?: AbortSignal): Promise<string>;
+}
+
+/**
+ * OpenAI 兼容接口的看图实现：图片用 base64 的 data URL 放进 image_url，百炼的千问等模型都认这种格式。
+ * thinking 为 false 时关掉思考（百炼的 enable_thinking），抄文字用不着想；模型不认这个参数就去掉重试，之后都不再带
+ */
+export function createOpenAICompatibleVisionModel(config: Pick<LlmConfig, "baseURL" | "apiKey" | "model" | "thinking">): VisionModel {
+  const client = new OpenAI({ baseURL: config.baseURL, apiKey: config.apiKey });
+  let thinkingSupported = true;
+  return {
+    model: config.model,
+    async describe(image, instruction, signal) {
+      type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & { enable_thinking?: boolean };
+      const body: Body = {
+        model: config.model,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data.toString("base64")}` } },
+              { type: "text", text: instruction },
+            ],
+          },
+        ],
+      };
+      for (let attempt = 0; ; attempt++) {
+        const thinking = thinkingSupported ? config.thinking : undefined;
+        try {
+          const completion = await client.chat.completions.create(
+            { ...body, ...(thinking !== undefined ? { enable_thinking: thinking } : {}) },
+            { signal },
+          );
+          return stripThinkTags(completion.choices[0]?.message.content ?? "");
+        } catch (err) {
+          if (attempt === 0 && thinking !== undefined && err instanceof OpenAI.BadRequestError && /thinking/i.test(err.message)) {
+            thinkingSupported = false;
+            continue;
+          }
+          throw toLlmError(err);
+        }
+      }
+    },
+  };
+}
+
 /**
  * 千问多轮调工具时偶尔把思考漏进正文（aiops 的模型代理也专门处理过），发到群里前去掉：
  * 正文以一段思考开头、以 </think> 结束（开头的 <think> 有时在模板里，正文里看不到），后面还有正文时，去掉这段思考；
