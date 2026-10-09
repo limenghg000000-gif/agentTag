@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CardActionEvent, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { isTimeout, raceAbort, timeoutSignal } from "../abort.js";
 import type { Logger } from "../history.js";
@@ -15,6 +15,7 @@ import {
   type KnowledgeHit,
   normalizeDraft,
   renderHitsForPrompt,
+  sameContent,
   StaleProposalError,
   usable,
 } from "../knowledge.js";
@@ -39,7 +40,7 @@ const LINK_ATTEMPTS = 3;
 const LINK_RETRY_MS = 2000;
 /** 改确认卡片失败时一共试几次（每次隔 retryDelayMs） */
 const RENDER_ATTEMPTS = 3;
-/** 同步到 aiops 时表格里这一行一直在改，最多存几次 */
+/** 同步到 aiops 时一次点击最多存几次（上次结果没传回来、找到的是旧内容时再存一次） */
 const SYNC_ROUNDS = 2;
 
 /** 这次任务的信息 */
@@ -103,8 +104,15 @@ interface SaveProposal extends ProposalBase {
   requestId: string;
   /** aiops 给了结果的同步（存了，或者有相近的没存）：再试一次时表格里这一行没改过就不再调 save_lesson */
   synced?: AiopsSaveResult;
-  /** synced 是按表格里哪个样子同步的 */
+  /** synced 是按什么内容同步的 */
   syncedDraft?: KnowledgeDraft;
+  /**
+   * 同步到 aiops 的内容：只同步写权限名单里的人确认过的。点保存时确认的是卡片上的草稿（这时为空）；
+   * 表格里改过、在卡片上列出来核对后点了「再试一次」的，换成改过的内容和点的人
+   */
+  approved?: { draft: KnowledgeDraft; by: string };
+  /** 表格里这一行改过，和确认过的不一样：卡片上列出来，写权限名单里的人点「再试一次」才按它同步 */
+  reconfirm?: KnowledgeDraft;
   /** 调 save_lesson 出错时发过去的内容：可能已经存进去、只是结果没传回来，再试之前先按这些找一下 */
   aiopsUnsure?: KnowledgeDraft[];
 }
@@ -379,7 +387,7 @@ export class KnowledgeDesk {
 
   /** 处理确认卡片上的按钮。不是经验库的卡片返回 false */
   async handleCardAction(evt: CardActionEvent): Promise<boolean> {
-    const value = evt.action.value as { action?: unknown; proposal?: unknown; op?: unknown } | undefined;
+    const value = evt.action.value as { action?: unknown; proposal?: unknown; op?: unknown; v?: unknown } | undefined;
     if (value?.action !== KNOWLEDGE_ACTION || typeof value.proposal !== "string" || typeof value.op !== "string") {
       return false;
     }
@@ -440,6 +448,17 @@ export class KnowledgeDesk {
       this.logger.info(`经验库卡片 不在写权限名单里，没有执行 proposal=${proposal.id} operator=${operator.openId}`);
       await this.render(proposal);
       return true;
+    }
+    if (proposal.kind === "save" && proposal.reconfirm) {
+      // 点的那张卡片上列的要是现在要同步的内容：卡片没更新成功时旧卡片还能点，点的人看到的可能是之前的内容
+      if (value.v !== contentDigest(proposal.reconfirm)) {
+        proposal.note = `${who}点的卡片上列的不是表格里现在的内容，这次没有执行。请核对下面列出的内容后再点「再试一次」`;
+        this.logger.info(`经验库卡片 点的是旧内容，没有执行 proposal=${proposal.id} operator=${operator.openId}`);
+        await this.render(proposal);
+        return true;
+      }
+      proposal.approved = { draft: proposal.reconfirm, by: who };
+      proposal.reconfirm = undefined;
     }
     // 建表、写表格、同步 aiops 加起来可能要好几秒，放到后台做，按钮回调马上返回（飞书等回调有时限，同一个群的卡片回调还要排队）
     proposal.state = "working";
@@ -544,8 +563,8 @@ export class KnowledgeDesk {
     task: McpTaskContext,
     out: Outcome,
   ): Promise<OldLesson> {
-    // 等 aiops 存的时候可能有人在表格里改了这一行：存完重新读一遍，改过的交给 keepSynced（归档刚存的，按现在的样子重新同步）。
-    // 一直在改的，来回几次后先停下，等「再试一次」
+    // 等 aiops 存的时候可能有人在表格里改了这一行：存完重新读一遍，改过的交给 keepSynced 归档刚存的那条，改过的内容要确认过才同步。
+    // 上次的结果没传回来、找到的那条是之前发的内容时，归档它再存一次；次数有上限，不会一直存下去
     for (let round = 1; ; round++) {
       if (proposal.synced) {
         if (!(await this.keepSynced(proposal, proposal.synced, entry, confirmedBy, task, out))) {
@@ -565,13 +584,18 @@ export class KnowledgeDesk {
         out.unfinished.push(`经验 ${entry.id} 在表格里${entry.incomplete ?? entry.unsafe}，没有同步到 aiops 经验库。请在表格里改好后再点「再试一次」`);
         return "keep-until-synced";
       }
+      const approved = this.approvedDraft(proposal, entry, out);
+      if (!approved) {
+        return "keep-until-synced";
+      }
       if (round > SYNC_ROUNDS) {
-        out.unfinished.push(`同步到 aiops 的时候经验 ${entry.id} 在表格里一直有人在改，先没同步。改完后再点「再试一次」`);
+        out.unfinished.push(`同步到 aiops 时经验 ${entry.id} 存了 ${SYNC_ROUNDS} 次还没和表格对上，先没同步。请再点「再试一次」`);
         return "keep-until-synced";
       }
       try {
-        proposal.synced = await this.saveLesson(proposal, entry, replacedLesson, confirmedBy, task);
-        proposal.syncedDraft = draftOf(entry);
+        const saved = await this.saveLesson(proposal, entry.id, approved, replacedLesson, confirmedBy, task);
+        proposal.synced = saved.synced;
+        proposal.syncedDraft = saved.draft;
       } catch (err) {
         out.unfinished.push(`没能同步到 aiops 经验库：${describe(err)}`);
         return "keep-until-synced";
@@ -592,7 +616,11 @@ export class KnowledgeDesk {
       out.done.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}「${synced.duplicate.title}」，没有重复同步。`);
       return "archive";
     }
-    out.done.push(`已同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`);
+    out.done.push(
+      proposal.approved
+        ? `已按表格里改过、${proposal.approved.by}在卡片上核对过的内容同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`
+        : `已同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`,
+    );
     if (entry.aiopsId !== synced.id) {
       try {
         await this.linkAiops(entry, synced.id);
@@ -607,7 +635,7 @@ export class KnowledgeDesk {
 
   /**
    * 已经同步过去以后（等 aiops 返回的时候，或者再试一次之前）有人在表格里改了这一行、归档了或者改了类别：aiops 里那条已经不对了。
-   * 是这次存进去的就归档它、忘掉之前的结果，接着按表格里现在的样子来（还该同步的重新存）。归档没成功时返回 false，下次再试
+   * 是这次存进去的就归档它、忘掉之前的结果，接着按表格里现在的样子来：改过的内容要确认过才同步（approvedDraft）。归档没成功时返回 false，下次再试
    */
   private async keepSynced(
     proposal: SaveProposal,
@@ -618,7 +646,7 @@ export class KnowledgeDesk {
     out: Outcome,
   ): Promise<boolean> {
     const current = rowDraft(entry);
-    const changed = this.rowChange(entry) ?? (current && JSON.stringify(current) === JSON.stringify(proposal.syncedDraft) ? undefined : `经验 ${entry.id} 在表格里改过`);
+    const changed = this.rowChange(entry) ?? (current && proposal.syncedDraft && sameContent(current, proposal.syncedDraft) ? undefined : `经验 ${entry.id} 在表格里改过`);
     if (!changed) {
       return true;
     }
@@ -637,7 +665,31 @@ export class KnowledgeDesk {
     }
     proposal.synced = undefined;
     proposal.syncedDraft = undefined;
+    // 之前没收到结果的那几次已经找到、处理过了，不再按它们找（不然会找回刚归档的那条）
+    proposal.aiopsUnsure = undefined;
     return true;
+  }
+
+  /**
+   * 表格里这一行现在的内容，是写权限名单里的人确认过的才返回。aiops 里的经验告警自动排查会引用，有编辑权限的人在表格里改的
+   * （KNOWLEDGE_BITABLE 指的表格、没配写权限名单时群里人人都能改）不能不经确认就同步过去：卡片上列出来，名单里的人点「再试一次」才算确认
+   */
+  private approvedDraft(proposal: SaveProposal, entry: KnowledgeEntry, out: Outcome): KnowledgeDraft | undefined {
+    let current: KnowledgeDraft;
+    try {
+      current = draftOf(entry);
+    } catch (err) {
+      out.unfinished.push(`经验 ${entry.id} 在表格里的内容不能同步到 aiops 经验库：${describe(err)}。请在表格里改好后再点「再试一次」`);
+      return undefined;
+    }
+    if (sameContent(current, proposal.approved?.draft ?? proposal.draft)) {
+      return current;
+    }
+    proposal.reconfirm = current;
+    out.unfinished.push(
+      `经验 ${entry.id} 在表格里改过，和确认的内容不一样，改过的没有同步到 aiops 经验库（告警自动排查会引用，要写权限名单里的人确认）。卡片上列出了表格里现在的内容，核对后点「再试一次」就按它同步`,
+    );
+    return undefined;
   }
 
   /** 表格里这一行现在不该或者不能同步到 aiops 的原因：再试一次前有人在表格里归档了它、改了类别，或者 aiops 没有写入工具 */
@@ -657,38 +709,39 @@ export class KnowledgeDesk {
   }
 
   /**
-   * 写进 aiops。写的是表格里现在这一行（再试一次前可能有人在表格里改过），不是卡片上的草稿。
-   * 上次调用出错了（可能已经存进去，只是结果没传回来）时，先找这条团队经验同步过去的，找到了就不再存
+   * 写进 aiops，写的是确认过的内容（approvedDraft）。返回同步的结果和 aiops 里那条是按什么内容存的。
+   * 上次调用出错了（可能已经存进去，只是结果没传回来）时，先找这条团队经验同步过去的，找到了就不再存，返回当时发过去的内容
    */
   private async saveLesson(
     proposal: SaveProposal,
-    entry: KnowledgeEntry,
+    teamId: string,
+    draft: KnowledgeDraft,
     replacedLesson: number | undefined,
     confirmedBy: string,
     task: McpTaskContext,
-  ): Promise<AiopsSaveResult> {
+  ): Promise<{ synced: AiopsSaveResult; draft: KnowledgeDraft }> {
     const { aiops } = this.options;
     if (!aiops?.writable) {
       throw new KnowledgeError("aiops 现在连不上");
     }
-    const draft = draftOf(entry);
     try {
-      const existing = proposal.aiopsUnsure ? await aiops.findSynced(proposal.aiopsUnsure, entry.id, task) : undefined;
+      const existing = proposal.aiopsUnsure ? await aiops.findSynced(proposal.aiopsUnsure, teamId, task) : undefined;
       if (existing !== undefined) {
-        return { saved: true, id: existing };
+        proposal.aiopsUnsure = undefined;
+        return { synced: { saved: true, id: existing.id }, draft: existing.draft };
       }
-      const options = { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
-      const synced = await aiops.save(draft, options, task);
+      const options = { confirmedBy, teamId, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
+      let synced = await aiops.save(draft, options, task);
       if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
         // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的后面归档
-        const forced = await aiops.save(draft, { ...options, force: true }, task);
-        if (!forced.saved) {
+        synced = await aiops.save(draft, { ...options, force: true }, task);
+        if (!synced.saved) {
           // aiops 不认 force（版本旧）：不能算进了 aiops，不然旧的那条会被归档，aiops 里这个问题一条都不剩
           throw new KnowledgeError(`aiops 说新的这条和要取代的经验 #${replacedLesson} 重复，带上 force 也没有存`);
         }
-        return forced;
       }
-      return synced;
+      proposal.aiopsUnsure = undefined;
+      return { synced, draft };
     } catch (err) {
       if (!proposal.aiopsUnsure?.some((sent) => JSON.stringify(sent) === JSON.stringify(draft))) {
         proposal.aiopsUnsure = [...(proposal.aiopsUnsure ?? []), draft];
@@ -1042,6 +1095,17 @@ export function renderProposalCard(proposal: Proposal): object {
   if (proposal.unfinished) {
     elements.push({ tag: "markdown", content: ["**没做成的**：", ...proposal.unfinished.map((line) => `- ${line}`)].join("\n") });
   }
+  const reconfirm = proposal.kind === "save" && proposal.state === "partial" ? proposal.reconfirm : undefined;
+  if (reconfirm) {
+    const lines = [["类别", KNOWLEDGE_CATEGORIES[reconfirm.category]], ["标题", reconfirm.title], ...fieldLines(reconfirm)];
+    elements.push({
+      tag: "markdown",
+      content: [
+        `**表格里现在的内容**（和确认的不一样；点「再试一次」就按下面的同步到 aiops，不同意的话在表格里改回来或者点「不用了」）：`,
+        ...lines.map(([name, value]) => `**${name}**：${value}`),
+      ].join("\n"),
+    });
+  }
   if (proposal.state === "pending" || proposal.state === "partial") {
     const op = proposal.kind === "archive" ? "archive" : "save";
     const retry = proposal.state === "partial";
@@ -1050,6 +1114,8 @@ export function renderProposalCard(proposal: Proposal): object {
         action: KNOWLEDGE_ACTION,
         proposal: proposal.id,
         op,
+        // 点的时候核对卡片上列的是不是现在要同步的内容
+        ...(reconfirm ? { v: contentDigest(reconfirm) } : {}),
       }),
       button(retry ? "不用了" : "取消", "default", { action: KNOWLEDGE_ACTION, proposal: proposal.id, op: "cancel" }),
     );
@@ -1069,6 +1135,11 @@ function giveUp(proposal: Proposal, lead: string): void {
   proposal.result = [...(proposal.result ?? []), lead, ...(proposal.unfinished ?? []).map((line) => `- ${line}`)];
   proposal.unfinished = undefined;
   proposal.note = undefined;
+}
+
+/** 卡片上列出的内容的摘要，放在按钮里：点的时候和现在要确认的比，不一样就是点了旧卡片 */
+function contentDigest(draft: KnowledgeDraft): string {
+  return createHash("sha256").update(JSON.stringify(draft)).digest("hex").slice(0, 16);
 }
 
 function expiredCard(text: string): object {

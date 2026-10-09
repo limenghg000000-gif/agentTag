@@ -664,7 +664,6 @@ function isBasicCredential(value: string): boolean {
   return /^[^\x00-\x1f\x7f\ufffd:]+:[^\x00-\x1f\x7f\ufffd]+$/.test(Buffer.from(value, "base64").toString("utf8"));
 }
 
-/** 草稿里像是密钥的是哪一种；没有时返回 undefined */
 /**
  * TOML、Python 里三个引号的多行字符串（password = """correct horse battery staple"""、api_key = '''…'''），值可以跨好几行。
  * 第 1 组是三个双引号里的，第 2 组是三个单引号里的
@@ -686,6 +685,26 @@ function tripleQuotedValues(text: string): string[] {
   });
 }
 
+/**
+ * XML 配置里名字是密钥的元素（Maven settings.xml 的 <password>…</password>、<api-key><![CDATA[…]]></api-key>），可以带命名空间和属性。
+ * 第 2 组是 CDATA 里的，第 3 组是直接写的
+ */
+const XML_ELEMENT = new RegExp(String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*</\1\s*>`, "gi");
+/** XML 里用名字和值两个属性写的配置项：.NET 的 <add key="ApiKey" value="…"/>、Spring 的 <property name="password" value="…"/>。第 2、3 组是值 */
+const XML_PAIR = new RegExp(String.raw`\b(?:name|key)[^\S\r\n]*=[^\S\r\n]*(["'])${CONFIG_KEY}\1[^<>]*?\bvalue[^\S\r\n]*=[^\S\r\n]*(?:"([^"]*)"|'([^']*)')`, "gi");
+
+/** XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，有 * 的是打了码的，不算 */
+function xmlValues(text: string): string[] {
+  return [
+    ...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain),
+    ...[...text.matchAll(XML_PAIR)].map(([, , double, single]) => double ?? single),
+  ].flatMap((raw) => {
+    const value = raw.replace(/\s+/g, " ").trim();
+    return value.length >= 6 && !/[*　-〿一-鿿＀-￯]/.test(value) ? [value] : [];
+  });
+}
+
+/** 草稿里像是密钥的是哪一种；没有时返回 undefined */
 function findSecret(text: string): string | undefined {
   const known = SECRET_PATTERNS.find(([pattern]) => pattern.test(text));
   if (known) {
@@ -699,6 +718,7 @@ function findSecret(text: string): string | undefined {
     ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
     ...blockValues(text),
     ...tripleQuotedValues(text),
+    ...xmlValues(text),
     // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
     ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) =>
       bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],
@@ -814,7 +834,7 @@ export function usable(entry: KnowledgeEntry): boolean {
 }
 
 /** 卡片上给大家看的那些内容（类别、标题、问题、结论这些）和表格里现在的一样不一样；aiops 编号、状态不算 */
-export function sameContent(a: KnowledgeEntry, b: KnowledgeEntry): boolean {
+export function sameContent(a: KnowledgeDraft, b: KnowledgeDraft): boolean {
   const keys = ["category", "title", "scope", "question", "conclusion", "handling", "basis", "keywords", "errorCodes", "alertname"] as const;
   return keys.every((key) => (a[key] ?? "") === (b[key] ?? ""));
 }

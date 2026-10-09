@@ -178,10 +178,10 @@ export class AiopsLessons {
   }
 
   /**
-   * 团队经验库里这一条之前同步到 aiops 的经验，看排查过程末尾的出处；没有时返回 undefined。
+   * 团队经验库里这一条之前同步到 aiops 的经验和当时发过去的内容，看排查过程末尾的出处；没有时返回 undefined。
    * aiops 不能按出处查，只能检索：用当时发过去的内容查（表格后来改过也不影响），带上服务名和关键词让那一条排在前面，不按分数筛
    */
-  async findSynced(sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<number | undefined> {
+  async findSynced(sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<{ id: number; draft: KnowledgeDraft } | undefined> {
     for (const draft of sent) {
       const hits = await this.query(
         {
@@ -194,7 +194,7 @@ export class AiopsLessons {
       );
       const found = hits.find((hit) => hit.diagnosis_path?.includes(teamSourceNote(teamId)));
       if (found) {
-        return found.id;
+        return { id: found.id, draft };
       }
     }
     return undefined;
