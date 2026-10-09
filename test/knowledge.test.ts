@@ -198,6 +198,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "<ns:Token>correcthorsebattery</ns:TOKEN>",
     '<add key="ApiKey" value="correcthorsebatterystaple" />',
     "<property name='db.password' value='correct horse battery'/>",
+    // value 写在 key、name 前面的，属性分几行写、别的属性值里有 > 的也算
+    '<add value="correcthorsebatterystaple" key="ApiKey"/>',
+    "<property\n  value='correct horse battery'\n  name=\"db.password\"\n/>",
+    '<add key="ApiKey" description="a > b" value="correcthorsebatterystaple" />',
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -249,6 +253,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "<password>${DB_PASSWORD}</password><token>******</token><secret></secret><api-key><![CDATA[请找管理员要]]></api-key><token>expired</token>",
     '<passwordPolicy>strongpolicyvalue</passwordPolicy><secretName>aiops-secrets</secretName><add key="Timeout" value="correcthorsebatterystaple"/>',
     '<property name="password" value="${DB_PASSWORD}"/>',
+    '<add value="correcthorsebatterystaple" key="Timeout"/><property value="${DB_PASSWORD}" name="password"/>',
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }

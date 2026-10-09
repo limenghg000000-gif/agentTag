@@ -709,15 +709,32 @@ function tripleQuotedValues(text: string): string[] {
  * 第 2 组是 CDATA 里的，第 3 组是直接写的
  */
 const XML_ELEMENT = new RegExp(String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*</\1\s*>`, "gi");
-/** XML 里用名字和值两个属性写的配置项：.NET 的 <add key="ApiKey" value="…"/>、Spring 的 <property name="password" value="…"/>。第 2、3 组是值 */
-const XML_PAIR = new RegExp(String.raw`\b(?:name|key)[^\S\r\n]*=[^\S\r\n]*(["'])${CONFIG_KEY}\1[^<>]*?\bvalue[^\S\r\n]*=[^\S\r\n]*(?:"([^"]*)"|'([^']*)')`, "gi");
+/**
+ * 连在一起的一串「名字="值"」属性（一个 XML 标签里的全部属性）。属性的先后不限，值里可以有 >、可以换行，所以一个个属性往后接，不靠 > 断开
+ */
+const XML_ATTRIBUTES = /[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*')(?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))*/g;
+const XML_ATTRIBUTE = /([\w.:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+const CONFIG_NAME = new RegExp(String.raw`^${CONFIG_KEY}$`, "i");
+
+/**
+ * XML 里用名字和值两个属性写的配置项：.NET 的 <add key="ApiKey" value="…"/>、Spring 的 <property name="password" value="…"/>，
+ * value 写在 key 前面的也算。属性名的命名空间前缀不看
+ */
+function xmlPairValues(text: string): string[] {
+  return [...text.matchAll(XML_ATTRIBUTES)].flatMap(([attributes]) => {
+    const values = new Map<string, string>();
+    for (const [, name, double, single] of attributes.matchAll(XML_ATTRIBUTE)) {
+      values.set(name.replace(/^.*:/, "").toLowerCase(), double ?? single);
+    }
+    const value = values.get("value");
+    const named = [values.get("key"), values.get("name")].some((key) => key !== undefined && CONFIG_NAME.test(key.trim()));
+    return named && value !== undefined ? [value] : [];
+  });
+}
 
 /** XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，有 * 的是打了码的，不算 */
 function xmlValues(text: string): string[] {
-  return [
-    ...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain),
-    ...[...text.matchAll(XML_PAIR)].map(([, , double, single]) => double ?? single),
-  ].flatMap((raw) => {
+  return [...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlPairValues(text)].flatMap((raw) => {
     const value = raw.replace(/\s+/g, " ").trim();
     return value.length >= 6 && !/[*　-〿一-鿿＀-￯]/.test(value) ? [value] : [];
   });
