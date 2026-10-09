@@ -45,6 +45,13 @@ function fakeBitable() {
       }
       return structuredClone(tables.get(tableId)?.records ?? []);
     },
+    async listFields(_app, tableId) {
+      return (tables.get(tableId)?.fields ?? []).map((f) => f.field_name);
+    },
+    async createField(_app, tableId, field) {
+      calls.push(`createField ${field.field_name}`);
+      tables.get(tableId)!.fields.push(field);
+    },
     async createRecord(_app, tableId, fields, clientToken) {
       tokens.push(clientToken);
       const recordId = `rec${++next}`;
@@ -148,7 +155,7 @@ test("没配写权限名单时群也给可编辑；用 KNOWLEDGE_BITABLE 指定�
     logger: quiet,
   });
   await new KnowledgeBase(fixed, { logger: quiet }).save(dau);
-  assert.equal(target.calls.length, 0);
+  assert.ok(!target.calls.some((c) => c.startsWith("createApp")), "指定了表就不自己建");
   assert.equal(await fixed.location(), "https://example.feishu.cn/base/appX?table=tblX");
   assert.equal(calls.length, 3);
 });
@@ -221,6 +228,20 @@ test("保存时把草稿编号带给飞书（client_token）并写进表格；�
   assert.deepEqual(tokens, [requestId]);
   assert.equal(tables.get("tblX")!.records[0].fields["草稿编号"], requestId);
   assert.equal((await backend.list())[0].requestId, requestId);
+});
+
+test("KNOWLEDGE_BITABLE 指定的表缺列时，第一次写之前补上；已有的列不动，同一次启动只查一次", async () => {
+  const { api, calls, tables } = fakeBitable();
+  tables.set("tblX", { fields: [{ field_name: "标题", type: 1 }, { field_name: "结论", type: 1 }], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "schema.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(dau);
+  const created = calls.filter((c) => c.startsWith("createField"));
+  assert.ok(created.includes("createField 草稿编号") && created.includes("createField 编号") && created.includes("createField 保存时间"));
+  assert.ok(!created.includes("createField 标题") && !created.includes("createField 结论"));
+  assert.deepEqual(new Set(tables.get("tblX")!.fields.map((f) => f.field_name)).size, tables.get("tblX")!.fields.length);
+  await base.save(dau);
+  assert.equal(calls.filter((c) => c.startsWith("createField")).length, created.length);
 });
 
 test("表格里有人手动加的行：文本列是分段数组也能读，没编号的用行号，没有标题或结论的跳过；类别认不出算其他", async () => {

@@ -85,6 +85,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "GITLAB_TOKEN=glpat-abcdefghijklmnopqrstu",
     "用 sk-abcdefghijklmnopqrstuvwxyz123 调的接口",
     "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789",
+    "password=correcthorsebatterystaple",
     "mysql://agent:p4ssw0rd@10.0.0.5:3306/aiops",
     "数据库密码：Abc12345678",
     "-----BEGIN RSA PRIVATE KEY-----",
@@ -96,6 +97,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     );
   }
   assert.ok(normalizeDraft({ ...code8, basis: "报错 token expired，令牌过期后重新登录；密码：***" }));
+  assert.ok(normalizeDraft({ ...code8, basis: "密码：请找管理员重置；token=expired_session" }));
 });
 
 function fakeEmbedder(topics: string[]) {
@@ -152,6 +154,13 @@ test("没有向量模型时按关键词检索：关键词、错误码命中加�
   assert.deepEqual(await base.search("今天中午吃什么"), []);
   assert.deepEqual(await base.search("   "), []);
   assert.equal((await base.search("code=8", { category: "metric" })).length, 0);
+});
+
+test("问题写得很长时，只在结论里出现的说法也能检索到", async () => {
+  const backend = new MemoryBackend();
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(normalizeDraft({ ...dau, keywords: "", question: "讨论记录：".concat("大家各自说了统计的口径。".repeat(160)), conclusion: "以埋点表 app_open 去重为准" }));
+  assert.equal((await base.search("app_open 去重"))[0]?.entry.id, "K1");
 });
 
 test("有向量模型时按意思检索：向量按内容缓存，列表一分钟内不重读；向量服务出错时退回关键词", async () => {

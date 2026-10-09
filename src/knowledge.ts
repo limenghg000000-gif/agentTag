@@ -29,6 +29,8 @@ const CACHE_MS = 60_000;
 const EMBED_BATCH = 10;
 /** 算向量时每条最多多少字 */
 const EMBED_TEXT_CHARS = 2000;
+/** 检索用的文字里，问题和结论各最多取多少字：问题写得很长时结论也要留在里面 */
+const INDEX_FIELD_CHARS = 800;
 /** 提问最多取多少字去检索 */
 const QUERY_CHARS = 1000;
 /** 语义相似度到这个数才算相近 */
@@ -314,7 +316,7 @@ export class KnowledgeBase {
   }
 }
 
-/** 一条经验用来检索的文字 */
+/** 一条经验用来检索的文字：结论放在问题前面，两者各截一段，总长超了截掉的是问题的末尾 */
 function indexText(entry: KnowledgeDraft): string {
   return [
     `${KNOWLEDGE_CATEGORIES[entry.category]}：${entry.title}`,
@@ -322,8 +324,8 @@ function indexText(entry: KnowledgeDraft): string {
     entry.keywords,
     entry.errorCodes,
     entry.alertname,
-    entry.question,
-    entry.conclusion,
+    entry.conclusion.slice(0, INDEX_FIELD_CHARS),
+    entry.question.slice(0, INDEX_FIELD_CHARS),
   ]
     .filter(Boolean)
     .join("\n")
@@ -413,7 +415,10 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b(?:AKIA|LTAI)[A-Za-z0-9]{12,}/, "云服务的 AccessKey"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
-  [/(?:password|passwd|pwd|secret|token|密码|口令)\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}/i, "密码或令牌"],
+  // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple）；中文说明（「密码：请找管理员重置」）和 *** 不算
+  [/(?:password|passwd|pwd|密码|口令)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{6,}/i, "密码"],
+  // token、secret 后面常跟报错原文（token=expired_session），要带数字才算
+  [/(?:secret|token)\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}/i, "密码或令牌"],
 ];
 
 /** 去掉首尾空白、检查必填、长度和密钥 */

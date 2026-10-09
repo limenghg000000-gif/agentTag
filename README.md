@@ -173,7 +173,7 @@ npm start
 | `MCP_<名字>_WRITE_TOOLS` | 否 | 额外算作「会写东西」的工具。名字里带 create、save、delete 这类动词的程序自己认，不用列 |
 | `MCP_<名字>_PROMPT` | 否 | 这个服务在飞书群里的使用说明文件，默认 `prompts/mcp/<名字>.md` |
 | `KNOWLEDGE` | 否 | 团队经验库，默认 `on`，填 `off` 关掉（回答前不查，也没有起草经验的工具） |
-| `KNOWLEDGE_BITABLE` | 否 | 用哪张多维表格存经验，填打开那张数据表时浏览器里的链接（`https://xxx.feishu.cn/base/…?table=tbl…`）。不填时第一次保存经验时机器人自己建一张，记在 `<DATA_DIR>/knowledge/bitable.json`。数据目录丢了的时候，把机器人建的那张表的链接填在这里接着用 |
+| `KNOWLEDGE_BITABLE` | 否 | 用哪张多维表格存经验，填打开那张数据表时浏览器里的链接（`https://xxx.feishu.cn/base/…?table=tbl…`）。不填时第一次保存经验时机器人自己建一张，记在 `<DATA_DIR>/knowledge/bitable.json`。数据目录丢了的时候，把机器人建的那张表的链接填在这里接着用。指定的表缺哪些列，机器人第一次写入前自动补上 |
 | `KNOWLEDGE_EMBEDDING_MODEL` | 否 | 经验库按意思检索用的向量模型，和主模型用同一个服务和 Key。百炼默认 `text-embedding-v4`，别家服务不配时只按关键词检索，填 `off` 也只按关键词 |
 | `DATA_DIR` | 否 | 数据目录，默认启动目录下的 `data`。群记忆存在 `<DATA_DIR>/memory/<chat_id>.json` |
 

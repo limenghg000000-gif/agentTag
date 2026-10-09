@@ -66,6 +66,9 @@ export interface BitableApi {
   createTable(appToken: string, name: string, fields: readonly BitableField[]): Promise<string>;
   deleteTable(appToken: string, tableId: string): Promise<void>;
   listRecords(appToken: string, tableId: string): Promise<BitableRecord[]>;
+  /** 数据表里已有的列名 */
+  listFields(appToken: string, tableId: string): Promise<string[]>;
+  createField(appToken: string, tableId: string, field: BitableField): Promise<void>;
   /** clientToken（UUID）相同的请求飞书只建一行，结果没传回来时可以放心重试 */
   createRecord(appToken: string, tableId: string, fields: Record<string, unknown>, clientToken?: string): Promise<string>;
   updateRecord(appToken: string, tableId: string, recordId: string, fields: Record<string, unknown>): Promise<void>;
@@ -124,6 +127,30 @@ export function createBitableApi(client: Client): BitableApi {
         }
       }
       return records;
+    },
+
+    async listFields(appToken, tableId) {
+      const names: string[] = [];
+      let pageToken: string | undefined;
+      for (let page = 0; page < 10; page++) {
+        const data = await call(() =>
+          client.bitable.v1.appTableField.list({ path: { app_token: appToken, table_id: tableId }, params: { page_size: 100, page_token: pageToken } }),
+        );
+        for (const item of data?.items ?? []) {
+          if (item.field_name) {
+            names.push(item.field_name);
+          }
+        }
+        pageToken = data?.has_more ? data.page_token : undefined;
+        if (!pageToken) {
+          break;
+        }
+      }
+      return names;
+    },
+
+    async createField(appToken, tableId, field) {
+      await call(() => client.bitable.v1.appTableField.create({ path: { app_token: appToken, table_id: tableId }, data: field as never }));
     },
 
     async createRecord(appToken, tableId, fields, clientToken) {
@@ -246,6 +273,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   private creating?: Promise<BitableState>;
   /** 调整共享排队进行（启动时和保存时可能同时来） */
   private sharing: Promise<void> = Promise.resolve();
+  /** 补齐列：每次启动后第一次写表格前做一次 */
+  private schema?: Promise<void>;
   /** 编号 → 行 id，update 时用 */
   private readonly rows = new Map<string, string>();
   /** 表格里不止一行用的编号（有人复制了行）：改这些编号时不知道该改哪行，不改 */
@@ -296,6 +325,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     if (!this.options.target) {
       await this.share(target);
     }
+    await this.ensureColumns(target);
     const recordId = await this.explain(() => this.options.api.createRecord(target.appToken, target.tableId, toFields(entry), entry.requestId));
     if (recordId) {
       this.rows.set(entry.id.toUpperCase(), recordId);
@@ -311,6 +341,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     if (this.ambiguous.has(id.toUpperCase())) {
       throw new KnowledgeError(`多维表格里不止一行的编号是 ${id}，不知道该改哪一行。请先在表格里把重复的编号改掉再试`);
     }
+    await this.ensureColumns(target);
     const fields: Record<string, unknown> = {};
     if (changes.status) {
       fields[FIELDS.status] = STATUS_LABELS[changes.status];
@@ -380,6 +411,30 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     this.target = Promise.resolve(target);
     this.logger.info(`经验库：新建了多维表格 ${target.url ?? target.appToken}`);
     return target;
+  }
+
+  /**
+   * 表格里缺的列补上：KNOWLEDGE_BITABLE 指定的是新建的空表、或者是旧版本建的表少了后来加的列时，不补的话写入会报列不存在。
+   * 同名但类型不同的列不动
+   */
+  private ensureColumns(target: BitableTarget): Promise<void> {
+    this.schema ??= this.addMissingColumns(target).catch((err: unknown) => {
+      this.schema = undefined;
+      throw err;
+    });
+    return this.schema;
+  }
+
+  private async addMissingColumns(target: BitableTarget): Promise<void> {
+    const { api } = this.options;
+    const existing = new Set(await this.explain(() => api.listFields(target.appToken, target.tableId)));
+    const missing = TABLE_FIELDS.filter((field) => !existing.has(field.field_name));
+    for (const field of missing) {
+      await this.explain(() => api.createField(target.appToken, target.tableId, field));
+    }
+    if (missing.length > 0) {
+      this.logger.info(`经验库：多维表格里补上了 ${missing.length} 列：${missing.map((field) => field.field_name).join("、")}`);
+    }
   }
 
   /** 按名单调整共享，排队进行 */
