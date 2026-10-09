@@ -834,6 +834,11 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   // 只在线上数据里出现的：带秒的时间、日期加时间、定位结果
   assert.equal(block("prod", "宽泛关键词查到 50 条，时间 2026-10-08 17:03～18:03"), true);
   assert.equal(block("诊断一下 network-tester", "network-tester 在 default、kube-system、monitoring 都有部署，请选择命名空间"), true);
+  assert.equal(block("诊断一下 network-tester", "network-tester 在 default、kube-system、monitoring 都有部署。请问查哪个？"), true);
+  assert.equal(block("gateway-api 呢", "已自动定位到 prod，gateway-api 运行正常"), true);
+  assert.equal(block("prod", "Pod gateway-api-6978f9454f-tnc56 重启了"), true);
+  // 写成线上结论的，举例的句子也照样查
+  assert.equal(block("prod", "结论：例如 gateway-api-6978f9454f-tnc56 已重启（把握：中）"), true);
   // 数量、「没有报错」写成线上结论时拦
   assert.equal(block("prod", "结论：最近 1 小时没有报错（把握：中）"), true);
   assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）"), true);
@@ -884,6 +889,14 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   assert.equal(block("命名空间有什么用", "可以把同一个服务部署在多个命名空间里，隔开测试和生产"), false);
   assert.equal(block("Pod 内存 limit 一般设多少", "一般 512MiB 到 2GiB，CPU 0.5 核起步，看压测结果调"), false);
   assert.equal(block("Pod 重启一般什么原因", "常见原因是 OOM、探针失败、镜像拉取失败"), false);
+  // 讲概念时举的 Pod 名、「节点都有部署」「会自动定位到」
+  assert.equal(
+    block("Deployment 的 Pod 名称是怎么生成的", "例如 gateway-api-6978f9454f-tnc56 中，gateway-api 是 Deployment 名，6978f9454f 是模板哈希，tnc56 是随机后缀"),
+    false,
+  );
+  assert.equal(block("DaemonSet 和 Deployment 有什么区别？", "DaemonSet 确保符合条件的节点都有部署；Deployment 则维护指定数量的副本"), false);
+  assert.equal(block("DaemonSet 是干什么的", "让 worker、master 节点上都有部署一份，比如日志采集"), false);
+  assert.equal(block("aiops 不写命名空间会怎样", "aiops 会自动定位到唯一的命名空间，有好几个时列出候选让你选"), false);
 });
 
 test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {

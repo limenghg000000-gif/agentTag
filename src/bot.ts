@@ -368,11 +368,13 @@ const OPS_TIME_PATTERNS = [
   String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
   String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
 ];
-/** 只在线上数据里出现的写法：K8s Pod 名（gateway-api-6978f9454f-tnc56）、「都有部署」「自动定位到」这类定位结果 */
+/** 一般只在线上数据里出现的写法：K8s Pod 名（gateway-api-6978f9454f-tnc56）、「都有部署」「自动定位到」这类定位结果 */
 const OPS_STRONG_PATTERNS = [
   String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
-  // 定位结果：「在多个命名空间都有部署」「default、kube-system 都有部署」「已自动定位到 prod」
-  String.raw`都有部署|自动定位到`,
+  // 定位结果：「在多个命名空间都有部署」「default、kube-system 都有部署」「已自动定位到 prod」。要说到命名空间、列出名字，
+  // 或者定位到具体的名字：「DaemonSet 确保节点都有部署」「aiops 会自动定位到唯一的命名空间」是在讲概念
+  String.raw`(?:命名空间|namespace|、)[^。；;！!？?\n]*(?<!节点上?)都有部署|(?<!节点上?)都有部署[^。；;！!？?\n]*(?:命名空间|namespace)`,
+  String.raw`已自动定位到|自动定位到了?\s*[*\x60「“]*[a-z]`,
 ];
 /** 概念解释、单位换算里也常见的写法：带单位的数量（47 条、95%、120ms、3.1 cores）、就绪数（1/1 就绪）、「多个命名空间」、「没有报错」「没有 error 级别日志」 */
 const OPS_WEAK_PATTERNS = [
@@ -462,7 +464,7 @@ export const BLOCKED_OPS_ANSWER =
 /**
  * 打回重做以后还是没查证就给出线上数据时，这个回答不发出去，换成 BLOCKED_OPS_ANSWER。
  * 2026-10-08 复测：用户回了「prod」以后模型两次都没调工具，第二次打回重做后照样编出了三次查询的结果。
- * Pod 名、定位结果这类只在线上数据里出现的，有就拦；带秒的时间也拦，问的是时间换算、时区、格式时，只在问线上服务又写成线上结论时才拦。
+ * Pod 名、定位结果这类只在线上数据里出现的，有就拦（举例的句子除外）；带秒的时间也拦，问的是时间换算、时区、格式时，只在问线上服务又写成线上结论时才拦。
  * 数量、就绪数、「没有报错」这类概念解释里也常见的，只在写成线上结论（带「把握：中」这类把握）时才拦，
  * 「结论：1GiB = 1024MiB」「Go 没有异常机制」「北京时间为 16:00:00」照常发。
  * 只是整理之前回答的请求放行（数据来自话题里之前的回答）。调过工具都失败了时，说调用失败的那一句不算，剩下的照样查。
@@ -478,15 +480,27 @@ export function blockUnverifiedOps(
   if (checkedLive(servers, succeeded) || rewriteOnly(question)) {
     return false;
   }
-  const text = attempted ? withoutToolFailures(answer) : answer;
-  const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
   const conclusion = OPS_CONCLUSION.test(answer);
+  const reported = attempted ? withoutToolFailures(answer) : answer;
+  // 举例的句子不算（「例如 gateway-api-6978f9454f-tnc56 中，6978f9454f 是模板哈希」）；写成线上结论的照样整段查
+  const text = conclusion ? reported : withoutExamples(reported);
+  const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
   const liveTime = !TIME_QUESTION.test(question) || (conclusion && OPS_QUESTION.test(question));
   return live(OPS_STRONG) || (liveTime && live(OPS_TIME)) || (conclusion && live(OPS_WEAK));
 }
 
 function rewriteOnly(question: string): boolean {
   return REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question) && (EARLIER_CONTENT.test(question) || !OPS_QUESTION.test(question));
+}
+
+/** 举例的句子 */
+const EXAMPLE = /例如|比如|譬如|举例|举个例子|示例|样例|为例|假如|假设|e\.g\.|for example/i;
+
+function withoutExamples(text: string): string {
+  return text
+    .split(/(?<=[。；;！!？?\n])/)
+    .filter((sentence) => !EXAMPLE.test(sentence))
+    .join("");
 }
 
 /** 去掉说工具调用失败的分句；分句里除了「N 次」还有别的数据（「查询返回 50 条请求超时」）就留着 */
