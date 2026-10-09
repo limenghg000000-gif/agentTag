@@ -12,6 +12,7 @@ import {
   renderHitsForPrompt,
 } from "../src/knowledge.js";
 import { AiopsLessons, type LessonsMcp, renderAiopsHitsForPrompt } from "../src/knowledge-aiops.js";
+import { raceAbort } from "../src/abort.js";
 import { readFile } from "node:fs/promises";
 import { buildSystemPrompt } from "../src/prompt.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
@@ -318,7 +319,7 @@ function deskSetup({
 } = {}) {
   const control = { failSend: false };
   const backend = new MemoryBackend();
-  const base = new KnowledgeBase(backend, { logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 200 });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
   const updates: { messageId: string; card: any }[] = [];
   const { mcp, calls } = fakeMcp({
@@ -755,6 +756,58 @@ test("两张卡片取代同一条经验：先点的存好并归档旧的，后�
   }
 });
 
+test("取代旧经验时归档旧的没做成：别的卡片不能再取代那条旧的，免得两条新的同时有效", async () => {
+  const { backend, base, desk, sent, updates, click } = deskSetup({ aiops: false });
+  await base.save(normalizeDraft(dau));
+  const other = { chatId: "oc_1", threadKey: "om_other", senderId: "ou_2", askerName: "李四", messageId: "om_2" };
+  await desk.tools({ chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" }).find((t) => t.spec.name === "knowledge_propose")!
+    .run({ ...dau, title: "日活的口径（张三改的）", replaces: "K1" }, { signal });
+  await desk.tools(other).find((t) => t.spec.name === "knowledge_propose")!.run({ ...dau, title: "日活的口径（李四改的）", replaces: "K1" }, { signal });
+  const [first, second] = sent.map((s) => (s.input as { card: any }).card);
+  const update = backend.update.bind(backend);
+  let limited = true;
+  backend.update = async (id, changes) => {
+    if (id === "K1" && limited) {
+      throw new KnowledgeError("飞书接口限流");
+    }
+    return update(id, changes);
+  };
+  await desk.handleCardAction(click(first, "save"));
+  await desk.idle();
+  const partial = updates.filter((u) => u.messageId === "om_card_1").at(-1)!.card;
+  assert.equal(partial.header.title.content, "已存进经验库，还有没做成的");
+  assert.equal(backend.entries[1].replaces, "K1", "表格里记下新的这条取代的是哪条");
+
+  limited = false;
+  await desk.handleCardAction({ ...click(second, "save"), messageId: "om_card_2" });
+  await desk.idle();
+  const voided = updates.filter((u) => u.messageId === "om_card_2").at(-1)!.card;
+  assert.equal(voided.header.title.content, "已作废");
+  assert.match(cardText(voided), /经验 K1 已经有取代它的新经验 K2「日活的口径（张三改的）」，只是旧的还没归档，这张卡片不能再保存/);
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status]),
+    [
+      ["K1", "active"],
+      ["K2", "active"],
+    ],
+  );
+
+  await desk.handleCardAction(click(partial, "save"));
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status]),
+    [
+      ["K1", "archived"],
+      ["K2", "active"],
+    ],
+  );
+  // 取代它的那条归档了，旧的又能被取代
+  await base.archive("K2");
+  await update("K1", { status: "active" });
+  const again = await base.save(normalizeDraft({ ...dau, title: "日活的口径（王五改的）" }), { replaces: "k1" });
+  assert.deepEqual([again.id, again.replaces], ["K3", "K1"]);
+});
+
 test("归档、取代时用表格里现在的 aiops 编号：卡片发出后有人在表格里改了编号，归档改过的那条", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup();
   await base.save(normalizeDraft(code8));
@@ -834,6 +887,27 @@ test("模型查经验库、看经验时任务停了不等表格", async () => {
   stop.abort();
   await assert.rejects(searching, (err: Error) => err.name === "AbortError");
   await assert.rejects(getting, (err: Error) => err.name === "AbortError");
+});
+
+test("读表格卡住时这次报错、不留在缓存里：回答前检索超时后模型再查，不会一直等那次读", async () => {
+  const backend = new MemoryBackend();
+  const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 30 });
+  await base.save(normalizeDraft(dau));
+  const list = backend.list.bind(backend);
+  backend.list = () => new Promise(() => {});
+  // 回答前检索到时间就不等了，那次读还挂着
+  const lookup = new AbortController();
+  const abandoned = raceAbort(base.search("日活"), lookup.signal);
+  lookup.abort();
+  await assert.rejects(abandoned, (err: Error) => err.name === "AbortError");
+  // 模型接着调 knowledge_search：用的是缓存里那次读，到了读表格的期限就报错
+  await assert.rejects(base.search("日活"), /读经验库表格超过 0.03 秒没读完/);
+  // 报错的那次不留在缓存里，表格好了马上能查到
+  backend.list = list;
+  assert.deepEqual(
+    (await base.search("日活")).map((hit) => hit.entry.id),
+    ["K1"],
+  );
 });
 
 test("归档：团队经验库的按编号，aiops 经验库的按 aiops_id；两个都填或都不填报错", async () => {
@@ -924,7 +998,7 @@ test("回答前检索每个库限时：表格卡住了照样用 aiops 的结果�
   const lessons = new AiopsLessons(fakeMcp({ search_knowledge: () => JSON.stringify({ hits: [{ id: 40, title: "Open WebUI 存的", score: 8 }] }) }).mcp, "aiops", quiet);
   const make = (aiops?: AiopsLessons) =>
     new KnowledgeDesk({
-      base: new KnowledgeBase(hanging, { logger: quiet }),
+      base: new KnowledgeBase(hanging, { logger: quiet, readTimeoutMs: 200 }),
       ...(aiops ? { aiops } : {}),
       send: async () => ({ messageId: "x" }),
       updateCard: async () => {},

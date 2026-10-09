@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { anySignal, raceAbort } from "./abort.js";
+import { anySignal, isTimeout, raceAbort, timeoutSignal } from "./abort.js";
 import type { Logger } from "./history.js";
 
 /**
@@ -29,6 +29,8 @@ const PROMPT_FIELD_CHARS = 400;
 const PROMPT_FIRST_FIELDS = ["结论", "怎么处理"];
 /** 列表多久重新读一次：多维表格里有人直接改了，过一会儿就能用上 */
 const CACHE_MS = 60_000;
+/** 读一次整张表最多等多久：飞书接口不认中止信号，卡住的读不能留在缓存里，让后面的检索和保存都跟着等 */
+const READ_TIMEOUT_MS = 15_000;
 /** 一次给向量模型的条数（百炼 text-embedding-v4 一次最多 10 条） */
 const EMBED_BATCH = 10;
 /** 算向量时每条最多多少字 */
@@ -84,6 +86,8 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   aiopsId?: number;
   /** 哪张确认卡片存的：保存的结果没传回来、再点一次时，靠它认出已经存过 */
   requestId?: string;
+  /** 这条取代的旧经验编号。旧的还没归档时（归档那步没做成），别的卡片不能再取代它 */
+  replaces?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -150,6 +154,7 @@ export interface KnowledgeBaseOptions {
   logger?: Logger;
   now?: () => Date;
   cacheMs?: number;
+  readTimeoutMs?: number;
 }
 
 /**
@@ -161,6 +166,7 @@ export class KnowledgeBase {
   private readonly logger: Logger;
   private readonly now: () => Date;
   private readonly cacheMs: number;
+  private readonly readTimeoutMs: number;
   private cached?: { at: number; entries: Promise<KnowledgeEntry[]> };
   private readonly vectors = new Map<string, number[]>();
   private embedFailedAt?: number;
@@ -174,6 +180,7 @@ export class KnowledgeBase {
     this.logger = options.logger ?? console;
     this.now = options.now ?? (() => new Date());
     this.cacheMs = options.cacheMs ?? CACHE_MS;
+    this.readTimeoutMs = options.readTimeoutMs ?? READ_TIMEOUT_MS;
   }
 
   location(): Promise<string | undefined> {
@@ -183,9 +190,9 @@ export class KnowledgeBase {
   async entries(fresh = false): Promise<KnowledgeEntry[]> {
     const at = this.now().getTime();
     if (fresh || !this.cached || at - this.cached.at > this.cacheMs) {
-      const entries = this.backend.list();
+      const entries = this.read();
       this.cached = { at, entries };
-      // 读失败不缓存，下次重试
+      // 读失败、超时都不缓存，下次重新读
       entries.catch(() => {
         if (this.cached?.entries === entries) {
           this.cached = undefined;
@@ -193,6 +200,16 @@ export class KnowledgeBase {
       });
     }
     return structuredClone(await this.cached.entries);
+  }
+
+  /** 读整张表，超过 readTimeoutMs 就不等了、报错（还在读的那次回来了也不用） */
+  private read(): Promise<KnowledgeEntry[]> {
+    const timeout = timeoutSignal(this.readTimeoutMs);
+    const reading = raceAbort(this.backend.list(), timeout.signal).catch((err: unknown) => {
+      throw isTimeout(err) ? new KnowledgeError(`读经验库表格超过 ${this.readTimeoutMs / 1000} 秒没读完，这次没读到`) : err;
+    });
+    void reading.then(timeout.clear, timeout.clear);
+    return reading;
   }
 
   async get(id: string): Promise<KnowledgeEntry | undefined> {
@@ -238,13 +255,23 @@ export class KnowledgeBase {
         this.logger.info(`经验库 ${saved.id}「${saved.title}」上次已经存进去了（草稿 ${meta.requestId}），不重复保存`);
         return saved;
       }
+      let replaces: string | undefined;
       if (meta.replaces) {
-        const old = entries.find((entry) => entry.id.toUpperCase() === normalizeId(meta.replaces!));
+        const wanted = normalizeId(meta.replaces);
+        const old = entries.find((entry) => entry.id.toUpperCase() === wanted);
         if (old?.status !== "active") {
           throw new StaleProposalError(
             `要取代的经验 ${meta.replaces} ${old ? "已经归档了（可能已经被别的卡片取代）" : "不在经验库里了"}，这张卡片不能再保存。需要的话请重新起草`,
           );
         }
+        // 别的卡片已经存了取代它的新经验、只是归档旧的那步没做成：再存一条，就会有两条新的同时有效
+        const successor = entries.find((entry) => entry.status === "active" && entry.replaces !== undefined && normalizeId(entry.replaces) === wanted);
+        if (successor) {
+          throw new StaleProposalError(
+            `经验 ${old.id} 已经有取代它的新经验 ${successor.id}「${successor.title}」，只是旧的还没归档，这张卡片不能再保存。要改的话请在 ${successor.id} 的基础上重新起草，或者直接归档 ${old.id}`,
+          );
+        }
+        replaces = old.id;
       }
       const next = Math.max(0, ...entries.map((entry) => numberOf(entry.id))) + 1;
       const entry: KnowledgeEntry = {
@@ -255,6 +282,7 @@ export class KnowledgeBase {
         ...(meta.confirmedBy ? { confirmedBy: meta.confirmedBy } : {}),
         ...(meta.source ? { source: meta.source } : {}),
         ...(meta.requestId ? { requestId: meta.requestId } : {}),
+        ...(replaces ? { replaces } : {}),
         createdAt: this.now().toISOString(),
       };
       await this.backend.add(entry);

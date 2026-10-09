@@ -29,6 +29,7 @@ const FIELDS = {
   proposedBy: "发起人",
   confirmedBy: "确认人",
   source: "来源",
+  replaces: "取代的经验",
   aiopsId: "aiops 经验编号",
   requestId: "草稿编号",
   createdAt: "保存时间",
@@ -109,46 +110,24 @@ export function createBitableApi(client: Client): BitableApi {
     },
 
     async listRecords(appToken, tableId) {
-      const records: BitableRecord[] = [];
-      let pageToken: string | undefined;
-      for (let page = 0; page < 40; page++) {
-        const data = await call(() =>
+      const items = await allPages("经验库表格的记录", (pageToken) =>
+        call(() =>
           client.bitable.v1.appTableRecord.list({
             path: { app_token: appToken, table_id: tableId },
             params: { page_size: 500, page_token: pageToken, automatic_fields: true },
           }),
-        );
-        for (const item of data?.items ?? []) {
-          if (item.record_id) {
-            records.push({ recordId: item.record_id, fields: item.fields as Record<string, unknown> });
-          }
-        }
-        pageToken = data?.has_more ? data.page_token : undefined;
-        if (!pageToken) {
-          break;
-        }
-      }
-      return records;
+        ),
+      );
+      return items.flatMap((item) => (item.record_id ? [{ recordId: item.record_id, fields: item.fields as Record<string, unknown> }] : []));
     },
 
     async listFields(appToken, tableId) {
-      const names: string[] = [];
-      let pageToken: string | undefined;
-      for (let page = 0; page < 10; page++) {
-        const data = await call(() =>
+      const items = await allPages("经验库表格的列", (pageToken) =>
+        call(() =>
           client.bitable.v1.appTableField.list({ path: { app_token: appToken, table_id: tableId }, params: { page_size: 100, page_token: pageToken } }),
-        );
-        for (const item of data?.items ?? []) {
-          if (item.field_name) {
-            names.push(item.field_name);
-          }
-        }
-        pageToken = data?.has_more ? data.page_token : undefined;
-        if (!pageToken) {
-          break;
-        }
-      }
-      return names;
+        ),
+      );
+      return items.flatMap((item) => (item.field_name ? [item.field_name] : []));
     },
 
     async createField(appToken, tableId, field) {
@@ -233,6 +212,37 @@ export interface BitableTarget {
   appToken: string;
   tableId: string;
   url?: string;
+}
+
+/** 翻页最多翻多少页：只防接口一直说还有下一页、停不下来（500 行一页，够十万行） */
+const MAX_PAGES = 200;
+
+/**
+ * 一页一页读到底。接口说还有下一页、却没给新的翻页位置，或者页数多得不正常时报错：
+ * 读了一半的结果不能当成整张表用（漏掉的行检索不到，新编号还可能和漏掉的行重复）
+ */
+async function allPages<T>(
+  what: string,
+  fetch: (pageToken: string | undefined) => Promise<{ items?: T[]; has_more?: boolean; page_token?: string } | undefined>,
+): Promise<T[]> {
+  const items: T[] = [];
+  const seen = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 1; ; page++) {
+    const data = await fetch(pageToken);
+    items.push(...(data?.items ?? []));
+    if (!data?.has_more) {
+      return items;
+    }
+    if (!data.page_token || seen.has(data.page_token)) {
+      throw new KnowledgeError(`读${what}时，飞书说还有下一页，却没给新的翻页位置，读不全，这次先不用`);
+    }
+    if (page >= MAX_PAGES) {
+      throw new KnowledgeError(`${what}读了 ${MAX_PAGES} 页还没读完，这次先不用读了一半的结果`);
+    }
+    seen.add(data.page_token);
+    pageToken = data.page_token;
+  }
 }
 
 /**
@@ -643,6 +653,7 @@ const TABLE_FIELDS: BitableField[] = [
   { field_name: FIELDS.proposedBy, type: TEXT },
   { field_name: FIELDS.confirmedBy, type: TEXT },
   { field_name: FIELDS.source, type: TEXT },
+  { field_name: FIELDS.replaces, type: TEXT },
   { field_name: FIELDS.aiopsId, type: TEXT },
   { field_name: FIELDS.requestId, type: TEXT },
   { field_name: FIELDS.createdAt, type: CREATED_TIME, property: { date_formatter: "yyyy/MM/dd HH:mm" } },
@@ -668,6 +679,7 @@ function toFields(entry: KnowledgeEntry): Record<string, unknown> {
     [FIELDS.proposedBy, entry.proposedBy],
     [FIELDS.confirmedBy, entry.confirmedBy],
     [FIELDS.source, entry.source],
+    [FIELDS.replaces, entry.replaces],
     [FIELDS.aiopsId, entry.aiopsId === undefined ? undefined : String(entry.aiopsId)],
     [FIELDS.requestId, entry.requestId],
   ];
@@ -693,7 +705,7 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
   const createdAt = timeOf(fields[FIELDS.createdAt]);
   const updatedAt = timeOf(fields[FIELDS.updatedAt]);
   const optional = (
-    key: "scope" | "handling" | "basis" | "keywords" | "errorCodes" | "alertname" | "proposedBy" | "confirmedBy" | "source" | "requestId",
+    key: "scope" | "handling" | "basis" | "keywords" | "errorCodes" | "alertname" | "proposedBy" | "confirmedBy" | "source" | "requestId" | "replaces",
   ) => {
     const value = text(FIELDS[key]);
     return value ? { [key]: value } : {};
@@ -715,6 +727,7 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
     ...optional("confirmedBy"),
     ...optional("source"),
     ...optional("requestId"),
+    ...optional("replaces"),
     ...(Number.isFinite(aiopsId) ? { aiopsId } : {}),
     createdAt: createdAt ?? new Date(0).toISOString(),
     ...(updatedAt && updatedAt !== createdAt ? { updatedAt } : {}),

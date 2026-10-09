@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import type { Client } from "@larksuiteoapi/node-sdk";
 import { FeishuApiError } from "../src/feishu.js";
 import { KnowledgeBase, KnowledgeError, normalizeDraft } from "../src/knowledge.js";
 import {
@@ -10,6 +11,7 @@ import {
   type BitableField,
   BitableKnowledgeBackend,
   type BitableMember,
+  createBitableApi,
   type BitableRecord,
   parseBitableUrl,
 } from "../src/knowledge-bitable.js";
@@ -310,6 +312,45 @@ test("保存时把草稿编号带给飞书（client_token）并写进表格；�
   assert.equal((await backend.list())[0].requestId, requestId);
 });
 
+test("取代旧经验的那条在表格里记下取代的编号，读回来也有", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "replaces.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(dau);
+  await base.save({ ...dau, title: "日活的口径（改过）" }, { replaces: "k1" });
+  assert.equal(tables.get("tblX")!.records[1].fields["取代的经验"], "K1");
+  assert.equal(tables.get("tblX")!.records[0].fields["取代的经验"], undefined);
+  assert.deepEqual(
+    (await backend.list()).map((entry) => entry.replaces),
+    [undefined, "K1"],
+  );
+});
+
+test("读表格一页一页读到底，超过 2 万行也不截断；飞书说还有下一页却没给新位置、页数多得不正常时报错，不拿一半当全部", async () => {
+  const paged = (page: (token: string | undefined, n: number) => { items: unknown[]; has_more: boolean; page_token?: string }) => {
+    let n = 0;
+    const list = async ({ params }: { params: { page_token?: string } }) => ({ code: 0, data: page(params.page_token, ++n) });
+    return createBitableApi({ bitable: { v1: { appTableRecord: { list }, appTableField: { list } } } } as unknown as Client);
+  };
+  const rows = (n: number) => Array.from({ length: 500 }, (_, i) => ({ record_id: `rec${n}_${i}`, fields: {} }));
+  const all = await paged((token, n) => ({ items: rows(n), has_more: n < 41, page_token: `p${n}` })).listRecords("app1", "tbl1");
+  assert.equal(all.length, 41 * 500);
+  assert.equal(all.at(-1)!.recordId, "rec41_499");
+
+  await assert.rejects(
+    paged((_token, n) => ({ items: rows(n), has_more: true, page_token: "same" })).listRecords("app1", "tbl1"),
+    (err: Error) => err instanceof KnowledgeError && /还有下一页，却没给新的翻页位置/.test(err.message),
+  );
+  await assert.rejects(paged((_token, n) => ({ items: rows(n), has_more: true })).listRecords("app1", "tbl1"), /还有下一页，却没给新的翻页位置/);
+  await assert.rejects(
+    paged((_token, n) => ({ items: [], has_more: true, page_token: `p${n}` })).listRecords("app1", "tbl1"),
+    /经验库表格的记录读了 200 页还没读完/,
+  );
+  const fields = await paged((_token, n) => ({ items: [{ field_name: `列${n}` }], has_more: n < 12, page_token: `f${n}` })).listFields("app1", "tbl1");
+  assert.equal(fields.length, 12);
+});
+
 test("KNOWLEDGE_BITABLE 指定的表缺列时，第一次写之前补上；已有的列不动，同一次启动只查一次", async () => {
   const { api, calls, tables } = fakeBitable();
   tables.set("tblX", { fields: [{ field_name: "标题", type: 1 }, { field_name: "结论", type: 1 }], records: [] });
@@ -318,6 +359,7 @@ test("KNOWLEDGE_BITABLE 指定的表缺列时，第一次写之前补上；已�
   await base.save(dau);
   const created = calls.filter((c) => c.startsWith("createField"));
   assert.ok(created.includes("createField 草稿编号") && created.includes("createField 编号") && created.includes("createField 保存时间"));
+  assert.ok(created.includes("createField 取代的经验"));
   assert.ok(!created.includes("createField 标题") && !created.includes("createField 结论"));
   assert.deepEqual(new Set(tables.get("tblX")!.fields.map((f) => f.field_name)).size, tables.get("tblX")!.fields.length);
   await base.save(dau);
