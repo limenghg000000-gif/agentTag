@@ -238,22 +238,25 @@ test("撤权限失败（没开 docs:permission.member:delete）时警告写明�
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
 });
 
-test("设置谁能管协作者失败（没开 docs:permission.setting:write_only）时照常共享，警告写明缺的权限，下次启动再设", async () => {
+test("设置谁能管协作者失败（没开 docs:permission.setting:write_only）时先不共享给任何人，警告写明缺的权限；开了以后下次启动设好再共享", async () => {
   const stateFile = path.join(dir, "restrict-fail", "bitable.json");
   const { api, shared, restricted } = fakeBitable();
   api.failRestrict = true;
   const warnings: string[] = [];
   const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
   await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }), { logger: quiet }).save(dau);
-  assert.equal(shared.length, 1);
+  assert.equal(shared.length, 0, "没限制好之前不共享");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /只有机器人能加、移除协作者.*要用应用权限 docs:permission\.setting:write_only/);
   assert.equal(JSON.parse(await readFile(stateFile, "utf8")).restricted, undefined);
 
   api.failRestrict = false;
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
-  assert.deepEqual(restricted, ["app1，此前已共享 1 个"]);
-  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).restricted, true);
+  assert.deepEqual(restricted, ["app1，此前已共享 0 个"]);
+  assert.equal(shared.length, 1);
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(state.restricted, true);
+  assert.deepEqual(state.shared, ["openchat:oc_1:view"]);
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
   assert.equal(restricted.length, 1, "设好了就不再调");
 });

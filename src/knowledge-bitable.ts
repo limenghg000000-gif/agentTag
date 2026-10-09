@@ -469,7 +469,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   }
 
   /**
-   * 先把表格设成只有机器人能管协作者、只有协作者能打开，名单里的人就没法再共享给名单外的人。
+   * 先把表格设成只有机器人能管协作者、只有协作者能打开，名单里的人就没法再共享给名单外的人；这一步没成功就先不共享给任何人。
    * 再拿白名单群（默认只读）和写权限名单里的人（可编辑）要有的权限，和机器人已经共享出去的比：
    * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
    * 加协作者之前先把它记进数据目录：加上了却没来得及记下就退出的话，以后移出名单时就不知道要撤它。
@@ -523,7 +523,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
       attempt(`把 ${member.id} 对多维表格的权限从${PERM_LABELS[from]}改成${PERM_LABELS[perm]}`, "docs:permission.member:update", () =>
         api.updateCollaborator(target.appToken, member, perm),
       );
-    for (const [key, [member, perm]] of wanted) {
+    // 没设成只有机器人能管协作者之前不共享给任何人：看组织的默认设置，拿到权限的人可能再共享给名单外的人，之后也撤不掉。撤权限照常
+    for (const [key, [member, perm]] of target.restricted ? wanted : []) {
       const had = granted.get(key);
       if (had && !pending.has(key)) {
         if (had.perm !== perm && (await update(member, had.perm, perm)).ok) {
