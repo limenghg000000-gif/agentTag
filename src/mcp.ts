@@ -169,6 +169,11 @@ export class McpHub {
     return this.find(serverName)?.catalog.has(tool) ?? false;
   }
 
+  /** 连上过、拿到了工具清单（之后刷新失败也算，沿用上次的清单） */
+  connected(serverName: string): boolean {
+    return this.find(serverName)?.synced ?? false;
+  }
+
   /**
    * 程序自己调服务端的工具，不经过模型：回答前检索 aiops 经验库、有人在确认卡片上点了保存后同步到 aiops 经验库。
    * 不受「只开只读工具」的限制（写操作的确认由调用方负责），不占模型的调用次数，照样记审计日志。返回结果原文，工具报错时抛错

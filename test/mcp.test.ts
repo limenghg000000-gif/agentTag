@@ -359,6 +359,7 @@ test("连不上不影响启动，提示词里说明连不上；之后自动重�
   const hub = await hubFor([config(`http://127.0.0.1:${port}/mcp`)], { logger: log.logger, retryMs: [50] });
 
   assert.deepEqual(hub.tools(task), []);
+  assert.ok(!hub.connected("aiops"), "还没连上");
   assert.match(hub.prompt([]) ?? "", /aiops 现在连不上（程序在自动重连），这次没有 aiops_ 开头的工具/);
   assert.equal(log.find(/MCP aiops 连不上/)?.level, "warn");
   assert.match(log.find(/MCP aiops 连不上/)!.text, /0\.05 秒后重试；机器人照常运行，这期间没有 aiops 的工具/);
@@ -368,6 +369,8 @@ test("连不上不影响启动，提示词里说明连不上；之后自动重�
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.equal(hub.tools(task).length, 3);
+  assert.ok(hub.connected("aiops"));
+  assert.ok(!hub.connected("other"));
   assert.ok(log.find(/MCP aiops：已连上/));
   assert.ok(server.initializes >= 1);
 });

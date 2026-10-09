@@ -309,14 +309,16 @@ test("起草时找很像的已有经验", async () => {
 
 function fakeMcp(handlers: Record<string, (args: Record<string, unknown>) => string>) {
   const calls: { tool: string; args: Record<string, unknown> }[] = [];
-  const mcp: LessonsMcp = {
-    hasTool: (_server, tool) => tool in handlers,
+  const mcp: LessonsMcp & { up: boolean } = {
+    up: true,
+    hasTool: (_server, tool) => mcp.up && tool in handlers,
+    connected: () => mcp.up,
     async callDirect(_server, tool, args) {
       calls.push({ tool, args });
       return handlers[tool](args);
     },
   };
-  return { mcp, calls };
+  return { mcp, calls, handlers };
 }
 
 const task = { chatId: "oc_1", senderId: "ou_1", messageId: "om_1" };
@@ -373,7 +375,7 @@ function deskSetup({
   const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 200 });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
   const updates: { messageId: string; card: any }[] = [];
-  const { mcp, calls } = fakeMcp({
+  const { mcp, calls, handlers } = fakeMcp({
     search_knowledge: searchLessons,
     get_knowledge: (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", root_cause: "旧结论" }),
     save_lesson: saveLesson,
@@ -409,7 +411,7 @@ function deskSetup({
     return { messageId: "om_card_1", chatId: "oc_1", operator: { openId, name }, action: { tag: "button", value } };
   };
   const lastCard = () => updates.at(-1)!.card;
-  return { backend, base, desk, sent, updates, calls, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
+  return { backend, base, desk, sent, updates, calls, mcp, handlers, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
 }
 
 const cardText = (card: any) => JSON.stringify(card);
@@ -691,6 +693,116 @@ test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一�
   assert.deepEqual(down.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
   assert.equal(down.lastCard().header.title.content, "已存进经验库");
   assert.match(markdown(down), /已同步到 aiops 经验库（经验 #33）[\s\S]*旧的经验 K1「.*」已归档。\naiops 经验库里同步的经验 #31 也已归档。/);
+});
+
+test("取代旧的排查经验：aiops 不认 force、强制保存还说重复时不算进了 aiops，旧的在 aiops 里那条留着，卡片可以再试一次", async () => {
+  const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: false, duplicate_of: { id: 31, title: "旧的", why: "错误码相同" } }) });
+  await setup.base.save(normalizeDraft(code8));
+  await setup.base.linkAiops("K1", 31);
+  await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+  await setup.desk.idle();
+  assert.deepEqual(
+    setup.calls.filter((call) => call.tool === "save_lesson").map((call) => call.args.force),
+    [undefined, true],
+  );
+  assert.equal(setup.calls.filter((call) => call.tool === "archive_lesson").length, 0, "aiops 里旧的那条不归档");
+  const partial = setup.lastCard();
+  assert.equal(partial.header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(partial), /没能同步到 aiops 经验库：aiops 说新的这条和要取代的经验 #31 重复，带上 force 也没有存/);
+  assert.match(cardText(partial), /aiops 经验库里同步的旧经验 #31 先留着没归档/);
+  assert.equal(setup.backend.entries.find((e) => e.id === "K2")!.aiopsId, undefined);
+});
+
+test("aiops 连上了却没有保存、归档经验的工具：起草时不答应同步，保存不调 aiops；起草后才发现没有的，保存时说明没同步，卡片照常做完", async () => {
+  const missing = deskSetup();
+  delete missing.handlers.save_lesson;
+  delete missing.handlers.archive_lesson;
+  const propose = missing.tool("knowledge_propose");
+  assert.doesNotMatch(propose.spec.description, /aiops/);
+  await propose.run(code8, { signal });
+  const card = (missing.sent[0].input as { card: any }).card;
+  assert.doesNotMatch(cardText(card), /排查经验会同时存一份到 aiops 经验库/);
+  await missing.desk.handleCardAction(missing.click(card, "save"));
+  await missing.desk.idle();
+  assert.equal(missing.lastCard().header.title.content, "已存进经验库");
+  assert.equal(missing.calls.filter((call) => call.tool === "save_lesson").length, 0);
+
+  // 还没连上时照样答应，连上了再同步
+  const later = deskSetup();
+  later.mcp.up = false;
+  assert.match(later.tool("knowledge_propose").spec.description, /排查经验同时存一份到 aiops 经验库/);
+  later.mcp.up = true;
+
+  const dropped = deskSetup();
+  await dropped.tool("knowledge_propose").run(code8, { signal });
+  delete dropped.handlers.save_lesson;
+  await dropped.desk.handleCardAction(dropped.click((dropped.sent[0].input as { card: any }).card, "save"));
+  await dropped.desk.idle();
+  assert.equal(dropped.lastCard().header.title.content, "已存进经验库");
+  assert.match((dropped.sent.at(-1)!.input as { markdown: string }).markdown, /aiops 没有保存经验的工具（save_lesson、archive_lesson），没有同步到 aiops 经验库/);
+});
+
+test("同步到 aiops 没做成，再试一次前有人在表格里归档了这一行或者改了类别：不再同步过去", async () => {
+  for (const [change, note] of [
+    [(row: KnowledgeEntry) => (row.status = "archived"), /经验 K1 在表格里已经归档了，没有同步到 aiops 经验库/],
+    [(row: KnowledgeEntry) => (row.category = "metric"), /经验 K1 在表格里已经改成「数据口径」，不是排查经验了，没有同步到 aiops 经验库/],
+  ] as const) {
+    let down = true;
+    const setup = deskSetup({
+      saveLesson: () => {
+        if (down) {
+          throw new Error("aiops 现在连不上");
+        }
+        return JSON.stringify({ saved: true, id: 31 });
+      },
+    });
+    await setup.tool("knowledge_propose").run(code8, { signal });
+    await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+    await setup.desk.idle();
+    assert.match(cardText(setup.lastCard()), /没能同步到 aiops 经验库/);
+    change(setup.backend.entries[0]);
+    down = false;
+    await setup.desk.handleCardAction(setup.click(setup.lastCard(), "save"));
+    await setup.desk.idle();
+    assert.equal(setup.calls.filter((call) => call.tool === "save_lesson").length, 1, "只有第一次没成功的那次");
+    assert.equal(setup.lastCard().header.title.content, "已存进经验库");
+    assert.match((setup.sent.at(-1)!.input as { markdown: string }).markdown, note);
+  }
+});
+
+test("同步到 aiops 时结果没传回来，再试一次前表格改了标题：按当时发过去的内容找到已经存进去的那条，分数低也认", async () => {
+  let stored: Record<string, unknown> | undefined;
+  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+    saveLesson: (args) => {
+      if (!stored) {
+        stored = args;
+        throw new Error("socket hang up");
+      }
+      return JSON.stringify({ saved: true, id: 99 });
+    },
+    // aiops 只在检索文字里有当时的标题时才返回存进去的那条，分数也不高
+    searchLessons: (args) =>
+      JSON.stringify({
+        hits:
+          stored && String(args.text).includes(String(stored.title))
+            ? [{ id: 31, title: String(stored.title), score: 3, diagnosis_path: String(stored.diagnosis_path) }]
+            : [],
+      }),
+  });
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /socket hang up/);
+
+  backend.entries[0].title = "gateway-api 报 code=8：user-rpc 只连一个 Pod";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1, "没有再存一条");
+  assert.equal(backend.entries[0].aiopsId, 31);
+  const lookup = calls.find((call) => call.tool === "search_knowledge")!.args;
+  assert.equal(lookup.service, "gateway-api, user-rpc");
+  assert.equal(lookup.keywords, "code=8,ResourceExhausted,user-rpc");
 });
 
 test("取代旧经验时归档旧的失败：卡片留着再试一次，新的不会存两遍，aiops 也不再存一条", async () => {
@@ -1092,6 +1204,7 @@ test("回答前检索：两个库一起查，已同步到 aiops 的只列团队�
     aiops: new AiopsLessons(
       {
         hasTool: () => true,
+        connected: () => true,
         callDirect: async () => {
           throw new Error("aiops 现在连不上");
         },
@@ -1125,7 +1238,7 @@ test("回答前检索每个库限时：表格卡住了照样用 aiops 的结果�
   assert.deepEqual(found?.missed, ["团队经验库"]);
 
   assert.equal(await make().lookup("code=8", task), undefined);
-  const disconnected = new AiopsLessons({ hasTool: () => false, callDirect: async () => "" }, "aiops", quiet);
+  const disconnected = new AiopsLessons({ hasTool: () => false, connected: () => false, callDirect: async () => "" }, "aiops", quiet);
   assert.equal(await make(disconnected).lookup("code=8", task), undefined);
 
   const stop = new AbortController();

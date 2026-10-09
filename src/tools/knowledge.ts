@@ -98,9 +98,12 @@ interface SaveProposal extends ProposalBase {
   requestId: string;
   /** aiops 给了结果的同步（存了，或者有相近的没存）：再试一次时不再调 save_lesson */
   synced?: AiopsSaveResult;
-  /** 上次调 save_lesson 出错了，可能已经存进去、只是结果没传回来：再试之前先找一下 */
-  aiopsUnsure?: boolean;
+  /** 调 save_lesson 出错时发过去的内容：可能已经存进去、只是结果没传回来，再试之前先按这些找一下 */
+  aiopsUnsure?: KnowledgeDraft[];
 }
+
+/** 被取代的旧经验在 aiops 里同步的那条怎么办：新的进了 aiops 就归档；新的还没进去先留着，再试一次进了再归档；新的不会进 aiops 了就一直留着 */
+type OldLesson = "archive" | "keep-until-synced" | "keep";
 
 interface ArchiveProposal extends ProposalBase {
   kind: "archive";
@@ -212,7 +215,8 @@ export class KnowledgeDesk {
    */
   tools(ctx: KnowledgeTaskContext, otherTools: readonly string[] = []): Tool[] {
     const { base } = this.options;
-    const withAiops = this.options.aiops !== undefined;
+    // 接了 aiops，而且没发现它缺保存、归档经验的工具（还没连上时照样答应，连上了再同步）
+    const withAiops = this.options.aiops !== undefined && !this.options.aiops.lacksWriteTools;
     const categories = Object.entries(KNOWLEDGE_CATEGORIES)
       .map(([key, label]) => `${key} ${label}`)
       .join("、");
@@ -315,7 +319,7 @@ export class KnowledgeDesk {
         return this.open(ctx, {
           kind: "save",
           draft,
-          syncAiops: draft.category === "incident" && this.options.aiops !== undefined,
+          syncAiops: draft.category === "incident" && withAiops,
           requestId: randomUUID(),
           ...(caseId === undefined ? {} : { caseId }),
           ...(replaces ? { replaces } : {}),
@@ -499,10 +503,10 @@ export class KnowledgeDesk {
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号
     const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
     const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
-    // aiops 里有没有这条经验（新存的或者已有相近的）。没有时不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
-    const inAiops = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : true;
+    // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
+    const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "archive";
     if (replaced) {
-      await this.archiveReplaced(replaced, confirmedBy, task, !inAiops, out);
+      await this.archiveReplaced(replaced, confirmedBy, task, oldLesson, out);
     }
     const location = await base.location().catch(() => undefined);
     if (location) {
@@ -511,7 +515,7 @@ export class KnowledgeDesk {
     return out;
   }
 
-  /** 排查经验同步到 aiops，再在表格里记下 aiops 编号；返回 aiops 里有没有这条（新存的或者已有相近的） */
+  /** 排查经验同步到 aiops，再在表格里记下 aiops 编号；返回被取代的旧经验在 aiops 里那条怎么办 */
   private async syncAiops(
     proposal: SaveProposal,
     entry: KnowledgeEntry,
@@ -519,19 +523,24 @@ export class KnowledgeDesk {
     confirmedBy: string,
     task: McpTaskContext,
     out: Outcome,
-  ): Promise<boolean> {
+  ): Promise<OldLesson> {
     if (!proposal.synced) {
+      const skip = this.skipSync(entry);
+      if (skip) {
+        out.done.push(`${skip}，没有同步到 aiops 经验库。`);
+        return "keep";
+      }
       try {
         proposal.synced = await this.saveLesson(proposal, entry, replacedLesson, confirmedBy, task);
       } catch (err) {
         out.unfinished.push(`没能同步到 aiops 经验库：${describe(err)}`);
-        return false;
+        return "keep-until-synced";
       }
     }
     const { synced } = proposal;
     if (!synced.saved) {
       out.done.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}「${synced.duplicate.title}」，没有重复同步。`);
-      return true;
+      return "archive";
     }
     out.done.push(`已同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`);
     if (entry.aiopsId !== synced.id) {
@@ -543,7 +552,21 @@ export class KnowledgeDesk {
         );
       }
     }
-    return true;
+    return "archive";
+  }
+
+  /** 表格里这一行现在不该或者不能同步到 aiops 的原因：再试一次前有人在表格里归档了它、改了类别，或者 aiops 没有写入工具 */
+  private skipSync(entry: KnowledgeEntry): string | undefined {
+    if (entry.status !== "active") {
+      return `经验 ${entry.id} 在表格里已经归档了`;
+    }
+    if (entry.category !== "incident") {
+      return `经验 ${entry.id} 在表格里已经改成「${KNOWLEDGE_CATEGORIES[entry.category]}」，不是排查经验了`;
+    }
+    if (this.options.aiops?.lacksWriteTools) {
+      return "aiops 没有保存经验的工具（save_lesson、archive_lesson）";
+    }
+    return undefined;
   }
 
   /**
@@ -563,7 +586,7 @@ export class KnowledgeDesk {
     }
     const draft = draftOf(entry);
     try {
-      const existing = proposal.aiopsUnsure ? await aiops.findSynced(draft, entry.id, task) : undefined;
+      const existing = proposal.aiopsUnsure ? await aiops.findSynced(proposal.aiopsUnsure, entry.id, task) : undefined;
       if (existing !== undefined) {
         return { saved: true, id: existing };
       }
@@ -571,11 +594,18 @@ export class KnowledgeDesk {
       const synced = await aiops.save(draft, options, task);
       if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
         // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的后面归档
-        return await aiops.save(draft, { ...options, force: true }, task);
+        const forced = await aiops.save(draft, { ...options, force: true }, task);
+        if (!forced.saved) {
+          // aiops 不认 force（版本旧）：不能算进了 aiops，不然旧的那条会被归档，aiops 里这个问题一条都不剩
+          throw new KnowledgeError(`aiops 说新的这条和要取代的经验 #${replacedLesson} 重复，带上 force 也没有存`);
+        }
+        return forced;
       }
       return synced;
     } catch (err) {
-      proposal.aiopsUnsure = true;
+      if (!proposal.aiopsUnsure?.some((sent) => JSON.stringify(sent) === JSON.stringify(draft))) {
+        proposal.aiopsUnsure = [...(proposal.aiopsUnsure ?? []), draft];
+      }
       throw err;
     }
   }
@@ -614,8 +644,8 @@ export class KnowledgeDesk {
     }
   }
 
-  /** 保存新经验后归档被取代的旧经验。keepAiops：新的没进 aiops，旧的在 aiops 里那条先留着，新的进了 aiops 再归档 */
-  private async archiveReplaced(old: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, keepAiops: boolean, out: Outcome): Promise<void> {
+  /** 保存新经验后归档被取代的旧经验；它在 aiops 里同步的那条按 oldLesson 归档或者留着 */
+  private async archiveReplaced(old: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, oldLesson: OldLesson, out: Outcome): Promise<void> {
     let entry: KnowledgeEntry;
     try {
       entry = await this.options.base.archive(old.id, { confirmedBy });
@@ -627,8 +657,12 @@ export class KnowledgeDesk {
     if (entry.aiopsId === undefined) {
       return;
     }
-    if (keepAiops) {
+    if (oldLesson === "keep-until-synced") {
       out.unfinished.push(`aiops 经验库里同步的旧经验 #${entry.aiopsId} 先留着没归档：新的这条进了 aiops 再归档它，不然告警自动排查就查不到这个问题了。`);
+      return;
+    }
+    if (oldLesson === "keep") {
+      out.done.push(`aiops 经验库里同步的旧经验 #${entry.aiopsId} 留着没归档：新的这条没有同步过去，归档了 aiops 里就没有这个问题的经验了。`);
       return;
     }
     await this.archiveLinked(entry.aiopsId, confirmedBy, task, out);
@@ -639,7 +673,7 @@ export class KnowledgeDesk {
     const { aiops } = this.options;
     try {
       if (!aiops?.writable) {
-        throw new KnowledgeError("aiops 现在连不上");
+        throw new KnowledgeError(aiops?.lacksWriteTools ? "aiops 没有归档经验的工具（archive_lesson）" : "aiops 现在连不上");
       }
       await aiops.archive(aiopsId, confirmedBy, task);
       out.done.push(`aiops 经验库里同步的经验 #${aiopsId} 也已归档。`);

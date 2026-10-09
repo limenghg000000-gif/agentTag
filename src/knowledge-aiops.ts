@@ -43,6 +43,8 @@ export type AiopsSaveResult = { saved: true; id: number } | { saved: false; dupl
 export interface LessonsMcp {
   /** 服务端有没有这个工具（不管开没开给模型） */
   hasTool(server: string, tool: string): boolean;
+  /** 连上过、拿到了服务端的工具清单 */
+  connected(server: string): boolean;
   /** 程序自己调工具（不经过模型），返回原文；工具报错时抛错 */
   callDirect(server: string, tool: string, args: Record<string, unknown>, task: McpTaskContext, signal?: AbortSignal): Promise<string>;
 }
@@ -72,13 +74,23 @@ export class AiopsLessons {
     return this.mcp.hasTool(this.server, "save_lesson") && this.mcp.hasTool(this.server, "archive_lesson");
   }
 
+  /** aiops 连上了，却没有保存或归档经验的工具（版本旧、没配 MySQL）：再试也存不进去，不能答应同步。还没连上时不算 */
+  get lacksWriteTools(): boolean {
+    return this.mcp.connected(this.server) && !this.writable;
+  }
+
   /** 按提问原文检索，返回够相近的（aiops 最多给 5 条，只看有效的） */
   async search(text: string, task: McpTaskContext, signal?: AbortSignal): Promise<AiopsLessonHit[]> {
     const query = text.trim().slice(0, QUERY_CHARS);
     if (!query || !this.searchable) {
       return [];
     }
-    const raw = await this.mcp.callDirect(this.server, "search_knowledge", { text: query }, task, signal);
+    return (await this.query({ text: query }, task, signal)).filter((hit) => hit.score >= MIN_PROMPT_SCORE);
+  }
+
+  /** 调 search_knowledge，返回 aiops 给的全部命中（最多 5 条，只有有效的） */
+  private async query(args: Record<string, unknown>, task: McpTaskContext, signal?: AbortSignal): Promise<AiopsLessonHit[]> {
+    const raw = await this.mcp.callDirect(this.server, "search_knowledge", args, task, signal);
     const data = parseJson(raw) as { hits?: unknown } | undefined;
     if (!Array.isArray(data?.hits)) {
       return [];
@@ -89,9 +101,7 @@ export class AiopsLessons {
         return [];
       }
       const score = typeof item.score === "number" ? item.score : 0;
-      return score >= MIN_PROMPT_SCORE
-        ? [{ id: item.id, title: item.title, score, ...pickStrings(item, ["symptom", "root_cause", "solution", "diagnosis_path"]) }]
-        : [];
+      return [{ id: item.id, title: item.title, score, ...pickStrings(item, ["symptom", "root_cause", "solution", "diagnosis_path"]) }];
     });
   }
 
@@ -149,10 +159,27 @@ export class AiopsLessons {
     throw new KnowledgeError(`aiops 没有说存没存成功：${raw.slice(0, 300)}`);
   }
 
-  /** 团队经验库里这一条同步到 aiops 的经验（按草稿检索，看排查过程末尾的出处）；没有时返回 undefined */
-  async findSynced(draft: KnowledgeDraft, teamId: string, task: McpTaskContext): Promise<number | undefined> {
-    const hits = await this.search(`${draft.title}\n${draft.question}`, task);
-    return hits.find((hit) => hit.diagnosis_path?.includes(teamSourceNote(teamId)))?.id;
+  /**
+   * 团队经验库里这一条之前同步到 aiops 的经验，看排查过程末尾的出处；没有时返回 undefined。
+   * aiops 不能按出处查，只能检索：用当时发过去的内容查（表格后来改过也不影响），带上服务名和关键词让那一条排在前面，不按分数筛
+   */
+  async findSynced(sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<number | undefined> {
+    for (const draft of sent) {
+      const hits = await this.query(
+        {
+          text: `${draft.title}\n${draft.question}`.slice(0, QUERY_CHARS),
+          ...(draft.scope ? { service: draft.scope } : {}),
+          ...(draft.keywords ? { keywords: draft.keywords } : {}),
+          ...(draft.alertname ? { alertname: draft.alertname } : {}),
+        },
+        task,
+      );
+      const found = hits.find((hit) => hit.diagnosis_path?.includes(teamSourceNote(teamId)));
+      if (found) {
+        return found.id;
+      }
+    }
+    return undefined;
   }
 
   /** 归档。archive_lesson 只改有效的，对已经归档的报错：报错时看一下，已经归档了（比如上次归档成功、结果没传回来）就算成功 */
