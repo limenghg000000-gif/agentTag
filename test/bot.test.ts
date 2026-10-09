@@ -843,6 +843,14 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   // 整理之前的内容放行；要求重新查的不放行
   assert.equal(block("总结一下上面查到的情况", "结论：最近 1 小时有 27 条报错（把握：中）"), false);
   assert.equal(block("不要总结旧结果，重新排查 gateway-api 的告警", "结论：最近 1 小时有 27 条报错（把握：中）"), true);
+  const made = "结论：gateway-api 在 2026-10-08 17:03:26 出现 50 条报错（把握：中）";
+  assert.equal(block("排查 gateway-api 最近一小时的报错并总结原因", made), true);
+  assert.equal(block("总结 gateway-api 的报错原因", made), true);
+  assert.equal(block("把上面 gateway-api 的排查结果总结一下", made), false);
+  assert.equal(block("翻译成英文", "Conclusion: 50 errors since 2026-10-08 17:03:26"), false);
+  assert.equal(block("总结以上内容", made), false);
+  assert.equal(block("总结一下 gateway-api 5 分钟以上的慢请求", made), true);
+  assert.equal(block("这段时间 gateway-api 的报错总结一下", made), true);
   // 调过工具都失败了：说调用失败的那句不算，剩下的照样查
   assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 连续 3 次查询都超时，无法确认线上状态", true), false);
   assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询 3 次都超时，无法确认（把握：低）", true), false);
@@ -856,6 +864,12 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   assert.equal(block("1GiB 是多少字节", "1GiB = 1024MiB = 1073741824 字节。"), false);
   assert.equal(block("Go 有异常机制吗", "Go 没有异常机制，错误靠返回值"), false);
   assert.equal(block("Go 的时间格式怎么写", "Go 用参考时间写格式：2006-01-02 15:04:05"), false);
+  // 问的是时间本身：回答里的时间是算出来、举例的，写成线上结论时才拦
+  assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "北京时间为 16:00:00。"), false);
+  assert.equal(block("时间戳 1696752000 是北京时间几点", "2023-10-08 16:00:00"), false);
+  assert.equal(block("Python 怎么格式化时间", "strftime('%Y-%m-%d %H:%M:%S') 输出类似 2024-01-01 12:00:00"), false);
+  assert.equal(block("gateway-api 15:30 以后有报错吗", "结论：15:31:22 起有 3 条 error 日志（把握：中）"), true);
+  assert.equal(block("prod", "15:31:22 起有 3 条 error 日志"), true);
   assert.equal(block("命名空间有什么用", "可以把同一个服务部署在多个命名空间里，隔开测试和生产"), false);
   assert.equal(block("Pod 内存 limit 一般设多少", "一般 512MiB 到 2GiB，CPU 0.5 核起步，看压测结果调"), false);
   assert.equal(block("Pod 重启一般什么原因", "常见原因是 OOM、探针失败、镜像拉取失败"), false);

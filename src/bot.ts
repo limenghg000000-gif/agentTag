@@ -358,14 +358,18 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
   };
 }
 
-// 回答里像线上数据的写法分两类，OPS_DATA 是两类合起来。打回重做（reviewOpsAnswer）两类都认；
-// 重做后的最后一道检查（blockUnverifiedOps）只在回答写成线上结论时才认第二类。
+// 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
+// 重做后的最后一道检查（blockUnverifiedOps）：Pod 名、定位结果有就拦；时间一般也是有就拦，问的是时间本身（换算、时区、格式）时
+// 和数量这类一样，只在回答写成线上结论时才拦。
 // 定位结果和就绪数：2026-10-08 复测时，模型没调工具就照着话题里前两次的定位结果，编出 network-tester 在三个命名空间「1/1 就绪」让用户选
 
-/** 只在线上数据里出现的写法：带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39）、K8s Pod 名（gateway-api-6978f9454f-tnc56）、「都有部署」「自动定位到」这类定位结果 */
-const OPS_STRONG_PATTERNS = [
+/** 带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39） */
+const OPS_TIME_PATTERNS = [
   String.raw`(?<!\d)\d{1,2}:\d{2}:\d{2}(?!\d)`,
   String.raw`\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}`,
+];
+/** 只在线上数据里出现的写法：K8s Pod 名（gateway-api-6978f9454f-tnc56）、「都有部署」「自动定位到」这类定位结果 */
+const OPS_STRONG_PATTERNS = [
   String.raw`\b[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{8,10}-[a-z0-9]{5}\b`,
   // 定位结果：「在多个命名空间都有部署」「default、kube-system 都有部署」「已自动定位到 prod」
   String.raw`都有部署|自动定位到`,
@@ -380,11 +384,14 @@ const OPS_WEAK_PATTERNS = [
   // 英文要带上级别、日志这类词，「Rust 没有 exception 机制」不算
   String.raw`(?:没有|无|未)(?:查到|发现|明显|任何)?的?\s*(?:报错|错误|异常|告警|重启|(?:error|exception|panic|fatal)\s*(?:级别|日志|记录))`,
 ];
-const OPS_DATA = new RegExp([...OPS_STRONG_PATTERNS, ...OPS_WEAK_PATTERNS].join("|"), "gi");
+const OPS_DATA = new RegExp([...OPS_TIME_PATTERNS, ...OPS_STRONG_PATTERNS, ...OPS_WEAK_PATTERNS].join("|"), "gi");
+const OPS_TIME = new RegExp(OPS_TIME_PATTERNS.join("|"), "gi");
 const OPS_STRONG = new RegExp(OPS_STRONG_PATTERNS.join("|"), "gi");
 const OPS_WEAK = new RegExp(OPS_WEAK_PATTERNS.join("|"), "gi");
 /** 按提示词写成的线上结论：「结论：…（把握：中）」 */
 const OPS_CONCLUSION = /把握|结论[:：]/;
+/** 问的就是时间本身：提问里带着时间，或者说到换算、时区、时间戳、格式。回答里的时间是算出来或者举例的（「UTC 08:00:00 是北京时间几点」答「16:00:00」） */
+const TIME_QUESTION = /(?<!\d)\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|时间戳|timestamp|时区|time\s*zone|utc|gmt|换算|转换|格式|format|strftime|strptime/i;
 /** Go 的时间格式样例，讲时间格式时常出现，不是线上的时间 */
 const TIME_LAYOUT = /2006-01-02|15:04:05/;
 
@@ -422,9 +429,16 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
   };
 }
 
-/** 整理、润色这类请求：内容来自话题里之前的回答或用户给的文字，不用重新查。带着「重新」「现在」这类词的还是要查（「别总结旧的，重新排查」） */
+/**
+ * 只是整理话题里之前的回答（「总结一下上面查到的情况」「翻译成英文」），内容不用重新查。用户自己给的文字不用靠这条，提问里有的数字本来就不算。
+ * 要指着之前的内容，或者没提服务、日志这类线上对象；带着「重新」「现在」「排查」这类词的还是要查
+ * （「别总结旧的，重新排查」「排查 gateway-api 最近一小时的报错并总结原因」）。「排查结果」「查到的」这类说的是之前查过的，不算
+ */
 const REWRITE_REQUEST = /总结|整理|汇总|归纳|概括|润色|翻译|改写|复述/;
-const LIVE_REQUEST = /重新|再查|再看|现在|目前|最新|实时|查一下|查查/;
+// 「以上」「之前」「刚才」也用来说数量和时间（「5 分钟以上的慢请求」「刚才的报错」「这段时间」），要跟着内容、结果这类词才算
+const EARLIER_CONTENT =
+  /上面|上述|你的回答|这段(?!时间)|(?:以上|前面|之前|刚才|刚刚)(?:查到|说|聊|讲|提到|的(?:回答|结果|内容|情况|信息|结论)|内容|信息|结果|情况|结论)/;
+const LIVE_REQUEST = /重新|再查|再看|现在|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
 /** 说工具调用失败的那一句（「aiops 连续 3 次查询都超时」），这句里的次数说的是调用本身 */
 const TOOL_FAILURE_CLAUSE = /(?:aiops|工具|调用|查询)[^，,。；;\n]{0,12}(?:超时|失败|出错|连不上|繁忙)/i;
 
@@ -434,9 +448,10 @@ export const BLOCKED_OPS_ANSWER =
 /**
  * 打回重做以后还是没查证就给出线上数据时，这个回答不发出去，换成 BLOCKED_OPS_ANSWER。
  * 2026-10-08 复测：用户回了「prod」以后模型两次都没调工具，第二次打回重做后照样编出了三次查询的结果。
- * 带秒的时间、Pod 名、定位结果这类只在线上数据里出现的，有就拦；数量、就绪数、「没有报错」这类概念解释里也常见的，
- * 只在写成线上结论（「结论：…（把握：中）」）时才拦，「1GiB = 1024MiB」「Go 没有异常机制」照常发。
- * 整理、润色这类请求放行（数据来自话题里之前的回答）。调过工具都失败了时，说调用失败的那一句不算，剩下的照样查。
+ * Pod 名、定位结果这类只在线上数据里出现的，有就拦；带秒的时间也拦，问的是时间换算、时区、格式时除外。
+ * 数量、就绪数、「没有报错」这类概念解释里也常见的，只在写成线上结论（「结论：…（把握：中）」）时才拦，
+ * 「1GiB = 1024MiB」「Go 没有异常机制」「北京时间为 16:00:00」照常发。
+ * 只是整理之前回答的请求放行（数据来自话题里之前的回答）。调过工具都失败了时，说调用失败的那一句不算，剩下的照样查。
  * attempted 是这次有没有调过工具，不管成没成功
  */
 export function blockUnverifiedOps(
@@ -446,11 +461,17 @@ export function blockUnverifiedOps(
   answer: string,
   attempted = false,
 ): boolean {
-  if (checkedLive(servers, succeeded) || (REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question))) {
+  if (checkedLive(servers, succeeded) || rewriteOnly(question)) {
     return false;
   }
   const text = attempted ? withoutToolFailures(answer) : answer;
-  return hasUnverified(OPS_STRONG, question, text) || (OPS_CONCLUSION.test(answer) && hasUnverified(OPS_WEAK, question, text));
+  const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
+  const timeQuestion = TIME_QUESTION.test(question);
+  return live(OPS_STRONG) || (!timeQuestion && live(OPS_TIME)) || (OPS_CONCLUSION.test(answer) && (live(OPS_WEAK) || live(OPS_TIME)));
+}
+
+function rewriteOnly(question: string): boolean {
+  return REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question) && (EARLIER_CONTENT.test(question) || !OPS_QUESTION.test(question));
 }
 
 /** 去掉说工具调用失败的分句；分句里除了「N 次」还有别的数据（「查询返回 50 条请求超时」）就留着 */
