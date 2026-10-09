@@ -202,6 +202,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<add value="correcthorsebatterystaple" key="ApiKey"/>',
     "<property\n  value='correct horse battery'\n  name=\"db.password\"\n/>",
     '<add key="ApiKey" description="a > b" value="correcthorsebatterystaple" />',
+    // 名字写在 key、name 属性里，值写在元素里面的：Java 的 properties XML、Spring 的 <value> 子元素，可以是 CDATA
+    '<entry key="password">correcthorsebatterystaple</entry>',
+    "<entry key='api_key'><![CDATA[correct horse battery staple]]></entry>",
+    '<property name="db.password">\n  <value>correct horse battery</value>\n</property>',
+    '<constructor-arg name="token"><value><![CDATA[correcthorsebattery]]></value></constructor-arg>',
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -254,6 +259,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<passwordPolicy>strongpolicyvalue</passwordPolicy><secretName>aiops-secrets</secretName><add key="Timeout" value="correcthorsebatterystaple"/>',
     '<property name="password" value="${DB_PASSWORD}"/>',
     '<add value="correcthorsebatterystaple" key="Timeout"/><property value="${DB_PASSWORD}" name="password"/>',
+    '<entry key="password">${DB_PASSWORD}</entry><entry key="timeout">correcthorsebatterystaple</entry><property name="password"><value>******</value></property>',
+    '<property name="password"><description>找管理员要</description></property><entry key="token"/>',
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -2116,6 +2123,9 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   // 还有一行是确认人那一列里贴了密码（检索结果、knowledge_get 里会写出确认人）
   await base.save(normalizeDraft({ ...dau, title: "日活的口径（PC）", keywords: "日活,PC" }));
   backend.entries[4].confirmedBy = ["password", "correcthorsebatterystaple"].join("=");
+  // 还有一行的处理办法里贴了 Spring 配置，密码写在 <value> 里
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（TV）", keywords: "日活,TV" }));
+  backend.entries[5].handling = ['<property name="db.password"><value>correct horse', "battery staple</value></property>"].join(" ");
   const fresh = new KnowledgeBase(backend, { logger: quiet });
   const hits = await fresh.search("日活");
   assert.deepEqual(
@@ -2124,13 +2134,14 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   );
   const desk = deskSetup();
   desk.backend.entries = structuredClone(backend.entries);
-  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|horse/);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|K6|horse/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里被改过，结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K3" }, { signal }), /经验 K3 在表格里被改过，怎么处理里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K4" }, { signal }), /经验 K4 在表格里被改过，依据或排查过程里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K5" }, { signal }), /经验 K5 在表格里被改过，确认人里像是有密码/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K6" }, { signal }), /经验 K6 在表格里被改过，怎么处理里像是有密码或令牌/);
   assert.equal(desk.sent.length, 0);
-  // 新存的不会占掉 K2 到 K5
-  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K6");
+  // 新存的不会占掉 K2 到 K6
+  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K7");
 });

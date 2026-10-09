@@ -714,27 +714,59 @@ const XML_ELEMENT = new RegExp(String.raw`<((?:[\w.-]+:)?${CONFIG_KEY})(?:\s[^<>
  */
 const XML_ATTRIBUTES = /[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*')(?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))*/g;
 const XML_ATTRIBUTE = /([\w.:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+/** 带属性的开始标签。第 1 组是全部属性，第 2 组是自闭合的 / */
+const XML_OPEN_TAG = /<[\w.:-]+((?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))+)\s*(\/?)>/g;
+/**
+ * 开始标签后面紧跟的内容（从 lastIndex 开始匹配）：CDATA 里的、Spring 的 <value> 子元素里的（CDATA 或直接写的），或者直接写的文字。
+ * 第 1 到 4 组，有一个是值
+ */
+const XML_BODY = /\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|<(?:[\w.-]+:)?value(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))|([^<]*))/iy;
 const CONFIG_NAME = new RegExp(String.raw`^${CONFIG_KEY}$`, "i");
 
+/** 一串属性按名字（小写、去掉命名空间前缀）取值 */
+function xmlAttributes(attributes: string): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const [, name, double, single] of attributes.matchAll(XML_ATTRIBUTE)) {
+    values.set(name.replace(/^.*:/, "").toLowerCase(), double ?? single);
+  }
+  return values;
+}
+
+/** key 或 name 属性是密钥的名字（ApiKey、db.password） */
+function namesCredential(attributes: Map<string, string>): boolean {
+  return [attributes.get("key"), attributes.get("name")].some((key) => key !== undefined && CONFIG_NAME.test(key.trim()));
+}
+
 /**
- * XML 里用名字和值两个属性写的配置项：.NET 的 <add key="ApiKey" value="…"/>、Spring 的 <property name="password" value="…"/>，
- * value 写在 key 前面的也算。属性名的命名空间前缀不看
+ * XML 里用名字属性标明是密钥的配置项的值：写在 value 属性里的（.NET 的 <add key="ApiKey" value="…"/>、Spring 的 <property name="password" value="…"/>，
+ * value 写在 key 前面的也算），和写在元素里面的（Java 的 <entry key="password">…</entry>、Spring 的 <property name="password"><value>…</value></property>，可以是 CDATA）
  */
-function xmlPairValues(text: string): string[] {
-  return [...text.matchAll(XML_ATTRIBUTES)].flatMap(([attributes]) => {
-    const values = new Map<string, string>();
-    for (const [, name, double, single] of attributes.matchAll(XML_ATTRIBUTE)) {
-      values.set(name.replace(/^.*:/, "").toLowerCase(), double ?? single);
+function xmlNamedValues(text: string): string[] {
+  const values: string[] = [];
+  for (const [attributes] of text.matchAll(XML_ATTRIBUTES)) {
+    const parsed = xmlAttributes(attributes);
+    const value = parsed.get("value");
+    if (value !== undefined && namesCredential(parsed)) {
+      values.push(value);
     }
-    const value = values.get("value");
-    const named = [values.get("key"), values.get("name")].some((key) => key !== undefined && CONFIG_NAME.test(key.trim()));
-    return named && value !== undefined ? [value] : [];
-  });
+  }
+  for (const tag of text.matchAll(XML_OPEN_TAG)) {
+    if (tag[2] || !namesCredential(xmlAttributes(tag[1]))) {
+      continue;
+    }
+    XML_BODY.lastIndex = tag.index + tag[0].length;
+    const body = XML_BODY.exec(text);
+    const value = body?.slice(1).find((group) => group !== undefined);
+    if (value !== undefined) {
+      values.push(value);
+    }
+  }
+  return values;
 }
 
 /** XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，有 * 的是打了码的，不算 */
 function xmlValues(text: string): string[] {
-  return [...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlPairValues(text)].flatMap((raw) => {
+  return [...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlNamedValues(text)].flatMap((raw) => {
     const value = raw.replace(/\s+/g, " ").trim();
     return value.length >= 6 && !/[*　-〿一-鿿＀-￯]/.test(value) ? [value] : [];
   });
