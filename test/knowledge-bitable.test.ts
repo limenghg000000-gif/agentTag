@@ -208,6 +208,27 @@ test("共享跟着名单走：启动时把移出白名单的群、移出写权�
   assert.equal(target.calls.length, 0);
 });
 
+test("撤权限失败（没开 docs:permission.member:delete）时警告写明缺的权限，记录留着，下次启动再撤", async () => {
+  const stateFile = path.join(dir, "revoke-fail", "bitable.json");
+  const { api, calls } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  const remove = api.removeCollaborator.bind(api);
+  api.removeCollaborator = async () => {
+    throw new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[docs:permission.member:delete]");
+  };
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }).syncSharing();
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /撤掉 ou_old .*要用应用权限 docs:permission\.member:delete/);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view", "openid:ou_old:full_access"]);
+
+  api.removeCollaborator = remove;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(calls.slice(-1), ["remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+});
+
 test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {
   const { api, tables, tokens } = fakeBitable();
   tables.set("tblX", { fields: [], records: [] });

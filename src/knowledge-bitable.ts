@@ -458,15 +458,18 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     ]);
     const granted = parseShared(target.shared ?? []);
     let changed = false;
-    const attempt = async (what: string, run: () => Promise<void>): Promise<boolean> => {
+    // 加、改、撤协作者各要一个应用权限，失败时把要的权限名写进警告
+    const attempt = async (what: string, scope: string, run: () => Promise<void>): Promise<boolean> => {
       try {
         await run();
         changed = true;
         this.logger.info(`经验库：${what}`);
         return true;
       } catch (err) {
-        // 不用 describeBitableError：它把缺权限都说成缺 bitable:app，共享要的是另外的权限，原文里有权限名
-        this.logger.warn(`经验库：没能${what}，下次启动或保存经验时再试：${err instanceof Error ? err.message : String(err)}`);
+        // 不用 describeBitableError：它把缺权限都说成缺 bitable:app
+        this.logger.warn(
+          `经验库：没能${what}（要用应用权限 ${scope}），下次启动或保存经验时再试：${err instanceof Error ? err.message : String(err)}`,
+        );
         return false;
       }
     };
@@ -476,14 +479,23 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         continue;
       }
       const ok = had
-        ? await attempt(`把 ${member.id} 对多维表格的权限从${PERM_LABELS[had.perm]}改成${PERM_LABELS[perm]}`, () => api.updateCollaborator(target.appToken, member, perm))
-        : await attempt(`把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}）`, () => api.addCollaborator(target.appToken, member, perm));
+        ? await attempt(`把 ${member.id} 对多维表格的权限从${PERM_LABELS[had.perm]}改成${PERM_LABELS[perm]}`, "docs:permission.member:update", () =>
+            api.updateCollaborator(target.appToken, member, perm),
+          )
+        : await attempt(`把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}）`, "docs:permission.member:create", () =>
+            api.addCollaborator(target.appToken, member, perm),
+          );
       if (ok) {
         granted.set(key, { member, perm });
       }
     }
     for (const [key, { member }] of [...granted]) {
-      if (!wanted.has(key) && (await attempt(`撤掉 ${member.id} 对多维表格的权限（已不在白名单群或写权限名单里）`, () => api.removeCollaborator(target.appToken, member)))) {
+      if (
+        !wanted.has(key) &&
+        (await attempt(`撤掉 ${member.id} 对多维表格的权限（已不在白名单群或写权限名单里）`, "docs:permission.member:delete", () =>
+          api.removeCollaborator(target.appToken, member),
+        ))
+      ) {
         granted.delete(key);
       }
     }

@@ -97,13 +97,14 @@
 5. **版本管理与发布** → 创建版本并发布，让机器人和权限生效。
 6. 按第三步把程序跑起来，保持运行。
 7. **事件与回调** → 事件配置 → 订阅方式选「使用长连接接收事件」并保存（程序没在运行时保存会失败）→ 添加事件「接收消息」`im.message.receive_v1`。
-8. 可选，用飞书云文档和团队经验库时开：**权限管理** 里再开通下面这些。可以用「批量导入」粘贴 `{"scopes":{"tenant":["docx:document","docx:document.block:convert","wiki:wiki:readonly","docs:permission.member:create","drive:drive.metadata:readonly","bitable:app"],"user":[]}}`，个别权限名在你的后台搜不到时去掉它，缺什么机器人用到时会报出来。
+8. 可选，用飞书云文档和团队经验库时开：**权限管理** 里再开通下面这些。可以用「批量导入」粘贴 `{"scopes":{"tenant":["docx:document","docx:document.block:convert","wiki:wiki:readonly","docs:permission.member:create","docs:permission.member:update","docs:permission.member:delete","drive:drive.metadata:readonly","bitable:app"],"user":[]}}`，个别权限名在你的后台搜不到时去掉它，缺什么机器人用到时会报出来。
    - `docx:document`（查看、编辑新版文档）：读文档、新建文档、改文档
    - `docx:document.block:convert`（把 Markdown 转成文档块）：写入内容
    - `wiki:wiki:readonly`（查看知识库）：读知识库链接背后的文档
    - `docs:permission.member:create`（添加文档协作者）：新建的文档共享给群和发起人，不开的话新建的文档谁都打不开
+   - `docs:permission.member:update`（更新协作者权限）、`docs:permission.member:delete`（移除协作者）：团队经验库的多维表格跟着白名单群和写权限名单走，名单里去掉的群或人要撤掉权限，权限变了要改。不开的话撤不掉，被移出写权限名单的人还能直接改表格，日志里会有警告写明缺哪个权限
    - `drive:drive.metadata:readonly`（查看文件元数据）：拿新建文档的链接。不开也行，机器人会用群里贴过的文档链接的域名拼
-   - `bitable:app`（查看、评论、编辑和管理多维表格）：团队经验库。不开时回答前的检索照常（还没有表），保存经验时卡片上会提示缺这个权限。建表后共享给群也要用上面的 `docs:permission.member:create`
+   - `bitable:app`（查看、评论、编辑和管理多维表格）：团队经验库。不开时回答前的检索照常（还没有表），保存经验时卡片上会提示缺这个权限。建表后共享给群、撤掉或改权限要用上面三个 `docs:permission.member:*`
 9. **事件与回调** → 回调配置 → 订阅方式选「使用长连接接收回调」并保存 → 添加回调「卡片回传交互」`card.action.trigger`。不配的话点进度卡片上的「停止」会报错，但在话题里 @ 机器人说「停止」照样能停。
 10. 再创建一个版本并发布，让事件和回调订阅生效。以后改权限、事件或回调都需要重新发布。
 11. 在飞书里建一个测试群 → 群设置 → 群机器人 → 添加这个机器人。
