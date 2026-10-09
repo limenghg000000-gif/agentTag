@@ -23,8 +23,9 @@ function fakeBitable() {
   const tables = new Map<string, { fields: BitableField[]; records: BitableRecord[] }>();
   const shared: [BitableMember, string][] = [];
   const tokens: (string | undefined)[] = [];
+  const restricted: string[] = [];
   let next = 0;
-  const api: BitableApi & { fail?: Error; failShare?: (member: BitableMember) => boolean } = {
+  const api: BitableApi & { fail?: Error; failShare?: (member: BitableMember) => boolean; failRestrict?: boolean } = {
     async createApp(name) {
       calls.push(`createApp ${name}`);
       tables.set("tbl_default", { fields: [], records: [] });
@@ -73,18 +74,24 @@ function fakeBitable() {
     async removeCollaborator(_app, member) {
       calls.push(`remove ${member.id}`);
     },
+    async restrictSharing(app) {
+      if (api.failRestrict) {
+        throw new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[docs:permission.setting:write_only]");
+      }
+      restricted.push(`${app}，此前已共享 ${shared.length} 个`);
+    },
     async getUrl() {
       return undefined;
     },
   };
-  return { api, calls, tables, shared, tokens };
+  return { api, calls, tables, shared, tokens, restricted };
 }
 
 const dau = normalizeDraft({ category: "metric", title: "日活的口径", question: "日活怎么统计", conclusion: "当天打开过 App 的去重用户数", keywords: "日活,DAU" });
 
-test("第一次保存时建多维表格：只留经验库这张表，共享给白名单群（只读）和写权限名单里的人（可管理），记进数据目录；重启后接着用", async () => {
+test("第一次保存时建多维表格：只留经验库这张表，先设成只有机器人能管协作者，再共享给白名单群（只读）和写权限名单里的人（可编辑），记进数据目录；重启后接着用", async () => {
   const stateFile = path.join(dir, "first", "bitable.json");
-  const { api, calls, tables, shared } = fakeBitable();
+  const { api, calls, tables, shared, restricted } = fakeBitable();
   const backend = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_admin"] }, logger: quiet });
   const base = new KnowledgeBase(backend, { logger: quiet });
 
@@ -97,8 +104,9 @@ test("第一次保存时建多维表格：只留经验库这张表，共享给�
   assert.deepEqual(calls, ["createApp AgentTag 经验库", "createTable 经验库", "deleteTable tbl_default"]);
   assert.deepEqual(shared, [
     [{ type: "openchat", id: "oc_1" }, "view"],
-    [{ type: "openid", id: "ou_admin" }, "full_access"],
+    [{ type: "openid", id: "ou_admin" }, "edit"],
   ]);
+  assert.deepEqual(restricted, ["app1，此前已共享 0 个"], "共享之前先设好");
   const table = tables.get("tbl1")!;
   const fields: Record<string, unknown> = table.records[0].fields;
   assert.deepEqual(table.fields.map((f) => f.field_name).slice(0, 4), ["标题", "编号", "类别", "状态"]);
@@ -119,7 +127,8 @@ test("第一次保存时建多维表格：只留经验库这张表，共享给�
     appToken: "app1",
     tableId: "tbl1",
     url: "https://example.feishu.cn/base/app1?table=tbl1",
-    shared: ["openchat:oc_1:view", "openid:ou_admin:full_access"],
+    shared: ["openchat:oc_1:view", "openid:ou_admin:edit"],
+    restricted: true,
   });
 
   // 重启：读数据目录里记的表，不再建
@@ -166,8 +175,8 @@ test("共享失败的下次保存时再试，后来加进白名单的群也补�
   api.failShare = (member) => member.type === "openchat";
   const first = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_admin"] }, logger: quiet });
   assert.equal((await new KnowledgeBase(first, { logger: quiet }).save(dau)).id, "K1");
-  assert.deepEqual(shared, [[{ type: "openid", id: "ou_admin" }, "full_access"]]);
-  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:full_access"]);
+  assert.deepEqual(shared, [[{ type: "openid", id: "ou_admin" }, "edit"]]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:edit"]);
 
   // 开通权限、重启，白名单里又加了一个群：下次保存时补上没共享成的，已经共享过的不再调
   api.failShare = undefined;
@@ -177,7 +186,7 @@ test("共享失败的下次保存时再试，后来加进白名单的群也补�
     [{ type: "openchat", id: "oc_1" }, "view"],
     [{ type: "openchat", id: "oc_2" }, "view"],
   ]);
-  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:full_access", "openchat:oc_1:view", "openchat:oc_2:view"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:edit", "openchat:oc_1:view", "openchat:oc_2:view"]);
   await new KnowledgeBase(again, { logger: quiet }).save(dau);
   assert.equal(shared.length, 3, "都共享过了就不再调");
 });
@@ -221,12 +230,32 @@ test("撤权限失败（没开 docs:permission.member:delete）时警告写明�
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }).syncSharing();
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /撤掉 ou_old .*要用应用权限 docs:permission\.member:delete/);
-  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view", "openid:ou_old:full_access"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view", "openid:ou_old:edit"]);
 
   api.removeCollaborator = remove;
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
   assert.deepEqual(calls.slice(-1), ["remove ou_old"]);
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+});
+
+test("设置谁能管协作者失败（没开 docs:permission.setting:write_only）时照常共享，警告写明缺的权限，下次启动再设", async () => {
+  const stateFile = path.join(dir, "restrict-fail", "bitable.json");
+  const { api, shared, restricted } = fakeBitable();
+  api.failRestrict = true;
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }), { logger: quiet }).save(dau);
+  assert.equal(shared.length, 1);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /只有机器人能加、移除协作者.*要用应用权限 docs:permission\.setting:write_only/);
+  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).restricted, undefined);
+
+  api.failRestrict = false;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(restricted, ["app1，此前已共享 1 个"]);
+  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).restricted, true);
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.equal(restricted.length, 1, "设好了就不再调");
 });
 
 test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {

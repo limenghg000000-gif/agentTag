@@ -75,6 +75,8 @@ export interface BitableApi {
   addCollaborator(appToken: string, member: BitableMember, perm: BitablePerm): Promise<void>;
   updateCollaborator(appToken: string, member: BitableMember, perm: BitablePerm): Promise<void>;
   removeCollaborator(appToken: string, member: BitableMember): Promise<void>;
+  /** 只有可管理的协作者（机器人自己）能加、移除协作者；关掉链接分享和分享到组织外，只有协作者能打开 */
+  restrictSharing(appToken: string): Promise<void>;
   getUrl(appToken: string): Promise<string | undefined>;
 }
 
@@ -203,6 +205,16 @@ export function createBitableApi(client: Client): BitableApi {
       );
     },
 
+    async restrictSharing(appToken) {
+      await call(() =>
+        client.drive.v2.permissionPublic.patch({
+          path: { token: appToken },
+          params: { type: "bitable" },
+          data: { manage_collaborator_entity: "collaborator_full_access", external_access_entity: "closed", link_share_entity: "closed" },
+        }),
+      );
+    },
+
     async getUrl(appToken) {
       const data = await call(() =>
         client.drive.v1.meta.batchQuery({ data: { request_docs: [{ doc_token: appToken, doc_type: "bitable" }], with_url: true } }),
@@ -249,8 +261,8 @@ export interface BitableBackendOptions {
   /** KNOWLEDGE_BITABLE 指定的表；指定了就不自己建 */
   target?: BitableTarget;
   /**
-   * 机器人自己建表时共享给谁：白名单群默认只读，写权限名单里的人可管理。
-   * 没配写权限名单时群里谁都能点「保存」，群也给可编辑
+   * 机器人自己建表时共享给谁：白名单群默认只读，写权限名单里的人可编辑。
+   * 没配写权限名单时群里谁都能点「保存」，群也给可编辑。可管理只留给机器人：能管协作者的人才能把表格共享出名单
    */
   share: { chatIds: readonly string[]; editors: readonly string[]; chatPerm?: "view" | "edit" };
   logger?: Logger;
@@ -260,11 +272,14 @@ export interface BitableBackendOptions {
 interface BitableState extends BitableTarget {
   /** 机器人共享出去的「类型:id:权限」。只管这些：别人在飞书里手动加的协作者不动 */
   shared?: string[];
+  /** 已经设成只有机器人能管协作者、只有协作者能打开 */
+  restricted?: boolean;
 }
 
 /**
  * 经验存在飞书多维表格里：大家在飞书里能直接看、筛选和修改，机器人每分钟重新读一次。
- * 没指定表时，第一次保存经验时机器人自己建一张，共享给白名单群（只读）和写权限名单里的人（可管理）。
+ * 没指定表时，第一次保存经验时机器人自己建一张，共享给白名单群（只读）和写权限名单里的人（可编辑）。
+ * 表格设成只有机器人能加、移除协作者，链接分享关掉，所以能打开的只有名单里的群和人。
  * 共享跟着白名单群和写权限名单走：启动时和每次保存时补上没共享成的、改掉权限变了的、撤掉移出名单的。
  * 有人在表格里手动加的行没有编号时，用行的 record_id 当编号，照样能检索到
  */
@@ -378,7 +393,13 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         return undefined;
       }
       const shared = Array.isArray(data.shared) ? data.shared.filter((key): key is string => typeof key === "string") : [];
-      return { appToken: data.appToken, tableId: data.tableId, ...(data.url ? { url: data.url } : {}), shared };
+      return {
+        appToken: data.appToken,
+        tableId: data.tableId,
+        ...(data.url ? { url: data.url } : {}),
+        shared,
+        ...(data.restricted === true ? { restricted: true } : {}),
+      };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return undefined;
@@ -445,7 +466,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   }
 
   /**
-   * 白名单群（默认只读）和写权限名单里的人（可管理）要有的权限，和机器人已经共享出去的比：
+   * 先把表格设成只有机器人能管协作者、只有协作者能打开，名单里的人就没法再共享给名单外的人。
+   * 再拿白名单群（默认只读）和写权限名单里的人（可编辑）要有的权限，和机器人已经共享出去的比：
    * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
    * 失败不影响保存，记一条警告，下次启动或保存时再试
    */
@@ -454,11 +476,11 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     const chatPerm = share.chatPerm ?? "view";
     const wanted = new Map<string, [BitableMember, BitablePerm]>([
       ...share.chatIds.map((id): [string, [BitableMember, BitablePerm]] => [`openchat:${id}`, [{ type: "openchat", id }, chatPerm]]),
-      ...share.editors.map((id): [string, [BitableMember, BitablePerm]] => [`openid:${id}`, [{ type: "openid", id }, "full_access"]]),
+      ...share.editors.map((id): [string, [BitableMember, BitablePerm]] => [`openid:${id}`, [{ type: "openid", id }, "edit"]]),
     ]);
     const granted = parseShared(target.shared ?? []);
     let changed = false;
-    // 加、改、撤协作者各要一个应用权限，失败时把要的权限名写进警告
+    // 每一步各要一个应用权限，失败时把要的权限名写进警告
     const attempt = async (what: string, scope: string, run: () => Promise<void>): Promise<boolean> => {
       try {
         await run();
@@ -473,6 +495,14 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         return false;
       }
     };
+    if (
+      !target.restricted &&
+      (await attempt("把多维表格设成只有机器人能加、移除协作者，关掉链接分享和分享到组织外", "docs:permission.setting:write_only", () =>
+        api.restrictSharing(target.appToken),
+      ))
+    ) {
+      target.restricted = true;
+    }
     for (const [key, [member, perm]] of wanted) {
       const had = granted.get(key);
       if (had?.perm === perm) {
