@@ -767,7 +767,9 @@ export class Workspace {
     if (!oldText) {
       await mkdir(path.dirname(abs), { recursive: true });
       await writeFile(abs, newText);
-      return `${info ? "已覆盖" : "已新建"} ${file}（${newText.split("\n").length} 行）。`;
+      // 和 numberedLines 一样数行：结尾的换行不算多一行
+      const lines = newText.split("\n");
+      return `${info ? "已覆盖" : "已新建"} ${file}（${lines.at(-1) === "" ? lines.length - 1 : lines.length} 行）。`;
     }
     if (!info) {
       throw new RepoError(`没有这个文件：${file}。要新建文件时不填 old_text`);

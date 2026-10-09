@@ -98,7 +98,7 @@ test("改文件：替换唯一的片段、新建文件，找不到或不唯一�
   await assert.rejects(ws.editFile("src/a.ts", "not there", "x"), /没找到 old_text/);
   await assert.rejects(ws.editFile("src/b.ts", "a", "x"), /出现了 \d+ 次/);
   await assert.rejects(ws.editFile("src/new.ts", "x", "y"), /要新建文件时不填 old_text/);
-  assert.equal(await ws.editFile("src/util/new.ts", undefined, "export {};\n"), "已新建 src/util/new.ts（2 行）。");
+  assert.equal(await ws.editFile("src/util/new.ts", undefined, "export {};\n"), "已新建 src/util/new.ts（1 行）。");
 
   const diff = await ws.diff();
   assert.match(diff, /src\/a.ts\s+\| 2 \+-/);

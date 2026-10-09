@@ -501,7 +501,7 @@ export interface ToolEvidence {
 /**
  * 按这次的工具结果认引用：路径、提交号查到过就算；带行号的还要那一行真的查到过。
  * 代码工具的结果按各自的格式解析，只认工具自己写的部分：读文件结果的文件名和每行开头的行号（「35| …」）、搜索结果每行开头的「路径:行号:」、
- * 文件列表、改文件的结果（「已修改 src/foo.ts 第 35 行起的内容」、新建的文件）、标题里的「分支 @ 提交号」。
+ * 文件列表、改文件的结果（「已修改 src/foo.ts 第 35 行起的内容」、新建的文件）、diff 和开 PR 结果里的改动统计、标题里的「分支 @ 提交号」。
  * 读到、搜到的代码正文里写的路径、行号、提交号不算：仓库里的测试和文档常常写着别的路径，机器人自己的仓库 ai/agent-tag 的测试里
  * 就有 2026-10-09 编出来的那几个引用。
  * 别的工具（aiops 查到的日志、报错堆栈）没有固定格式，按原文找：路径要整段对上，前面是绝对路径的也算（/app/src/a.ts:12）。
@@ -523,12 +523,17 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
       ...repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => text.slice(repo.length + 1)),
     ];
     return forms.some((form) => {
-      const sha = form.toLowerCase();
-      const found = COMMIT_ID.test(form)
-        ? facts.commits.some((seen) => seen.startsWith(sha) || sha.startsWith(seen))
-        : line === undefined
-          ? facts.paths.has(form)
-          : (facts.lines.get(form) ?? []).some(([from, to]) => line >= from && line <= to);
+      let found: boolean;
+      if (COMMIT_ID.test(form)) {
+        // 回答里的提交号可以是查到的提交号的前几位，不能比查到的长：多出来的几位是编的
+        const sha = form.toLowerCase();
+        found = facts.commits.some((seen) => seen.startsWith(sha));
+      } else {
+        // 带空格的路径（src/my files/app.ts），回答里只认得出空格后面那段（files/app.ts）
+        const files = [...facts.paths].filter((seen) => seen === form || seen.endsWith(` ${form}`));
+        found =
+          line === undefined ? files.length > 0 : files.some((file) => (facts.lines.get(file) ?? []).some(([from, to]) => line >= from && line <= to));
+      }
       return found || facts.text.some((output) => (line === undefined ? mentions(output, form) : hasLine(output, form, line)));
     });
   };
@@ -571,7 +576,7 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     const [head, ...rows] = output.split("\n");
     switch (tool) {
       case "code_read_file": {
-        const read = /^(\S+?)（(?:([^（）]*?)，)?共 \d+ 行，/.exec(head);
+        const read = /^(\S.*?)（(?:([^（）]*?)，)?共 \d+ 行，/.exec(head);
         if (read) {
           addPath(read[1]);
           addCommit(BRANCH_SHA.exec(read[2] ?? ""));
@@ -582,7 +587,7 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
             }
           }
         }
-        const short = /^(\S+) 只有 \d+ 行。$/.exec(head);
+        const short = /^(\S.*?) 只有 \d+ 行。$/.exec(head);
         if (short) {
           addPath(short[1]);
         }
@@ -616,25 +621,37 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
         }
         break;
       case "code_edit_file": {
-        const edited = /^已修改 (\S+) 第 (\d+) 行起的内容。$/.exec(output);
+        const edited = /^已修改 (\S.*?) 第 (\d+) 行起的内容。$/.exec(output);
         if (edited) {
           addLines(edited[1], Number(edited[2]));
         }
         // 机器人新建、覆盖的文件，第 1 到 N 行都是它自己写的
-        const written = /^(?:已新建|已覆盖) (\S+)（(\d+) 行）。$/.exec(output);
+        const written = /^(?:已新建|已覆盖) (\S.*?)（(\d+) 行）。$/.exec(output);
         if (written) {
           addLines(written[1], 1, Number(written[2]));
         }
         break;
       }
-      case "code_diff":
+      case "code_diff": {
+        // 开头是 git diff --stat 的统计，空一行以后是完整 diff；diff 里的上下文行也以空格开头，统计只认空行以前的
+        const blank = rows.indexOf("");
+        statPaths([head, ...rows.slice(0, blank < 0 ? rows.length : blank)]).forEach(addPath);
         for (const row of rows) {
-          const file = /^diff --git a\/\S+ b\/(\S+)$/.exec(row);
+          const file = /^diff --git a\/(.+) b\/\1$/.exec(row);
           if (file) {
             addPath(file[1]);
           }
         }
         break;
+      }
+      case "code_open_pr": {
+        // 「改动统计：」后面是 git diff --stat 的统计
+        const at = rows.indexOf("改动统计：");
+        if (at >= 0) {
+          statPaths(rows.slice(at + 1)).forEach(addPath);
+        }
+        break;
+      }
       case "code_branches":
         addCommit(/^已切到 \S+ 分支，最新提交 ([0-9a-f]{7,40}) /.exec(head));
         break;
@@ -654,7 +671,7 @@ const BRANCH_SHA = /分支 @ ([0-9a-f]{7,40})/;
 /** 文件列表标题里的提交号：「共 12 个文件（aiops 分支 @ 3f2a1c9）：」「没有匹配的文件（aiops 分支 @ 3f2a1c9）。」 */
 const LIST_SHA = /^(?:共 \d+ 个文件|没有匹配的文件)（\S+ 分支 @ ([0-9a-f]{7,40})/;
 /** src/repo.ts 读、改文件时，文件在但读不了、改不了的报错（「src/a.ts 有 2048 KB，太大了不读」） */
-const EXISTING_FILE_ERROR = /^(\S+) (?:有 \d+ KB，太大了|是二进制文件|是子模块|是符号链接|是目录|太大了|里没找到 old_text|里 old_text 出现了)/;
+const EXISTING_FILE_ERROR = /^([^\s：][^：]*?) (?:有 \d+ KB，太大了|是二进制文件|是子模块|是符号链接|是目录|太大了|里没找到 old_text|里 old_text 出现了)/;
 /**
  * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、src/a.tsx 都不是 src/a.ts）。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算
@@ -690,6 +707,11 @@ function seenByModel(output: string, limit: number): string {
 /** 和 src/repo.ts 读写文件时一样整理路径：去掉开头的 ./ 和 /，合并多余的 / 和 ./（src//a.ts、src/./a.ts 都是 src/a.ts） */
 function repoPath(file: string): string {
   return posix.normalize(file.replace(/^\.?\/+/, ""));
+}
+
+/** git diff --stat 统计里的文件：「 src/a.ts | 12 +++---」「 assets/logo.png | Bin 0 -> 1234 bytes」。路径太长被缩写的（.../a.ts）对不上回答里的路径，自然不认 */
+function statPaths(rows: readonly string[]): string[] {
+  return rows.flatMap((row) => /^ (\S.*?) +\| +(?:\d+|Bin)\b/.exec(row)?.[1] ?? []);
 }
 
 function isCodeTool(name: string): boolean {

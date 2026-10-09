@@ -1238,8 +1238,47 @@ test("代码引用的路径要整段对上，改文件的结果里写的行也�
   assert.equal(seen("src/util/new.ts", 12), true);
   assert.equal(seen("src/util/new.ts", 13), false);
   assert.equal(seen("internal/svc/ctx.go", 21), true);
-  // 提交号可以只写前几位
-  assert.equal(codeEvidence([], [{ tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9d8e7b）：\na/b.go:1: x" }])("3f2a1c9"), true);
+  // 提交号可以只写前几位，不能在查到的后面再编几位
+  const commit = codeEvidence([], [{ tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9d8e7b）：\na/b.go:1: x" }]);
+  assert.equal(commit("3f2a1c9"), true);
+  assert.equal(commit("3f2a1c9d8e7b"), true);
+  assert.equal(commit("3f2a1c9d8e7bdeadbeef"), false);
+});
+
+test("代码引用：带空格的路径、diff 和开 PR 结果里的改动统计", () => {
+  const seen = codeEvidence(
+    [],
+    [
+      { tool: "code_list_files", output: "共 1 个文件（master 分支 @ 3f2a1c9）：\nsrc/my files/app.ts" },
+      { tool: "code_read_file", output: "src/my files/app.ts（共 2 行，下面是第 1 到 2 行）\n1| a\n2| b" },
+      {
+        tool: "code_open_pr",
+        output:
+          "已开合并请求 !12：https://lab.example.com/x/-/merge_requests/12\n\n改动统计：\n src/a.ts | 3 ++-\n assets/logo.png | Bin 0 -> 1234 bytes\n" +
+          " .../deep/name.ts | 1 +\n 3 files changed, 3 insertions(+), 1 deletion(-)",
+      },
+      // 统计在空行以前；diff 里的上下文行也以空格开头，长得像统计的不算
+      {
+        tool: "code_diff",
+        output:
+          " src/c.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/src/c.ts b/src/c.ts\n@@ -1,3 +1,3 @@\n fake/path.ts | 9 +\n-x\n+y\n" +
+          "diff --git a/src/my dir/d.ts b/src/my dir/d.ts",
+      },
+    ],
+  );
+  // 回答里认得出的是空格后面那段
+  assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:2`", seen), []);
+  assert.equal(seen("files/app.ts"), true);
+  assert.equal(seen("files/app.ts", 2), true);
+  assert.equal(seen("files/app.ts", 3), false);
+  assert.equal(seen("les/app.ts"), false);
+  assert.equal(seen("src/a.ts"), true);
+  assert.equal(seen("src/a.ts", 1), false);
+  assert.equal(seen("assets/logo.png"), true);
+  assert.equal(seen("deep/name.ts"), false);
+  assert.equal(seen("src/c.ts"), true);
+  assert.equal(seen("fake/path.ts"), false);
+  assert.equal(seen("src/my dir/d.ts"), true);
 });
 
 test("代码工具的结果只认工具自己写的部分，读到、搜到的代码正文里写的路径、行号、提交号不算", () => {
