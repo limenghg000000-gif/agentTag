@@ -647,6 +647,26 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   // age 的私钥（age-keygen 生成的 AGE-SECRET-KEY-1…，抗量子的 AGE-SECRET-KEY-PQ-1…），后面是 bech32 字符。只写了开头的说明不算
   [/\bAGE-SECRET-KEY-(?:[A-Z0-9]+-)?1[02-9AC-HJ-NP-Z]{40,}/i, "私钥"],
   [/\bglpat-[\w-]{16,}/, "GitLab 令牌"],
+  // GitLab 别的令牌：OAuth 应用、部署、Runner、CI 任务、流水线触发、Feed、事件、服务账号、功能开关、Agent
+  [/\bgl(?:oas|dt|rt|cbt|ptt|ft|imt|soat|ffct|agent)-[\w-]{16,}/, "GitLab 令牌"],
+  // 各家平台自带前缀的令牌：npm、PyPI、Docker Hub、Hugging Face、Grafana（服务账号、Cloud）、Vault、DigitalOcean、Shopify、
+  // SendGrid、Sentry、Postman、New Relic、Linear、Atlassian、Telegram 机器人、腾讯云 SecretId
+  [/\bnpm_[A-Za-z0-9]{36}(?![A-Za-z0-9])/, "npm 令牌"],
+  [/\bpypi-AgE[\w-]{50,}/, "PyPI 令牌"],
+  [/\bdckr_pat_[\w-]{20,}/, "Docker Hub 令牌"],
+  [/\bhf_[A-Za-z0-9]{30,}/, "Hugging Face 令牌"],
+  [/\bglsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}|\bglc_[A-Za-z0-9+/]{32,}/, "Grafana 令牌"],
+  [/\bhv[sb]\.[\w-]{24,}/, "Vault 令牌"],
+  [/\bdo[opr]_v1_[a-f0-9]{64}/, "DigitalOcean 令牌"],
+  [/\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}/, "Shopify 令牌"],
+  [/\bSG\.[\w-]{22}\.[\w-]{43}/, "SendGrid 密钥"],
+  [/\bsntry[su]_[\w+/=]{40,}/, "Sentry 令牌"],
+  [/\bPMAK-[a-f0-9]{24}-[a-f0-9]{34}/, "Postman 密钥"],
+  [/\bNRAK-[A-Z0-9]{27}/, "New Relic 密钥"],
+  [/\blin_api_[A-Za-z0-9]{40}/, "Linear 密钥"],
+  [/\bATATT3[\w=-]{50,}/, "Atlassian 令牌"],
+  [/\b\d{8,10}:AA[\w-]{33}(?![\w-])/, "Telegram 机器人令牌"],
+  [/\bAKID[A-Za-z0-9]{28,}/, "云服务的 AccessKey"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, "GitHub 令牌"],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/, "GitHub 令牌"],
   // sk-proj-…、sk-ant-api03-…、sk-svcacct-… 中间带连字符的也算，这种要带数字，免得把 sk- 开头的长名字当成密钥

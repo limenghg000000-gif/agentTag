@@ -352,6 +352,25 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `# created: 2026-10-09T12:00:00+08:00\n# public key: age1${bech32(Buffer.alloc(32, 7))}\n${["AGE", "SECRET", "KEY", `1${bech32(Buffer.alloc(32, 8)).toUpperCase()}`].join("-")}`,
     ["AGE", "SECRET", "KEY", "PQ", `1${bech32(Buffer.alloc(32, 9)).toUpperCase()}`].join("-"),
     `identity = "${["age", "secret", "key", `1${bech32(Buffer.alloc(32, 10))}`].join("-")}"`,
+    // 各家平台自带前缀的令牌
+    ...[
+      ["npm", "a1B2c3D4".repeat(4) + "e5F6"],
+      ["pypi", "AgEIcHlwaS5vcmc" + "Ab1-Cd2_".repeat(8)],
+      ["dckr", "pat", "Ab1-Cd2_Ef3".repeat(3)],
+      ["hf", "a1B2c3D4e5".repeat(4)],
+      ["glrt", "a1B2c3D4e5F6g7H8i9J0"],
+      ["glsa", "a1B2c3D4".repeat(4), "0a1b2c3d"],
+      ["glc", "eyJvIjoiMTIzNDU2Nzg5MCIsIm4iOiJ0ZXN0In0".repeat(2)],
+      ["dop", "v1", "0a1b2c3d".repeat(8)],
+      ["shpat", "0a1b2c3d".repeat(4)],
+      ["sntrys", "eyJpYXQiOjE3MDAwMDAwMDAsInVybCI6Imh0dHBzOi8vc2VudHJ5LmlvIn0".repeat(2)],
+      ["lin", "api", "a1B2c3D4e5".repeat(4)],
+    ].map((parts) => `${parts.join(parts[0] === "pypi" || parts[0] === "glrt" ? "-" : "_")} 是部署用的`),
+    `vault login 用的是 ${["hvs", "CAESIAbCdEfGh0123456789IjKlMnOp"].join(".")}`,
+    `SENDGRID=${["SG", "a1B2c3D4e5F6g7H8i9J0kL", "a1B2c3D4e5F6g7H8i9J0kLm1N2o3P4q5R6s7T8u9V0w"].join(".")}`,
+    `postman ${["PMAK", "0a1b2c3d".repeat(3), "0a1b2c3d".repeat(4) + "0a"].join("-")}；newrelic ${["NRAK", "A1B2C3D4E5F6G7H8I9J0K1L2M3N"].join("-")}`,
+    `jira ${["ATATT3", "xFfGF0a1B2c3D4e5F6g7H8i9J0kL".repeat(2)].join("")}；telegram ${["123456789", "AA" + "a1B2c3D4e5F6g7H8i9J0k-L_m1N2o3P4q"].join(":")}`,
+    `TENCENTCLOUD_SECRET_ID 是 ${["AKID", "a1B2c3D4".repeat(4)].join("")}`,
     // 字符串里套着转义过的 JSON，转义了几层都算
     `payload="{\\"password\\":\\"${["CorrectHorse", "BatteryStaple9"].join("")}\\"}"`,
     `{"body":"{\\"config\\":\\"{\\\\\\"api_key\\\\\\":\\\\\\"${["correct", "horse", "battery", "staple"].join("")}\\\\\\"}\\"}"}`,
@@ -460,6 +479,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host, Signature=<signature>；Digest 里 response=\"see above\"",
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
+    // 只提到令牌前缀、配置名的
+    "npm_config_registry=https://registry.npmmirror.com；hf_hub_download；SG.example；glsa_ 是 Grafana 服务账号令牌的前缀；hvs. 开头的是 Vault 令牌；Credential=AKIDEXAMPLE/20150830",
     // age 的公钥、只写了私钥开头的说明
     `age 的公钥 age1${bech32(Buffer.alloc(32, 7))} 可以贴；私钥以 AGE-SECRET-KEY-1 开头，写在 key.txt 里（AGE-SECRET-KEY-1...）`,
     // PuTTY 私钥文件只说了格式、没贴私钥的；转义过的 JSON 里是占位、打了码的
