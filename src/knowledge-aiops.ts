@@ -35,6 +35,9 @@ export interface AiopsLesson {
   solution?: string;
   diagnosis_path?: string;
   keywords?: string;
+  /** 告警匹配用的错误码、告警名。get_knowledge 返回了这一项（空的也算）才有，没返回时是 undefined */
+  error_codes?: string;
+  alertname?: string;
 }
 
 export type AiopsSaveResult = { saved: true; id: number } | { saved: false; duplicate: { id: number; title: string; why?: string } };
@@ -145,6 +148,8 @@ export class AiopsLessons {
       title: item.title,
       status: typeof item.status === "string" ? item.status : "active",
       ...pickStrings(item, ["service", "symptom", "root_cause", "solution", "diagnosis_path", "keywords"]),
+      // 空的也留着：和「没返回这一项」分开，在 aiops 里清空了也认得出改过
+      ...Object.fromEntries(MATCH_FIELDS.flatMap((key) => (typeof item[key] === "string" ? [[key, item[key]]] : []))),
     };
   }
 
@@ -159,8 +164,6 @@ export class AiopsLessons {
       source: caseId === undefined ? "chat" : "case",
       created_by: `feishu:${confirmedBy}`,
       ...(caseId === undefined ? {} : { case_id: caseId }),
-      ...(draft.errorCodes ? { error_codes: draft.errorCodes } : {}),
-      ...(draft.alertname ? { alertname: draft.alertname } : {}),
       ...(force ? { force: true } : {}),
     };
     const raw = await this.mcp.callDirect(this.server, "save_lesson", args, task);
@@ -222,10 +225,7 @@ export class AiopsLessons {
       return undefined;
     }
     const stored = (key: LessonField) => (lesson[key] ?? "").trim();
-    const draft = sent.find((draft) => {
-      const content = lessonContent(draft, teamId);
-      return LESSON_FIELDS.every((key) => stored(key) === (content[key] ?? "").trim());
-    });
+    const draft = sent.find((draft) => sameLesson(lesson, lessonContent(draft, teamId)));
     if (draft) {
       return { id, draft };
     }
@@ -241,6 +241,8 @@ export class AiopsLessons {
         ...(lesson.solution ? { handling: lesson.solution } : {}),
         ...(basis ? { basis } : {}),
         ...(lesson.keywords ? { keywords: lesson.keywords } : {}),
+        ...(lesson.error_codes?.trim() ? { errorCodes: lesson.error_codes.trim() } : {}),
+        ...(lesson.alertname?.trim() ? { alertname: lesson.alertname.trim() } : {}),
       },
     };
   }
@@ -274,8 +276,7 @@ export class AiopsLessons {
       this.logger.info(`aiops 经验库 经验 #${seen.id} 已经是归档的`);
       return;
     }
-    const stored = (lesson: AiopsLesson, key: LessonField) => (lesson[key] ?? "").trim();
-    if (!LESSON_FIELDS.every((key) => stored(current, key) === stored(seen, key))) {
+    if (!sameLesson(current, seen)) {
       throw new StaleProposalError(`aiops 经验 #${seen.id} 在卡片发出后改过，卡片上的已经不是现在这条，这张卡片不能再用。需要的话请按现在的内容重新起草`);
     }
     await this.archive(seen.id, confirmedBy, task);
@@ -297,9 +298,18 @@ export class AiopsLessons {
   }
 }
 
-/** 存进 aiops 的内容里 get_knowledge 也会返回的几项：认上次存进去的是哪一份时比这些 */
-const LESSON_FIELDS = ["title", "symptom", "root_cause", "solution", "service", "diagnosis_path", "keywords"] as const;
+/** 存进 aiops 的内容里 get_knowledge 也会返回的几项：认上次存进去的是哪一份、卡片发出后改没改过时比这些 */
+const LESSON_FIELDS = ["title", "symptom", "root_cause", "solution", "service", "diagnosis_path", "keywords", "error_codes", "alertname"] as const;
 type LessonField = (typeof LESSON_FIELDS)[number];
+/** 告警匹配用的两项：get_knowledge 没返回这一项时（不知道存的是什么）不比，别的项照样比 */
+const MATCH_FIELDS = ["error_codes", "alertname"] as const;
+
+/** aiops 里存的这条和 content（发过去的内容，或者卡片上那时的这条）是不是一样 */
+function sameLesson(lesson: AiopsLesson, content: Partial<Record<LessonField, string>>): boolean {
+  return LESSON_FIELDS.every(
+    (key) => ((MATCH_FIELDS as readonly string[]).includes(key) && lesson[key] === undefined) || (lesson[key] ?? "").trim() === (content[key] ?? "").trim(),
+  );
+}
 
 /** 一条团队经验存进 aiops 时各项的内容 */
 function lessonContent(draft: KnowledgeDraft, teamId: string): Partial<Record<LessonField, string>> & { title: string } {
@@ -312,14 +322,18 @@ function lessonContent(draft: KnowledgeDraft, teamId: string): Partial<Record<Le
     ...(draft.scope ? { service: draft.scope } : {}),
     ...(draft.handling ? { solution: draft.handling } : {}),
     ...(draft.keywords ? { keywords: draft.keywords } : {}),
+    ...(draft.errorCodes ? { error_codes: draft.errorCodes } : {}),
+    ...(draft.alertname ? { alertname: draft.alertname } : {}),
   };
 }
 
 /** aiops 里这条经验的标题、现象、根因、处理办法、排查过程这些里像不像有密钥 */
 export function lessonHasSecret(lesson: AiopsLessonHit | AiopsLesson): boolean {
   // 检索结果里没有服务名、关键词
-  const { title, symptom, root_cause, solution, diagnosis_path, service, keywords }: Partial<AiopsLesson> = lesson;
-  return [title, symptom, root_cause, solution, diagnosis_path, service, keywords].some((value) => value !== undefined && containsSecret(value));
+  const { title, symptom, root_cause, solution, diagnosis_path, service, keywords, error_codes, alertname }: Partial<AiopsLesson> = lesson;
+  return [title, symptom, root_cause, solution, diagnosis_path, service, keywords, error_codes, alertname].some(
+    (value) => value !== undefined && containsSecret(value),
+  );
 }
 
 /** 报错里带上 aiops 返回的原文（前 chars 个字符）：报错会列在卡片上给群里看，原文里像有密钥的不带 */

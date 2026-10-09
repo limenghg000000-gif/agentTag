@@ -433,6 +433,14 @@ test("提问里像是有密钥、回答前没查 aiops 经验库：提示词里�
   assert.match(requests[0].system, /这次提问在团队经验库里没查到相近的经验/);
   assert.match(requests[0].system, /提问里像是有密钥，回答前没拿它去查 aiops 经验库/);
   assert.doesNotMatch(requests[0].system, /这次提问在经验库里没查到相近的经验/);
+
+  // 团队经验库也没查成：不说「另一边没查到」，也不叫它拿原话去查 aiops
+  const failed = { lookup: async () => ({ text: "", ids: [], missed: ["团队经验库"], aiopsSkipped: true }), tools: () => [] };
+  const second = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: second.model, knowledge: failed }).handle(message("code=8 是怎么回事"));
+  assert.match(second.requests[0].system, /回答前团队经验库没查成（超时或出错）。需要时自己再查：团队经验库用 knowledge_search。/);
+  assert.match(second.requests[0].system, /提问里像是有密钥，回答前没拿它去查 aiops 经验库/);
+  assert.doesNotMatch(second.requests[0].system, /另一边没查到/);
 });
 
 test("回答前查到了 aiops 的经验、模型却没有 aiops 的检索工具：提示词里照样说清 aiops 经验怎么引用", async () => {

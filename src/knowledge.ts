@@ -322,9 +322,7 @@ export class KnowledgeBase {
       let replaces: string | undefined;
       if (meta.replaces) {
         const wanted = normalizeId(meta.replaces);
-        // 先按卡片上那条的草稿编号找：卡片发出后有人复制了这一行、又把原来那行改了编号时，复制出来的那行占着旧编号、内容也一样，
-        // 按编号找会取代（归档）复制出来的那行、原来那行还有效
-        const old = (meta.seen?.requestId ? byRequestId(entries, meta.seen.requestId) : undefined) ?? entries.find((entry) => normalizeId(entry.id) === wanted);
+        const old = cardTarget(entries, meta.replaces, meta.seen);
         if (old?.status !== "active") {
           throw new StaleProposalError(
             `要取代的经验 ${meta.replaces} ${old ? "已经归档了（可能已经被别的卡片取代）" : "不在经验库里了"}，这张卡片不能再保存。需要的话请重新起草`,
@@ -380,9 +378,14 @@ export class KnowledgeBase {
   archive(id: string, meta: KnowledgeMeta = {}): Promise<KnowledgeEntry> {
     return this.exclusive(async () => {
       const entries = await this.entries(true);
-      const entry =
-        (meta.seen?.requestId ? byRequestId(entries, meta.seen.requestId) : undefined) ?? entries.find((e) => normalizeId(e.id) === normalizeId(id));
+      const entry = cardTarget(entries, id, meta.seen);
       if (!entry) {
+        // 没有草稿编号的行（表格里手动加的、导入的）认不出是删了，还是改了编号又改了内容：不当成删了，卡片留着
+        if (meta.seen && !meta.seen.requestId) {
+          throw new KnowledgeError(
+            `表格里找不到经验 ${id}。这一行没有草稿编号，认不出是被删了还是改了编号：改了编号的请改回 ${id} 后再点一次卡片上的按钮；确实删了的，点「取消」或「不用了」`,
+          );
+        }
         throw new MissingEntryError(`经验库里没有 ${id}`);
       }
       // 先对卡片上的内容，再看是不是已经归档了：上次点确认归档成功、结果没传回来的，内容没变照样接着做；
@@ -610,8 +613,11 @@ function isMasked(value: string): boolean {
  * 经验库所有群都能看，排查经验还会同步给 aiops 的告警自动排查，所以明显的密钥、密码不让存。
  * 只拦格式很确定的，免得误伤；手机号这类个人信息靠提示词
  */
+/** PEM 私钥（RSA、EC、OPENSSH、PKCS#8，加密的也算）和 OpenPGP 私钥（PGP PRIVATE KEY BLOCK）的开头；公钥、证书不算 */
+const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
+
 const SECRET_PATTERNS: [RegExp, string][] = [
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, "私钥"],
+  [PRIVATE_KEY_HEADER, "私钥"],
   [/\bglpat-[\w-]{16,}/, "GitLab 令牌"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, "GitHub 令牌"],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/, "GitHub 令牌"],
@@ -984,7 +990,7 @@ function encodedSecret(text: string): string | undefined {
   for (const [run] of text.matchAll(BASE64_RUN)) {
     const encoded = run.replace(/\s+/g, "");
     const bytes = Buffer.from(encoded, "base64");
-    if (encoded.length >= 64 && (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(bytes.toString("latin1")) || isDerPrivateKey(bytes))) {
+    if (encoded.length >= 64 && (PRIVATE_KEY_HEADER.test(bytes.toString("latin1")) || isDerPrivateKey(bytes))) {
       return "私钥";
     }
     const decoded = printableText(bytes);
@@ -1029,23 +1035,46 @@ function secretDataEntries(text: string): [string, string, string][] {
     if (!block) {
       return;
     }
-    // 列表项（- data:）里的名字比「-」多缩进两格。只看下一层的「名字: 值」，更深的是块写法的值（config.yaml: | 下面的几行）
+    // 列表项（- data:）里的名字比「-」多缩进两格。只看下一层的「名字: 值」；值是块写法的（db: |、config.yaml: >-），
+    // 下面缩进更深的几行连起来才是值（| 按行连，> 折成一行）
     const indent = block[1].length + (/^[ \t]*-/.test(line) ? 2 : 0);
     let child: number | undefined;
+    let scalar: { name: string; lines: string[]; folded: boolean } | undefined;
+    const flush = () => {
+      if (scalar) {
+        entries.push([block[2], scalar.name, scalar.lines.join(scalar.folded ? " " : "\n")]);
+        scalar = undefined;
+      }
+    };
     for (const next of lines.slice(i + 1)) {
-      if (!next.trim() || /^[ \t]*#/.test(next)) {
+      if (!next.trim()) {
         continue;
       }
       const depth = /^[ \t]*/.exec(next)![0].length;
+      if (scalar && child !== undefined && depth > child) {
+        scalar.lines.push(next.trim());
+        continue;
+      }
+      flush();
+      if (/^[ \t]*#/.test(next)) {
+        continue;
+      }
       if (depth <= indent) {
         break;
       }
       child ??= depth;
       const pair = depth === child ? SECRET_DATA_LINE.exec(next) : null;
-      if (pair) {
-        entries.push([block[2], pair[1], pair[2] ?? pair[3] ?? pair[4]]);
+      if (!pair) {
+        continue;
+      }
+      const value = pair[2] ?? pair[3] ?? pair[4];
+      if (pair[4] !== undefined && /^[|>][-+0-9]*$/.test(value)) {
+        scalar = { name: pair[1], lines: [], folded: value.startsWith(">") };
+      } else {
+        entries.push([block[2], pair[1], value]);
       }
     }
+    flush();
   });
   for (const [, section, body] of text.matchAll(SECRET_DATA_OBJECT)) {
     for (const [, name, double, single, bare] of body.matchAll(SECRET_DATA_PAIR)) {
@@ -1067,10 +1096,12 @@ function secretManifestValue(text: string): boolean {
   return secretDataEntries(text).some(([section, name, value]) => {
     let plain: string | undefined = value;
     if (section !== "stringData") {
-      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+      // 块写法折成几行的 base64 连起来
+      const encoded = value.replace(/\s+/g, "");
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
         return false;
       }
-      const bytes = Buffer.from(value, "base64");
+      const bytes = Buffer.from(encoded, "base64");
       plain = printableText(bytes);
       // 解出来不是文字的（keystore、DER 证书这些二进制）：名字不像是公开信息的算
       if (plain === undefined) {
@@ -1385,6 +1416,26 @@ function checkSeen(entry: KnowledgeEntry, seen: KnowledgeEntry | undefined): voi
   if (seen && (!usable(entry) || !sameContent(entry, seen))) {
     throw new StaleProposalError(`经验 ${entry.id} 在卡片发出后在表格里改过，卡片上的已经不是现在这条，这张卡片不能再用。需要的话请按现在的内容重新起草`);
   }
+}
+
+/**
+ * 卡片上那一条现在是表格里的哪一行：先按草稿编号（卡片发出后编号被改了、或者复制出来的行占着旧编号也认得对），再按编号。
+ * 没有草稿编号的行（表格里手动加的、导入的）按编号找不到时，按内容找：正好一行和卡片上的一样，就是改了编号的那一行；
+ * 好几行一样分不清时报错。都找不到返回 undefined
+ */
+function cardTarget(entries: readonly KnowledgeEntry[], id: string, seen: KnowledgeEntry | undefined): KnowledgeEntry | undefined {
+  const found = (seen?.requestId ? byRequestId(entries, seen.requestId) : undefined) ?? entries.find((entry) => normalizeId(entry.id) === normalizeId(id));
+  if (found || !seen || seen.requestId) {
+    return found;
+  }
+  const same = entries.filter((entry) => !entry.requestId && sameContent(entry, seen));
+  if (same.length > 1) {
+    const ids = same.map((row) => row.id).filter((rowId) => !containsSecret(rowId));
+    throw new KnowledgeError(
+      `表格里找不到经验 ${id}，内容和它一样的有 ${same.length} 行${ids.length > 0 ? `（经验 ${ids.join("、")}）` : ""}，分不清是哪一行。请把其中一行的编号改回 ${id} 后再点一次卡片上的按钮`,
+    );
+  }
+  return same[0];
 }
 
 /**

@@ -226,9 +226,10 @@ export class KnowledgeDesk {
           this.logger.warn(`查${name}没查成 message=${task.messageId}：${why}`);
         }
       }
-      // 没接 aiops 时不算 aiops 查成了：团队经验库没查成就是都没查成
+      // 没接 aiops 时不算 aiops 查成了：团队经验库没查成就是都没查成。
+      // 提问里有密钥、没查 aiops 的要说出来：不然提示词让模型自己去查 aiops，可能把带密钥的原话发过去
       if (team.status === "rejected" && (!queryAiops || lessons.status === "rejected")) {
-        return undefined;
+        return secret ? { text: "", ids: [], missed: ["团队经验库"], aiopsSkipped: true } : undefined;
       }
       const teamHits = team.status === "fulfilled" ? team.value : [];
       // 只去掉从团队经验库这次也查到了的那条同步过去的（排查过程最后一行是那一条的出处）：两边检索方式不一样，团队经验库没查到的那条 aiops 查到了，
@@ -1216,6 +1217,8 @@ export function renderProposalCard(proposal: Proposal): object {
         ["处理办法", lesson.solution],
         ["排查过程", lesson.diagnosis_path],
         ["关键词", lesson.keywords],
+        ["错误码", lesson.error_codes],
+        ["告警名", lesson.alertname],
       ] as [string, string | undefined][]
     )
       .filter((pair): pair is [string, string] => Boolean(pair[1]))

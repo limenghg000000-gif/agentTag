@@ -130,13 +130,17 @@ function knowledgeSection(
         (hasAiops ? "需要时只用错误码、服务名这些不含密钥的词自己查（aiops_search_knowledge），不要把密钥写进查询。" : ""),
     );
   }
+  // 查询会发到 aiops、记进审计日志：自己去查时只写不含密钥的词
+  const aiopsQuery = "，aiops 经验库用 aiops_search_knowledge（查询里只写错误码、服务名、现象，不要带密钥、密码）";
   if (failed) {
     lines.push(
-      `- 回答前自动查经验库没查成（超时或出错），不知道有没有相近的经验。需要参考以前的经验时自己查：团队经验库用 knowledge_search${hasAiops ? "，aiops 经验库用 aiops_search_knowledge" : ""}。`,
+      `- 回答前自动查经验库没查成（超时或出错），不知道有没有相近的经验。需要参考以前的经验时自己查：团队经验库用 knowledge_search${hasAiops ? aiopsQuery : ""}。`,
     );
   } else if (missed?.length) {
+    // 没查 aiops 的（提问里像有密钥）下面另有一句，这里不说成「另一边没查到」
+    const other = aiopsSkipped ? "" : hits ? "，上面只有查成的那边的结果" : "，另一边没查到相近的";
     lines.push(
-      `- 回答前${missed.join("和")}没查成（超时或出错），${hits ? "上面只有查成的那边的结果" : "另一边没查到相近的"}。需要时自己再查：团队经验库用 knowledge_search${hasAiops ? "，aiops 经验库用 aiops_search_knowledge" : ""}。`,
+      `- 回答前${missed.join("和")}没查成（超时或出错）${other}。需要时自己再查：团队经验库用 knowledge_search${hasAiops && !aiopsSkipped ? aiopsQuery : ""}。`,
     );
   }
   if (!canPropose) {

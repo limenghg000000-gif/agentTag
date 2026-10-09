@@ -337,6 +337,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `key: ${base64(rsaKeys.privateKey.export({ type: "pkcs1", format: "der" }))}`,
     `key: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "der" }))}`,
     `key: ${base64(generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "der" }))}`,
+    // OpenPGP 私钥（gpg --export-secret-keys --armor），base64 编码过的也算
+    `${["-----BEGIN PGP PRIVATE", "KEY BLOCK-----"].join(" ")}\n\n${base64(Buffer.alloc(96, 5))}\n=AbCd\n${["-----END PGP PRIVATE", "KEY BLOCK-----"].join(" ")}`,
+    `key: ${base64(`${["-----BEGIN PGP PRIVATE", "KEY BLOCK-----"].join(" ")}\n\n${base64(Buffer.alloc(96, 5))}`)}`,
     // base64 编码的别的密钥（名字不像密钥的也算）：Secret 的 data 下、kubectl 取出来的 JSON、环境变量、echo … | base64 -d
     `apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ntype: Opaque\ndata:\n  DATABASE_URL: ${base64(dbUrl)}\n  username: ${base64("app")}`,
     `kubectl get secret db -o jsonpath='{.data}'\n{"DATABASE_URL":"${base64(dbUrl)}"}`,
@@ -347,6 +350,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"x"},"data":{"db":"${base64(["S3cr3t", "P@ss!"].join(""))}"}}`,
     ["kind: Secret\nstringData:\n  api: abcdef", "123456"].join(""),
     `items:\n- apiVersion: v1\n  kind: Secret\n  binaryData:\n    keystore.p12: ${base64(Buffer.from([0x30, 0x82, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))}`,
+    // 块写法的值：下面缩进的几行才是值（stringData 里的配置文件整个算；data 里折成几行的 base64 连起来解）
+    ["kind: Secret\nstringData:\n  db: |\n    CorrectHorse", "BatteryStaple9\n  username: app"].join(""),
+    "kind: Secret\nstringData:\n  config.yaml: |\n    log_level: debugging\n    mode: production",
+    `kind: Secret\ndata:\n  db: >-\n    ${base64(["S3cr3t", "P@ss!"].join("")).slice(0, 8)}\n    ${base64(["S3cr3t", "P@ss!"].join("")).slice(8)}`,
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -438,11 +445,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host, Signature=<signature>；Digest 里 response=\"see above\"",
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
+    // OpenPGP 公钥、签名
+    `-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n${base64(Buffer.alloc(96, 5))}\n-----END PGP PUBLIC KEY BLOCK-----\n-----BEGIN PGP SIGNATURE-----\n${base64(Buffer.alloc(48, 6))}\n-----END PGP SIGNATURE-----`,
     `encrypted: ${base64(rsaKeys.privateKey.export({ type: "pkcs8", format: "der", cipher: "aes-256-cbc", passphrase: "x" }))}；sha512: ${base64(Buffer.alloc(64, 7))}`,
     // 解出来没有密钥的 base64、乱码，Secret 里写明不是密钥的（用户名、地址、端口、CA 证书）、很短的、占位，ConfigMap、SecretProviderClass 的 data
     `DATABASE_URL=${base64("postgresql://db.internal:5432/app")}；ResourceExhaustedErrorHandler；${"a1B2".repeat(8)}；${base64("username: admin")}`,
     `kind: Secret\ndata:\n  username: ${base64("admin")}\n  host: ${base64("db.internal")}\n  port: ${base64("5432")}\n  ca.crt: ${base64("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----")}\n  enabled: ${base64("true")}`,
-    "kind: Secret\nstringData:\n  config.yaml: |\n    log_level: debugging\n    mode: production",
     "kind: ConfigMap\ndata:\n  mode: production\n  APP_NAME: agenttag\n---\nkind: SecretProviderClass\ndata:\n  objects: something-long",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
@@ -1550,6 +1558,44 @@ test("同步到 aiops 时结果没传回来、再试前那条在 aiops 里被改
   assert.match(result, /已同步到 aiops 经验库（经验 #32）/);
 });
 
+test("同步到 aiops 时结果没传回来、再试前那条在 aiops 里只改了错误码或告警名：也算改过，归档它重新同步；aiops 不返回这两项时不比", async () => {
+  for (const [edit, resynced] of [
+    [(lesson: Record<string, unknown>) => (lesson.error_codes = "8"), true],
+    [(lesson: Record<string, unknown>) => (lesson.alertname = "GatewayCode8"), true],
+    // 旧版本的 get_knowledge 不返回这两项：不知道存的是什么，不能当成改过
+    [(lesson: Record<string, unknown>) => delete lesson.error_codes, false],
+  ] as const) {
+    let lose = true;
+    const stored = new Map<number, Record<string, unknown>>();
+    const { backend, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup({
+      saveLesson: (args) => {
+        if (lose) {
+          lose = false;
+          stored.set(31, { ...args });
+          throw new Error("socket hang up");
+        }
+        return JSON.stringify({ saved: true, id: 32 });
+      },
+      searchLessons: () =>
+        JSON.stringify({ hits: [...stored].map(([id, lesson]) => ({ id, title: lesson.title, score: 9.8, diagnosis_path: lesson.diagnosis_path })) }),
+    });
+    handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, status: "active", ...stored.get(Number(args.id)) });
+    await tool("knowledge_propose").run({ ...code8, alertname: "GatewayErrors" }, { signal });
+    await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+    await desk.idle();
+    assert.equal(stored.get(31)!.error_codes, "8,ResourceExhausted");
+    assert.equal(stored.get(31)!.alertname, "GatewayErrors");
+
+    edit(stored.get(31)!);
+    await desk.handleCardAction(click(lastCard(), "save"));
+    await desk.idle();
+    assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), resynced ? [{ id: 31 }] : []);
+    assert.equal(calls.filter((call) => call.tool === "save_lesson").length, resynced ? 2 : 1);
+    assert.equal(backend.entries[0].aiopsId, resynced ? 32 : 31);
+    assert.equal(lastCard().header.title.content, "已存进经验库");
+  }
+});
+
 test("同步到 aiops 时结果没传回来、再试时检索没排到存进去的那条：aiops 说重复的正是它（排查过程末尾是这一条的出处），记下它的编号，不当成别的相近经验", async () => {
   let lose = true;
   const stored = new Map<number, Record<string, unknown>>();
@@ -2441,6 +2487,15 @@ test("归档 aiops 经验：点归档时重新取一遍，卡片发出后在 aio
   await desk.idle();
   assert.match(cardText(lastCard()), /aiops 经验 #40 在卡片发出后改过，卡片上的已经不是现在这条/);
   assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  // 只改了告警匹配用的错误码也算改过；卡片上列出错误码
+  lesson.error_codes = "8";
+  const codes = await propose();
+  assert.match(cardText(codes), /\*\*错误码\*\*：8/);
+  lesson.error_codes = "8,ResourceExhausted";
+  await desk.handleCardAction(click(codes, "archive"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /aiops 经验 #40 在卡片发出后改过/);
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
 
   const current = await propose();
   await desk.handleCardAction(click(current, "archive"));
@@ -2477,7 +2532,7 @@ test("归档时表格改成功了、结果没传回来：再点一次照常完�
 
 test("归档：表格里归档了、aiops 那步没做成，再试之前有人删了这一行：不再报找不到，aiops 里同步的那条核对出处后照样归档；卡片发出后改了编号的按草稿编号认", async () => {
   const { backend, base, desk, sent, click, tool, lastCard, handlers } = deskSetup();
-  await base.save(normalizeDraft(code8));
+  await base.save(normalizeDraft(code8), { requestId: "req-0" });
   await base.linkAiops("K1", 31);
   await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
   const archiveLesson = handlers.archive_lesson;
@@ -2507,6 +2562,39 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
   await renamed.desk.idle();
   assert.equal(renamed.backend.entries[0].status, "archived");
   assert.deepEqual(renamed.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }], "aiops 里那条的出处是卡片上的 K1");
+});
+
+test("归档没有草稿编号的行（表格里手动加的）：卡片发出后改了编号的按内容认出来归档；找不到时不当成删了，卡片留着；内容一样的好几行分不清时也留着", async () => {
+  const renamed = deskSetup({ aiops: false });
+  await renamed.base.save(normalizeDraft(dau));
+  await renamed.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  renamed.backend.entries[0].id = "K7";
+  await renamed.desk.handleCardAction(renamed.click((renamed.sent[0].input as { card: any }).card, "archive"));
+  await renamed.desk.idle();
+  assert.equal(renamed.backend.entries[0].status, "archived");
+  assert.equal(renamed.lastCard().header.title.content, "已归档");
+
+  const gone = deskSetup({ aiops: false });
+  await gone.base.save(normalizeDraft(dau));
+  await gone.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  // 改了编号又改了内容，和删了一样认不出来
+  gone.backend.entries[0].id = "K7";
+  gone.backend.entries[0].conclusion = "改过的结论";
+  await gone.desk.handleCardAction(gone.click((gone.sent[0].input as { card: any }).card, "archive"));
+  await gone.desk.idle();
+  assert.equal(gone.backend.entries[0].status, "active");
+  assert.match(cardText(gone.lastCard()), /表格里找不到经验 K1。这一行没有草稿编号，认不出是被删了还是改了编号/);
+  assert.ok(gone.lastCard().body.elements.some((element: any) => JSON.stringify(element).includes("archive")), "卡片上还能再点");
+
+  const twins = deskSetup({ aiops: false });
+  await twins.base.save(normalizeDraft(dau));
+  await twins.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  twins.backend.entries[0].id = "K7";
+  twins.backend.entries.push({ ...structuredClone(twins.backend.entries[0]), id: "K8" });
+  await twins.desk.handleCardAction(twins.click((twins.sent[0].input as { card: any }).card, "archive"));
+  await twins.desk.idle();
+  assert.ok(twins.backend.entries.every((entry) => entry.status === "active"));
+  assert.match(cardText(twins.lastCard()), /表格里找不到经验 K1，内容和它一样的有 2 行（经验 K7、K8），分不清是哪一行/);
 });
 
 /** aiops 检索结果里 #31 的排查过程末尾写着是 K1 同步过去的 */
@@ -2613,6 +2701,13 @@ test("回答前检索每个库限时：表格卡住了照样用 aiops 的结果�
   assert.deepEqual(found?.missed, ["团队经验库"]);
 
   assert.equal(await make().lookup("code=8", task), undefined);
+  // 提问里有密钥、没查 aiops，表格又卡住了：照样说出 aiops 没查，不当成都没查成（那样提示词会让模型拿原话去查 aiops）
+  assert.deepEqual(await make(lessons).lookup(["code=8，MCP_AIOPS_TOKEN", "correcthorsebatterystaple"].join("="), task), {
+    text: "",
+    ids: [],
+    missed: ["团队经验库"],
+    aiopsSkipped: true,
+  });
   const disconnected = new AiopsLessons({ hasTool: () => false, connected: () => false, callDirect: async () => "" }, "aiops", quiet);
   assert.equal(await make(disconnected).lookup("code=8", task), undefined);
 
