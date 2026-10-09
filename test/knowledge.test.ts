@@ -141,6 +141,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '{"password":"correcthorsebatterystaple"}',
     '{"password": "correct horse battery staple"}',
     "'password' => 'hunter2hunter'",
+    // 引号里转义的引号不算结束
+    '{"password":"ab\\"correcthorsebatterystaple"}',
+    "{'token': 'ab\\'correcthorsebattery'}",
     '{"token": "correct horse battery staple"}',
     "MCP_AIOPS_TOKEN='correct horse battery staple'",
     // .env、shell 里不带引号、中间有空格的值取到行尾
@@ -158,6 +161,17 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "aiops:\n  api_key: my correct horse battery staple  # 换过",
     "- token: my correct horse battery staple",
     "spring.datasource.password=my correct horse battery",
+    // 命令行里隔着空格写在密钥选项后面的值，exec 数组、YAML 的 args 列表里的也算
+    "deployctl --password correcthorsebatterystaple",
+    "deployctl --token correcthorsebattery --verbose",
+    "deployctl --api-key 'correct horse battery staple'",
+    "app -token correcthorsebattery",
+    "app --db-password hunter2hunter",
+    "mysql --password changeme",
+    "deployctl --token dGhpcyBpcyBhIHRva2Vu=",
+    'CMD ["deployctl", "--token", "correcthorsebattery"]',
+    "args:\n  - --token\n  - correcthorsebattery",
+    'args:\n  - "--password"\n  - "correcthorsebattery"',
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -196,6 +210,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "token: signature is invalid\nToken: has expired, please login again\ntoken_ttl: 3600 seconds\ntokenizer: bert base uncased",
     // 冒号后面空着、下面是嵌套的子项（k8s 的 secret: 下面写 secretName），不是它的值；块写法里是变量引用的也不算
     "volumes:\n  - name: tok\n    secret:\n      secretName: aiops-secrets\napi_key: |-\n  ${MODEL_API_KEY}",
+    // 命令行：选项名不以密钥的词结尾的、值是下一个选项、变量、占位、打码、文件路径、另一个赋值的，和说选项本身的话
+    "docker login --password-stdin < pw.txt；kubectl --token-file /var/run/token；app --no-password --verbose",
+    'deployctl --token $MCP_AIOPS_TOKEN；deployctl --token "${MCP_AIOPS_TOKEN}"；deployctl --token <your-token> --password ******',
+    "ansible-playbook --private-key ~/.ssh/deploy.pem site.yml；docker build --secret id=npmrc,src=$HOME/.npmrc .",
+    "用 --token 参数传进去；pass the --token option, then restart；use --api-key instead of --password",
+    "args:\n  - --token\n  - $(MCP_AIOPS_TOKEN)",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -408,7 +428,7 @@ function deskSetup({
   searchLessons?: (args: Record<string, unknown>) => string;
 } = {}) {
   // holds：按发送的先后，每次发送等对应的一个；用完了等 hold
-  const control: { failSend: boolean; failUpdate?: boolean; hold?: Promise<void>; holds?: Promise<void>[] } = { failSend: false };
+  const control: { failSend: boolean; failUpdate?: boolean; hold?: Promise<void>; holds?: Promise<void>[]; updateHold?: Promise<void> } = { failSend: false };
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 200 });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
@@ -432,6 +452,9 @@ function deskSetup({
       return { messageId: `om_card_${sent.length}` };
     },
     updateCard: async (messageId, card) => {
+      if (control.updateHold) {
+        await control.updateHold;
+      }
       if (control.failUpdate) {
         throw new Error("飞书更新卡片失败");
       }
@@ -672,6 +695,35 @@ test("一次回复里同时起草两条、后一条还在查（取要归档的 a
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
   assert.equal(backend.entries.length, 0, "作废以后点了也不存");
+});
+
+test("一次回复里同时起草两条、改话题里的旧卡片很慢：第一张新卡片发出去后照样先不让点，第二张发出去就作废它，只存一条", async () => {
+  const { backend, desk, sent, click, tool, control } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  let releaseUpdate!: () => void;
+  control.updateHold = new Promise((resolve) => (releaseUpdate = resolve));
+  let releaseThird!: () => void;
+  control.holds = [Promise.resolve(), new Promise((resolve) => (releaseThird = resolve))];
+  const first = tool("knowledge_propose").run({ ...dau, title: "日活的口径（第二版）" }, { signal });
+  const second = tool("knowledge_propose").run({ ...dau, title: "日活的口径（第三版）" }, { signal });
+  for (let i = 0; i < 5 && sent.length < 2; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(sent.length, 2);
+  // 第二张卡片发出去了，第一张卡片（话题里原来那张）还在改；这时点第二张
+  await desk.handleCardAction({ ...click((sent[1].input as { card: any }).card, "save"), messageId: "om_card_2" });
+  await desk.idle();
+  const savedEarly = backend.entries.length;
+  releaseThird();
+  releaseUpdate();
+  await Promise.all([first, second]);
+  assert.equal(savedEarly, 0, "后一条还在发的时候点前一张不存");
+  await desk.handleCardAction({ ...click((sent[2].input as { card: any }).card, "save"), messageId: "om_card_3" });
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => e.title),
+    ["日活的口径（第三版）"],
+  );
 });
 
 test("卡片发的时候任务停了：发出去的卡片作废、点了不存，话题里之前的卡片照旧能用", async () => {
@@ -1034,7 +1086,7 @@ test("同步到 aiops 没做成、有人在表格里改了这一行再点再试�
   down = false;
   await desk.handleCardAction(click(lastCard(), "save"));
   await desk.idle();
-  assert.match(cardText(lastCard()), /没能同步到 aiops 经验库：依据或排查过程（basis）里像是有HTTP Basic 认证的用户名和密码/);
+  assert.match(cardText(lastCard()), /经验 K1 在表格里依据或排查过程里像是有HTTP Basic 认证的用户名和密码，没有同步到 aiops 经验库/);
   assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1, "带密钥的这一行没有同步过去");
 
   row.basis = "看了 user-rpc 每个 Pod 的连接数";
@@ -1520,12 +1572,87 @@ test("aiops 的说明在经验库关掉时也成立：只在有起草工具时�
   assert.match(text, /没有这两个工具时（经验库没开），有人要沉淀或归档经验，直说现在做不了/);
 });
 
+test("存好了、同步到 aiops 之前有人在表格里清空了标题：再试一次不按卡片上的草稿同步，表格里补上以后再试才同步", async () => {
+  let down = true;
+  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+  });
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  backend.entries[0].title = "";
+  down = false;
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /经验 K1 在表格里标题是空的，没有同步到 aiops 经验库/);
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1, "没有按卡片上的草稿同步过去");
+  assert.equal(backend.entries.length, 1);
+
+  backend.entries[0].title = "gateway-api 报 code=8：user-rpc 只连一个 Pod";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  const saves = calls.filter((call) => call.tool === "save_lesson");
+  assert.equal(saves.length, 2);
+  assert.equal(saves[1].args.title, "gateway-api 报 code=8：user-rpc 只连一个 Pod");
+  assert.equal(backend.entries[0].aiopsId, 31);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+});
+
+test("aiops 已经存了、记编号没成功，再试一次前表格里清空了结论：归档 aiops 里上次那条，补上之前不再同步", async () => {
+  let next = 31;
+  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: next++ }) });
+  await tool("knowledge_propose").run(code8, { signal });
+  backend.failUpdates = 99;
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  backend.failUpdates = 0;
+  backend.entries[0].conclusion = "";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.deepEqual(
+    calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args.id),
+    [31],
+  );
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1);
+  assert.match(cardText(lastCard()), /上次同步到 aiops 的经验 #31 已经不对了，已归档/);
+  assert.match(cardText(lastCard()), /经验 K1 在表格里结论是空的，没有同步到 aiops 经验库/);
+});
+
+test("归档、取代卡片发出后有人在表格里改了那一条：点确认时卡片作废，不归档改过的，也不存取代它的", async () => {
+  const archiving = deskSetup();
+  await archiving.base.save(normalizeDraft(dau));
+  await archiving.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  archiving.backend.entries[0].conclusion = "改过的口径：以登录日志去重为准";
+  await archiving.desk.handleCardAction(archiving.click((archiving.sent[0].input as { card: any }).card, "archive"));
+  await archiving.desk.idle();
+  assert.equal(archiving.backend.entries[0].status, "active");
+  assert.match(cardText(archiving.lastCard()), /经验 K1 在卡片发出后在表格里改过/);
+
+  const replacing = deskSetup();
+  await replacing.base.save(normalizeDraft(dau));
+  await replacing.tool("knowledge_propose").run({ ...dau, title: "日活的口径（新）", replaces: "K1" }, { signal });
+  replacing.backend.entries[0].keywords = "日活,DAU,活跃用户";
+  await replacing.desk.handleCardAction(replacing.click((replacing.sent[0].input as { card: any }).card, "save"));
+  await replacing.desk.idle();
+  assert.equal(replacing.backend.entries.length, 1);
+  assert.equal(replacing.backend.entries[0].status, "active");
+  assert.match(cardText(replacing.lastCard()), /经验 K1 在卡片发出后在表格里改过/);
+});
+
 test("有人直接在表格里写进了密钥：这一行不拿来检索、不给模型看，也不能起草归档卡片；编号照常算它", async () => {
   const { base, backend } = deskSetup();
   await base.save(normalizeDraft(dau));
   await base.save(normalizeDraft({ ...dau, title: "日活的口径（App 端）", keywords: "日活,App" }));
   // 表格里直接改的：结论后面贴了令牌
   backend.entries[1].conclusion += ["\nMCP_AIOPS_TOKEN=my correct", "horse battery staple"].join(" ");
+  // 另一行的处理办法里贴了带密码的命令
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（小程序）", keywords: "日活,小程序" }));
+  backend.entries[2].handling = ["deployctl --password", "correcthorsebatterystaple"].join(" ");
   const fresh = new KnowledgeBase(backend, { logger: quiet });
   const hits = await fresh.search("日活");
   assert.deepEqual(
@@ -1534,10 +1661,11 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   );
   const desk = deskSetup();
   desk.backend.entries = structuredClone(backend.entries);
-  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|horse/);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|horse/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里被改过，结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /结论里像是有密码或令牌/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K3" }, { signal }), /经验 K3 在表格里被改过，怎么处理里像是有密码或令牌/);
   assert.equal(desk.sent.length, 0);
-  // 新存的不会占掉 K2
-  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K3");
+  // 新存的不会占掉 K2、K3
+  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K4");
 });

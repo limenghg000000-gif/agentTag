@@ -522,14 +522,21 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     const granted = parseShared(target.shared ?? []);
     const pending = new Set((target.pending ?? []).filter((key) => granted.has(key)));
     let changed = false;
+    // 写进数据目录成功了才改内存里的记录：没写进去的话内存里还是上次写下的样子，同一次启动里再调整时照样先记再动
     const persist = async () => {
-      target.shared = [...granted.values()].map(({ member, perm }) => `${member.type}:${member.id}:${perm}`);
+      const next: BitableState = { ...target, shared: [...granted.values()].map(({ member, perm }) => `${member.type}:${member.id}:${perm}`) };
       if (pending.size > 0) {
-        target.pending = [...pending];
+        next.pending = [...pending];
+      } else {
+        delete next.pending;
+      }
+      await this.writeState(next);
+      target.shared = next.shared;
+      if (next.pending) {
+        target.pending = next.pending;
       } else {
         delete target.pending;
       }
-      await this.writeState(target);
     };
     // 每一步各要一个应用权限，失败时把要的权限名写进警告。rejected：飞书明确拒绝了（带错误码），不是结果不明
     const attempt = async (what: string, scope: string, run: () => Promise<void>): Promise<{ ok: boolean; rejected?: boolean }> => {
@@ -706,12 +713,15 @@ function toFields(entry: KnowledgeEntry): Record<string, unknown> {
   return fields;
 }
 
-/** 表格里的一行 → 一条经验。没有标题或结论的行（空行、写到一半的）跳过 */
+/**
+ * 表格里的一行 → 一条经验。空行跳过；缺了标题或结论的（写到一半、有人清空了）照样返回，
+ * 编号和草稿编号还要算它（不然新存的会占它的编号，再试一次的卡片认不出已经存过），检索时由经验库跳过
+ */
 function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefined {
   const text = (name: string) => textOf(fields[name]);
-  const title = text(FIELDS.title);
-  const conclusion = text(FIELDS.conclusion);
-  if (!title || !conclusion) {
+  const title = text(FIELDS.title) ?? "";
+  const conclusion = text(FIELDS.conclusion) ?? "";
+  if (!title && !conclusion && !text(FIELDS.id) && !text(FIELDS.requestId)) {
     return undefined;
   }
   const categoryLabel = text(FIELDS.category);

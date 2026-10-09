@@ -92,6 +92,8 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   updatedAt?: string;
   /** 有人直接在表格里写进了像密钥的东西（哪一项里像是有什么）：不拿来检索，也不给模型看 */
   unsafe?: string;
+  /** 表格里这一行缺了标题或结论（写到一半、有人清空了）：编号、去重照常算它，不拿来检索，也不拿它同步、归档 */
+  incomplete?: string;
 }
 
 export interface KnowledgeMeta {
@@ -102,6 +104,11 @@ export interface KnowledgeMeta {
   requestId?: string;
   /** 要取代的旧经验编号：存之前确认它还有效，免得两张卡片各存一条新的去取代同一条 */
   replaces?: string;
+  /**
+   * 卡片上给大家看的那一条（要归档的、要取代的）：确认时表格里的这一行和它不一样了（卡片发出后有人在表格里改过），
+   * 大家确认的就不是现在这条，卡片作废
+   */
+  seen?: KnowledgeEntry;
 }
 
 export interface SearchOptions {
@@ -170,8 +177,8 @@ export class KnowledgeBase {
   private readonly cacheMs: number;
   private readonly readTimeoutMs: number;
   private cached?: { at: number; entries: Promise<KnowledgeEntry[]> };
-  /** 写进了密钥、已经警告过的经验编号（每条只警告一次） */
-  private readonly warnedUnsafe = new Set<string>();
+  /** 已经警告过的表格行（编号加上缺了什么、哪里像有密钥），同一个问题只警告一次 */
+  private readonly warned = new Set<string>();
   private readonly vectors = new Map<string, number[]>();
   private embedFailedAt?: number;
   private lock: Promise<unknown> = Promise.resolve();
@@ -208,12 +215,12 @@ export class KnowledgeBase {
 
   /**
    * 读整张表，超过 readTimeoutMs 就不等了、报错（还在读的那次回来了也不用）。
-   * 表格能直接改，有人写进了密钥的行记下来（unsafe）：编号、去重照常算它，检索、给模型看时跳过
+   * 表格能直接改：缺了标题或结论的行（incomplete）、有人写进了密钥的行（unsafe）记下来，编号、去重照常算它们，检索、给模型看时跳过
    */
   private read(): Promise<KnowledgeEntry[]> {
     const timeout = timeoutSignal(this.readTimeoutMs);
     const reading = raceAbort(this.backend.list(), timeout.signal).then(
-      (entries) => entries.map((entry) => this.checkSecrets(entry)),
+      (entries) => entries.map((entry) => this.checkRow(entry)),
       (err: unknown) => {
         throw isTimeout(err) ? new KnowledgeError(`读经验库表格超过 ${this.readTimeoutMs / 1000} 秒没读完，这次没读到`) : err;
       },
@@ -222,16 +229,19 @@ export class KnowledgeBase {
     return reading;
   }
 
-  private checkSecrets(entry: KnowledgeEntry): KnowledgeEntry {
+  private checkRow(entry: KnowledgeEntry): KnowledgeEntry {
+    const missing = [entry.title ? "" : "标题", entry.conclusion ? "" : "结论"].filter(Boolean);
+    const incomplete = missing.length > 0 ? `${missing.join("、")}是空的` : undefined;
     const unsafe = entrySecret(entry);
-    if (!unsafe) {
+    const warning = [incomplete && `${incomplete}，请在表格里补上`, unsafe && `${unsafe}，请在表格里删掉`].filter(Boolean).join("；");
+    if (!warning) {
       return entry;
     }
-    if (!this.warnedUnsafe.has(entry.id)) {
-      this.warnedUnsafe.add(entry.id);
-      this.logger.warn(`经验库：表格里 ${entry.id} 的${unsafe}，不拿来检索、也不给模型看，请在表格里删掉`);
+    if (!this.warned.has(`${entry.id}\n${warning}`)) {
+      this.warned.add(`${entry.id}\n${warning}`);
+      this.logger.warn(`经验库：表格里 ${entry.id} 的${warning}。这一行先不拿来检索、也不给模型看`);
     }
-    return { ...entry, unsafe };
+    return { ...entry, ...(incomplete ? { incomplete } : {}), ...(unsafe ? { unsafe } : {}) };
   }
 
   async get(id: string): Promise<KnowledgeEntry | undefined> {
@@ -246,7 +256,7 @@ export class KnowledgeBase {
       return [];
     }
     const candidates = (await this.entries()).filter(
-      (entry) => !entry.unsafe && (includeArchived || entry.status === "active") && (!category || entry.category === category),
+      (entry) => usable(entry) && (includeArchived || entry.status === "active") && (!category || entry.category === category),
     );
     if (candidates.length === 0) {
       return [];
@@ -293,6 +303,7 @@ export class KnowledgeBase {
             `经验 ${old.id} 已经有取代它的新经验 ${successor.id}「${successor.title}」，只是旧的还没归档，这张卡片不能再保存。要改的话请在 ${successor.id} 的基础上重新起草，或者直接归档 ${old.id}`,
           );
         }
+        checkSeen(old, meta.seen);
         replaces = old.id;
       }
       const next = Math.max(0, ...entries.map((entry) => numberOf(entry.id))) + 1;
@@ -328,6 +339,7 @@ export class KnowledgeBase {
         this.logger.info(`经验库 归档 ${entry.id}：已经是归档状态，不用再改`);
         return entry;
       }
+      checkSeen(entry, meta.seen);
       await this.backend.update(entry.id, { status: "archived" });
       this.cached = undefined;
       this.logger.info(`经验库 归档 ${entry.id} 确认人=${meta.confirmedBy ?? "未知"}`);
@@ -489,9 +501,12 @@ const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|priva
 const BEFORE_VALUE = String.raw`[^\S\r\n]*`;
 /** 名字和值之间：名字可以带引号（{"password": …}），等号、冒号、=>（PHP 数组）都算 */
 const ASSIGN = String.raw`["']?[^\S\r\n]*(?:=>|[:=：])${BEFORE_VALUE}`;
-/** 引号里的一整段值，中间有空格的口令也是一整段（"correct horse battery staple"）；里面有中文的是说明，有 * 的是打了码的，不算 */
+/**
+ * 引号里的一整段值，中间有空格的口令也是一整段（"correct horse battery staple"），转义的引号（"ab\"cd…"）不算结束；
+ * 里面有中文的是说明，有 * 的是打了码的，不算
+ */
 const quotedValue = (min: number) =>
-  String.raw`"([^"\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{${min},})"|'([^'\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{${min},})'`;
+  String.raw`"((?:[^"\\\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\[^\n]){${min},})"|'((?:[^'\\\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\[^\n]){${min},})'`;
 
 /**
  * 经验库所有群都能看，排查经验还会同步给 aiops 的告警自动排查，所以明显的密钥、密码不让存。
@@ -583,6 +598,17 @@ function blockValues(text: string): string[] {
     return value.length >= 8 && !value.includes("*") ? [value] : [];
   });
 }
+/**
+ * 命令行里写在密钥选项后面、隔着空格的值：deployctl --password correcthorsebatterystaple、--api-key "…"、Go 的 -token …；
+ * 也算 exec 数组（["deployctl", "--token", "…"]）和 YAML 的 args 列表（- --token 下一行 - …）。
+ * 选项名要以密钥的词结尾（--password-stdin、--token-file 不算）；值以 - 开头的是下一个选项（--no-password --verbose）
+ */
+const CLI_OPTION = new RegExp(
+  String.raw`(?<![\w.-])--?${CONFIG_KEY}(?:["']?[ \t]+|["'][ \t]*,[ \t]*|["']?[ \t]*\r?\n[ \t]*-[ \t]+)(?:${quotedValue(6)}|(?![-"'])(${VALUE_CHAR}{6,})${VALUE_END})`,
+  "gi",
+);
+/** 选项后面是 name=… 的（docker build --secret id=npmrc,src=…）是另一个赋值，里面的密钥由别的规则拦；base64 结尾补的 = 不算 */
+const OPTION_SPEC = /^[A-Za-z_][\w.-]*=(?!=|$)/;
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
 const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
 /**
@@ -590,7 +616,7 @@ const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRE
  * 夹着别的词的照样算（prod-secret-abcdefghijkl、my correct horse battery staple）
  */
 const PLACEHOLDER_WORD =
-  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|placeholder|is|are|was|were|be|been|has|have|had|do|does|did|no|cannot|can|could|the|a|an|of|for|to|from|in|on|with|by|and|or|please|again|login|relogin|retry|provided|given|received|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
+  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|placeholder|is|are|was|were|be|been|has|have|had|do|does|did|no|cannot|can|could|the|a|an|of|for|to|from|in|on|with|by|and|or|please|again|login|relogin|retry|provided|given|received|options?|arguments?|args?|parameters?|params?|flags?|switch|instead|prompts?|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
 /** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
 const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
 /** 整个值是 a.b.c 这样的属性引用 */
@@ -602,6 +628,10 @@ function isPlaceholder(raw: string): boolean {
   const value = raw.replace(/[.!?:]+$/, "");
   // 地址里带的密码、查询参数里的 token=… 由别的规则拦；变量引用（$NAME、${NAME}）、尖括号占位（<your-token>）、模板（{{ .Values.token }}）
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\$?\{\{.*\}\}$/.test(value)) {
+    return true;
+  }
+  // 家目录、当前目录、变量开头的文件路径（--private-key ~/.ssh/deploy.pem、$HOME/.npmrc）：说的是值放在哪个文件
+  if (/^(?:~|\.{1,2}|\$\{?[A-Za-z_]\w*\}?)\/\S*$/.test(value)) {
     return true;
   }
   const last = value.slice(value.lastIndexOf(".") + 1);
@@ -632,6 +662,7 @@ function findSecret(text: string): string | undefined {
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
     ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
     ...blockValues(text),
+    ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) => (bare !== undefined && OPTION_SPEC.test(bare) ? [] : [double ?? single ?? bare])),
   ];
   return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }
@@ -728,6 +759,24 @@ export function draftOf(entry: KnowledgeEntry): KnowledgeDraft {
     error_codes: entry.errorCodes,
     alertname: entry.alertname,
   });
+}
+
+/** 卡片发出后表格里这一行改过（或者缺了标题、结论，被写进了密钥）：卡片上的已经不是现在这条，作废 */
+function checkSeen(entry: KnowledgeEntry, seen: KnowledgeEntry | undefined): void {
+  if (seen && (!usable(entry) || !sameContent(entry, seen))) {
+    throw new StaleProposalError(`经验 ${entry.id} 在卡片发出后在表格里改过，卡片上的已经不是现在这条，这张卡片不能再用。需要的话请按现在的内容重新起草`);
+  }
+}
+
+/** 这一行能拿来检索、给模型看、起草卡片：没缺标题或结论，也没被写进密钥 */
+export function usable(entry: KnowledgeEntry): boolean {
+  return !entry.unsafe && !entry.incomplete;
+}
+
+/** 卡片上给大家看的那些内容（类别、标题、问题、结论这些）和表格里现在的一样不一样；aiops 编号、状态不算 */
+export function sameContent(a: KnowledgeEntry, b: KnowledgeEntry): boolean {
+  const keys = ["category", "title", "scope", "question", "conclusion", "handling", "basis", "keywords", "errorCodes", "alertname"] as const;
+  return keys.every((key) => (a[key] ?? "") === (b[key] ?? ""));
 }
 
 const DATE_FORMAT = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "numeric", day: "numeric" });

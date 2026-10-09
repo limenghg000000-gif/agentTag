@@ -16,6 +16,7 @@ import {
   normalizeDraft,
   renderHitsForPrompt,
   StaleProposalError,
+  usable,
 } from "../knowledge.js";
 import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, renderAiopsHitsForPrompt } from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
@@ -285,8 +286,8 @@ export class KnowledgeDesk {
         if (!entry) {
           throw new KnowledgeError(`团队经验库里没有 ${String(args.id ?? "")}`);
         }
-        if (entry.unsafe) {
-          throw new KnowledgeError(unsafeNote(entry));
+        if (!usable(entry)) {
+          throw new KnowledgeError(unusableNote(entry));
         }
         const location = await raceAbort(base.location(), signal).catch(() => undefined);
         signal.throwIfAborted();
@@ -511,11 +512,11 @@ export class KnowledgeDesk {
       confirmedBy,
       source: `飞书群 ${proposal.chatId} 的话题（消息 ${proposal.sourceMessageId}）`,
       requestId: proposal.requestId,
-      ...(proposal.replaces ? { replaces: proposal.replaces.id } : {}),
+      ...(proposal.replaces ? { replaces: proposal.replaces.id, seen: proposal.replaces } : {}),
     });
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号
     const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
-    const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
+    const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title || draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
     // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "archive";
     if (replaced) {
@@ -545,6 +546,11 @@ export class KnowledgeDesk {
       if (skip) {
         out.done.push(`${skip}，没有同步到 aiops 经验库。`);
         return "keep";
+      }
+      // 再试一次前有人在表格里清空了标题、结论，或者写进了密钥：不按卡片上的草稿同步，等表格里改好了再试
+      if (!usable(entry)) {
+        out.unfinished.push(`经验 ${entry.id} 在表格里${entry.incomplete ?? entry.unsafe}，没有同步到 aiops 经验库。请在表格里改好后再点「再试一次」`);
+        return "keep-until-synced";
       }
       try {
         proposal.synced = await this.saveLesson(proposal, entry, replacedLesson, confirmedBy, task);
@@ -584,7 +590,8 @@ export class KnowledgeDesk {
     task: McpTaskContext,
     out: Outcome,
   ): Promise<boolean> {
-    const changed = this.rowChange(entry) ?? (JSON.stringify(draftOf(entry)) === JSON.stringify(proposal.syncedDraft) ? undefined : `经验 ${entry.id} 在表格里改过`);
+    const current = rowDraft(entry);
+    const changed = this.rowChange(entry) ?? (current && JSON.stringify(current) === JSON.stringify(proposal.syncedDraft) ? undefined : `经验 ${entry.id} 在表格里改过`);
     if (!changed) {
       return true;
     }
@@ -673,7 +680,7 @@ export class KnowledgeDesk {
       };
     }
     // 用归档时表格里的样子：卡片发出后可能有人在表格里改过 aiops 编号
-    const entry = await this.options.base.archive(target.entry.id, { confirmedBy });
+    const entry = await this.options.base.archive(target.entry.id, { confirmedBy, seen: target.entry });
     const out: Outcome = { done: [`已归档经验 ${entry.id}「${entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`], unfinished: [] };
     if (entry.aiopsId !== undefined) {
       await this.archiveLinked(entry.aiopsId, confirmedBy, task, out);
@@ -745,8 +752,8 @@ export class KnowledgeDesk {
       throw new KnowledgeError(`经验 ${entry.id} 已经归档了`);
     }
     // 卡片上会列出它的内容，群里人人都看得到
-    if (entry.unsafe) {
-      throw new KnowledgeError(unsafeNote(entry));
+    if (!usable(entry)) {
+      throw new KnowledgeError(unusableNote(entry));
     }
     return entry;
   }
@@ -847,11 +854,10 @@ export class KnowledgeDesk {
       old.result = ["已换成新的草稿，以下面的卡片为准"];
       this.proposals.delete(old.id);
     }
-    // 先登记新卡片再去改旧卡片：改卡片要调接口，这期间点新卡片也认
+    // 先登记新卡片再去改旧卡片：改卡片要调接口，这期间点新卡片也认。
+    // 旧卡片在后台改，不等：等的时候这个话题里排在后面的草稿开始不了，新卡片没被它拦着，被点了确认的话两条都会存
     this.proposals.set(proposal.id, proposal);
-    for (const old of replaced) {
-      await this.render(old);
-    }
+    void Promise.all(replaced.map((old) => this.render(old))).catch((err: unknown) => this.logger.warn("更新经验库旧卡片失败", err));
     this.logger.info(
       `经验库卡片 发出 proposal=${proposal.id} ${proposal.kind === "save" ? `保存「${proposal.draft.title}」` : `归档 ${targetLabel(proposal.target)}`} ` +
         `chat=${ctx.chatId} sender=${ctx.senderId} message=${ctx.messageId}`,
@@ -1063,7 +1069,22 @@ function lacksToolsNote(aiops: AiopsLessons): string {
   return `aiops 少了同步、归档经验要用的工具（${aiops.missingWriteTools.join("、")}）`;
 }
 
-/** 表格里有人写进了密钥的那一条：不给模型看，让人去表格里删 */
-function unsafeNote(entry: KnowledgeEntry): string {
-  return `经验 ${entry.id} 在表格里被改过，${entry.unsafe}，先不给你看。请群里有写权限的人直接在经验库表格里删掉密钥，回答里不要猜它的内容`;
+/** 表格里这一行现在的内容，按起草的规则检查过的；缺了必填的、太长的、写进了密钥的返回 undefined */
+function rowDraft(entry: KnowledgeEntry): KnowledgeDraft | undefined {
+  if (!usable(entry)) {
+    return undefined;
+  }
+  try {
+    return draftOf(entry);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 表格里有人写进了密钥、缺了标题或结论的那一条：不给模型看，让人去表格里改 */
+function unusableNote(entry: KnowledgeEntry): string {
+  if (entry.unsafe) {
+    return `经验 ${entry.id} 在表格里被改过，${entry.unsafe}，先不给你看。请群里有写权限的人直接在经验库表格里删掉密钥，回答里不要猜它的内容`;
+  }
+  return `经验 ${entry.id} 在表格里${entry.incomplete}，先不用它。请群里有写权限的人在经验库表格里补上`;
 }

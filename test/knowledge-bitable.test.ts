@@ -321,17 +321,22 @@ test("撤权限前也先记成不确定：撤掉了但结果没传回来、以�
   assert.equal(state.pending, undefined);
 });
 
-test("撤权限前没能记进数据目录时先不撤，下次记得下了再撤", async () => {
+test("撤权限、加协作者前没能记进数据目录时先不动，同一次启动再调整也不动；下次记得下了再撤", async () => {
   const stateFile = path.join(dir, "journal-remove-fail", "bitable.json");
-  const { api, calls } = fakeBitable();
+  const { api, calls, shared } = fakeBitable();
   await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
   // 数据目录写不进去：临时文件的位置被一个目录占了
   await mkdir(`${stateFile}.tmp`);
   const warnings: string[] = [];
   const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
-  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }).syncSharing();
+  const blocked = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: [] }, logger });
+  await blocked.syncSharing();
+  // 同一次启动里再调整一次（比如有人保存经验）：没写进去的记录不能留在内存里当成已经记下了
+  await blocked.syncSharing();
   assert.equal(calls.filter((call) => call.startsWith("remove")).length, 0, "没记下来就不撤");
+  assert.equal(shared.filter(([member]) => member.id === "oc_2").length, 0, "没记下来就不加");
   assert.match(warnings.join("\n"), /撤 ou_old 的权限之前没能记进数据目录，这次先不撤/);
+  assert.match(warnings.join("\n"), /没能先把 oc_2 记进数据目录，这次先不共享给它/);
 
   await rm(`${stateFile}.tmp`, { recursive: true });
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
@@ -359,6 +364,24 @@ test("保存时把草稿编号带给飞书（client_token）并写进表格；�
   assert.deepEqual(tokens, [requestId]);
   assert.equal(tables.get("tblX")!.records[0].fields["草稿编号"], requestId);
   assert.equal((await backend.list())[0].requestId, requestId);
+});
+
+test("存好以后有人在表格里清空了标题或结论：再试一次照样认出存过，返回表格里这一行，不按卡片上的草稿另算；新存的不占它的编号", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "blanked.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] } });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const requestId = "5b1d7c2e-3f4a-4c6b-8d9e-0a1b2c3d4e5f";
+  assert.equal((await base.save(dau, { requestId })).id, "K1");
+  const fields = tables.get("tblX")!.records[0].fields;
+  fields["标题"] = "";
+  const retried = await base.save(dau, { requestId });
+  assert.equal(retried.id, "K1");
+  assert.equal(retried.title, "", "返回的是表格里现在的样子");
+  assert.equal(retried.incomplete, "标题是空的");
+  assert.equal(tables.get("tblX")!.records.length, 1);
+  assert.deepEqual(await base.search("日活"), []);
+  assert.equal((await base.save({ ...dau, title: "周活的口径" })).id, "K2");
 });
 
 test("取代旧经验的那条在表格里记下取代的编号，读回来也有", async () => {
@@ -415,7 +438,7 @@ test("KNOWLEDGE_BITABLE 指定的表缺列时，第一次写之前补上；已�
   assert.equal(calls.filter((c) => c.startsWith("createField")).length, created.length);
 });
 
-test("表格里有人手动加的行：文本列是分段数组也能读，没编号的用行号，没有标题或结论的跳过；类别认不出算其他", async () => {
+test("表格里有人手动加的行：文本列是分段数组也能读，没编号的用行号，空行跳过，没有标题或结论的读出来但不拿来检索；类别认不出算其他", async () => {
   const { api, tables } = fakeBitable();
   tables.set("tblX", {
     fields: [],
@@ -423,6 +446,7 @@ test("表格里有人手动加的行：文本列是分段数组也能读，没�
       { recordId: "recA", fields: { 标题: [{ type: "text", text: "退款" }, { type: "text", text: "多久到账" }], 结论: "3 个工作日", 类别: "常见问题" } },
       { recordId: "recB", fields: { 标题: "写到一半" } },
       { recordId: "recC", fields: { 标题: "已归档的", 结论: "旧的", 状态: "已归档", 编号: "K5" } },
+      { recordId: "recD", fields: {} },
     ],
   });
   const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "manual.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] } });
@@ -431,11 +455,18 @@ test("表格里有人手动加的行：文本列是分段数组也能读，没�
     entries.map((e) => [e.id, e.title, e.category, e.status]),
     [
       ["recA", "退款多久到账", "other", "active"],
+      ["recB", "写到一半", "other", "active"],
       ["K5", "已归档的", "other", "archived"],
     ],
   );
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  assert.deepEqual(
+    (await base.search("写到一半")).map((hit) => hit.entry.id),
+    [],
+  );
+  assert.equal((await base.get("recB"))?.incomplete, "结论是空的");
   // 编号接着表里最大的 K 编号往后排
-  assert.equal((await new KnowledgeBase(backend, { logger: quiet }).save(dau)).id, "K6");
+  assert.equal((await base.save(dau)).id, "K6");
 });
 
 test("表格里 aiops 经验编号写得不对（不是整个正整数）时当成没填，免得归档 aiops 里别的经验", async () => {
