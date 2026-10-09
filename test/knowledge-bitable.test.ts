@@ -60,6 +60,12 @@ function fakeBitable() {
       }
       shared.push([member, perm]);
     },
+    async updateCollaborator(_app, member, perm) {
+      calls.push(`update ${member.id} ${perm}`);
+    },
+    async removeCollaborator(_app, member) {
+      calls.push(`remove ${member.id}`);
+    },
     async getUrl() {
       return undefined;
     },
@@ -167,6 +173,32 @@ test("共享失败的下次保存时再试，后来加进白名单的群也补�
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:full_access", "openchat:oc_1:view", "openchat:oc_2:view"]);
   await new KnowledgeBase(again, { logger: quiet }).save(dau);
   assert.equal(shared.length, 3, "都共享过了就不再调");
+});
+
+test("共享跟着名单走：启动时把移出白名单的群、移出写权限名单的人的权限撤掉，权限变了的改掉；用 KNOWLEDGE_BITABLE 指定的表时不动", async () => {
+  const stateFile = path.join(dir, "revoke", "bitable.json");
+  const { api, calls } = fakeBitable();
+  const first = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: ["ou_admin", "ou_old"] }, logger: quiet });
+  await new KnowledgeBase(first, { logger: quiet }).save(dau);
+
+  // 重启：oc_2 和 ou_old 移出了名单；写权限名单清空后群改成可编辑
+  const restarted = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [], chatPerm: "edit" }, logger: quiet });
+  await restarted.syncSharing();
+  assert.deepEqual(calls.slice(3), ["update oc_1 edit", "remove oc_2", "remove ou_admin", "remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:edit"]);
+  await restarted.syncSharing();
+  assert.equal(calls.length, 7, "名单没变就不再调");
+
+  const target = fakeBitable();
+  const fixed = new BitableKnowledgeBackend({
+    api: target.api,
+    stateFile: path.join(dir, "fixed-sync", "bitable.json"),
+    target: { appToken: "appX", tableId: "tblX" },
+    share: { chatIds: ["oc_1"], editors: [] },
+    logger: quiet,
+  });
+  await fixed.syncSharing();
+  assert.equal(target.calls.length, 0);
 });
 
 test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {

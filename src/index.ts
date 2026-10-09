@@ -66,19 +66,22 @@ const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefin
 const mcp = config.mcp.length > 0 ? new McpHub(config.mcp) : undefined;
 void mcp?.start();
 // 团队经验库存在飞书多维表格里：回答前先查，起草后发确认卡片，写权限名单里的人点了才写；排查经验同步一份到 aiops 经验库
+const knowledgeTable = config.knowledge
+  ? new BitableKnowledgeBackend({
+      api: createBitableApi(channel.rawClient),
+      stateFile: config.knowledge.stateFile,
+      ...(config.knowledge.bitable ? { target: config.knowledge.bitable } : {}),
+      share: {
+        chatIds: [...config.feishu.allowedChatIds],
+        editors: [...(config.feishu.writeAllowedUsers ?? [])],
+        chatPerm: config.feishu.writeAllowedUsers ? "view" : "edit",
+      },
+    })
+  : undefined;
 const knowledge = config.knowledge
   ? new KnowledgeDesk({
       base: new KnowledgeBase(
-        new BitableKnowledgeBackend({
-          api: createBitableApi(channel.rawClient),
-          stateFile: config.knowledge.stateFile,
-          ...(config.knowledge.bitable ? { target: config.knowledge.bitable } : {}),
-          share: {
-            chatIds: [...config.feishu.allowedChatIds],
-            editors: [...(config.feishu.writeAllowedUsers ?? [])],
-            chatPerm: config.feishu.writeAllowedUsers ? "view" : "edit",
-          },
-        }),
+        knowledgeTable!,
         config.knowledge.embeddingModel
           ? { embedder: createOpenAICompatibleEmbedder({ baseURL: config.llm.baseURL, apiKey: config.llm.apiKey, model: config.knowledge.embeddingModel }) }
           : {},
@@ -195,6 +198,8 @@ if (mcp) {
   console.log(`MCP 服务：${mcp.names.join(", ")}，在后台连接，连上后日志里有一行「MCP <名字>：已连上」`);
 }
 if (config.knowledge) {
+  // 机器人建的表按现在的白名单群和写权限名单调整共享（移出名单的撤掉权限），在后台做
+  void knowledgeTable?.syncSharing().catch((err: unknown) => console.warn("经验库：调整多维表格的共享失败", err));
   console.log(
     `团队经验库：存在飞书多维表格里（${config.knowledge.bitable?.url ?? "第一次保存经验时机器人自己建表"}），每个提问回答前先查一次` +
       `（${config.knowledge.embeddingModel ? `关键词加向量模型 ${config.knowledge.embeddingModel}` : "只按关键词"}）；` +

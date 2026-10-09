@@ -58,6 +58,7 @@ export interface BitableRecord {
 }
 
 export type BitableMember = { type: "openchat" | "openid"; id: string };
+export type BitablePerm = "view" | "edit" | "full_access";
 
 /** 用到的多维表格接口，测试时换成假的 */
 export interface BitableApi {
@@ -68,7 +69,9 @@ export interface BitableApi {
   /** clientToken（UUID）相同的请求飞书只建一行，结果没传回来时可以放心重试 */
   createRecord(appToken: string, tableId: string, fields: Record<string, unknown>, clientToken?: string): Promise<string>;
   updateRecord(appToken: string, tableId: string, recordId: string, fields: Record<string, unknown>): Promise<void>;
-  addCollaborator(appToken: string, member: BitableMember, perm: "view" | "edit" | "full_access"): Promise<void>;
+  addCollaborator(appToken: string, member: BitableMember, perm: BitablePerm): Promise<void>;
+  updateCollaborator(appToken: string, member: BitableMember, perm: BitablePerm): Promise<void>;
+  removeCollaborator(appToken: string, member: BitableMember): Promise<void>;
   getUrl(appToken: string): Promise<string | undefined>;
 }
 
@@ -148,7 +151,27 @@ export function createBitableApi(client: Client): BitableApi {
         client.drive.v1.permissionMember.create({
           path: { token: appToken },
           params: { type: "bitable", need_notification: false },
-          data: { member_type: member.type, member_id: member.id, perm, type: member.type === "openchat" ? "chat" : "user" },
+          data: { member_type: member.type, member_id: member.id, perm, type: memberKind(member) },
+        }),
+      );
+    },
+
+    async updateCollaborator(appToken, member, perm) {
+      await call(() =>
+        client.drive.v1.permissionMember.update({
+          path: { token: appToken, member_id: member.id },
+          params: { type: "bitable", need_notification: false },
+          data: { member_type: member.type, perm, type: memberKind(member) },
+        }),
+      );
+    },
+
+    async removeCollaborator(appToken, member) {
+      await call(() =>
+        client.drive.v1.permissionMember.delete({
+          path: { token: appToken, member_id: member.id },
+          params: { type: "bitable", member_type: member.type },
+          data: { type: memberKind(member) },
         }),
       );
     },
@@ -160,6 +183,10 @@ export function createBitableApi(client: Client): BitableApi {
       return data?.metas?.[0]?.url || undefined;
     },
   };
+}
+
+function memberKind(member: BitableMember): "chat" | "user" {
+  return member.type === "openchat" ? "chat" : "user";
 }
 
 /** 用哪张多维表格：KNOWLEDGE_BITABLE 里给的链接，或者机器人自己建的（记在数据目录里） */
@@ -204,19 +231,21 @@ export interface BitableBackendOptions {
 
 /** 机器人自己建的表记在数据目录里：表在哪，已经共享给了谁 */
 interface BitableState extends BitableTarget {
-  /** 共享成功的「类型:id:权限」 */
+  /** 机器人共享出去的「类型:id:权限」。只管这些：别人在飞书里手动加的协作者不动 */
   shared?: string[];
 }
 
 /**
  * 经验存在飞书多维表格里：大家在飞书里能直接看、筛选和修改，机器人每分钟重新读一次。
  * 没指定表时，第一次保存经验时机器人自己建一张，共享给白名单群（只读）和写权限名单里的人（可管理）。
- * 共享没成功的（比如还没开通权限）、后来加进白名单的群，下次保存经验时再共享。
+ * 共享跟着白名单群和写权限名单走：启动时和每次保存时补上没共享成的、改掉权限变了的、撤掉移出名单的。
  * 有人在表格里手动加的行没有编号时，用行的 record_id 当编号，照样能检索到
  */
 export class BitableKnowledgeBackend implements KnowledgeBackend {
   private target?: Promise<BitableState | undefined>;
   private creating?: Promise<BitableState>;
+  /** 调整共享排队进行（启动时和保存时可能同时来） */
+  private sharing: Promise<void> = Promise.resolve();
   /** 编号 → 行 id，update 时用 */
   private readonly rows = new Map<string, string>();
   private readonly logger: Logger;
@@ -275,6 +304,20 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     await this.explain(() => this.options.api.updateRecord(target.appToken, target.tableId, recordId, fields));
   }
 
+  /** 启动时调：机器人自己建的表按现在的名单调整共享。还没建表、用的是 KNOWLEDGE_BITABLE 指定的表时什么也不做 */
+  async syncSharing(): Promise<void> {
+    if (this.options.target) {
+      return;
+    }
+    const target = await this.current().catch((err: unknown) => {
+      this.logger.warn("经验库：读不出数据目录里记的多维表格，这次没调整共享", err);
+      return undefined;
+    });
+    if (target) {
+      await this.share(target);
+    }
+  }
+
   private current(): Promise<BitableState | undefined> {
     this.target ??= this.options.target ? Promise.resolve(this.options.target) : this.readState();
     return this.target;
@@ -322,36 +365,59 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     return target;
   }
 
+  /** 按名单调整共享，排队进行 */
+  private share(target: BitableState): Promise<void> {
+    const run = this.sharing.then(() => this.reconcile(target));
+    this.sharing = run.catch(() => {});
+    return run;
+  }
+
   /**
-   * 共享给白名单群（默认只读）和写权限名单里的人（可管理）。只做还没成功的：上次失败的、后来加进名单的。
-   * 共享失败不影响保存，记一条警告，下次保存时再试
+   * 白名单群（默认只读）和写权限名单里的人（可管理）要有的权限，和机器人已经共享出去的比：
+   * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
+   * 失败不影响保存，记一条警告，下次启动或保存时再试
    */
-  private async share(target: BitableState): Promise<void> {
+  private async reconcile(target: BitableState): Promise<void> {
     const { api, share } = this.options;
-    const wanted: [string, BitableMember, "view" | "edit" | "full_access"][] = [
-      ...share.chatIds.map((id): [string, BitableMember, "view" | "edit"] => [`openchat:${id}:${share.chatPerm ?? "view"}`, { type: "openchat", id }, share.chatPerm ?? "view"]),
-      ...share.editors.map((id): [string, BitableMember, "full_access"] => [`openid:${id}:full_access`, { type: "openid", id }, "full_access"]),
-    ];
-    const shared = new Set(target.shared ?? []);
-    const missing = wanted.filter(([key]) => !shared.has(key));
-    if (missing.length === 0) {
-      return;
-    }
+    const chatPerm = share.chatPerm ?? "view";
+    const wanted = new Map<string, [BitableMember, BitablePerm]>([
+      ...share.chatIds.map((id): [string, [BitableMember, BitablePerm]] => [`openchat:${id}`, [{ type: "openchat", id }, chatPerm]]),
+      ...share.editors.map((id): [string, [BitableMember, BitablePerm]] => [`openid:${id}`, [{ type: "openid", id }, "full_access"]]),
+    ]);
+    const granted = parseShared(target.shared ?? []);
     let changed = false;
-    for (const [key, member, perm] of missing) {
+    const attempt = async (what: string, run: () => Promise<void>): Promise<boolean> => {
       try {
-        await api.addCollaborator(target.appToken, member, perm);
-        shared.add(key);
+        await run();
         changed = true;
-        this.logger.info(`经验库：多维表格已共享给 ${member.id}（${PERM_LABELS[perm]}）`);
+        this.logger.info(`经验库：${what}`);
+        return true;
       } catch (err) {
         // 不用 describeBitableError：它把缺权限都说成缺 bitable:app，共享要的是另外的权限，原文里有权限名
-        this.logger.warn(`经验库：没能把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}），下次保存经验时再试：${err instanceof Error ? err.message : String(err)}`);
+        this.logger.warn(`经验库：没能${what}，下次启动或保存经验时再试：${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
+    };
+    for (const [key, [member, perm]] of wanted) {
+      const had = granted.get(key);
+      if (had?.perm === perm) {
+        continue;
+      }
+      const ok = had
+        ? await attempt(`把 ${member.id} 对多维表格的权限从${PERM_LABELS[had.perm]}改成${PERM_LABELS[perm]}`, () => api.updateCollaborator(target.appToken, member, perm))
+        : await attempt(`把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}）`, () => api.addCollaborator(target.appToken, member, perm));
+      if (ok) {
+        granted.set(key, { member, perm });
+      }
+    }
+    for (const [key, { member }] of [...granted]) {
+      if (!wanted.has(key) && (await attempt(`撤掉 ${member.id} 对多维表格的权限（已不在白名单群或写权限名单里）`, () => api.removeCollaborator(target.appToken, member)))) {
+        granted.delete(key);
       }
     }
     if (changed) {
-      target.shared = [...shared];
-      await this.writeState(target).catch((err: unknown) => this.logger.warn("经验库：共享结果没能记进数据目录，下次保存时会再共享一次", err));
+      target.shared = [...granted.values()].map(({ member, perm }) => `${member.type}:${member.id}:${perm}`);
+      await this.writeState(target).catch((err: unknown) => this.logger.warn("经验库：共享结果没能记进数据目录，下次会再调整一次", err));
     }
   }
 
@@ -472,6 +538,19 @@ function toEntry({ recordId, fields }: BitableRecord): KnowledgeEntry | undefine
     createdAt: createdAt ?? new Date(0).toISOString(),
     ...(updatedAt && updatedAt !== createdAt ? { updatedAt } : {}),
   };
+}
+
+/** 数据目录里记的「类型:id:权限」→ 成员和权限；认不出的跳过 */
+function parseShared(keys: readonly string[]): Map<string, { member: BitableMember; perm: BitablePerm }> {
+  const granted = new Map<string, { member: BitableMember; perm: BitablePerm }>();
+  for (const key of keys) {
+    const match = /^(openchat|openid):(.+):(view|edit|full_access)$/.exec(key);
+    if (match) {
+      const member: BitableMember = { type: match[1] as BitableMember["type"], id: match[2] };
+      granted.set(`${member.type}:${member.id}`, { member, perm: match[3] as BitablePerm });
+    }
+  }
+  return granted;
 }
 
 /** 文本列读出来可能是字符串，也可能是分段的数组（带链接、@ 人时）；单选是字符串 */
