@@ -247,6 +247,16 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "curl -s -u 'deploy:correct horse battery' https://api.example",
     "curl \\\n  -u admin:correcthorsebattery \\\n  https://api.example",
     "curl --proxy-user=proxy:correcthorse1 https://api.example",
+    // 短选项紧贴着写值的、和别的短选项并着写的、选项后面续行的
+    "curl -usvc:CorrectHorseBatteryStaple9 https://api.example/v1",
+    "curl -x http://proxy:3128 -Uproxy:correcthorse1 https://api.example",
+    "curl -sSLu 'deploy:correct horse battery' https://api.example",
+    "curl -u \\\n  admin:correcthorsebattery https://api.example",
+    // Docker、npm 配置里 base64 的「用户名:密码」，Yarn 的 npmAuthIdent，Kubernetes 镜像仓库 Secret 里整个编成 base64 的 config.json
+    `{"auths":{"registry.example.com":{"auth":"${Buffer.from(["deploy", "correcthorsebatterystaple"].join(":")).toString("base64")}"}}}`,
+    `//registry.npmjs.org/:_auth=${Buffer.from(["deploy", "correcthorsebatterystaple"].join(":")).toString("base64")}`,
+    'npmAuthIdent: "deploy:correcthorsebatterystaple"',
+    `.dockerconfigjson: ${Buffer.from(JSON.stringify({ auths: { "registry.example.com": { auth: Buffer.from(["deploy", "correcthorsebatterystaple"].join(":")).toString("base64") } } })).toString("base64")}`,
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -314,6 +324,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // curl 只写了用户名、密码是变量、占位、打码的；别的命令的 -u、--user
     'curl -u admin https://api.example；curl -u "$API_USER:$API_PASS" https://api.example；curl -u user:password https://api.example；curl -u admin:****** https://x',
     "docker run -u 1000:1000 nginx；sudo -u postgres psql；git push -u origin main；docker run --user deploy:deploygroup nginx",
+    "curl -uadmin https://api.example；curl -sSL https://api.example/v1/user:list；curl -H 'X-User: ops' -o user:report.json https://x",
+    // auth 配置项是空的、开关、变量的，Kubernetes Secret 里的 config.json 没带密码的
+    '{"auths":{"registry.example.com":{}}}；"auth": ""；auth: required；oauth: https://sso.example/login；_auth=${NPM_AUTH}；npmAuthIdent: "${NPM_USER}:${NPM_PASS}"',
+    `.dockerconfigjson: ${Buffer.from(JSON.stringify({ auths: { "registry.example.com": {} } })).toString("base64")}`,
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
     'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
@@ -1242,6 +1256,71 @@ test("同步到 aiops 时结果没传回来：再试一次先找到已经存进�
   assert.equal(backend.entries[0].aiopsId, 31);
   assert.equal(lastCard().header.title.content, "已存进经验库");
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已同步到 aiops 经验库（经验 #31）/);
+});
+
+test("同步到 aiops 时结果没传回来、再试时检索没排到存进去的那条：aiops 说重复的正是它（排查过程末尾是这一条的出处），记下它的编号，不当成别的相近经验", async () => {
+  let lose = true;
+  const stored = new Map<number, Record<string, unknown>>();
+  const { backend, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup({
+    saveLesson: (args) => {
+      if (lose) {
+        lose = false;
+        stored.set(31, args);
+        throw new Error("socket hang up");
+      }
+      return JSON.stringify({ saved: false, duplicate_of: { id: 31, title: String(args.title), why: "标题相同" } });
+    },
+    // aiops 检索只给前几条：存进去的那条没排进来
+    searchLessons: () => JSON.stringify({ hits: [{ id: 40, title: "Open WebUI 存的", score: 9 }] }),
+  });
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, status: "active", ...stored.get(Number(args.id)) });
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /没能同步到 aiops 经验库：socket hang up/);
+
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 2);
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.equal(backend.entries[0].aiopsId, 31);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  const result = (sent.at(-1)!.input as { markdown: string }).markdown;
+  assert.match(result, /已同步到 aiops 经验库（经验 #31）/);
+  assert.doesNotMatch(result, /相近的经验/);
+});
+
+test("aiops 说重复的那条是这一条上次同步过去的、内容却被改过（和发过去的都对不上）：归档它，按表格重新同步", async () => {
+  let lose = true;
+  let archived = false;
+  const stored = new Map<number, Record<string, unknown>>();
+  const { backend, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup({
+    saveLesson: (args) => {
+      if (lose) {
+        lose = false;
+        stored.set(31, { ...args, root_cause: "在 aiops 里被改过的根因" });
+        throw new Error("socket hang up");
+      }
+      return archived ? JSON.stringify({ saved: true, id: 32 }) : JSON.stringify({ saved: false, duplicate_of: { id: 31, title: String(args.title) } });
+    },
+    searchLessons: () => JSON.stringify({ hits: [] }),
+  });
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, status: archived ? "archived" : "active", ...stored.get(Number(args.id)) });
+  handlers.archive_lesson = () => {
+    archived = true;
+    return JSON.stringify({ archived: true });
+  };
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 3);
+  assert.equal(backend.entries[0].aiopsId, 32);
+  const result = (sent.at(-1)!.input as { markdown: string }).markdown;
+  assert.match(result, /aiops 里存的和经验 K1 在表格里的不一样，之前同步到 aiops 的经验 #31 已经不对了，已归档/);
+  assert.match(result, /已同步到 aiops 经验库（经验 #32）/);
 });
 
 test("同步到 aiops 没做成、有人在表格里改了这一行：改过的列在卡片上，写权限名单里的人核对后点再试一次才同步；改进去的密钥不带过去", async () => {
@@ -2294,4 +2373,46 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   assert.equal(desk.sent.length, 0);
   // 新存的不会占掉 K2 到 K8
   assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K9");
+});
+
+test("表格里不止一行用了同一个编号（有人复制了行）：这几行都不拿来检索、看全文、起草归档，新编号照常往后排", async () => {
+  const { base, backend, desk, sent, tool } = deskSetup({ aiops: false });
+  await base.save(normalizeDraft(dau));
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（App 端）", keywords: "日活,App" }));
+  // 有人复制了 K1 这一行、改了结论，编号没改（小写的也算同一个）
+  backend.entries.push({ ...structuredClone(backend.entries[0]), id: "k1", requestId: undefined, conclusion: "复制以后改过的日活结论" });
+  await base.entries(true);
+  assert.deepEqual(
+    (await base.search("日活")).map((hit) => hit.entry.id),
+    ["K2"],
+  );
+  assert.deepEqual((await desk.lookup("日活怎么算", task))?.ids, ["K2"]);
+  assert.doesNotMatch(await tool("knowledge_search").run({ query: "日活" }, { signal }), /K1|k1|复制以后/);
+  await assert.rejects(tool("knowledge_get").run({ id: "K1" }, { signal }), /经验 K1 在表格里和别的行用了同一个编号，分不清是哪一行/);
+  await assert.rejects(tool("knowledge_propose_archive").run({ id: "K1" }, { signal }), /和别的行用了同一个编号/);
+  assert.equal(sent.length, 0);
+  assert.equal((await base.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K3");
+  // 改掉重复的编号以后照常用
+  backend.entries[2].id = "K9";
+  await base.entries(true);
+  assert.deepEqual((await desk.lookup("日活怎么算", task))?.ids.sort(), ["K1", "K2", "K9"]);
+});
+
+test("aiops 里别处存的经验写进了密钥：回答前检索不给模型看，也不能起草归档卡片列出来", async () => {
+  const token = ["MCP_AIOPS_TOKEN", "correcthorsebatterystaple"].join("=");
+  const { desk, sent, tool, handlers } = deskSetup({
+    searchLessons: () =>
+      JSON.stringify({
+        hits: [
+          { id: 40, title: "Open WebUI 存的", score: 9, solution: `重启后配置 ${token}` },
+          { id: 41, title: "user-rpc 降载", score: 8, root_cause: "单 Pod 被打满" },
+        ],
+      }),
+  });
+  const found = await desk.lookup("gateway-api 报 code=8", task);
+  assert.deepEqual(found?.ids, ["aiops#41"]);
+  assert.doesNotMatch(found!.text, /correcthorse|#40/);
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", keywords: token });
+  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal }), /aiops 经验 #40 里像是写进了密钥，不能列在卡片上/);
+  assert.equal(sent.length, 0);
 });

@@ -94,6 +94,11 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   unsafe?: string;
   /** 表格里这一行缺了标题或结论（写到一半、有人清空了）：编号、去重照常算它，不拿来检索，也不拿它同步、归档 */
   incomplete?: string;
+  /**
+   * 表格里不止一行用了这个编号（有人复制了行、改错了编号）：说「经验 K3」时分不清是哪一行。
+   * 和 incomplete 一样编号照常算，这几行都不拿来检索、给模型看、同步、归档
+   */
+  conflict?: string;
 }
 
 export interface KnowledgeMeta {
@@ -224,7 +229,7 @@ export class KnowledgeBase {
   private read(): Promise<KnowledgeEntry[]> {
     const timeout = timeoutSignal(this.readTimeoutMs);
     const reading = raceAbort(this.backend.list(), timeout.signal).then(
-      (entries) => entries.map((entry) => this.checkRow(entry)),
+      (entries) => markConflicts(entries.map((entry) => this.checkRow(entry))),
       (err: unknown) => {
         throw isTimeout(err) ? new KnowledgeError(`读经验库表格超过 ${this.readTimeoutMs / 1000} 秒没读完，这次没读到`) : err;
       },
@@ -686,13 +691,18 @@ const CLI_OPTION = new RegExp(
 );
 /** 选项后面是 name=… 的（docker build --secret id=npmrc,src=…）是另一个赋值，里面的密钥由别的规则拦；base64 结尾补的 = 不算 */
 const OPTION_SPEC = /^[A-Za-z_][\w.-]*=(?!=|$)/;
+/** curl 里不带值、能和 -u 并着写的短选项（-s、-S、-L、-k、-v 这些） */
+const CURL_FLAGS = "[#0-46aBfgGhIijJklLMNnOpqRsSvVZ]*";
+/** 选项和值之间的空白，行尾 \ 续到下一行的也算 */
+const CURL_GAP = String.raw`[ \t]+|[ \t]*\\\r?\n[ \t]*`;
 /**
  * curl 的 -u、--user、-U、--proxy-user 后面写的「用户名:密码」（curl -u svc:… https://…，行尾 \ 续行的也算）：取冒号后面的密码。
+ * 短选项的值可以紧贴着写（-usvc:…、-Uproxy:…），前面也可以并着不带值的短选项（-sSu svc:…）。
  * 只认 curl 的：别的命令的 -u、--user 是用户名或者 uid:gid（docker run -u 1000:1000、sudo -u postgres）。
  * 只写了用户名的（curl -u admin，curl 会问密码）不算。第 1 组是双引号里的，第 2 组是单引号里的，第 3 组是没引号的
  */
 const CURL_USER = new RegExp(
-  String.raw`\bcurl\b(?:[^\n]|\\\r?\n)*?(?<![\w.-])(?:-u|--user|-U|--proxy-user)(?:[ \t]+|=)` +
+  String.raw`\bcurl\b(?:[^\n]|\\\r?\n)*?(?<![\w.-])(?:-${CURL_FLAGS}[uU](?:${CURL_GAP})?|--(?:proxy-)?user(?:${CURL_GAP}|=))` +
     String.raw`(?:"[^"\n:]*:([^"\n]*)"|'[^'\n:]*:([^'\n]*)'|[^\s"':]*:([^\s"']+))`,
   "g",
 );
@@ -749,6 +759,24 @@ const BASIC_AUTH = /\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})(?![\w+/=])/gi;
 /** 解出来是「用户名:密码」才算，「Basic configuration」这类英文解出来是乱码 */
 function isBasicCredential(value: string): boolean {
   return /^[^\x00-\x1f\x7f\ufffd:]+:[^\x00-\x1f\x7f\ufffd]+$/.test(Buffer.from(value, "base64").toString("utf8"));
+}
+
+/**
+ * 名字以 auth 结尾的配置项：Docker config.json 的 "auth"、.npmrc 的 _auth、basicAuth 这些，值是「用户名:密码」的 base64；
+ * Yarn 的 npmAuthIdent 也可以直接写「用户名:密码」。第 1 组是名字，第 2 组是值
+ */
+const AUTH_FIELD = new RegExp(String.raw`(?<![\w.-])["']?(\w*auth(?:[_-]?ident)?)${ASSIGN}["']?([^\s"',;，；]+)`, "gi");
+/** Kubernetes 镜像仓库的 Secret（.dockerconfigjson: …）：整个 config.json 编成了 base64，要解开再查 */
+const DOCKER_CONFIG = /\.docker(?:configjson|cfg)["']?[^\S\r\n]*[:=][^\S\r\n]*["']?([A-Za-z0-9+/]{16,}={0,2})(?![\w+/=])/gi;
+
+/** auth 配置项里写的是不是登录用的用户名和密码 */
+function isAuthCredential(name: string, value: string): boolean {
+  if (/^[A-Za-z0-9+/]{8,}={0,2}$/.test(value) && isBasicCredential(value)) {
+    return true;
+  }
+  // 直接写的「用户名:密码」只认 npmAuthIdent 这类：别的 auth 后面的冒号是地址（oauth: https://…）
+  const password = /ident$/i.test(name) ? /^[^:]+:(.{6,})$/.exec(value)?.[1] : undefined;
+  return password !== undefined && !isPlaceholder(password);
 }
 
 /**
@@ -869,6 +897,16 @@ function findSecret(text: string): string | undefined {
   }
   if ([...text.matchAll(BASIC_AUTH)].some(([, value]) => isBasicCredential(value))) {
     return "HTTP Basic 认证的用户名和密码";
+  }
+  if ([...text.matchAll(AUTH_FIELD)].some(([, name, value]) => isAuthCredential(name, value))) {
+    return "仓库登录用的用户名和密码";
+  }
+  // 解开的 config.json 比原文短，递归会停下来
+  const dockerConfig = [...text.matchAll(DOCKER_CONFIG)]
+    .map(([, value]) => findSecret(Buffer.from(value, "base64").toString("utf8")))
+    .find((label) => label !== undefined);
+  if (dockerConfig) {
+    return dockerConfig;
   }
   const values = [
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
@@ -992,9 +1030,19 @@ function checkSeen(entry: KnowledgeEntry, seen: KnowledgeEntry | undefined): voi
   }
 }
 
-/** 这一行能拿来检索、给模型看、起草卡片：没缺标题或结论，也没被写进密钥 */
+/** 这一行能拿来检索、给模型看、起草卡片：没缺标题或结论，没被写进密钥，编号也没和别的行重复 */
 export function usable(entry: KnowledgeEntry): boolean {
-  return !entry.unsafe && !entry.incomplete;
+  return !entry.unsafe && !entry.incomplete && !entry.conflict;
+}
+
+/** 表格里编号重复的几行（不分大小写）都标上 conflict */
+function markConflicts(entries: KnowledgeEntry[]): KnowledgeEntry[] {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    const key = entry.id.toUpperCase();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return entries.map((entry) => (counts.get(entry.id.toUpperCase())! > 1 ? { ...entry, conflict: "和别的行用了同一个编号" } : entry));
 }
 
 /** 卡片上给大家看的那些内容（类别、标题、问题、结论这些）和表格里现在的一样不一样；aiops 编号、状态不算 */

@@ -20,7 +20,7 @@ import {
   StaleProposalError,
   usable,
 } from "../knowledge.js";
-import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, renderAiopsHitsForPrompt, syncedFrom } from "../knowledge-aiops.js";
+import { type AiopsLesson, type AiopsLessons, type AiopsSaveResult, lessonHasSecret, renderAiopsHitsForPrompt, syncedFrom } from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { Tool } from "./tool.js";
 
@@ -624,7 +624,7 @@ export class KnowledgeDesk {
       }
       // 再试一次前有人在表格里清空了标题、结论，或者写进了密钥：不按卡片上的草稿同步，等表格里改好了再试
       if (!usable(entry)) {
-        out.unfinished.push(`经验 ${entry.id} 在表格里${entry.incomplete ?? entry.unsafe}，没有同步到 aiops 经验库。请在表格里改好后再点「再试一次」`);
+        out.unfinished.push(`经验 ${entry.id} 在表格里${entry.incomplete ?? entry.unsafe ?? entry.conflict}，没有同步到 aiops 经验库。请在表格里改好后再点「再试一次」`);
         return "keep-until-synced";
       }
       const approved = this.approvedDraft(proposal, entry, out);
@@ -689,7 +689,14 @@ export class KnowledgeDesk {
     out: Outcome,
   ): Promise<boolean> {
     const current = rowDraft(entry);
-    const changed = this.rowChange(entry) ?? (current && proposal.syncedDraft && sameContent(current, proposal.syncedDraft) ? undefined : `经验 ${entry.id} 在表格里改过`);
+    let changed = this.rowChange(entry);
+    if (!changed && !(current && proposal.syncedDraft && sameContent(current, proposal.syncedDraft))) {
+      // 表格里还是确认过的内容、aiops 里存的却不是（比如存进去以后在 aiops 里被改过）：一样算不对了
+      changed =
+        current && sameContent(current, proposal.approved?.draft ?? proposal.draft)
+          ? `aiops 里存的和经验 ${entry.id} 在表格里的不一样`
+          : `经验 ${entry.id} 在表格里改过`;
+    }
     if (!changed) {
       return true;
     }
@@ -770,6 +777,14 @@ export class KnowledgeDesk {
       }
       const options = { confirmedBy, teamId, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
       let synced = await aiops.save(draft, options, task);
+      if (!synced.saved && proposal.aiopsUnsure) {
+        // 上次存进去了、结果没传回来，上面又没检索到（aiops 检索只给前几条）：aiops 说重复的那条正是这一条同步过去的，就是上次存的
+        const own = await aiops.ownDuplicate(synced.duplicate.id, [...proposal.aiopsUnsure, draft], teamId, task);
+        if (own) {
+          proposal.aiopsUnsure = undefined;
+          return { synced: { saved: true, id: own.id }, draft: own.draft };
+        }
+      }
       if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
         // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的后面归档
         synced = await aiops.save(draft, { ...options, force: true }, task);
@@ -847,7 +862,7 @@ export class KnowledgeDesk {
       return false;
     }
     if (!usable(current)) {
-      out.unfinished.push(`新的经验 ${current.id} 在表格里${current.incomplete ?? current.unsafe}，旧的经验 ${oldId} 先没归档。请在表格里改好后再点「再试一次」`);
+      out.unfinished.push(`新的经验 ${current.id} 在表格里${current.incomplete ?? current.unsafe ?? current.conflict}，旧的经验 ${oldId} 先没归档。请在表格里改好后再点「再试一次」`);
       return false;
     }
     return true;
@@ -928,6 +943,10 @@ export class KnowledgeDesk {
     const lesson = await aiops.get(id, { chatId: ctx.chatId, senderId: ctx.senderId, messageId: ctx.messageId }, signal);
     if (lesson.status !== "active") {
       throw new KnowledgeError(`aiops 经验 #${id} 已经归档了`);
+    }
+    // 卡片上会列出它的内容，群里人人都看得到
+    if (lessonHasSecret(lesson)) {
+      throw new KnowledgeError(`aiops 经验 #${id} 里像是写进了密钥，不能列在卡片上给群里看。请 aiops 的管理员在 aiops 里删掉密钥或者直接归档它，回答里不要猜它的内容`);
     }
     return lesson;
   }
@@ -1274,6 +1293,9 @@ function rowDraft(entry: KnowledgeEntry): KnowledgeDraft | undefined {
 function unusableNote(entry: KnowledgeEntry): string {
   if (entry.unsafe) {
     return `经验 ${entry.id} 在表格里被改过，${entry.unsafe}，先不给你看。请群里有写权限的人直接在经验库表格里删掉密钥，回答里不要猜它的内容`;
+  }
+  if (entry.conflict) {
+    return `经验 ${entry.id} 在表格里${entry.conflict}，分不清是哪一行，先不用它。请群里有写权限的人在经验库表格里把重复的编号改掉，回答里不要猜它的内容`;
   }
   return `经验 ${entry.id} 在表格里${entry.incomplete}，先不用它。请群里有写权限的人在经验库表格里补上`;
 }

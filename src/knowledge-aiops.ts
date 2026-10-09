@@ -1,5 +1,5 @@
 import type { Logger } from "./history.js";
-import { type KnowledgeDraft, KnowledgeError } from "./knowledge.js";
+import { containsSecret, type KnowledgeDraft, KnowledgeError } from "./knowledge.js";
 import type { McpTaskContext } from "./mcp.js";
 
 /** 回答前检索时，提问最多取多少字 */
@@ -89,13 +89,25 @@ export class AiopsLessons {
     return this.mcp.connected(this.server) && !this.writable;
   }
 
-  /** 按提问原文检索，返回够相近的（aiops 最多给 5 条，只看有效的） */
+  /**
+   * 按提问原文检索，返回够相近的（aiops 最多给 5 条，只看有效的）。aiops 里的经验别处（告警自动排查、Open WebUI）也能存，
+   * 不经过团队经验库的密钥检查：像是写进了密钥的不返回，不给模型看，群里也就看不到
+   */
   async search(text: string, task: McpTaskContext, signal?: AbortSignal): Promise<AiopsLessonHit[]> {
     const query = text.trim().slice(0, QUERY_CHARS);
     if (!query || !this.searchable) {
       return [];
     }
-    return (await this.query({ text: query }, task, signal)).filter((hit) => hit.score >= MIN_PROMPT_SCORE);
+    return (await this.query({ text: query }, task, signal)).filter((hit) => {
+      if (hit.score < MIN_PROMPT_SCORE) {
+        return false;
+      }
+      if (lessonHasSecret(hit)) {
+        this.logger.warn(`aiops 经验 #${hit.id} 里像是写进了密钥，这次不给模型看。请 aiops 的管理员删掉密钥`);
+        return false;
+      }
+      return true;
+    });
   }
 
   /** 调 search_knowledge，返回 aiops 给的全部命中（最多 5 条，只有有效的） */
@@ -143,17 +155,10 @@ export class AiopsLessons {
     task: McpTaskContext,
   ): Promise<AiopsSaveResult> {
     const args: Record<string, unknown> = {
-      title: draft.title,
-      root_cause: draft.conclusion,
-      symptom: draft.question,
+      ...lessonContent(draft, teamId),
       source: caseId === undefined ? "chat" : "case",
       created_by: `feishu:${confirmedBy}`,
-      // 排查过程末尾注明出自团队经验库，aiops 里看到的人知道去哪改，再试一次时也靠它认出已经存过的
-      diagnosis_path: [draft.basis, teamSourceNote(teamId)].filter(Boolean).join("\n"),
       ...(caseId === undefined ? {} : { case_id: caseId }),
-      ...(draft.scope ? { service: draft.scope } : {}),
-      ...(draft.handling ? { solution: draft.handling } : {}),
-      ...(draft.keywords ? { keywords: draft.keywords } : {}),
       ...(draft.errorCodes ? { error_codes: draft.errorCodes } : {}),
       ...(draft.alertname ? { alertname: draft.alertname } : {}),
       ...(force ? { force: true } : {}),
@@ -201,6 +206,40 @@ export class AiopsLessons {
   }
 
   /**
+   * aiops 说和已有的经验 #id 重复时，看它是不是团队经验库这一条之前同步过去的（排查过程最后一行是出处）：上次存进去了、结果没传回来，
+   * findSynced 又没检索到它（aiops 检索只给前几条）。是的话返回它和发过去的内容里对得上的那份；都对不上的按 aiops 里存的内容算，
+   * 和表格里的不一样时会归档它、按表格重新同步。不是的返回 undefined
+   */
+  async ownDuplicate(id: number, sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<{ id: number; draft: KnowledgeDraft } | undefined> {
+    const lesson = await this.get(id, task);
+    if (lesson.status !== "active" || !syncedFrom(lesson.diagnosis_path, teamId)) {
+      return undefined;
+    }
+    const stored = (key: LessonField) => (lesson[key] ?? "").trim();
+    const draft = sent.find((draft) => {
+      const content = lessonContent(draft, teamId);
+      return LESSON_FIELDS.every((key) => stored(key) === (content[key] ?? "").trim());
+    });
+    if (draft) {
+      return { id, draft };
+    }
+    const basis = stored("diagnosis_path").split(/\r?\n/).slice(0, -1).join("\n").trim();
+    return {
+      id,
+      draft: {
+        category: "incident",
+        title: lesson.title,
+        question: stored("symptom"),
+        conclusion: stored("root_cause"),
+        ...(lesson.service ? { scope: lesson.service } : {}),
+        ...(lesson.solution ? { handling: lesson.solution } : {}),
+        ...(basis ? { basis } : {}),
+        ...(lesson.keywords ? { keywords: lesson.keywords } : {}),
+      },
+    };
+  }
+
+  /**
    * 归档团队经验库里一条经验同步过去的那条。编号是从表格里读的，有编辑权限的人能改成别的：先取出来看排查过程末尾的出处，
    * 不是从这一条同步过去的不归档
    */
@@ -232,6 +271,31 @@ export class AiopsLessons {
     }
     this.logger.info(`aiops 经验库 归档 经验 #${id} 确认人=${confirmedBy}`);
   }
+}
+
+/** 存进 aiops 的内容里 get_knowledge 也会返回的几项：认上次存进去的是哪一份时比这些 */
+const LESSON_FIELDS = ["title", "symptom", "root_cause", "solution", "service", "diagnosis_path", "keywords"] as const;
+type LessonField = (typeof LESSON_FIELDS)[number];
+
+/** 一条团队经验存进 aiops 时各项的内容 */
+function lessonContent(draft: KnowledgeDraft, teamId: string): Partial<Record<LessonField, string>> & { title: string } {
+  return {
+    title: draft.title,
+    root_cause: draft.conclusion,
+    symptom: draft.question,
+    // 排查过程末尾注明出自团队经验库，aiops 里看到的人知道去哪改，再试一次时也靠它认出已经存过的
+    diagnosis_path: [draft.basis, teamSourceNote(teamId)].filter(Boolean).join("\n"),
+    ...(draft.scope ? { service: draft.scope } : {}),
+    ...(draft.handling ? { solution: draft.handling } : {}),
+    ...(draft.keywords ? { keywords: draft.keywords } : {}),
+  };
+}
+
+/** aiops 里这条经验的标题、现象、根因、处理办法、排查过程这些里像不像有密钥 */
+export function lessonHasSecret(lesson: AiopsLessonHit | AiopsLesson): boolean {
+  // 检索结果里没有服务名、关键词
+  const { title, symptom, root_cause, solution, diagnosis_path, service, keywords }: Partial<AiopsLesson> = lesson;
+  return [title, symptom, root_cause, solution, diagnosis_path, service, keywords].some((value) => value !== undefined && containsSecret(value));
 }
 
 /** aiops 的经验编号：正的安全整数，别的（小数、负数、超出范围被四舍五入过的）不认 */
