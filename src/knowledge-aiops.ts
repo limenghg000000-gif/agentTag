@@ -110,10 +110,10 @@ export class AiopsLessons {
     };
   }
 
-  /** 把一条排查经验写进 aiops。aiops 说和已有的很像时不存，返回那一条 */
+  /** 把一条排查经验写进 aiops。aiops 说和已有的很像时不存，返回那一条；force 时不查重 */
   async save(
     draft: KnowledgeDraft,
-    { confirmedBy, caseId, teamId }: { confirmedBy: string; caseId?: number; teamId: string },
+    { confirmedBy, caseId, teamId, force }: { confirmedBy: string; caseId?: number; teamId: string; force?: boolean },
     task: McpTaskContext,
   ): Promise<AiopsSaveResult> {
     const args: Record<string, unknown> = {
@@ -130,6 +130,7 @@ export class AiopsLessons {
       ...(draft.keywords ? { keywords: draft.keywords } : {}),
       ...(draft.errorCodes ? { error_codes: draft.errorCodes } : {}),
       ...(draft.alertname ? { alertname: draft.alertname } : {}),
+      ...(force ? { force: true } : {}),
     };
     const raw = await this.mcp.callDirect(this.server, "save_lesson", args, task);
     const data = parseJson(raw) as Record<string, unknown> | undefined;

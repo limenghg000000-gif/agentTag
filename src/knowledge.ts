@@ -408,6 +408,7 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, "私钥"],
   [/\bglpat-[\w-]{16,}/, "GitLab 令牌"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, "GitHub 令牌"],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/, "GitHub 令牌"],
   [/\bsk-[A-Za-z0-9]{20,}/, "API 密钥"],
   [/\b(?:AKIA|LTAI)[A-Za-z0-9]{12,}/, "云服务的 AccessKey"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],

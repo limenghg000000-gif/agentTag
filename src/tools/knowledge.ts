@@ -31,6 +31,9 @@ const LOOKUP_MS = 7000;
 const SEMANTIC_MS = 5000;
 /** 起草时查「很像的已有经验」最多等多久 */
 const SIMILAR_TIMEOUT_MS = 8000;
+/** 同步到 aiops 后在表格里记 aiops 编号，失败时一共试几次、每次隔多久 */
+const LINK_ATTEMPTS = 3;
+const LINK_RETRY_MS = 2000;
 
 /** 这次任务的信息 */
 export interface KnowledgeTaskContext {
@@ -107,9 +110,10 @@ export interface KnowledgeDeskOptions {
   allowedChatIds: ReadonlySet<string>;
   logger?: Logger;
   now?: () => number;
-  /** 回答前检索每个库最多等多久、算向量最多等多久（测试时调短） */
+  /** 回答前检索每个库最多等多久、算向量最多等多久、记 aiops 编号失败后隔多久再试（测试时调短） */
   lookupMs?: number;
   semanticMs?: number;
+  retryDelayMs?: number;
 }
 
 /**
@@ -125,12 +129,14 @@ export class KnowledgeDesk {
   private readonly now: () => number;
   private readonly lookupMs: number;
   private readonly semanticMs: number;
+  private readonly retryDelayMs: number;
 
   constructor(private readonly options: KnowledgeDeskOptions) {
     this.logger = options.logger ?? console;
     this.now = options.now ?? Date.now;
     this.lookupMs = options.lookupMs ?? LOOKUP_MS;
     this.semanticMs = options.semanticMs ?? SEMANTIC_MS;
+    this.retryDelayMs = options.retryDelayMs ?? LINK_RETRY_MS;
   }
 
   /**
@@ -207,10 +213,14 @@ export class KnowledgeDesk {
         },
       },
       describe: (args) => `查经验库：${preview(args.query)}`,
-      run: async (args) => {
+      run: async (args, { signal }) => {
         const query = typeof args.query === "string" ? args.query : "";
         const category = typeof args.category === "string" && args.category in KNOWLEDGE_CATEGORIES ? (args.category as KnowledgeCategory) : undefined;
-        const hits = await base.search(query, { limit: 5, includeArchived: args.include_archived === true, ...(category ? { category } : {}) });
+        // 读表格的接口不认中止信号：任务停了就不等它
+        const hits = await raceAbort(
+          base.search(query, { limit: 5, includeArchived: args.include_archived === true, signal, ...(category ? { category } : {}) }),
+          signal,
+        );
         return hits.length > 0 ? renderHitsForPrompt(hits) : "团队经验库里没有相近的经验。";
       },
     };
@@ -225,12 +235,13 @@ export class KnowledgeDesk {
         },
       },
       describe: (args) => `看经验 ${String(args.id ?? "")}`,
-      run: async (args) => {
-        const entry = await base.get(String(args.id ?? ""));
+      run: async (args, { signal }) => {
+        const entry = await raceAbort(base.get(String(args.id ?? "")), signal);
         if (!entry) {
           throw new KnowledgeError(`团队经验库里没有 ${String(args.id ?? "")}`);
         }
-        const location = await base.location().catch(() => undefined);
+        const location = await raceAbort(base.location(), signal).catch(() => undefined);
+        signal.throwIfAborted();
         return `${formatKnowledge(entry)}${location ? `\n经验库表格：${location}` : ""}`;
       },
     };
@@ -408,14 +419,23 @@ export class KnowledgeDesk {
       requestId: proposal.requestId,
     });
     const lines = [`已存进团队经验库：经验 ${entry.id}「${draft.title}」，确认人 ${confirmedBy}。`];
+    // aiops 里有没有这条经验（新存的或者已有相近的）。没有时不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
+    let inAiops = false;
     if (proposal.syncAiops && !aiops?.writable) {
       lines.push("aiops 现在连不上，这条没有同步到 aiops 经验库。");
     } else if (proposal.syncAiops && aiops) {
       try {
-        const synced = await aiops.save(draft, { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) }, task);
+        const options = { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
+        let synced = await aiops.save(draft, options, task);
+        const replacedLesson = proposal.replaces?.aiopsId;
+        if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
+          // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的在下面归档
+          synced = await aiops.save(draft, { ...options, force: true }, task);
+        }
+        inAiops = true;
         if (synced.saved) {
-          await base.linkAiops(entry.id, synced.id).catch((err: unknown) => this.logger.warn(`经验库：${entry.id} 没能记下 aiops 编号 ${synced.id}`, err));
           lines.push(`已同步到 aiops 经验库（经验 #${synced.id}），告警自动排查也能用上。`);
+          lines.push(...(await this.linkAiops(entry, synced.id)));
         } else {
           lines.push(`aiops 经验库里已经有相近的经验 #${synced.duplicate.id}「${synced.duplicate.title}」，没有重复同步。`);
         }
@@ -424,7 +444,7 @@ export class KnowledgeDesk {
       }
     }
     if (proposal.replaces) {
-      lines.push(...(await this.archiveEntry(proposal.replaces, confirmedBy, task, "旧的")));
+      lines.push(...(await this.archiveEntry(proposal.replaces, confirmedBy, task, "旧的", proposal.syncAiops && !inAiops)));
     }
     const location = await base.location().catch(() => undefined);
     if (location) {
@@ -447,15 +467,35 @@ export class KnowledgeDesk {
     return lines;
   }
 
-  /** 保存新经验后归档被取代的旧经验，失败只写进结果 */
-  private async archiveEntry(entry: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, label: string): Promise<string[]> {
+  /** 在表格里记下同步到 aiops 后的编号，失败隔一会儿再试；都没成功时请人在表格里手动填 */
+  private async linkAiops(entry: KnowledgeEntry, aiopsId: number): Promise<string[]> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.options.base.linkAiops(entry.id, aiopsId);
+        return [];
+      } catch (err) {
+        if (attempt >= LINK_ATTEMPTS) {
+          this.logger.warn(`经验库：${entry.id} 没能记下 aiops 编号 ${aiopsId}`, err);
+          return [
+            `没能在经验库表格里记下 aiops 编号（${describe(err)}）。请在表格里把 ${entry.id} 的「aiops 经验编号」填成 ${aiopsId}，不然检索时会列出两遍，以后归档 ${entry.id} 时 aiops 里这条也不会跟着归档。`,
+          ];
+        }
+        await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
+      }
+    }
+  }
+
+  /** 保存新经验后归档被取代的旧经验，失败只写进结果。keepAiops：新的没进 aiops，旧的在 aiops 里那条先留着 */
+  private async archiveEntry(entry: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, label: string, keepAiops = false): Promise<string[]> {
     try {
       await this.options.base.archive(entry.id, { confirmedBy });
     } catch (err) {
       return [`${label}经验 ${entry.id} 没能归档：${describe(err)}`];
     }
     const lines = [`${label}经验 ${entry.id}「${entry.title}」已归档。`];
-    if (entry.aiopsId !== undefined) {
+    if (entry.aiopsId !== undefined && keepAiops) {
+      lines.push(`aiops 经验库里同步的旧经验 #${entry.aiopsId} 先留着没归档：新的这条没同步到 aiops，归档了告警自动排查就查不到这个问题了。aiops 能用以后请在 aiops 里更新它。`);
+    } else if (entry.aiopsId !== undefined) {
       lines.push(...(await this.archiveLinked(entry.aiopsId, confirmedBy, task)));
     }
     return lines;

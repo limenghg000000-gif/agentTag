@@ -20,6 +20,8 @@ class MemoryBackend implements KnowledgeBackend {
   entries: KnowledgeEntry[] = [];
   lists = 0;
   failAdd?: Error;
+  /** 前几次 update 失败 */
+  failUpdates = 0;
 
   async location() {
     return "https://example.feishu.cn/base/app1?table=tbl1";
@@ -38,6 +40,10 @@ class MemoryBackend implements KnowledgeBackend {
   }
 
   async update(id: string, changes: Partial<KnowledgeEntry>) {
+    if (this.failUpdates > 0) {
+      this.failUpdates--;
+      throw new KnowledgeError("飞书接口限流");
+    }
     Object.assign(this.entries.find((entry) => entry.id === id)!, changes);
   }
 }
@@ -78,6 +84,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
   for (const secret of [
     "GITLAB_TOKEN=glpat-abcdefghijklmnopqrstu",
     "用 sk-abcdefghijklmnopqrstuvwxyz123 调的接口",
+    "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789",
     "mysql://agent:p4ssw0rd@10.0.0.5:3306/aiops",
     "数据库密码：Abc12345678",
     "-----BEGIN RSA PRIVATE KEY-----",
@@ -252,9 +259,15 @@ test("aiops 经验库：检索只留够相近的；排查经验同步过去时�
     saved: false,
     duplicate: { id: 12, title: "user-rpc 降载", why: "错误码相同" },
   });
+  await lessons.save(draft, { confirmedBy: "ML", teamId: "K3", force: true }, task);
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").at(-1)!.args.force, true);
 });
 
-function deskSetup({ aiops = true, approvers = new Set(["ou_admin"]) }: { aiops?: boolean; approvers?: ReadonlySet<string> } = {}) {
+function deskSetup({
+  aiops = true,
+  approvers = new Set(["ou_admin"]),
+  saveLesson = () => JSON.stringify({ saved: true, id: 31 }),
+}: { aiops?: boolean; approvers?: ReadonlySet<string>; saveLesson?: (args: Record<string, unknown>) => string } = {}) {
   const control = { failSend: false };
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet });
@@ -263,7 +276,7 @@ function deskSetup({ aiops = true, approvers = new Set(["ou_admin"]) }: { aiops?
   const { mcp, calls } = fakeMcp({
     search_knowledge: () => JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9 }, { id: 40, title: "Open WebUI 存的", score: 8 }] }),
     get_knowledge: (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", root_cause: "旧结论" }),
-    save_lesson: () => JSON.stringify({ saved: true, id: 31 }),
+    save_lesson: saveLesson,
     archive_lesson: () => JSON.stringify({ archived: true }),
   });
   let now = 1_000_000;
@@ -284,6 +297,7 @@ function deskSetup({ aiops = true, approvers = new Set(["ou_admin"]) }: { aiops?
     allowedChatIds: new Set(["oc_1"]),
     logger: quiet,
     now: () => now,
+    retryDelayMs: 0,
   });
   const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
   const tool = (name: string) => desk.tools(ctx).find((t) => t.spec.name === name)!;
@@ -504,6 +518,63 @@ test("起草时经验库里有很像的，卡片上提示；带 replaces 时保�
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /旧的经验 K1「.*」已归档。\naiops 经验库里同步的经验 #31 也已归档。/);
 
   await assert.rejects(tool("knowledge_propose").run({ ...code8, replaces: "K1" }, { signal }), /经验 K1 已经归档了/);
+});
+
+test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一条新的再归档旧的；新的没进 aiops 时旧的在 aiops 里那条先留着", async () => {
+  const replace = async (saveLesson: (args: Record<string, unknown>) => string) => {
+    const setup = deskSetup({ saveLesson });
+    await setup.base.save(normalizeDraft(code8));
+    await setup.base.linkAiops("K1", 31);
+    await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+    await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+    await setup.desk.idle();
+    return { ...setup, text: (setup.sent.at(-1)!.input as { markdown: string }).markdown };
+  };
+
+  const dup = await replace((args) =>
+    args.force ? JSON.stringify({ saved: true, id: 32 }) : JSON.stringify({ saved: false, duplicate_of: { id: 31, title: "旧的", why: "错误码相同" } }),
+  );
+  assert.equal(dup.backend.entries.find((e) => e.id === "K2")!.aiopsId, 32);
+  assert.deepEqual(dup.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.match(dup.text, /已同步到 aiops 经验库（经验 #32）/);
+
+  const down = await replace(() => {
+    throw new Error("aiops 现在连不上");
+  });
+  assert.equal(down.backend.entries.find((e) => e.id === "K1")!.status, "archived");
+  assert.equal(down.calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.match(down.text, /没能同步到 aiops 经验库：aiops 现在连不上/);
+  assert.match(down.text, /aiops 经验库里同步的旧经验 #31 先留着没归档/);
+});
+
+test("同步到 aiops 后记编号失败会再试，试了几次都不行时请人在表格里手动填", async () => {
+  const once = deskSetup();
+  await once.tool("knowledge_propose").run(code8, { signal });
+  once.backend.failUpdates = 1;
+  await once.desk.handleCardAction(once.click((once.sent[0].input as { card: any }).card, "save"));
+  await once.desk.idle();
+  assert.equal(once.backend.entries[0].aiopsId, 31);
+  assert.doesNotMatch((once.sent.at(-1)!.input as { markdown: string }).markdown, /手动|没能在经验库表格里/);
+
+  const never = deskSetup();
+  await never.tool("knowledge_propose").run(code8, { signal });
+  never.backend.failUpdates = 99;
+  await never.desk.handleCardAction(never.click((never.sent[0].input as { card: any }).card, "save"));
+  await never.desk.idle();
+  assert.equal(never.backend.entries[0].aiopsId, undefined);
+  assert.match((never.sent.at(-1)!.input as { markdown: string }).markdown, /请在表格里把 K1 的「aiops 经验编号」填成 31/);
+});
+
+test("模型查经验库、看经验时任务停了不等表格", async () => {
+  const { base, backend, tool } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  backend.list = () => new Promise(() => {});
+  const stop = new AbortController();
+  const searching = tool("knowledge_search").run({ query: "日活" }, { signal: stop.signal });
+  const getting = tool("knowledge_get").run({ id: "K1" }, { signal: stop.signal });
+  stop.abort();
+  await assert.rejects(searching, (err: Error) => err.name === "AbortError");
+  await assert.rejects(getting, (err: Error) => err.name === "AbortError");
 });
 
 test("归档：团队经验库的按编号，aiops 经验库的按 aiops_id；两个都填或都不填报错", async () => {

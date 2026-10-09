@@ -248,6 +248,9 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   private sharing: Promise<void> = Promise.resolve();
   /** 编号 → 行 id，update 时用 */
   private readonly rows = new Map<string, string>();
+  /** 表格里不止一行用的编号（有人复制了行）：改这些编号时不知道该改哪行，不改 */
+  private readonly ambiguous = new Set<string>();
+  private warnedAmbiguous = "";
   private readonly logger: Logger;
 
   constructor(private readonly options: BitableBackendOptions) {
@@ -266,14 +269,25 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     }
     const records = await this.explain(() => this.options.api.listRecords(target.appToken, target.tableId));
     this.rows.clear();
+    this.ambiguous.clear();
     const entries: KnowledgeEntry[] = [];
     for (const record of records) {
       const entry = toEntry(record);
       if (entry) {
-        this.rows.set(entry.id.toUpperCase(), record.recordId);
+        const key = entry.id.toUpperCase();
+        if (this.rows.has(key)) {
+          this.ambiguous.add(key);
+        } else {
+          this.rows.set(key, record.recordId);
+        }
         entries.push(entry);
       }
     }
+    const ambiguous = [...this.ambiguous].join(" ");
+    if (ambiguous && ambiguous !== this.warnedAmbiguous) {
+      this.logger.warn(`经验库：表格里有不止一行用了同一个编号：${ambiguous}。归档这些编号前请先在表格里把重复的改掉`);
+    }
+    this.warnedAmbiguous = ambiguous;
     return entries;
   }
 
@@ -293,6 +307,9 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     const recordId = this.rows.get(id.toUpperCase());
     if (!target || !recordId) {
       throw new KnowledgeError(`多维表格里找不到 ${id} 这一行`);
+    }
+    if (this.ambiguous.has(id.toUpperCase())) {
+      throw new KnowledgeError(`多维表格里不止一行的编号是 ${id}，不知道该改哪一行。请先在表格里把重复的编号改掉再试`);
     }
     const fields: Record<string, unknown> = {};
     if (changes.status) {
