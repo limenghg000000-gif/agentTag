@@ -600,6 +600,11 @@ export class KnowledgeDesk {
     if (replaced && (await this.replacementReady(proposal, entry.id, replaced.id, out))) {
       await this.archiveReplaced(replaced, proposal.replaces!, confirmedBy, task, oldLesson, out, replacedGone);
     }
+    // 上次存的结果没传回来、再试之前有人把这一行的标题、结论清空了，或者别的行用了同一个编号：检索时用不上它，改好了才算存好。
+    // 同步 aiops、归档旧经验的步骤遇到它已经记了没做完的，不再重复说
+    if (!usable(entry) && out.unfinished.length === 0) {
+      out.unfinished.push(`存进去的经验 ${entry.id} 在表格里${entry.incomplete ?? entry.conflict}，检索时用不上它。请在表格里改好后再点「再试一次」`);
+    }
     const location = await base.location().catch(() => undefined);
     if (location) {
       out.done.push(`经验库表格：${location}`);

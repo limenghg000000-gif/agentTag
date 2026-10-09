@@ -463,8 +463,13 @@ function indexText(entry: KnowledgeDraft): string {
 function scoreEntry(entry: KnowledgeEntry, query: string, semantic: number | undefined): KnowledgeHit | undefined {
   const lower = query.toLowerCase();
   const text = indexText(entry).toLowerCase();
-  const markers = [...splitList(entry.keywords), ...splitList(entry.errorCodes), ...splitList(entry.alertname)];
-  const keywordHits = markers.filter((word) => word.length >= 2 && lower.includes(word.toLowerCase())).length;
+  // 同一个词在关键词、错误码里各写一遍，或者一个是另一个的一部分（ResourceExhausted 和 Exhausted），提问里出现一次只算一个
+  const markers = new Set(
+    [...splitList(entry.keywords), ...splitList(entry.errorCodes), ...splitList(entry.alertname)]
+      .map((word) => word.toLowerCase())
+      .filter((word) => word.length >= 2 && lower.includes(word)),
+  );
+  const keywordHits = [...markers].filter((word) => ![...markers].some((other) => other !== word && other.includes(word))).length;
   const bonus = Math.min(0.6, keywordHits * 0.3);
   if (semantic !== undefined) {
     return semantic >= SEMANTIC_MIN || bonus >= 0.6 ? { entry, score: semantic + bonus / 2, semantic } : undefined;
@@ -859,8 +864,14 @@ function authorizationCredentials(text: string): string[] {
 const SIGNED_URL = /[?&](?:[\w.-]*[_.-])?(?:sig|signature)=([^&\s#"'`<>()[\]\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{16,})/gi;
 /** Cookie、Set-Cookie 头（JSON 里的 "Cookie": "…" 也算）后面的「名字=值; 名字=值」，到行尾或引号为止 */
 const COOKIE_HEADER = /\b(?:set-)?cookie["']?[^\S\r\n]*:[^\S\r\n]*["']?([^\r\n"']+)/gi;
-/** curl 的 -b、--cookie 后面的 Cookie（-b cookies.txt 是文件，里面没有 =，取出来也不算）。第 1 组是双引号里的，第 2 组是单引号里的，第 3 组是没引号的 */
-const CURL_COOKIE = /\bcurl\b(?:[^\n]|\\\r?\n)*?(?<![\w.-])(?:-b|--cookie)(?:[ \t]+|=)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"']+))/g;
+/**
+ * curl 的 -b、--cookie 后面的 Cookie（-b cookies.txt 是文件，里面没有 =，取出来也不算）。和 -u 一样，短选项的值可以紧贴着写（-bsessionid=…），
+ * 前面也可以并着不带值的短选项（-sSb 'sid=…'），行尾 \ 续到下一行的也算（没引号的值不以 \ 开头）。第 1 组是双引号里的，第 2 组是单引号里的，第 3 组是没引号的
+ */
+const CURL_COOKIE = new RegExp(
+  String.raw`\bcurl\b(?:[^\n]|\\\r?\n)*?(?<![\w.-])(?:-${CURL_FLAGS}b(?:${CURL_GAP})?|--cookie(?:${CURL_GAP}|=))(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'\\][^\s"']*))`,
+  "g",
+);
 /** Set-Cookie 里的属性，不是 Cookie 本身 */
 const COOKIE_ATTRIBUTES = new Set(["expires", "max-age", "domain", "path", "samesite", "priority", "partitioned", "secure", "httponly"]);
 

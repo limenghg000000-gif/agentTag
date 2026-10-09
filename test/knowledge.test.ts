@@ -281,6 +281,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `curl -H 'Cookie: lang=zh; laravel_session=${"eyJpdiI6IkNvcnJlY3RIb3JzZSJ9"}' https://api.example`,
     ["curl -b \"token", "CorrectHorseBatteryStaple9\" https://api.example"].join("="),
     ["curl --cookie sid", "CorrectHorse9 https://api.example"].join("="),
+    // -b 紧贴着写值的、和别的短选项并着写的、选项后面续行的
+    ["curl -bsessionid", "CorrectHorseBatteryStaple9 https://example"].join("="),
+    ["curl -sSb 'sid", "CorrectHorse9xyz' https://api.example"].join("="),
+    ["curl \\\n  -b \\\n  \"sid", "CorrectHorse9xyz\" https://api.example"].join("="),
     `{"Cookie": "connect.sid=${"s%3ACorrectHorseBattery.abc123"}"}`,
     // PostgreSQL 的 .pgpass：主机像主机的、端口是 5432 的、提到了 pgpass 的；密码里转义的冒号、反斜杠
     ["db.example.com:5432:prod:svc", "CorrectHorseBatteryStaple9"].join(":"),
@@ -381,6 +385,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "报错 SignatureDoesNotMatch；?X-Amz-Signature=<signature>；&sig=${SAS_SIG}；?Signature=xxxxxxxxxxxxxxxx；?X-Amz-Signature=****；?signature=invalid",
     // Cookie 没带上的报错、打了码的、变量、cookie 文件、属性、很短的
     "Cookie: 没带上登录态；Set-Cookie: sessionid=******; Path=/; Domain=.example.com; Expires=Wed, 21 Oct 2026 07:28:00 GMT；curl -b cookies.txt https://x；cookie: session=${SESSION_ID}；Cookie: lang=zh-CN",
+    "curl -bcookies.txt https://x；curl -sSb ~/.cookies https://x；curl -b 'sid=${SESSION_ID}' https://x",
     // Redis 的 key 也是几段冒号；.pgpass 里密码是变量、打码的；Azure 的 AccountKey 是变量的
     "order:1001:item:detail:summary；user:10086:coupon:list:available；db.example.com:5432:prod:svc:${PGPASSWORD}；*:*:*:*:******；AccountName=prod;AccountKey=${AZURE_STORAGE_KEY}",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
@@ -517,6 +522,17 @@ test("有向量模型时按意思检索：向量按内容缓存，列表一分�
   now = new Date(now.getTime() + 5 * 60_000);
   await base.search("code=8");
   assert.equal(calls.length, failed, "出错后 10 分钟内不再调向量模型");
+});
+
+test("关键词命中按不同的词算：同一个错误码在关键词、错误码里各写一遍，或者一个是另一个的一部分，提问里出现一次只算一个", async () => {
+  const backend = new MemoryBackend();
+  const { embedder } = fakeEmbedder(["降载", "日活"]);
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet });
+  await base.save(normalizeDraft({ ...dau, keywords: "ERR_TIMEOUT、TIMEOUT、支付回调", error_codes: "ERR_TIMEOUT" }));
+  // 提问和这条经验的意思不相干（向量正交），只是带了同一个常见的错误码：不能靠重复的词凑够两个
+  assert.deepEqual(await base.search("订单服务报 ERR_TIMEOUT"), []);
+  // 对上两个不同的词照样算
+  assert.equal((await base.search("支付回调报 ERR_TIMEOUT"))[0]?.entry.id, "K1");
 });
 
 test("向量没在期限内算完：这次只按关键词，下次照常调向量模型；用户停止任务时整个检索中止", async () => {
@@ -841,6 +857,32 @@ test("保存的结果没传回来、再点一次：同一张卡片不会存两�
   await desk.idle();
   assert.equal(backend.entries.length, 1);
   assert.ok(backend.entries[0].requestId);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已存进团队经验库：经验 K1「日活的口径」/);
+});
+
+test("保存的结果没传回来、再点之前有人把那一行的结论清空了：检索用不上它，卡片还能再试，补上以后才算存好", async () => {
+  const { backend, desk, sent, click, tool, lastCard } = deskSetup();
+  await tool("knowledge_propose").run(dau, { signal });
+  const add = backend.add.bind(backend);
+  backend.add = async (entry) => {
+    await add(entry);
+    throw new KnowledgeError("飞书接口超时");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  backend.add = add;
+  backend.entries[0].conclusion = "";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 1, "不再存一遍");
+  assert.equal(lastCard().header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(lastCard()), /存进去的经验 K1 在表格里结论是空的，检索时用不上它/);
+  assert.equal(sent.length, 1, "没做完时话题里不发结果");
+
+  backend.entries[0].conclusion = dau.conclusion;
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
   assert.equal(lastCard().header.title.content, "已存进经验库");
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已存进团队经验库：经验 K1「日活的口径」/);
 });
