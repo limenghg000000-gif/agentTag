@@ -376,6 +376,7 @@ test("回答前先查经验库：查到的写进提示词，进度卡片多一�
   const failed = await ask("code=8");
   assert.match(failed.system, /## 团队经验库/);
   assert.doesNotMatch(failed.system, /没查到相近的经验|这次提问可能相关的经验/);
+  assert.match(failed.system, /回答前自动查经验库没查成（超时或出错），不知道有没有相近的经验。需要参考以前的经验时自己查：团队经验库用 knowledge_search。/);
   assert.deepEqual(markdowns(failed.sent), ["好"]);
 });
 
@@ -386,6 +387,7 @@ test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有�
   await handle(message("code=8 是怎么回事"));
   assert.deepEqual(markdowns(sent), ["好"]);
   assert.doesNotMatch(requests[0].system, /没查到相近的经验|这次提问可能相关的经验/);
+  assert.match(requests[0].system, /回答前自动查经验库没查成/);
 
   const partial = { lookup: async () => ({ text: "", ids: [], missed: ["团队经验库"] }), tools: () => [] };
   const second = fakeModel(() => ({ text: "好", finish: "stop" }));

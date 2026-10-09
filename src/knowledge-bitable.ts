@@ -274,6 +274,8 @@ interface BitableState extends BitableTarget {
   shared?: string[];
   /** 已经设成只有机器人能管协作者、只有协作者能打开 */
   restricted?: boolean;
+  /** shared 里结果不明的「类型:id」（先记下来再加的，加的结果没传回来或者进程退出了）：可能加上了，下次再加一次确认 */
+  pending?: string[];
 }
 
 /**
@@ -399,6 +401,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         ...(data.url ? { url: data.url } : {}),
         shared,
         ...(data.restricted === true ? { restricted: true } : {}),
+        ...(Array.isArray(data.pending) ? { pending: data.pending.filter((key): key is string => typeof key === "string") } : {}),
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
@@ -469,6 +472,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
    * 先把表格设成只有机器人能管协作者、只有协作者能打开，名单里的人就没法再共享给名单外的人。
    * 再拿白名单群（默认只读）和写权限名单里的人（可编辑）要有的权限，和机器人已经共享出去的比：
    * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
+   * 加协作者之前先把它记进数据目录：加上了却没来得及记下就退出的话，以后移出名单时就不知道要撤它。
    * 失败不影响保存，记一条警告，下次启动或保存时再试
    */
   private async reconcile(target: BitableState): Promise<void> {
@@ -479,59 +483,95 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
       ...share.editors.map((id): [string, [BitableMember, BitablePerm]] => [`openid:${id}`, [{ type: "openid", id }, "edit"]]),
     ]);
     const granted = parseShared(target.shared ?? []);
+    const pending = new Set((target.pending ?? []).filter((key) => granted.has(key)));
     let changed = false;
-    // 每一步各要一个应用权限，失败时把要的权限名写进警告
-    const attempt = async (what: string, scope: string, run: () => Promise<void>): Promise<boolean> => {
+    const persist = async () => {
+      target.shared = [...granted.values()].map(({ member, perm }) => `${member.type}:${member.id}:${perm}`);
+      if (pending.size > 0) {
+        target.pending = [...pending];
+      } else {
+        delete target.pending;
+      }
+      await this.writeState(target);
+    };
+    // 每一步各要一个应用权限，失败时把要的权限名写进警告。rejected：飞书明确拒绝了（带错误码），不是结果不明
+    const attempt = async (what: string, scope: string, run: () => Promise<void>): Promise<{ ok: boolean; rejected?: boolean }> => {
       try {
         await run();
         changed = true;
         this.logger.info(`经验库：${what}`);
-        return true;
+        return { ok: true };
       } catch (err) {
         // 不用 describeBitableError：它把缺权限都说成缺 bitable:app
         this.logger.warn(
           `经验库：没能${what}（要用应用权限 ${scope}），下次启动或保存经验时再试：${err instanceof Error ? err.message : String(err)}`,
         );
-        return false;
+        return { ok: false, rejected: err instanceof FeishuApiError && err.code !== undefined };
       }
     };
     if (
       !target.restricted &&
-      (await attempt("把多维表格设成只有机器人能加、移除协作者，关掉链接分享和分享到组织外", "docs:permission.setting:write_only", () =>
-        api.restrictSharing(target.appToken),
-      ))
+      (
+        await attempt("把多维表格设成只有机器人能加、移除协作者，关掉链接分享和分享到组织外", "docs:permission.setting:write_only", () =>
+          api.restrictSharing(target.appToken),
+        )
+      ).ok
     ) {
       target.restricted = true;
     }
+    const update = (member: BitableMember, from: BitablePerm, perm: BitablePerm) =>
+      attempt(`把 ${member.id} 对多维表格的权限从${PERM_LABELS[from]}改成${PERM_LABELS[perm]}`, "docs:permission.member:update", () =>
+        api.updateCollaborator(target.appToken, member, perm),
+      );
     for (const [key, [member, perm]] of wanted) {
       const had = granted.get(key);
-      if (had?.perm === perm) {
+      if (had && !pending.has(key)) {
+        if (had.perm !== perm && (await update(member, had.perm, perm)).ok) {
+          granted.set(key, { member, perm });
+        }
         continue;
       }
-      const ok = had
-        ? await attempt(`把 ${member.id} 对多维表格的权限从${PERM_LABELS[had.perm]}改成${PERM_LABELS[perm]}`, "docs:permission.member:update", () =>
-            api.updateCollaborator(target.appToken, member, perm),
-          )
-        : await attempt(`把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}）`, "docs:permission.member:create", () =>
-            api.addCollaborator(target.appToken, member, perm),
-          );
-      if (ok) {
+      if (!had) {
         granted.set(key, { member, perm });
+        pending.add(key);
+        try {
+          await persist();
+        } catch (err) {
+          granted.delete(key);
+          pending.delete(key);
+          this.logger.warn(`经验库：没能先把 ${member.id} 记进数据目录，这次先不共享给它，下次再试`, err);
+          continue;
+        }
+      }
+      // 新加的，或者上次结果不明的：加一次；上次其实加上了的话加会失败，再改一次权限
+      const added = await attempt(`把多维表格共享给 ${member.id}（${PERM_LABELS[perm]}）`, "docs:permission.member:create", () =>
+        api.addCollaborator(target.appToken, member, perm),
+      );
+      if (added.ok || (had && (await update(member, had.perm, perm)).ok)) {
+        pending.delete(key);
+        granted.set(key, { member, perm });
+      } else if (!had && added.rejected) {
+        // 飞书明确拒绝了（比如还没开权限），肯定没加上，不用记着
+        granted.delete(key);
+        pending.delete(key);
+        changed = true;
       }
     }
     for (const [key, { member }] of [...granted]) {
       if (
         !wanted.has(key) &&
-        (await attempt(`撤掉 ${member.id} 对多维表格的权限（已不在白名单群或写权限名单里）`, "docs:permission.member:delete", () =>
-          api.removeCollaborator(target.appToken, member),
-        ))
+        (
+          await attempt(`撤掉 ${member.id} 对多维表格的权限（已不在白名单群或写权限名单里）`, "docs:permission.member:delete", () =>
+            api.removeCollaborator(target.appToken, member),
+          )
+        ).ok
       ) {
         granted.delete(key);
+        pending.delete(key);
       }
     }
     if (changed) {
-      target.shared = [...granted.values()].map(({ member, perm }) => `${member.type}:${member.id}:${perm}`);
-      await this.writeState(target).catch((err: unknown) => this.logger.warn("经验库：共享结果没能记进数据目录，下次会再调整一次", err));
+      await persist().catch((err: unknown) => this.logger.warn("经验库：共享结果没能记进数据目录，下次会再调整一次", err));
     }
   }
 

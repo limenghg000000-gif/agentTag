@@ -258,6 +258,31 @@ test("设置谁能管协作者失败（没开 docs:permission.setting:write_only
   assert.equal(restricted.length, 1, "设好了就不再调");
 });
 
+test("加协作者前先记进数据目录：加上了但结果没传回来时记成不确定，移出名单后照样撤；还在名单里的下次再加一次确认", async () => {
+  const stateFile = path.join(dir, "journal", "bitable.json");
+  const { api, calls, shared } = fakeBitable();
+  const add = api.addCollaborator.bind(api);
+  const recorded: string[][] = [];
+  // 飞书加上了，但结果没传回来
+  api.addCollaborator = async (app, member, perm) => {
+    recorded.push(JSON.parse(await readFile(stateFile, "utf8")).shared);
+    await add(app, member, perm);
+    throw new Error("socket hang up");
+  };
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: [] }, logger: quiet }), { logger: quiet }).save(dau);
+  assert.deepEqual(recorded, [["openchat:oc_1:view"], ["openchat:oc_1:view", "openchat:oc_2:view"]], "调接口之前已经记下了");
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).pending, ["openchat:oc_1", "openchat:oc_2"]);
+
+  // 重启：oc_2 移出了名单，oc_1 还在
+  api.addCollaborator = add;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(calls.slice(-1), ["remove oc_2"]);
+  assert.equal(shared.filter(([member]) => member.id === "oc_1").length, 2, "结果不明的再加一次");
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.deepEqual(state.shared, ["openchat:oc_1:view"]);
+  assert.equal(state.pending, undefined);
+});
+
 test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {
   const { api, tables, tokens } = fakeBitable();
   tables.set("tblX", { fields: [], records: [] });

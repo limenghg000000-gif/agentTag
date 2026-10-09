@@ -95,6 +95,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "OPENAI_KEY 是 sk-proj-abcdefghij0123456789_ABCDEFGHIJ-klmnop",
     "sk-ant-api03-abcdefghijklmnop0123456789",
     "sk-svcacct-AbCdEfGhIj0123456789",
+    "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "AccessKeySecret: abcdefghijklmnopqrstuvwxyzABCD",
     "password=correcthorsebatterystaple",
     "mysql://agent:p4ssw0rd@10.0.0.5:3306/aiops",
     "数据库密码：Abc12345678",
@@ -109,6 +111,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
   assert.ok(normalizeDraft({ ...code8, basis: "报错 token expired，令牌过期后重新登录；密码：***" }));
   assert.ok(normalizeDraft({ ...code8, basis: "密码：请找管理员重置；token=expired_session" }));
   assert.ok(normalizeDraft({ ...code8, basis: "用 sk-learn-preprocessing-pipeline 处理的数据" }));
+  assert.ok(normalizeDraft({ ...code8, basis: "这次调用 total_tokens: 123456789" }));
 });
 
 function fakeEmbedder(topics: string[]) {
@@ -574,6 +577,57 @@ test("取代旧的排查经验：aiops 说和旧的那条很像时照样存一�
   assert.match(down.text, /aiops 经验库里同步的旧经验 #31 先留着没归档/);
 });
 
+test("两张卡片取代同一条经验：先点的存好并归档旧的，后点的不再存（同时点也一样）", async () => {
+  for (const together of [false, true]) {
+    const { backend, base, desk, sent, updates, click } = deskSetup();
+    await base.save(normalizeDraft(code8));
+    const other = { chatId: "oc_1", threadKey: "om_other", senderId: "ou_2", askerName: "李四", messageId: "om_2" };
+    await desk.tools({ chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" }).find((t) => t.spec.name === "knowledge_propose")!
+      .run({ ...code8, title: "gateway-api 报 code=8（张三改的）", replaces: "K1" }, { signal });
+    await desk.tools(other).find((t) => t.spec.name === "knowledge_propose")!.run({ ...code8, title: "gateway-api 报 code=8（李四改的）", replaces: "K1" }, { signal });
+    const [first, second] = sent.map((s) => (s.input as { card: any }).card);
+    await desk.handleCardAction(click(first, "save"));
+    if (!together) {
+      await desk.idle();
+    }
+    await desk.handleCardAction({ ...click(second, "save"), messageId: "om_card_2" });
+    await desk.idle();
+    assert.deepEqual(
+      backend.entries.map((e) => [e.id, e.status]),
+      [
+        ["K1", "archived"],
+        ["K2", "active"],
+      ],
+      together ? "同时点" : "先后点",
+    );
+    assert.equal(backend.entries[1].title, "gateway-api 报 code=8（张三改的）");
+    const voided = updates.filter((u) => u.messageId === "om_card_2").at(-1)!.card;
+    assert.equal(voided.header.title.content, "已作废");
+    assert.match(cardText(voided), /要取代的经验 K1 已经归档了（可能已经被别的卡片取代），这张卡片不能再保存/);
+    assert.doesNotMatch(cardText(voided), /"保存"/);
+  }
+});
+
+test("归档、取代时用表格里现在的 aiops 编号：卡片发出后有人在表格里改了编号，归档改过的那条", async () => {
+  const { backend, base, desk, sent, calls, click, tool } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  backend.entries[0].aiopsId = 35;
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
+
+  const replace = deskSetup();
+  await replace.base.save(normalizeDraft(code8));
+  await replace.base.linkAiops("K1", 31);
+  await replace.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  replace.backend.entries[0].aiopsId = 35;
+  await replace.desk.handleCardAction(replace.click((replace.sent[0].input as { card: any }).card, "save"));
+  await replace.desk.idle();
+  assert.deepEqual(replace.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
+});
+
 test("同步到 aiops 后记编号失败会再试，试了几次都不行时请人在表格里手动填", async () => {
   const once = deskSetup();
   await once.tool("knowledge_propose").run(code8, { signal });
@@ -643,6 +697,14 @@ test("归档时表格改成功了、结果没传回来：再点一次照常完�
   await desk.idle();
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档经验 K1.*\naiops 经验库里同步的经验 #31 也已归档/);
+});
+
+test("回答前检索：团队经验库这次没查到的，aiops 查到了它同步过去的那条照样列出", async () => {
+  const { base, desk } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  const found = await desk.lookup("完全不相干的一句话", task);
+  assert.deepEqual(found?.ids, ["aiops#31", "aiops#40"]);
 });
 
 test("回答前检索：两个库一起查，已同步到 aiops 的只列团队经验库那条；一个库出错不影响另一个，都出错时返回空", async () => {

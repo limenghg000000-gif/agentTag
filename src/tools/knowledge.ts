@@ -14,6 +14,7 @@ import {
   type KnowledgeHit,
   normalizeDraft,
   renderHitsForPrompt,
+  StaleProposalError,
 } from "../knowledge.js";
 import { type AiopsLesson, type AiopsLessons, renderAiopsHitsForPrompt } from "../knowledge-aiops.js";
 import type { McpTaskContext } from "../mcp.js";
@@ -57,7 +58,7 @@ interface Person {
   name?: string;
 }
 
-type ProposalState = "pending" | "working" | "done" | "cancelled" | "superseded";
+type ProposalState = "pending" | "working" | "done" | "cancelled" | "superseded" | "stale";
 
 interface ProposalBase {
   id: string;
@@ -125,6 +126,8 @@ export class KnowledgeDesk {
   private readonly proposals = new Map<string, Proposal>();
   /** 点了确认、还在执行的 */
   private readonly running = new Set<Promise<void>>();
+  /** 取代旧经验的保存排队进行 */
+  private replacing: Promise<unknown> = Promise.resolve();
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly lookupMs: number;
@@ -169,12 +172,9 @@ export class KnowledgeDesk {
         return undefined;
       }
       const teamHits = team.status === "fulfilled" ? team.value : [];
-      let aiopsHits = lessons.status === "fulfilled" ? lessons.value : [];
-      if (aiopsHits.length > 0) {
-        const entries = await raceAbort(base.entries(), deadline).catch(() => []);
-        const synced = new Set(entries.flatMap((entry) => (entry.aiopsId === undefined ? [] : [entry.aiopsId])));
-        aiopsHits = aiopsHits.filter((hit) => !synced.has(hit.id)).slice(0, LOOKUP_HITS);
-      }
+      // 只去掉团队经验库这次也查到了的：两边检索方式不一样，团队经验库没查到的那条 aiops 查到了，就用 aiops 的
+      const synced = new Set(teamHits.flatMap((hit) => (hit.entry.aiopsId === undefined ? [] : [hit.entry.aiopsId])));
+      const aiopsHits = (lessons.status === "fulfilled" ? lessons.value : []).filter((hit) => !synced.has(hit.id)).slice(0, LOOKUP_HITS);
       const parts = [
         teamHits.length > 0 ? renderHitsForPrompt(teamHits) : "",
         aiopsHits.length > 0 ? renderAiopsHitsForPrompt(aiopsHits) : "",
@@ -394,6 +394,13 @@ export class KnowledgeDesk {
     try {
       proposal.result = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
     } catch (err) {
+      if (err instanceof StaleProposalError) {
+        proposal.state = "stale";
+        proposal.note = err.message;
+        this.proposals.delete(proposal.id);
+        await this.render(proposal);
+        return;
+      }
       proposal.state = "pending";
       proposal.note = `上次点确认没成功：${describe(err)}。可以再点一次`;
       this.logger.warn(`经验库卡片 执行失败 proposal=${proposal.id}`, err);
@@ -408,8 +415,20 @@ export class KnowledgeDesk {
       .catch((err: unknown) => this.logger.warn("经验库：结果没能发到话题里", err));
   }
 
-  /** 保存，排查经验再同步到 aiops；返回发到话题里的几行。存进团队经验库之后的步骤失败只记在结果里 */
-  private async save(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
+  /**
+   * 保存，排查经验再同步到 aiops；返回发到话题里的几行。存进团队经验库之后的步骤失败只记在结果里。
+   * 取代旧经验的一张一张来：两张卡片取代同一条时，后点的那张存之前就能看到旧的已经归档了
+   */
+  private save(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
+    if (!proposal.replaces) {
+      return this.saveNow(proposal, confirmedBy, task);
+    }
+    const run = this.replacing.then(() => this.saveNow(proposal, confirmedBy, task));
+    this.replacing = run.catch(() => {});
+    return run;
+  }
+
+  private async saveNow(proposal: SaveProposal, confirmedBy: string, task: McpTaskContext): Promise<string[]> {
     const { base, aiops } = this.options;
     const { draft } = proposal;
     const entry = await base.save(draft, {
@@ -417,7 +436,10 @@ export class KnowledgeDesk {
       confirmedBy,
       source: `飞书群 ${proposal.chatId} 的话题（消息 ${proposal.sourceMessageId}）`,
       requestId: proposal.requestId,
+      ...(proposal.replaces ? { replaces: proposal.replaces.id } : {}),
     });
+    // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号
+    const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
     const lines = [`已存进团队经验库：经验 ${entry.id}「${draft.title}」，确认人 ${confirmedBy}。`];
     // aiops 里有没有这条经验（新存的或者已有相近的）。没有时不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     let inAiops = false;
@@ -427,7 +449,7 @@ export class KnowledgeDesk {
       try {
         const options = { confirmedBy, teamId: entry.id, ...(proposal.caseId === undefined ? {} : { caseId: proposal.caseId }) };
         let synced = await aiops.save(draft, options, task);
-        const replacedLesson = proposal.replaces?.aiopsId;
+        const replacedLesson = replaced?.aiopsId;
         if (!synced.saved && replacedLesson !== undefined && synced.duplicate.id === replacedLesson) {
           // aiops 说很像的正是要取代的那条：本来就是同一个问题的新版本，照样存，旧的在下面归档
           synced = await aiops.save(draft, { ...options, force: true }, task);
@@ -443,8 +465,8 @@ export class KnowledgeDesk {
         lines.push(`没能同步到 aiops 经验库：${describe(err)}`);
       }
     }
-    if (proposal.replaces) {
-      lines.push(...(await this.archiveEntry(proposal.replaces, confirmedBy, task, "旧的", proposal.syncAiops && !inAiops)));
+    if (replaced) {
+      lines.push(...(await this.archiveEntry(replaced, confirmedBy, task, "旧的", proposal.syncAiops && !inAiops)));
     }
     const location = await base.location().catch(() => undefined);
     if (location) {
@@ -459,10 +481,11 @@ export class KnowledgeDesk {
       await this.options.aiops!.archive(target.lesson.id, confirmedBy, task);
       return [`已归档 aiops 经验 #${target.lesson.id}「${target.lesson.title}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`];
     }
-    await this.options.base.archive(target.entry.id, { confirmedBy });
-    const lines = [`已归档经验 ${target.entry.id}「${target.entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`];
-    if (target.entry.aiopsId !== undefined) {
-      lines.push(...(await this.archiveLinked(target.entry.aiopsId, confirmedBy, task)));
+    // 用归档时表格里的样子：卡片发出后可能有人在表格里改过 aiops 编号
+    const entry = await this.options.base.archive(target.entry.id, { confirmedBy });
+    const lines = [`已归档经验 ${entry.id}「${entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`];
+    if (entry.aiopsId !== undefined) {
+      lines.push(...(await this.archiveLinked(entry.aiopsId, confirmedBy, task)));
     }
     return lines;
   }
@@ -486,11 +509,12 @@ export class KnowledgeDesk {
   }
 
   /** 保存新经验后归档被取代的旧经验，失败只写进结果。keepAiops：新的没进 aiops，旧的在 aiops 里那条先留着 */
-  private async archiveEntry(entry: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, label: string, keepAiops = false): Promise<string[]> {
+  private async archiveEntry(old: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, label: string, keepAiops = false): Promise<string[]> {
+    let entry: KnowledgeEntry;
     try {
-      await this.options.base.archive(entry.id, { confirmedBy });
+      entry = await this.options.base.archive(old.id, { confirmedBy });
     } catch (err) {
-      return [`${label}经验 ${entry.id} 没能归档：${describe(err)}`];
+      return [`${label}经验 ${old.id} 没能归档：${describe(err)}`];
     }
     const lines = [`${label}经验 ${entry.id}「${entry.title}」已归档。`];
     if (entry.aiopsId !== undefined && keepAiops) {
@@ -623,6 +647,7 @@ const HEADERS: Record<ProposalState, { save: string; archive: string; template: 
   done: { save: "已存进经验库", archive: "已归档", template: "green" },
   cancelled: { save: "已取消", archive: "已取消", template: "grey" },
   superseded: { save: "已换成新的草稿", archive: "已换成新的草稿", template: "grey" },
+  stale: { save: "已作废", archive: "已作废", template: "grey" },
 };
 
 /** 确认卡片（飞书卡片 JSON 2.0）：草稿全文、说明和按钮；处理完以后去掉按钮，写上结果 */

@@ -16,8 +16,11 @@ export interface PromptContext {
   readOnly?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
   extra?: string;
-  /** 团队经验库。hits 是回答前自动查到的相近经验（已排好版）：空字符串表示查了没有相近的，没有这一项表示这次没查成；missed 是一边查成、另一边没查成时没查成的库 */
-  knowledge?: { hits?: string; missed?: readonly string[] };
+  /**
+   * 团队经验库。hits 是回答前自动查到的相近经验（已排好版），空字符串表示查了没有相近的；
+   * missed 是一边查成、另一边没查成时没查成的库；failed 是都没查成（超时或出错）
+   */
+  knowledge?: { hits?: string; missed?: readonly string[]; failed?: boolean };
 }
 
 export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, knowledge }: PromptContext): string {
@@ -75,7 +78,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
     lines.push("", extra);
   }
   if (knowledge) {
-    lines.push("", ...knowledgeSection(knowledge, toolNames.includes("knowledge_propose")));
+    lines.push("", ...knowledgeSection(knowledge, toolNames.includes("knowledge_propose"), toolNames.includes("aiops_search_knowledge")));
   }
   if (memory) {
     lines.push("", ...memorySection(memory));
@@ -83,7 +86,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
   return lines.join("\n");
 }
 
-function knowledgeSection({ hits, missed }: { hits?: string; missed?: readonly string[] }, canPropose: boolean): string[] {
+function knowledgeSection(
+  { hits, missed, failed }: { hits?: string; missed?: readonly string[]; failed?: boolean },
+  canPropose: boolean,
+  hasAiops: boolean,
+): string[] {
   const lines = [
     "## 团队经验库",
     "团队经验库存在飞书多维表格里，所有群共用，存的是有人确认过的结论，编号写成「经验 K3」（和群记忆的 #N、aiops 的「案例 #N」「经验 #N」都不是一套编号，不要混）。" +
@@ -104,7 +111,11 @@ function knowledgeSection({ hits, missed }: { hits?: string; missed?: readonly s
   } else if (hits === "" && !missed?.length) {
     lines.push("- 这次提问在经验库里没查到相近的经验。查到新线索（报错原文、错误码、服务名）后可以用 knowledge_search 再查。");
   }
-  if (missed?.length) {
+  if (failed) {
+    lines.push(
+      `- 回答前自动查经验库没查成（超时或出错），不知道有没有相近的经验。需要参考以前的经验时自己查：团队经验库用 knowledge_search${hasAiops ? "，aiops 经验库用 aiops_search_knowledge" : ""}。`,
+    );
+  } else if (missed?.length) {
     lines.push(
       `- 回答前${missed.join("和")}没查成（超时或出错），${hits ? "上面只有查成的那边的结果" : "另一边没查到相近的"}。需要时自己再查：团队经验库用 knowledge_search，aiops 经验库用 aiops_search_knowledge。`,
     );

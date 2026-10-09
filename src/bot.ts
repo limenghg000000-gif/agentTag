@@ -285,7 +285,9 @@ async function runTask(
         memory: memory?.prompt,
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
-        ...(deps.knowledge ? { knowledge: knowledge ? { hits: knowledge.text, ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}) } : {} } : {}),
+        ...(deps.knowledge
+          ? { knowledge: knowledge ? { hits: knowledge.text, ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}) } : { failed: true } }
+          : {}),
       }),
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,

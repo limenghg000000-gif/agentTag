@@ -94,6 +94,8 @@ export interface KnowledgeMeta {
   source?: string;
   /** 确认卡片的草稿编号（UUID）。同一个编号只存一次 */
   requestId?: string;
+  /** 要取代的旧经验编号：存之前确认它还有效，免得两张卡片各存一条新的去取代同一条 */
+  replaces?: string;
 }
 
 export interface SearchOptions {
@@ -132,6 +134,14 @@ export class KnowledgeError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "KnowledgeError";
+  }
+}
+
+/** 卡片上的内容已经不成立了（比如要取代的旧经验已经被别的卡片取代），这张卡片作废，再点也没用 */
+export class StaleProposalError extends KnowledgeError {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleProposalError";
   }
 }
 
@@ -227,6 +237,14 @@ export class KnowledgeBase {
       if (saved) {
         this.logger.info(`经验库 ${saved.id}「${saved.title}」上次已经存进去了（草稿 ${meta.requestId}），不重复保存`);
         return saved;
+      }
+      if (meta.replaces) {
+        const old = entries.find((entry) => entry.id.toUpperCase() === normalizeId(meta.replaces!));
+        if (old?.status !== "active") {
+          throw new StaleProposalError(
+            `要取代的经验 ${meta.replaces} ${old ? "已经归档了（可能已经被别的卡片取代）" : "不在经验库里了"}，这张卡片不能再保存。需要的话请重新起草`,
+          );
+        }
       }
       const next = Math.max(0, ...entries.map((entry) => numberOf(entry.id))) + 1;
       const entry: KnowledgeEntry = {
@@ -422,12 +440,14 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   // sk-proj-…、sk-ant-api03-…、sk-svcacct-… 中间带连字符的也算，这种要带数字，免得把 sk- 开头的长名字当成密钥
   [/\bsk-(?:[A-Za-z0-9]{20,}|(?=[\w-]*\d)[\w-]{20,})/, "API 密钥"],
   [/\b(?:AKIA|LTAI)[A-Za-z0-9]{12,}/, "云服务的 AccessKey"],
+  // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
+  [/(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{16,}/i, "云服务的 AccessKey Secret"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
   // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple）；中文说明（「密码：请找管理员重置」）和 *** 不算
   [/(?:password|passwd|pwd|密码|口令)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{6,}/i, "密码"],
-  // token、secret 后面常跟报错原文（token=expired_session），要带数字才算
-  [/(?:secret|token)\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}/i, "密码或令牌"],
+  // token、secret（也算 secret_key、token_key 这类）后面常跟报错原文（token=expired_session），要带数字才算
+  [/(?:secret|token)(?:[_-]?(?:access[_-]?)?key)?\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}/i, "密码或令牌"],
 ];
 
 /** 去掉首尾空白、检查必填、长度和密钥 */
