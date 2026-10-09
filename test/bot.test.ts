@@ -873,6 +873,10 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   // 问的是时间本身：回答里的时间是算出来、举例的，写成线上结论时才拦
   assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "北京时间为 16:00:00。"), false);
   assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "结论：北京时间为 16:00:00（把握：高）"), false);
+  assert.equal(block("现在是几月几日几点？", "现在是北京时间 2026-10-09 09:30。"), false);
+  assert.equal(block("一小时后是几点？", "一小时后是北京时间 10:30:00。"), false);
+  assert.equal(block("3 天后是星期几", "2026-10-12 00:00 是星期一"), false);
+  assert.equal(block("gateway-api 什么时候开始报错的", "结论：从 15:31:22 开始报错（把握：中）"), true);
   assert.equal(block("时间戳 1696752000 是北京时间几点", "2023-10-08 16:00:00"), false);
   assert.equal(block("Python 怎么格式化时间", "strftime('%Y-%m-%d %H:%M:%S') 输出类似 2024-01-01 12:00:00"), false);
   assert.equal(block("gateway-api 15:30 以后有报错吗", "结论：15:31:22 起有 3 条 error 日志（把握：中）"), true);

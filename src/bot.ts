@@ -393,8 +393,19 @@ const OPS_WEAK = new RegExp(OPS_WEAK_PATTERNS.join("|"), "gi");
  * 「结论：1GiB = 1024MiB」不算；「把握好内存 limit」「把握高峰期」这类说法也不算
  */
 const OPS_CONCLUSION = /把握[*_\x60\s]*[:：]?[*_\x60\s]*[高中低]等?(?![\u4e00-\u9fff])/;
-/** 问的就是时间本身：提问里带着时间，或者说到换算、时区、时间戳、格式。回答里的时间是算出来或者举例的（「UTC 08:00:00 是北京时间几点」答「16:00:00」） */
-const TIME_QUESTION = /(?<!\d)\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|时间戳|timestamp|时区|time\s*zone|utc|gmt|换算|转换|格式|format|strftime|strptime/i;
+/**
+ * 问的就是时间本身：提问里带着时间，问几点、几号、什么时候，问「一小时后」这类相对时间，或者说到换算、时区、时间戳、格式。
+ * 回答里的时间是算出来或者举例的（「UTC 08:00:00 是北京时间几点」答「16:00:00」）；现在几点模型从系统提示词里就知道
+ */
+const TIME_QUESTION = new RegExp(
+  [
+    String.raw`(?<!\d)\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}`,
+    String.raw`几点|几号|几月|几日|哪天|哪一天|星期几|周几|礼拜几|什么时[间候]|日期|多久|多长时间`,
+    String.raw`(?:\d+|[一二两三四五六七八九十半]+)\s*个?\s*(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月|年)(?:以?后|以?前|之后|之前)`,
+    String.raw`时间戳|timestamp|时区|time\s*zone|utc|gmt|换算|转换|格式|format|strftime|strptime`,
+  ].join("|"),
+  "i",
+);
 /** Go 的时间格式样例，讲时间格式时常出现，不是线上的时间 */
 const TIME_LAYOUT = /2006-01-02|15:04:05/;
 
