@@ -1,5 +1,5 @@
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
-import { type AgentEvent, type AgentResult, runAgent } from "./agent.js";
+import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { imageKeysOf } from "./feishu.js";
 import { type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
@@ -213,21 +213,29 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    // 记下这次成功跑完的工具和 MCP 工具的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
-    // 回答里引用的文件路径出现在 MCP 结果里（比如 aiops 查到的报错堆栈），就不算没查证
+    // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
+    // 回答里引用的文件路径、行号、提交号要在这些结果里出现过（代码工具读到的，或者 aiops 查到的报错堆栈），才算查证过
     const succeeded = new Set<string>();
+    const attempted = new Set<string>();
     const evidence: string[] = [];
+    const failures: string[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
-    const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
-          const output = await tool.run(args, ctx);
-          succeeded.add(tool.spec.name);
-          if (mcpNames.has(tool.spec.name)) {
-            evidence.push(output);
+          attempted.add(tool.spec.name);
+          let output: string;
+          try {
+            output = await tool.run(args, ctx);
+          } catch (err) {
+            // 失败的原因也记下：读文件报「没有这个文件：src/foo.ts」以后，回答说这个文件不存在不算编
+            failures.push(err instanceof Error ? err.message : String(err));
+            throw err;
           }
+          succeeded.add(tool.spec.name);
+          // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到
+          evidence.push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
           return output;
         },
       }),
@@ -246,10 +254,10 @@ async function runTask(
       logger.info(`这次打开深度思考 message=${msg.messageId}`);
     }
     const toolNames = taskTools.map((tool) => tool.spec.name);
+    const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
+    const seen = codeEvidence(deps.codeRepos ?? [], evidence, failures);
     const reviews = [
-      ...(taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX))
-        ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], (path) => evidence.some((output) => output.includes(path)))]
-        : []),
+      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
     ];
@@ -289,6 +297,19 @@ async function runTask(
     if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
+    }
+    if (hasCodeTools && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
+      // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
+      // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
+      const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
+      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, deps.codeRepos ?? []);
+      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || userText.includes(text)).filter(
+        (cite) => cite.located || investigating,
+      );
+      if (unseen.length > 0) {
+        logger.warn(`回答打回重做以后还是引用了没查到的代码位置，没有发出 message=${msg.messageId}：${unseen.map((cite) => cite.text).join("、")}`);
+        answer = blockedCodeAnswer(deps.codeRepos ?? []);
+      }
     }
     state.phase = "done";
     deps.context.remember(msg, prompt, answer);
@@ -406,31 +427,127 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 const CODE_TOOL_PREFIX = "code_";
 /** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
 const CODE_PATHS =
-  /(?:^|[\s`'"(（:：])((?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto))\b/g;
+  /(?:^|[\s`'"(（:：,，、])((?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto))\b/g;
+/** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
+const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
+/** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
+const COMMIT_REFS = /(?:@|\bcommit\b|提交|版本)\s*[:：]?\s*[`'"]?((?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40})(?![0-9a-z])/gi;
+
 export const UNVERIFIED_CODE_ANSWER =
   "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
   "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
   "如果和仓库无关，去掉没查证的文件路径后重新回答。不要提这段检查。";
 
+/** 调过代码工具，回答里却引用了工具结果里没有的文件、提交号时，让模型重做 */
+export function unseenCodeAnswer(cites: readonly string[], repos: readonly string[]): string {
+  return (
+    `（系统检查）你的回答引用了这些代码位置，但它们在这次的工具结果里都没有出现：${cites.join("、")}。` +
+    "只能引用工具结果里真出现过的文件、行号和提交号。先用 code_search、code_read_file 查到再写；" +
+    `要查的代码不在能读的仓库（${repos.join("、")}）里时，直说读不到这部分代码，不要拿别的仓库里的文件或常见的项目结构来回答。不要提这段检查。`
+  );
+}
+
+/** 打回重做以后还是引用了没查到的代码位置时，换成这句发出去 */
+export function blockedCodeAnswer(repos: readonly string[]): string {
+  return (
+    "这次没能给出结论：回答里引用的文件、行号或提交号在查到的代码里找不到，为免误导没有发出来。" +
+    `要查的代码可能不在机器人能读的仓库里（现在能读：${repos.join("、")}），需要的话请把仓库加进来，或者换个问法再问一次。`
+  );
+}
+
+export interface CodeCitation {
+  /** 回答里写的文件路径（带行号的连行号一起，如 src/foo.ts:35）或提交号 */
+  text: string;
+  /** 带了行号的路径、或者提交号：写得这么具体就是在说「查过」，不会是举例 */
+  located: boolean;
+}
+
+/** 认不认得回答里的路径、提交号；line 是路径后面写的行号 */
+export type CitationCheck = (text: string, line?: number) => boolean;
+
 /**
- * 模型不读代码就回答仓库的问题时（问题或回答提到了配置的仓库、或者回答里写了代码文件路径，这次却没调任何代码工具），
- * 让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
- * seenInEvidence 认的文件路径不算：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，不是编的；
- * 只放过工具结果里真出现过的路径，回答里多写一个结果里没有的路径照样打回
+ * 回答里引用、但 seen 认不出来的代码位置（文件路径、行号和提交号）。
+ * 2026-10-09 复测：问 gateway-api 和用户服务的代码，模型只调了一次工具，就写出「ai/agent-tag master @ 2c6a7d9」
+ * 和 userlogic.go:35 这些仓库里根本没有的提交和文件，把握写高
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], seenInEvidence: (path: string) => boolean = () => false) {
-  return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
-    if ([...usedTools].some((name) => name.startsWith(CODE_TOOL_PREFIX))) {
-      return undefined;
+export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCitation[] {
+  const cites = new Map<string, CodeCitation>();
+  for (const match of answer.matchAll(CODE_PATHS)) {
+    const path = match[1];
+    const at = LINE_AFTER_PATH.exec(answer.slice(match.index + match[0].length));
+    const line = at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
+    if (!seen(path, line)) {
+      const text = line === undefined ? path : `${path}:${line}`;
+      cites.set(text, { text, located: line !== undefined });
     }
-    const text = `${question}\n${answer}`.toLowerCase();
-    const mentionsRepo = repos.some((repo) => {
-      const full = repo.toLowerCase();
-      const short = full.split("/").pop() ?? full;
-      return text.includes(full) || (short.length >= 5 && text.includes(short));
-    });
-    const unverifiedPath = [...answer.matchAll(CODE_PATHS)].some((match) => !seenInEvidence(match[1]));
-    return mentionsRepo || unverifiedPath ? UNVERIFIED_CODE_ANSWER : undefined;
+  }
+  for (const match of answer.matchAll(COMMIT_REFS)) {
+    if (!seen(match[1])) {
+      cites.set(match[1], { text: match[1], located: true });
+    }
+  }
+  return [...cites.values()];
+}
+
+/**
+ * 按这次的工具结果认引用：路径、提交号出现在结果里就算；带行号的还要那一行真在结果里：搜索结果、报错堆栈里的「路径:行号」，
+ * 或者读这个文件时读到了那一行（「35| …」）。只列过文件、读了别的段落，编一个行号照样不认。
+ * 工具报的错里提到的路径也认（「没有这个文件：src/foo.ts」以后说它不存在）。
+ * 回答里写成「./路径」或「仓库名/路径」（ai/aiops-mcp/internal/x.go）时，去掉前缀再找
+ */
+export function codeEvidence(repos: readonly string[], outputs: readonly string[], failures: readonly string[] = []): CitationCheck {
+  return (cite, line) => {
+    const text = cite.replace(/^\.\//, "");
+    const forms = [
+      text,
+      ...repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => text.slice(repo.length + 1)),
+    ];
+    return forms.some(
+      (form) =>
+        failures.some((failure) => failure.includes(form)) ||
+        outputs.some((output) => (line === undefined ? output.includes(form) : hasLine(output, form, line))),
+    );
+  };
+}
+
+/** 这段工具结果里有没有 path 的第 line 行 */
+function hasLine(output: string, path: string, line: number): boolean {
+  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`${escaped}(?::|", line )${line}(?!\\d)`).test(output)) {
+    return true;
+  }
+  const read = output.startsWith(`${path}（`) || output.startsWith(`./${path}（`);
+  return read && output.includes(`\n${line}| `);
+}
+
+function isCodeTool(name: string): boolean {
+  return name.startsWith(CODE_TOOL_PREFIX);
+}
+
+/** 提问或回答里提到了配置的仓库（全名，或者 5 个字以上的最后一段名字） */
+function mentionsRepo(text: string, repos: readonly string[]): boolean {
+  const lower = text.toLowerCase();
+  return repos.some((repo) => {
+    const full = repo.toLowerCase();
+    const short = full.split("/").pop() ?? full;
+    return lower.includes(full) || (short.length >= 5 && lower.includes(short));
+  });
+}
+
+/**
+ * 有代码工具时检查回答：
+ * - 一次代码工具都没调，问题或回答却提到了配置的仓库、或者回答里写了没查证的文件路径：让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
+ * - 调过代码工具，回答里还是写了工具结果里没有的文件、行号、提交号：让它只按查到的重写。只看「调没调过」不够，调一次什么都没查到照样能编。
+ * seen 认的不算没查证：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，代码工具读到的也在里面；
+ * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码
+ */
+export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false) {
+  return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
+    const unseen = unseenCodeCitations(answer, seen);
+    if ([...usedTools].some(isCodeTool)) {
+      return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
+    }
+    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? UNVERIFIED_CODE_ANSWER : undefined;
   };
 }
 
