@@ -1461,9 +1461,11 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.match(String(asked.requests[2].messages.at(-1)?.content), /读失败、没搜到的路径也不算/);
   assert.deepEqual(asked.replies, [missing]);
   // 群成员写的是「仓库名/路径」，回答里写的是仓库里的路径，也算照着复述
-  const prefixed = await ask([missing, missing], { question: "ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的", tool: "code_read_file" });
-  assert.equal(prefixed.requests.length, 3);
-  assert.deepEqual(prefixed.replies, [missing]);
+  for (const question of ["ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的", "AI/AIOPS-MCP/src/legacy/user.ts 第 10 行是干嘛的"]) {
+    const prefixed = await ask([missing, missing], { question, tool: "code_read_file" });
+    assert.equal(prefixed.requests.length, 3, question);
+    assert.deepEqual(prefixed.replies, [missing], question);
+  }
 
   // 读失败、没搜到以后照样讲这个文件写了什么，或者自己猜的路径读失败了还写着：打回重做，重做后还这么写就不发出
   for (const [claim, tool] of [
@@ -1502,6 +1504,35 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.equal(clipped.requests.length, 3);
   assert.match(String(clipped.requests[2].messages.at(-1)?.content), /src\/hidden\/tail\.ts/);
   assert.deepEqual(clipped.replies, ["入口在 src/index.ts"]);
+});
+
+test("代码工具的结果被截断时，切开的最后一行整行不算（文件名里可以有空格）", async () => {
+  const output = "共 2 个文件（master 分支 @ 1a2b3c4）：\nsrc/index.ts\nsrc/foo.ts backup\nsrc/b.ts";
+  const ask = async (limit: number, answers: string[]) => {
+    const listFiles: Tool = {
+      spec: { name: "code_list_files", description: "列文件", parameters: { type: "object", properties: {} } },
+      describe: () => "列文件",
+      maxOutputChars: limit,
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_list_files", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({ model, taskTools: () => [listFiles], codeRepos: ["ai/aiops-mcp"] });
+    await handle(message("ai/aiops-mcp 的入口在哪"));
+    return { requests, replies: markdowns(sent) };
+  };
+
+  // 正好截在「src/foo.ts」后面，模型看到的像是一个完整的路径
+  const cut = await ask(output.indexOf(" backup"), ["入口在 `src/index.ts`，配置在 `src/foo.ts`", "入口在 `src/index.ts`"]);
+  assert.equal(cut.requests.length, 3);
+  assert.match(String(cut.requests[2].messages.at(-1)?.content), /src\/foo\.ts/);
+  assert.deepEqual(cut.replies, ["入口在 `src/index.ts`"]);
+  // 正好截在换行处：最后一行是完整的，照样算
+  const atNewline = await ask(output.indexOf("\nsrc/foo.ts"), ["入口在 `src/index.ts`"]);
+  assert.equal(atNewline.requests.length, 2);
 });
 
 test("没读代码、也没问仓库时，重做后还写着举例的路径照常发出", async () => {

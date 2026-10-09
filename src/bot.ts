@@ -237,7 +237,7 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
-          evidence.push({ tool: tool.spec.name, output: seenByModel(output, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS) });
+          evidence.push({ tool: tool.spec.name, output: seenByModel(output, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS, isCodeTool(tool.spec.name)) });
           return output;
         },
       }),
@@ -306,8 +306,9 @@ async function runTask(
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
-      // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts）、回答里写 src/foo.ts 的也算照着复述
-      const inQuestion = (text: string) => mentions(userText, text) || repos.some((repo) => mentions(userText, `${repo}/${text}`));
+      // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述
+      const unprefixed = repos.reduce((text, repo) => text.replace(new RegExp(`${escapeRegExp(repo)}/`, "gi"), " "), userText);
+      const inQuestion = (text: string) => mentions(userText, text) || mentions(unprefixed, text);
       const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || inQuestion(text)).filter(
         (cite) => cite.located || investigating,
       );
@@ -705,15 +706,19 @@ function hasLine(output: string, path: string, line: number): boolean {
 }
 
 /**
- * 工具结果里模型看到的部分：和 runAgent 交给模型时一样截短。被截掉的不算查到；截断处被切开的路径、行号也去掉：
- * 切在行号里（src/foo.ts:12 后面其实还有个 3）只去掉行号，路径是完整的；切在路径里（src/foo.t）整个去掉；
+ * 工具结果里模型看到的部分：和 runAgent 交给模型时一样截短。被截掉的不算查到，截断处被切开的也去掉。
+ * 代码工具的结果一行一条（文件列表的一行就是一个路径，路径里可以有空格），被切开的最后一行整行去掉。
+ * 别的工具按词：切在行号里（src/foo.ts:12 后面其实还有个 3）只去掉行号，路径是完整的；切在路径里（src/foo.t）整个去掉；
  * 正好切在路径后面的冒号前（src/foo.ts 后面是 :123）路径是完整的，都留着
  */
-function seenByModel(output: string, limit: number): string {
+function seenByModel(output: string, limit: number, byLine: boolean): string {
   if (output.length <= limit) {
     return output;
   }
   const kept = output.slice(0, limit);
+  if (byLine) {
+    return output[limit] === "\n" ? kept : kept.slice(0, kept.lastIndexOf("\n") + 1);
+  }
   const next = output[limit];
   if (next === ":" || !/[\w./-]/.test(next)) {
     return kept;
