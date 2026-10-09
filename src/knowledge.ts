@@ -816,6 +816,43 @@ function isBasicCredential(value: string): boolean {
 }
 
 /**
+ * Authorization 头（Proxy-Authorization、X-Authorization、CGI 的 HTTP_AUTHORIZATION，JSON 里的 "Authorization": "…"、
+ * curl -H 'Authorization: …'、转义的 \"Authorization\" 也算）后面这一行，第 1 组
+ */
+const AUTHORIZATION_HEADER = /(?<![\w-])(?:[A-Za-z0-9]+[-_])*authorization\\?["']?[^\S\r\n]*[:=：][^\S\r\n]*\\?["']?([^\r\n]*)/gi;
+/** 头的值：第 1 组是第一段，有第 2 段时第 1 组是认证方式、第 2 组是凭据，第 3 组是后面的。一段到空白、引号、逗号分号、括号、中文为止 */
+const AUTHORIZATION_VALUE = new RegExp(String.raw`^(${VALUE_CHAR}+)(?:[^\S\r\n]+(${VALUE_CHAR}+))?(.*)$`);
+
+/**
+ * Authorization 头里的凭据：Bearer 以外的认证方式（Token …、SSWS …、ApiKey …、Negotiate …）后面的那段，拿到就能调接口。
+ * 凭据带数字的都算；不带数字的，要整个头只有「认证方式 凭据」（后面是行尾、引号、逗号分号、中文），认证方式也不是报错里的词
+ * （Authorization: invalid credentials、failed verification 是说明，Token、Key 是真的认证方式）。
+ * 没写认证方式直接写的令牌，要不短于 16 个字符、带数字和小写字母（Authorization: Negotiate、SCRAM-SHA-256 说的是认证方式）。
+ * Basic 由 BASIC_AUTH 解开看；认证参数（Digest username="…"、AWS4-HMAC-SHA256 Credential=…）里写明了是密钥的由别的规则拦；
+ * 后面紧跟着 ( [ { < \ 的是代码、占位（Bearer {access_token}、SSWS {{apiToken}}）
+ */
+function authorizationCredentials(text: string): string[] {
+  return [...text.matchAll(AUTHORIZATION_HEADER)].flatMap(([, line]) => {
+    const parts = AUTHORIZATION_VALUE.exec(line);
+    if (!parts) {
+      return [];
+    }
+    const [, first, second, rest] = parts;
+    const scheme = second === undefined ? undefined : first;
+    const value = second ?? first;
+    if (/^basic$/i.test(scheme ?? "") || /=(?!=*$)/.test(value) || /^(?:["'`][^\s"'`,;)\]}>\\]|[([{<]|\\(?!["']))/.test(rest)) {
+      return [];
+    }
+    if (scheme === undefined) {
+      return value.length >= 16 && /\d/.test(value) && /[a-z]/.test(value) ? [value] : [];
+    }
+    const whole = /^(?:\\?["'`]|[^\S\r\n]*(?:$|[,;)\]}\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))/.test(rest);
+    const prose = PLACEHOLDER_WORD.test(scheme) && !/^(?:token|key)$/i.test(scheme);
+    return value.length >= 8 && (/\d/.test(value) || (whole && !prose)) ? [value] : [];
+  });
+}
+
+/**
  * 带签名的临时访问地址（Azure SAS 的 sig=、AWS 预签名的 X-Amz-Signature=、阿里云 OSS 的 Signature=、x-oss-signature=）：
  * 过期前谁拿到都能访问。参数名最后一段是 sig 或 signature，值不短于 16 个字符，到 &、空白、括号、中文为止；变量、占位（xxxx）、打了码的不算
  */
@@ -983,6 +1020,9 @@ function findSecret(text: string): string | undefined {
   }
   if ([...text.matchAll(BASIC_AUTH)].some(([, value]) => isBasicCredential(value))) {
     return "HTTP Basic 认证的用户名和密码";
+  }
+  if (authorizationCredentials(text).some((value) => !isPlaceholder(value))) {
+    return "Authorization 头里的凭据";
   }
   if ([...text.matchAll(AUTH_FIELD)].some(([, name, value]) => isAuthCredential(name, value))) {
     return "仓库登录用的用户名和密码";

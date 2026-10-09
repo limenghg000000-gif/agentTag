@@ -293,6 +293,19 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
+    // Authorization 头里 Bearer 以外的认证方式、没写认证方式的令牌、很短的 Bearer；JSON 里的、curl -H 的、转义的、Proxy-Authorization、HTTP_AUTHORIZATION
+    ["Authorization: Token correcthorse", "batterystaple9"].join(""),
+    ["Authorization: SSWS 00QCjAl4MlV-WPXM", "-ABCDEFGHIJKLMNOPQRSTUVWX"].join(""),
+    ["curl -H 'Authorization: ApiKey correcthorse", "batterystaple' https://api.example.com"].join(""),
+    ['{"Authorization": "token correcthorse', 'batterystaple"}'].join(""),
+    ['{\\"Authorization\\":\\"Token correcthorse', 'batterystaple\\"}'].join(""),
+    ["Proxy-Authorization: Negotiate YIIGhgYGKwYB", "BQUCoIIGejCCBnag"].join(""),
+    ["HTTP_AUTHORIZATION=Token abc123", "def456ghi"].join(""),
+    ["Authorization: lin_api_7f3a9c2e", "1b4d5a6f8e0c"].join(""),
+    ["Authorization: Bearer abc123", "def456"].join(""),
+    // 句子中间的，凭据带数字的
+    ["用 Authorization: Token abc123def", "456ghi 调接口"].join(""),
+    ["call it with Authorization: Token abc123", "def456 and retry"].join(""),
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -374,6 +387,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
     "<password><!-- 找管理员要 --></password><token>\n  <!-- 放在 vault 里 -->\n</token>",
+    // Authorization 头的报错、凭据是变量、占位、模板、打码的，只写了认证方式的，Digest 的认证参数，代码里拼的
+    "Authorization: invalid credentials\nAuthorization: failed verification\nAuthorization: Token expired\nAuthorization: Bearer undefined\nAuthorization: missing bearer token\nAuthorization: Token required, please login",
+    "Authorization: Token ${OKTA_TOKEN}\nAuthorization: SSWS {{apiToken}}\nAuthorization: Bearer {access_token}\nAuthorization: Token <your-token>\nAuthorization: token YOUR_API_TOKEN\nAuthorization: Token abcd****wxyz",
+    'Authorization: Negotiate；Authorization: SCRAM-SHA-256；Authorization: 需要登录；Authorization header is missing；headers = {"Authorization": f"Token {token}"}',
+    'Authorization: Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", qop=auth, nc=00000001, response="6629fae49393a05397450978507c4ef1"',
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -2317,6 +2335,7 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   // 带签名的临时访问地址也一样（拿到就能下载）
   await desk.lookup(`gateway-api 报 code=8，日志在 https://bucket.s3.amazonaws.com/k?X-Amz-Expires=300&X-Amz-Signature=${"0123456789abcdef".repeat(4)}`, task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="), task);
+  await desk.lookup(["gateway-api 报 code=8，请求头带了 Authorization: SSWS 00QCjAl4MlV-WPXM", "-ABCDEFGHIJKLMNOPQRSTUVWX"].join(""), task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);
