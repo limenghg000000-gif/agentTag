@@ -185,6 +185,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // shell 里转义的空格、行尾 \ 续行
     "deployctl --password correct\\ horse\\ battery\\ staple",
     "deployctl \\\n  --password \\\n  correcthorsebatterystaple \\\n  --verbose",
+    // TOML、Python 里三个引号的多行字符串，跨行的、行尾 \ 续行的也算
+    'password="""correct horse battery staple"""',
+    "api_key = '''correct horse battery staple'''",
+    '[aiops]\ntoken = """\ncorrect horse\nbattery staple\n"""',
+    'db_password = """correct \\\n    horse battery staple"""',
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -230,6 +235,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "用 --token 参数传进去；pass the --token option, then restart；use --api-key instead of --password",
     "args:\n  - --token\n  - $(MCP_AIOPS_TOKEN)",
     "deployctl --token \\\n  $MCP_AIOPS_TOKEN \\\n  --private-key C:\\keys\\deploy.pem",
+    // 三个引号里是变量、占位、打码、中文说明的，或者是空的
+    '配置里 token = """${MCP_AIOPS_TOKEN}"""、api_key = \'\'\'<your-api-key>\'\'\' 都是占位；secret = """******""" 打了码；token = """""" 是空的；password = """请找管理员重置"""',
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -1409,7 +1416,7 @@ test("aiops 已经存了、记编号没成功，再试一次前表格里改了�
       "aiops 里上次那条归档",
     );
     const result = (setup.sent.at(-1)!.input as { markdown: string }).markdown;
-    assert.match(result, /上次同步到 aiops 的经验 #31 已经不对了，已归档/);
+    assert.match(result, /之前同步到 aiops 的经验 #31 已经不对了，已归档/);
     if (synced) {
       assert.equal(setup.calls.filter((call) => call.tool === "save_lesson").length, 2);
       assert.equal(setup.backend.entries[0].aiopsId, 32);
@@ -1461,6 +1468,126 @@ test("aiops 归档：archive_lesson 报错时看一下，已经归档了就算�
   await lessons.archive(12, "ML", task);
   status = "active";
   await assert.rejects(lessons.archive(12, "ML", task), /经验不存在或已归档/);
+});
+
+test("aiops 返回的经验编号不是正的安全整数时不认：存的结果报错，检索里的跳过，取到的编号对不上报错", async () => {
+  let saved: unknown = 2 ** 53;
+  let duplicate: unknown = 12;
+  let got: unknown = 12;
+  const { mcp } = fakeMcp({
+    save_lesson: (args) =>
+      args.title === "重复的"
+        ? JSON.stringify({ saved: false, duplicate_of: { id: duplicate, title: "user-rpc 降载" } })
+        : JSON.stringify({ saved: true, id: saved }),
+    search_knowledge: () =>
+      JSON.stringify({
+        hits: [
+          { id: 1.5, title: "小数", score: 9 },
+          { id: -3, title: "负数", score: 9 },
+          { id: 2 ** 53, title: "超出范围", score: 9 },
+          { id: 12, title: "user-rpc 降载", score: 9 },
+        ],
+      }),
+    get_knowledge: () => JSON.stringify({ id: got, title: "user-rpc 降载", status: "active" }),
+    archive_lesson: () => JSON.stringify({ archived: true }),
+  });
+  const lessons = new AiopsLessons(mcp, "aiops", quiet);
+  const draft = normalizeDraft(code8);
+  for (const id of [2 ** 53, 1.5, 0, -1, "31"]) {
+    saved = id;
+    await assert.rejects(lessons.save(draft, { confirmedBy: "ML", teamId: "K1" }, task), /aiops 没有说存没存成功/);
+  }
+  for (const id of [2 ** 53, 0.5]) {
+    duplicate = id;
+    await assert.rejects(lessons.save({ ...draft, title: "重复的" }, { confirmedBy: "ML", teamId: "K1" }, task), /aiops 没有说存没存成功/);
+  }
+  assert.deepEqual(
+    (await lessons.search("user-rpc 降载", task)).map((hit) => hit.id),
+    [12],
+  );
+  assert.equal((await lessons.get(12, task)).id, 12);
+  got = 13;
+  await assert.rejects(lessons.get(12, task), /取经验 #12 时返回的是别的编号/);
+});
+
+test("同步到 aiops 时有人在表格里改了这一行：存完重新读表格，归档刚存的那条，按改过的重新同步再记编号", async () => {
+  let saves = 0;
+  let setup: ReturnType<typeof deskSetup>;
+  setup = deskSetup({
+    saveLesson: () => {
+      saves++;
+      if (saves === 1) {
+        setup.backend.entries[0].conclusion = "user-rpc 只有一个 Pod 接住了全部 gRPC 长连接，CPU 打满后降载（表格里改过）";
+      }
+      return JSON.stringify({ saved: true, id: 30 + saves });
+    },
+  });
+  const { backend, desk, sent, calls, click, tool, lastCard } = setup;
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  const lessonSaves = calls.filter((call) => call.tool === "save_lesson");
+  assert.equal(lessonSaves.length, 2);
+  assert.match(String(lessonSaves[1].args.root_cause), /表格里改过/);
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal(backend.entries[0].aiopsId, 32);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 在表格里改过，之前同步到 aiops 的经验 #31 已经不对了，已归档/);
+});
+
+test("同步到 aiops 时有人在表格里归档或者删了这一行：归档刚存的那条，不记编号、不再同步；一直在改的先停下等再试一次", async () => {
+  for (const change of ["archive", "delete"] as const) {
+      let setup: ReturnType<typeof deskSetup>;
+    setup = deskSetup({
+      saveLesson: () => {
+        if (change === "archive") {
+          setup.backend.entries[0].status = "archived";
+        } else {
+          setup.backend.entries.pop();
+        }
+        return JSON.stringify({ saved: true, id: 31 });
+      },
+    });
+    const { backend, desk, sent, calls, click, tool, lastCard } = setup;
+    await tool("knowledge_propose").run(code8, { signal });
+    await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+    await desk.idle();
+    assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1, change);
+    assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }], change);
+    assert.equal(backend.entries[0]?.aiopsId, undefined, change);
+    assert.equal(lastCard().header.title.content, "已存进经验库", change);
+    assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 在表格里已经归档了，没有同步到 aiops 经验库/, change);
+  }
+
+  let saves = 0;
+  let busy: ReturnType<typeof deskSetup>;
+  busy = deskSetup({
+    saveLesson: () => {
+      saves++;
+      busy.backend.entries[0].conclusion = `user-rpc 只有一个 Pod 接住了全部 gRPC 长连接，CPU 打满后降载（第 ${saves} 次改）`;
+      return JSON.stringify({ saved: true, id: 30 + saves });
+    },
+  });
+  await busy.tool("knowledge_propose").run(code8, { signal });
+  await busy.desk.handleCardAction(busy.click((busy.sent[0].input as { card: any }).card, "save"));
+  await busy.desk.idle();
+  assert.equal(saves, 2);
+  assert.deepEqual(busy.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args.id), [31, 32]);
+  assert.equal(busy.lastCard().header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(busy.lastCard()), /同步到 aiops 的时候经验 K1 在表格里一直有人在改，先没同步/);
+});
+
+test("取代旧的排查经验、新的不同步到 aiops（改成了别的类别）：aiops 里旧的那条留着", async () => {
+  const { backend, base, desk, sent, calls, click, tool } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose").run({ ...code8, category: "answer", title: "用户反馈接口返回空时怎么回复", replaces: "K1" }, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.equal(backend.entries.find((e) => e.id === "K1")!.status, "archived");
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 0);
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /aiops 经验库里同步的旧经验 #31 留着没归档/);
 });
 
 test("aiops 经验写进提示词：根因和处理办法在前面，每一项限长，现象写得很长也看得到根因", () => {
@@ -1740,7 +1867,7 @@ test("aiops 已经存了、记编号没成功，再试一次前表格里清空�
     [31],
   );
   assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1);
-  assert.match(cardText(lastCard()), /上次同步到 aiops 的经验 #31 已经不对了，已归档/);
+  assert.match(cardText(lastCard()), /之前同步到 aiops 的经验 #31 已经不对了，已归档/);
   assert.match(cardText(lastCard()), /经验 K1 在表格里结论是空的，没有同步到 aiops 经验库/);
 });
 

@@ -248,9 +248,10 @@ export class KnowledgeBase {
     return { ...entry, ...(incomplete ? { incomplete } : {}), ...(unsafe ? { unsafe } : {}) };
   }
 
-  async get(id: string): Promise<KnowledgeEntry | undefined> {
+  /** 按编号取一条；fresh 时不用缓存，重新读表格 */
+  async get(id: string, { fresh = false }: { fresh?: boolean } = {}): Promise<KnowledgeEntry | undefined> {
     const wanted = normalizeId(id);
-    return (await this.entries()).find((entry) => entry.id.toUpperCase() === wanted);
+    return (await this.entries(fresh)).find((entry) => entry.id.toUpperCase() === wanted);
   }
 
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
@@ -664,6 +665,27 @@ function isBasicCredential(value: string): boolean {
 }
 
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
+/**
+ * TOML、Python 里三个引号的多行字符串（password = """correct horse battery staple"""、api_key = '''…'''），值可以跨好几行。
+ * 第 1 组是三个双引号里的，第 2 组是三个单引号里的
+ */
+const TRIPLE_QUOTED = new RegExp(String.raw`${CONFIG_KEY}["']?[^\S\r\n]*=[^\S\r\n]*(?:"""([\s\S]*?)"""|'''([\s\S]*?)''')`, "gi");
+
+/**
+ * 三个引号里的值：开头紧跟的换行去掉，行尾 \ 续到下一行的连起来，换行和连续的空白算一个空格。
+ * 和单个引号里的一样，有中文的是说明，有 * 的是打了码的，不算
+ */
+function tripleQuotedValues(text: string): string[] {
+  return [...text.matchAll(TRIPLE_QUOTED)].flatMap(([, double, single]) => {
+    const value = (double ?? single)
+      .replace(/^\r?\n/, "")
+      .replace(/\\\r?\n\s*/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return value.length >= 6 && !/[*　-〿一-鿿＀-￯]/.test(value) ? [value] : [];
+  });
+}
+
 function findSecret(text: string): string | undefined {
   const known = SECRET_PATTERNS.find(([pattern]) => pattern.test(text));
   if (known) {
@@ -676,6 +698,7 @@ function findSecret(text: string): string | undefined {
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
     ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
     ...blockValues(text),
+    ...tripleQuotedValues(text),
     // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
     ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) =>
       bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],

@@ -108,11 +108,12 @@ export class AiopsLessons {
     }
     return data.hits.flatMap((hit): AiopsLessonHit[] => {
       const item = hit as Record<string, unknown>;
-      if (typeof item.id !== "number" || typeof item.title !== "string") {
+      const id = lessonId(item.id);
+      if (id === undefined || typeof item.title !== "string") {
         return [];
       }
       const score = typeof item.score === "number" ? item.score : 0;
-      return [{ id: item.id, title: item.title, score, ...pickStrings(item, ["symptom", "root_cause", "solution", "diagnosis_path"]) }];
+      return [{ id, title: item.title, score, ...pickStrings(item, ["symptom", "root_cause", "solution", "diagnosis_path"]) }];
     });
   }
 
@@ -124,8 +125,11 @@ export class AiopsLessons {
     if (!item || typeof item.title !== "string") {
       throw new KnowledgeError(`aiops 经验库里取不到经验 #${id}：${raw.slice(0, 200)}`);
     }
+    if (item.id !== undefined && lessonId(item.id) !== id) {
+      throw new KnowledgeError(`aiops 取经验 #${id} 时返回的是别的编号：${raw.slice(0, 200)}`);
+    }
     return {
-      id: typeof item.id === "number" ? item.id : id,
+      id,
       title: item.title,
       status: typeof item.status === "string" ? item.status : "active",
       ...pickStrings(item, ["service", "symptom", "root_cause", "solution", "diagnosis_path", "keywords"]),
@@ -156,15 +160,18 @@ export class AiopsLessons {
     };
     const raw = await this.mcp.callDirect(this.server, "save_lesson", args, task);
     const data = parseJson(raw) as Record<string, unknown> | undefined;
-    if (data?.saved === true && typeof data.id === "number") {
-      this.logger.info(`aiops 经验库 保存 经验 #${data.id}「${draft.title}」（团队经验库 ${teamId}） 确认人=${confirmedBy}`);
-      return { saved: true, id: data.id };
+    // 编号要是正的安全整数：超出范围的在解析 JSON 时已经被四舍五入，记下来以后归档会指到别的经验
+    const savedId = lessonId(data?.id);
+    if (data?.saved === true && savedId !== undefined) {
+      this.logger.info(`aiops 经验库 保存 经验 #${savedId}「${draft.title}」（团队经验库 ${teamId}） 确认人=${confirmedBy}`);
+      return { saved: true, id: savedId };
     }
     const duplicate = data?.duplicate_of as Record<string, unknown> | undefined;
-    if (data?.saved === false && duplicate && typeof duplicate.id === "number") {
+    const duplicateId = lessonId(duplicate?.id);
+    if (data?.saved === false && duplicate && duplicateId !== undefined) {
       return {
         saved: false,
-        duplicate: { id: duplicate.id, title: String(duplicate.title ?? ""), ...(typeof duplicate.why === "string" ? { why: duplicate.why } : {}) },
+        duplicate: { id: duplicateId, title: String(duplicate.title ?? ""), ...(typeof duplicate.why === "string" ? { why: duplicate.why } : {}) },
       };
     }
     throw new KnowledgeError(`aiops 没有说存没存成功：${raw.slice(0, 300)}`);
@@ -225,6 +232,11 @@ export class AiopsLessons {
     }
     this.logger.info(`aiops 经验库 归档 经验 #${id} 确认人=${confirmedBy}`);
   }
+}
+
+/** aiops 的经验编号：正的安全整数，别的（小数、负数、超出范围被四舍五入过的）不认 */
+function lessonId(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 /** 同步到 aiops 的经验在排查过程末尾注明的出处 */

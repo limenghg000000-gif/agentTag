@@ -39,6 +39,8 @@ const LINK_ATTEMPTS = 3;
 const LINK_RETRY_MS = 2000;
 /** 改确认卡片失败时一共试几次（每次隔 retryDelayMs） */
 const RENDER_ATTEMPTS = 3;
+/** 同步到 aiops 时表格里这一行一直在改，最多存几次 */
+const SYNC_ROUNDS = 2;
 
 /** 这次任务的信息 */
 export interface KnowledgeTaskContext {
@@ -522,7 +524,7 @@ export class KnowledgeDesk {
     const replaced = proposal.replaces && ((await base.get(proposal.replaces.id).catch(() => undefined)) ?? proposal.replaces);
     const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title || draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
     // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
-    const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "archive";
+    const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "keep";
     if (replaced) {
       await this.archiveReplaced(replaced, proposal.replaces!, confirmedBy, task, oldLesson, out);
     }
@@ -542,10 +544,17 @@ export class KnowledgeDesk {
     task: McpTaskContext,
     out: Outcome,
   ): Promise<OldLesson> {
-    if (proposal.synced && !(await this.keepSynced(proposal, proposal.synced, entry, confirmedBy, task, out))) {
-      return "keep-until-synced";
-    }
-    if (!proposal.synced) {
+    // 等 aiops 存的时候可能有人在表格里改了这一行：存完重新读一遍，改过的交给 keepSynced（归档刚存的，按现在的样子重新同步）。
+    // 一直在改的，来回几次后先停下，等「再试一次」
+    for (let round = 1; ; round++) {
+      if (proposal.synced) {
+        if (!(await this.keepSynced(proposal, proposal.synced, entry, confirmedBy, task, out))) {
+          return "keep-until-synced";
+        }
+        if (proposal.synced) {
+          break;
+        }
+      }
       const skip = this.skipSync(entry);
       if (skip) {
         out.done.push(`${skip}，没有同步到 aiops 经验库。`);
@@ -556,6 +565,10 @@ export class KnowledgeDesk {
         out.unfinished.push(`经验 ${entry.id} 在表格里${entry.incomplete ?? entry.unsafe}，没有同步到 aiops 经验库。请在表格里改好后再点「再试一次」`);
         return "keep-until-synced";
       }
+      if (round > SYNC_ROUNDS) {
+        out.unfinished.push(`同步到 aiops 的时候经验 ${entry.id} 在表格里一直有人在改，先没同步。改完后再点「再试一次」`);
+        return "keep-until-synced";
+      }
       try {
         proposal.synced = await this.saveLesson(proposal, entry, replacedLesson, confirmedBy, task);
         proposal.syncedDraft = draftOf(entry);
@@ -563,6 +576,16 @@ export class KnowledgeDesk {
         out.unfinished.push(`没能同步到 aiops 经验库：${describe(err)}`);
         return "keep-until-synced";
       }
+      let current: KnowledgeEntry | undefined;
+      try {
+        current = await this.options.base.get(entry.id, { fresh: true });
+      } catch (err) {
+        // 确认不了这期间表格有没有改：先不记编号，再试一次时按那时的表格核对
+        out.unfinished.push(`已经存进 aiops 经验库，但没能重新读表格确认经验 ${entry.id} 这期间没被改过：${describe(err)}`);
+        return "keep-until-synced";
+      }
+      // 这一行被删掉了：按归档了处理，刚存进 aiops 的那条归档
+      entry = current ?? { ...entry, status: "archived" };
     }
     const { synced } = proposal;
     if (!synced.saved) {
@@ -583,8 +606,8 @@ export class KnowledgeDesk {
   }
 
   /**
-   * 上次已经同步过去、后面的步骤没做成，再试之前有人在表格里改了这一行、归档了或者改了类别：aiops 里那条已经不对了。
-   * 是这次存进去的就归档它、忘掉上次的结果，接着按表格里现在的样子来（还该同步的重新存）。归档没成功时返回 false，下次再试
+   * 已经同步过去以后（等 aiops 返回的时候，或者再试一次之前）有人在表格里改了这一行、归档了或者改了类别：aiops 里那条已经不对了。
+   * 是这次存进去的就归档它、忘掉之前的结果，接着按表格里现在的样子来（还该同步的重新存）。归档没成功时返回 false，下次再试
    */
   private async keepSynced(
     proposal: SaveProposal,
@@ -607,10 +630,10 @@ export class KnowledgeDesk {
         }
         await aiops.archive(synced.id, confirmedBy, task);
       } catch (err) {
-        out.unfinished.push(`${changed}，上次同步到 aiops 的经验 #${synced.id} 已经不对了，没能归档：${describe(err)}`);
+        out.unfinished.push(`${changed}，之前同步到 aiops 的经验 #${synced.id} 已经不对了，没能归档：${describe(err)}`);
         return false;
       }
-      out.done.push(`${changed}，上次同步到 aiops 的经验 #${synced.id} 已经不对了，已归档。`);
+      out.done.push(`${changed}，之前同步到 aiops 的经验 #${synced.id} 已经不对了，已归档。`);
     }
     proposal.synced = undefined;
     proposal.syncedDraft = undefined;
