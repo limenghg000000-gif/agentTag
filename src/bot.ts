@@ -288,7 +288,12 @@ async function runTask(
         ...(deps.knowledge
           ? {
               knowledge: knowledge
-                ? { hits: knowledge.text, ...(knowledge.aiops ? { aiopsHits: true } : {}), ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}) }
+                ? {
+                    hits: knowledge.text,
+                    ...(knowledge.aiops ? { aiopsHits: true } : {}),
+                    ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}),
+                    ...(knowledge.aiopsSkipped ? { aiopsSkipped: true } : {}),
+                  }
                 : { failed: true },
             }
           : {}),

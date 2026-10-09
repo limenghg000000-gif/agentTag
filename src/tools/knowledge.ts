@@ -16,6 +16,7 @@ import {
   type KnowledgeHit,
   MissingEntryError,
   normalizeDraft,
+  normalizeId,
   renderHitsForPrompt,
   sameContent,
   StaleProposalError,
@@ -64,6 +65,8 @@ export interface KnowledgeLookup {
   missed?: string[];
   /** 查到的里有 aiops 经验库的经验（编号写成「aiops 经验 #N」） */
   aiops?: boolean;
+  /** 提问里像是有密钥，这次没拿它去查 aiops 经验库（不是查了没查到） */
+  aiopsSkipped?: boolean;
 }
 
 interface Person {
@@ -114,6 +117,8 @@ interface SaveProposal extends ProposalBase {
   synced?: AiopsSaveResult;
   /** synced 是按什么内容同步的 */
   syncedDraft?: KnowledgeDraft;
+  /** 同步时这一行在表格里的编号（存进 aiops 的那条排查过程末尾注明的出处） */
+  syncedAs?: string;
   /**
    * 同步到 aiops 的内容：只同步写权限名单里的人确认过的。点保存时确认的是卡片上的草稿（这时为空）；
    * 表格里改过、在卡片上列出来核对后点了「再试一次」的，换成改过的内容和点的人
@@ -240,6 +245,7 @@ export class KnowledgeDesk {
         ids: [...teamHits.map((hit) => hit.entry.id), ...aiopsHits.map((hit) => `aiops#${hit.id}`)],
         missed,
         ...(aiopsHits.length > 0 ? { aiops: true } : {}),
+        ...(secret ? { aiopsSkipped: true } : {}),
       };
     } finally {
       timeout.clear();
@@ -663,13 +669,15 @@ export class KnowledgeDesk {
         const saved = await this.saveLesson(proposal, entry.id, approved, replacedLesson, confirmedBy, task);
         proposal.synced = saved.synced;
         proposal.syncedDraft = saved.draft;
+        proposal.syncedAs = entry.id;
       } catch (err) {
         out.unfinished.push(`没能同步到 aiops 经验库：${describe(err)}`);
         return "keep-until-synced";
       }
       let current: KnowledgeEntry | undefined;
       try {
-        current = await this.options.base.get(entry.id, { fresh: true });
+        // 先按草稿编号找：等 aiops 存的时候有人在表格里改了编号，按旧编号找不到，会当成删了、把刚存的那条归档
+        current = await this.options.base.saved(proposal.requestId, entry.id);
       } catch (err) {
         // 确认不了这期间表格有没有改：先不记编号，再试一次时按那时的表格核对
         out.unfinished.push(`已经存进 aiops 经验库，但没能重新读表格确认经验 ${entry.id} 这期间没被改过：${describe(err)}`);
@@ -721,6 +729,10 @@ export class KnowledgeDesk {
           ? `aiops 里存的和经验 ${entry.id} 在表格里的不一样`
           : `经验 ${entry.id} 在表格里改过`;
     }
+    // 存进 aiops 的那条排查过程末尾注明的出处是当时的编号：之后表格里改了编号，出处就对不上了（回答前去重、以后归档都按出处认），归档它按新编号重新同步
+    if (!changed && synced.saved && proposal.syncedAs !== undefined && normalizeId(proposal.syncedAs) !== normalizeId(entry.id)) {
+      changed = `经验 ${proposal.syncedAs} 在表格里改成了 ${entry.id}，aiops 里那条注明的出处对不上了`;
+    }
     if (!changed) {
       return true;
     }
@@ -739,6 +751,7 @@ export class KnowledgeDesk {
     }
     proposal.synced = undefined;
     proposal.syncedDraft = undefined;
+    proposal.syncedAs = undefined;
     // 之前没收到结果的那几次已经找到、处理过了，不再按它们找（不然会找回刚归档的那条）
     proposal.aiopsUnsure = undefined;
     return true;

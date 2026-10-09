@@ -18,9 +18,10 @@ export interface PromptContext {
   extra?: string;
   /**
    * 团队经验库。hits 是回答前自动查到的相近经验（已排好版），空字符串表示查了没有相近的；
-   * aiopsHits 是 hits 里有 aiops 经验库的经验；missed 是一边查成、另一边没查成时没查成的库；failed 是都没查成（超时或出错）
+   * aiopsHits 是 hits 里有 aiops 经验库的经验；missed 是一边查成、另一边没查成时没查成的库；failed 是都没查成（超时或出错）；
+   * aiopsSkipped 是提问里像是有密钥、没拿去查 aiops 经验库
    */
-  knowledge?: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean };
+  knowledge?: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean };
 }
 
 export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, knowledge }: PromptContext): string {
@@ -87,7 +88,13 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
 }
 
 function knowledgeSection(
-  { hits, aiopsHits, missed, failed }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean },
+  {
+    hits,
+    aiopsHits,
+    missed,
+    failed,
+    aiopsSkipped,
+  }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean },
   toolNames: readonly string[],
 ): string[] {
   const canPropose = toolNames.includes("knowledge_propose");
@@ -115,7 +122,13 @@ function knowledgeSection(
       ...(aiopsHits && toolNames.includes("aiops_get_knowledge") ? ["- aiops 经验里写了「后面省略」的，要看全文用 aiops_get_knowledge。"] : []),
     );
   } else if (hits === "" && !missed?.length) {
-    lines.push("- 这次提问在经验库里没查到相近的经验。查到新线索（报错原文、错误码、服务名）后可以用 knowledge_search 再查。");
+    lines.push(`- 这次提问在${aiopsSkipped ? "团队" : ""}经验库里没查到相近的经验。查到新线索（报错原文、错误码、服务名）后可以用 knowledge_search 再查。`);
+  }
+  if (aiopsSkipped && !failed) {
+    lines.push(
+      `- 提问里像是有密钥，回答前没拿它去查 aiops 经验库（查询会发到 aiops、记进审计日志），aiops 经验库里有没有相近的经验不知道。` +
+        (hasAiops ? "需要时只用错误码、服务名这些不含密钥的词自己查（aiops_search_knowledge），不要把密钥写进查询。" : ""),
+    );
   }
   if (failed) {
     lines.push(

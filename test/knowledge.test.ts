@@ -99,12 +99,16 @@ test("起草的经验：去掉空白、检查必填和长度，关键词和错�
   assert.throws(() => normalizeDraft({ ...code8, conclusion: "  " }), /结论（conclusion）不能为空/);
   assert.throws(() => normalizeDraft({ ...code8, title: "长".repeat(81) }), /标题（title）最多 80 字/);
   assert.throws(() => normalizeDraft({ ...code8, scope: 42 }), /适用范围（scope）要填文字/);
+  // 标题合成一行后才像密钥的（值写在下一行），也不让存
+  assert.throws(() => normalizeDraft({ ...code8, title: ["API_KEY=\nCorrectHorse", "BatteryStaple9"].join("") }), /标题（title）里像是有/);
 });
 
 /** 测试里现生成的密钥对：kubeconfig、Kubernetes Secret 里 base64 编码的私钥用 */
 const ecKeys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 const rsaKeys = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const base64 = (value: string | Buffer) => Buffer.from(value).toString("base64");
+/** 带密码的数据库地址，Kubernetes Secret 里 base64 编码后放在 DATABASE_URL 下 */
+const dbUrl = ["postgresql://app:Corr3ct", "Horse@db.internal:5432/app"].join("");
 
 test("草稿里有密钥、密码时不让存，错误信息里不复述密钥；只是提到令牌过期的照常", () => {
   for (const secret of [
@@ -333,6 +337,16 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `key: ${base64(rsaKeys.privateKey.export({ type: "pkcs1", format: "der" }))}`,
     `key: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "der" }))}`,
     `key: ${base64(generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "der" }))}`,
+    // base64 编码的别的密钥（名字不像密钥的也算）：Secret 的 data 下、kubectl 取出来的 JSON、环境变量、echo … | base64 -d
+    `apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ntype: Opaque\ndata:\n  DATABASE_URL: ${base64(dbUrl)}\n  username: ${base64("app")}`,
+    `kubectl get secret db -o jsonpath='{.data}'\n{"DATABASE_URL":"${base64(dbUrl)}"}`,
+    `DATABASE_URL=${base64(dbUrl)}`,
+    `echo ${base64(dbUrl)} | base64 -d`,
+    // Secret 清单里的值本身就是密钥：data、binaryData 下解开的，stringData 下直接写的，JSON、列表项里的也算
+    `kind: Secret\ndata:\n  db: ${base64(["S3cr3t", "P@ss!"].join(""))}`,
+    `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"x"},"data":{"db":"${base64(["S3cr3t", "P@ss!"].join(""))}"}}`,
+    ["kind: Secret\nstringData:\n  api: abcdef", "123456"].join(""),
+    `items:\n- apiVersion: v1\n  kind: Secret\n  binaryData:\n    keystore.p12: ${base64(Buffer.from([0x30, 0x82, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))}`,
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -425,6 +439,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // base64 编码的公钥、加密过的私钥、别的长 base64（摘要）
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
     `encrypted: ${base64(rsaKeys.privateKey.export({ type: "pkcs8", format: "der", cipher: "aes-256-cbc", passphrase: "x" }))}；sha512: ${base64(Buffer.alloc(64, 7))}`,
+    // 解出来没有密钥的 base64、乱码，Secret 里写明不是密钥的（用户名、地址、端口、CA 证书）、很短的、占位，ConfigMap、SecretProviderClass 的 data
+    `DATABASE_URL=${base64("postgresql://db.internal:5432/app")}；ResourceExhaustedErrorHandler；${"a1B2".repeat(8)}；${base64("username: admin")}`,
+    `kind: Secret\ndata:\n  username: ${base64("admin")}\n  host: ${base64("db.internal")}\n  port: ${base64("5432")}\n  ca.crt: ${base64("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----")}\n  enabled: ${base64("true")}`,
+    "kind: Secret\nstringData:\n  config.yaml: |\n    log_level: debugging\n    mode: production",
+    "kind: ConfigMap\ndata:\n  mode: production\n  APP_NAME: agenttag\n---\nkind: SecretProviderClass\ndata:\n  objects: something-long",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -2232,6 +2251,32 @@ test("同步到 aiops 时有人在表格里改了这一行：存完重新读表�
   assert.equal(lastCard().header.title.content, "已存进经验库");
 });
 
+test("同步到 aiops 时有人在表格里改了这一行的编号：按草稿编号认出它，不当成删了；刚存的那条注明的是旧编号，归档它、按新编号重新同步", async () => {
+  let saves = 0;
+  let setup: ReturnType<typeof deskSetup>;
+  setup = deskSetup({
+    saveLesson: () => {
+      saves++;
+      if (saves === 1) {
+        setup.backend.entries[0].id = "K9";
+      }
+      return JSON.stringify({ saved: true, id: 30 + saves });
+    },
+  });
+  const { backend, desk, sent, calls, click, tool, lastCard } = setup;
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  const lessonSaves = calls.filter((call) => call.tool === "save_lesson");
+  assert.equal(lessonSaves.length, 2);
+  assert.match(String(lessonSaves[0].args.diagnosis_path), /（来自飞书团队经验库 K1）$/);
+  assert.match(String(lessonSaves[1].args.diagnosis_path), /（来自飞书团队经验库 K9）$/);
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.deepEqual([backend.entries[0].id, backend.entries[0].status, backend.entries[0].aiopsId], ["K9", "active", 32]);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 在表格里改成了 K9，aiops 里那条注明的出处对不上了，之前同步到 aiops 的经验 #31 已经不对了，已归档/);
+});
+
 test("同步到 aiops 时有人在表格里归档或者删了这一行：归档刚存的那条，不记编号、不再同步；确认后存的时候又改了，再列出来，点之前那张不算", async () => {
   for (const change of ["archive", "delete"] as const) {
       let setup: ReturnType<typeof deskSetup>;
@@ -2492,12 +2537,14 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   const found = await desk.lookup(["gateway-api 报 code=8，配置是 MCP_AIOPS_TOKEN", "correcthorsebatterystaple"].join("="), task);
   assert.deepEqual(found?.ids, ["K1"]);
   assert.deepEqual(found?.missed, []);
+  assert.equal(found?.aiopsSkipped, true, "没查 aiops 要说出来，不能当成查了没查到");
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   // 带签名的临时访问地址也一样（拿到就能下载）
   await desk.lookup(`gateway-api 报 code=8，日志在 https://bucket.s3.amazonaws.com/k?X-Amz-Expires=300&X-Amz-Signature=${"0123456789abcdef".repeat(4)}`, task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="), task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Authorization: SSWS 00QCjAl4MlV-WPXM", "-ABCDEFGHIJKLMNOPQRSTUVWX"].join(""), task);
   await desk.lookup(`gateway-api 报 code=8，kubeconfig 里 client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`, task);
+  await desk.lookup(`gateway-api 报 code=8，Secret 是这样的：\nkind: Secret\ndata:\n  DATABASE_URL: ${base64(dbUrl)}`, task);
   await desk.lookup(`gateway-api 报 code=8，请求头 Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${base64(Buffer.alloc(32, 9))}"`, task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);

@@ -973,19 +973,115 @@ const DOCKER_CONFIG =
   /\.docker(?:configjson|cfg)["']?[^\S\r\n]*[:=][^\S\r\n]*(?:[|>][-+0-9]*[^\S\r\n]*\r?\n[ \t]+)?["']?([A-Za-z0-9+/]{16,}(?:\r?\n[ \t]+[A-Za-z0-9+/]+)*={0,2})(?![\w+/=])/gi;
 
 /**
- * base64 编码过的私钥：kubeconfig 的 client-key-data、Kubernetes Secret 里的 tls.key、ssh-privatekey 这些，值是 PEM 私钥编成的 base64，
- * 也可能是 DER 编码的私钥。不按名字认，不短于 64 个字符的一段 base64 都解开看；YAML 里折成几行的连起来再算长短
+ * base64 编码过的密钥：kubeconfig 的 client-key-data、Kubernetes Secret 里 data 下的值（tls.key、DATABASE_URL、.env）、
+ * echo … | base64 -d 这些。不按名字认，不短于 16 个字符的一段 base64 都解开看（YAML 里折成几行的连起来）：
+ * 不短于 64 个字符、解出来是 PEM 或 DER 私钥的算私钥；解出来是文字的按同样的规则再查一遍（解出来的比原文短，递归会停下来）。
+ * 解出来是乱码的（普通的长单词、哈希、摘要）不算
  */
-const BASE64_RUN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{16,}(?:\r?\n[ \t]+[A-Za-z0-9+/]+)*={0,2}(?![A-Za-z0-9+/=_-])/g;
+const BASE64_RUN = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/]{16,}(?:\r?\n[ \t]+[A-Za-z0-9+/]+)*={0,2}(?![A-Za-z0-9+/=_-])/g;
 
-function encodedPrivateKey(text: string): boolean {
-  return [...text.matchAll(BASE64_RUN)].some(([run]) => {
+function encodedSecret(text: string): string | undefined {
+  for (const [run] of text.matchAll(BASE64_RUN)) {
     const encoded = run.replace(/\s+/g, "");
-    if (encoded.length < 64) {
-      return false;
-    }
     const bytes = Buffer.from(encoded, "base64");
-    return /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(bytes.toString("latin1")) || isDerPrivateKey(bytes);
+    if (encoded.length >= 64 && (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(bytes.toString("latin1")) || isDerPrivateKey(bytes))) {
+      return "私钥";
+    }
+    const decoded = printableText(bytes);
+    const label = decoded === undefined ? undefined : findSecret(decoded);
+    if (label) {
+      return `base64 编码的${label}`;
+    }
+  }
+  return undefined;
+}
+
+/** 解出来的字节是不是一段文字（合法的 UTF-8，除了换行、制表符没有控制字符）；不是时返回 undefined */
+function printableText(bytes: Buffer): string | undefined {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+  return /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text) ? undefined : text;
+}
+
+/** Kubernetes Secret 的清单（kind: Secret，JSON 里的 "kind": "Secret" 也算；SecretProviderClass 这些不算） */
+const SECRET_KIND = /["']?\bkind["']?[^\S\r\n]*:[^\S\r\n]*["']?Secret["']?(?![\w-])/;
+/** YAML 里 data:、binaryData:、stringData: 这一行（后面没有值，值在下面缩进着写）：第 1 组是缩进，第 2 组是哪一项 */
+const SECRET_DATA_BLOCK = /^([ \t]*)(?:-[ \t]+)?(data|binaryData|stringData)[ \t]*:[ \t]*(?:#.*)?$/;
+/** YAML 里缩进着的「名字: 值」：第 1 组是名字，第 2、3、4 组是值 */
+const SECRET_DATA_LINE = /^[ \t]+["']?([^\s"':#][^"':]*?)["']?[ \t]*:[ \t]*(?:"([^"]*)"|'([^']*)'|([^\s#]+))[ \t]*(?:#.*)?$/;
+/** JSON、YAML 流式写法的 "data": {…}：第 1 组是哪一项，第 2 组是大括号里的 */
+const SECRET_DATA_OBJECT = /["']?\b(data|binaryData|stringData)["']?[^\S\r\n]*:[^\S\r\n]*\{([^{}]*)\}/g;
+const SECRET_DATA_PAIR = /["']?([\w.-]+)["']?\s*:\s*(?:"([^"]*)"|'([^']*)'|([^\s,}]+))/g;
+/** Secret 里名字明说不是密钥的：用户名、地址、端口、库名、命名空间、CA 和证书（解出来是文字的照样按别的规则查） */
+const PUBLIC_SECRET_KEY =
+  /^(?:[\w.-]*[_.-])?(?:user(?:name)?|login|email|host(?:name)?|port|database|db_?name|namespace|region|endpoint|url|uri|address|bucket)$|(?:^|[_.-])ca(?:\.crt|\.pem|-bundle)?$|\.crt$/i;
+
+/** Secret 清单里 data、binaryData、stringData 下的每一项：[哪一项, 名字, 值] */
+function secretDataEntries(text: string): [string, string, string][] {
+  const entries: [string, string, string][] = [];
+  const lines = text.split(/\r?\n/);
+  lines.forEach((line, i) => {
+    const block = SECRET_DATA_BLOCK.exec(line);
+    if (!block) {
+      return;
+    }
+    // 列表项（- data:）里的名字比「-」多缩进两格。只看下一层的「名字: 值」，更深的是块写法的值（config.yaml: | 下面的几行）
+    const indent = block[1].length + (/^[ \t]*-/.test(line) ? 2 : 0);
+    let child: number | undefined;
+    for (const next of lines.slice(i + 1)) {
+      if (!next.trim() || /^[ \t]*#/.test(next)) {
+        continue;
+      }
+      const depth = /^[ \t]*/.exec(next)![0].length;
+      if (depth <= indent) {
+        break;
+      }
+      child ??= depth;
+      const pair = depth === child ? SECRET_DATA_LINE.exec(next) : null;
+      if (pair) {
+        entries.push([block[2], pair[1], pair[2] ?? pair[3] ?? pair[4]]);
+      }
+    }
+  });
+  for (const [, section, body] of text.matchAll(SECRET_DATA_OBJECT)) {
+    for (const [, name, double, single, bare] of body.matchAll(SECRET_DATA_PAIR)) {
+      entries.push([section, name, double ?? single ?? bare]);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Kubernetes Secret 清单里的值本身就是密钥，名字叫什么都一样（DATABASE_URL、db、config）：data、binaryData 下的解开 base64，
+ * stringData 下的直接看。名字明说不是密钥的（username、host、ca.crt 这些）不算，但解出来的文字里有密钥的照样算；
+ * 不短于 6 个字符、不是占位的才算（"true"、"password" 这种不算）
+ */
+function secretManifestValue(text: string): boolean {
+  if (!SECRET_KIND.test(text)) {
+    return false;
+  }
+  return secretDataEntries(text).some(([section, name, value]) => {
+    let plain: string | undefined = value;
+    if (section !== "stringData") {
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+        return false;
+      }
+      const bytes = Buffer.from(value, "base64");
+      plain = printableText(bytes);
+      // 解出来不是文字的（keystore、DER 证书这些二进制）：名字不像是公开信息的算
+      if (plain === undefined) {
+        return bytes.length >= 6 && !PUBLIC_SECRET_KEY.test(name);
+      }
+    }
+    if (findSecret(`${name}: ${plain}`) !== undefined) {
+      return true;
+    }
+    const trimmed = plain.trim();
+    return !PUBLIC_SECRET_KEY.test(name) && trimmed.length >= 6 && !isPlaceholder(trimmed);
   });
 }
 
@@ -1150,8 +1246,12 @@ function findSecret(text: string): string | undefined {
   if (dockerConfig) {
     return dockerConfig;
   }
-  if (encodedPrivateKey(text)) {
-    return "私钥";
+  const encoded = encodedSecret(text);
+  if (encoded) {
+    return encoded;
+  }
+  if (secretManifestValue(text)) {
+    return "Kubernetes Secret 里的值";
   }
   if ([...text.matchAll(SIGNED_URL)].some(([, value]) => !isPlaceholder(value))) {
     return "带签名的临时访问地址";
@@ -1210,7 +1310,9 @@ export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
   if (typeof category !== "string" || !Object.hasOwn(KNOWLEDGE_CATEGORIES, category)) {
     throw new KnowledgeError(`category 只能是 ${Object.keys(KNOWLEDGE_CATEGORIES).join("、")} 之一`);
   }
-  const field = (key: string, name: string, limit: number, required: boolean): string | undefined => {
+  // shape：存进去之前怎么改写（标题合成一行，关键词、错误码统一用逗号分隔）。改写前后都查一遍密钥：
+  // 「API_KEY=」换行写值时原文第一行是空的赋值，合成一行后就成了「API_KEY= 值」
+  const field = (key: string, name: string, limit: number, required: boolean, shape: (text: string) => string = (text) => text): string | undefined => {
     const value = draft[key];
     if (value !== undefined && value !== null && typeof value !== "string") {
       throw new KnowledgeError(`${name}（${key}）要填文字`);
@@ -1225,34 +1327,36 @@ export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
     if (text.length > limit) {
       throw new KnowledgeError(`${name}（${key}）最多 ${limit} 字，现在 ${text.length} 字，请写得更精炼`);
     }
-    const secret = findSecret(text);
+    const shaped = shape(text);
+    const secret = findSecret(text) ?? (shaped === text ? undefined : findSecret(shaped));
     if (secret) {
       throw new KnowledgeError(
         `${name}（${key}）里像是有${secret}。经验库所有群都能看到，不能存密钥和密码：去掉或者换成 *** 再起草，回答里也不要复述它`,
       );
     }
-    return text;
+    return shaped;
   };
   const optional = (key: string, name: string) => field(key, name, MAX_FIELD_CHARS, false);
   const result: KnowledgeDraft = {
     category: category as KnowledgeCategory,
-    title: field("title", "标题", MAX_TITLE_CHARS, true)!.replace(/\s*\n\s*/g, " "),
+    title: field("title", "标题", MAX_TITLE_CHARS, true, (text) => text.replace(/\s*\n\s*/g, " "))!,
     question: field("question", "问题或场景", MAX_FIELD_CHARS, true)!,
     conclusion: field("conclusion", "结论", MAX_FIELD_CHARS, true)!,
   };
   const scope = optional("scope", "适用范围");
   const handling = optional("handling", "怎么处理");
   const basis = optional("basis", "依据或排查过程");
-  const keywords = optional("keywords", "关键词");
-  const errorCodes = optional("error_codes", "错误码");
+  const list = (text: string) => splitList(text).join(",");
+  const keywords = field("keywords", "关键词", MAX_FIELD_CHARS, false, list);
+  const errorCodes = field("error_codes", "错误码", MAX_FIELD_CHARS, false, list);
   const alertname = optional("alertname", "告警名");
   return {
     ...result,
     ...(scope ? { scope } : {}),
     ...(handling ? { handling } : {}),
     ...(basis ? { basis } : {}),
-    ...(keywords ? { keywords: splitList(keywords).join(",") } : {}),
-    ...(errorCodes ? { errorCodes: splitList(errorCodes).join(",") } : {}),
+    ...(keywords ? { keywords } : {}),
+    ...(errorCodes ? { errorCodes } : {}),
     ...(alertname ? { alertname } : {}),
   };
 }
