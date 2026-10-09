@@ -137,6 +137,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "api_key=horse&battery%staple^x",
     "**MCP_AIOPS_TOKEN=correcthorsebattery**",
     "token=correct:horse.Token",
+    // JSON、PHP 里带引号的键和值，引号里带空格的口令整段都算
+    '{"password":"correcthorsebatterystaple"}',
+    '{"password": "correct horse battery staple"}',
+    "'password' => 'hunter2hunter'",
+    '{"token": "correct horse battery staple"}',
+    "MCP_AIOPS_TOKEN='correct horse battery staple'",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -164,6 +170,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "接口要 Basic authentication，Authorization: Basic *** 或者 Basic <base64>，Basic configuration 不对时报 401",
     "secret 放在 vault 里：secret: https://vault.example.com/agenttag，token=ab***cd 是打了码的，token=$MCP_AIOPS_TOKEN 从环境变量读",
     "报错 token=expired! 重新登录；api_key=os.environ[\"MODEL_API_KEY\"]；secret_key: C:\\keys\\agent",
+    '{"password": "******", "token": "${MCP_AIOPS_TOKEN}", "api_key": "<your-api-key>", "secret": "{{ .Values.secret }}"}',
+    '{"token": "your token here", "密码": "请找管理员重置"}',
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }

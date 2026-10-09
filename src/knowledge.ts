@@ -460,6 +460,11 @@ export function normalizeId(id: string): string {
 
 /** 写明了是密钥的名字：token、secret、API Key（MODEL_API_KEY、apiKey、x-api-key）、AccessKey、私钥，也算 secret_key、token_key 这类 */
 const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-]?(?:access[_-]?)?key)?`;
+/** 名字和值之间：名字可以带引号（{"password": …}），等号、冒号、=>（PHP 数组）都算 */
+const ASSIGN = String.raw`["']?\s*(?:=>|[:=：])\s*`;
+/** 引号里的一整段值，中间有空格的口令也是一整段（"correct horse battery staple"）；里面有中文的是说明，有 * 的是打了码的，不算 */
+const quotedValue = (min: number) =>
+  String.raw`"([^"\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{${min},})"|'([^'\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{${min},})'`;
 
 /**
  * 经验库所有群都能看，排查经验还会同步给 aiops 的告警自动排查，所以明显的密钥、密码不让存。
@@ -484,20 +489,20 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{16,}/i, "云服务的 AccessKey Secret"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
-  // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple）；中文说明（「密码：请找管理员重置」）和 *** 不算
-  [/(?:password|passwd|pwd|密码|口令)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{6,}/i, "密码"],
+  // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple、{"password": "correct horse battery staple"}）；中文说明（「密码：请找管理员重置」）和 *** 不算
+  [new RegExp(String.raw`(?:password|passwd|pwd|密码|口令)${ASSIGN}(?:${quotedValue(6)}|["']?[^\s"',，;；*\u4e00-\u9fff]{6,})`, "i"), "密码"],
   // 写明了是密钥的，值里带数字的都算（不带数字的见下面的 TOKEN_ASSIGNMENT）
   [new RegExp(String.raw`${SECRET_LABEL}\s*[:=：]\s*(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}`, "i"), "密码或令牌"],
 ];
 
 /**
  * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=correct.horse.battery.staple，
- * 这些配置什么样的值都能填）。值取一整段：到空白、引号、逗号分号、右括号、星号、中文为止，中间的标点都算（abc:def!ghi）。
- * 紧跟着 ( [ { < \ 的不算：那是代码、占位或者路径（getToken()、${MCP_AIOPS_TOKEN}、<token>、os.environ["X"]）
+ * 这些配置什么样的值都能填）。引号里的值取引号里的一整段（"correct horse battery staple"）；没引号的到空白、引号、逗号分号、右括号、星号、中文为止，
+ * 中间的标点都算（abc:def!ghi），紧跟着 ( [ { < \ 的不算：那是代码、占位或者路径（getToken()、${MCP_AIOPS_TOKEN}、<token>、os.environ["X"]）
  */
 const VALUE_CHAR = String.raw`[^\s"'\`,;*()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]`;
 const VALUE_END = String.raw`(?=$|[\s"'\`,;*)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
-const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}["']?\s*[:=：]\s*["']?(${VALUE_CHAR}{8,})${VALUE_END}`, "gi");
+const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}${ASSIGN}(?:${quotedValue(8)}|["']?(${VALUE_CHAR}{8,})${VALUE_END})`, "gi");
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
 const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
 /** 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here）；夹着别的词的照样算（prod-secret-abcdefghijkl） */
@@ -512,15 +517,15 @@ const PROPERTY_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
 function isPlaceholder(raw: string): boolean {
   // 句末的标点不算值的一部分（token: expired.、token=expired!）
   const value = raw.replace(/[.!?:]+$/, "");
-  // 地址里带的密码、查询参数里的 token=… 由别的规则拦；$NAME 是变量引用
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$[A-Za-z_]\w*$/.test(value)) {
+  // 地址里带的密码、查询参数里的 token=… 由别的规则拦；变量引用（$NAME、${NAME}）、尖括号占位（<your-token>）、模板（{{ .Values.token }}）
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\{\{.*\}\}$/.test(value)) {
     return true;
   }
   const last = value.slice(value.lastIndexOf(".") + 1);
   if (PROPERTY_PATH.test(value) && (CREDENTIAL_NAME.test(last) || ENV_NAME.test(last))) {
     return true;
   }
-  return ENV_NAME.test(value) || value.split(/[_+/~=.-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
+  return ENV_NAME.test(value) || value.split(/[\s_+/~=.-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
 }
 
 /** HTTP Basic 认证（Authorization: Basic …）：后面是「用户名:密码」的 base64 */
@@ -540,7 +545,7 @@ function findSecret(text: string): string | undefined {
   if ([...text.matchAll(BASIC_AUTH)].some(([, value]) => isBasicCredential(value))) {
     return "HTTP Basic 认证的用户名和密码";
   }
-  return [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, value]) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
+  return [...text.matchAll(TOKEN_ASSIGNMENT)].some(([, double, single, bare]) => !isPlaceholder(double ?? single ?? bare)) ? "密码或令牌" : undefined;
 }
 
 /** 去掉首尾空白、检查必填、长度和密钥 */
