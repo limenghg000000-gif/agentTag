@@ -360,7 +360,7 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
 // 重做后的最后一道检查（blockUnverifiedOps）：Pod 名、定位结果有就拦；时间一般也是有就拦，问的是时间本身（换算、时区、格式）时
-// 和数量这类一样，只在回答写成线上结论时才拦。
+// 只在问线上服务、回答又写成线上结论时才拦；数量这类只在回答写成线上结论时才拦。
 // 定位结果和就绪数：2026-10-08 复测时，模型没调工具就照着话题里前两次的定位结果，编出 network-tester 在三个命名空间「1/1 就绪」让用户选
 
 /** 带秒的时间（15:39:19）、日期加时间（2026-10-08 15:39） */
@@ -388,8 +388,11 @@ const OPS_DATA = new RegExp([...OPS_TIME_PATTERNS, ...OPS_STRONG_PATTERNS, ...OP
 const OPS_TIME = new RegExp(OPS_TIME_PATTERNS.join("|"), "gi");
 const OPS_STRONG = new RegExp(OPS_STRONG_PATTERNS.join("|"), "gi");
 const OPS_WEAK = new RegExp(OPS_WEAK_PATTERNS.join("|"), "gi");
-/** 按提示词写成的线上结论：「结论：…（把握：中）」 */
-const OPS_CONCLUSION = /把握|结论[:：]/;
+/**
+ * 按提示词写成的线上结论带着把握：「结论：…（把握：中）」。只认把握：「先给结论」是所有回答的写法，
+ * 「结论：1GiB = 1024MiB」不算；「把握好内存 limit」「把握高峰期」这类说法也不算
+ */
+const OPS_CONCLUSION = /把握[*_\x60\s]*[:：]?[*_\x60\s]*[高中低]等?(?![\u4e00-\u9fff])/;
 /** 问的就是时间本身：提问里带着时间，或者说到换算、时区、时间戳、格式。回答里的时间是算出来或者举例的（「UTC 08:00:00 是北京时间几点」答「16:00:00」） */
 const TIME_QUESTION = /(?<!\d)\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|时间戳|timestamp|时区|time\s*zone|utc|gmt|换算|转换|格式|format|strftime|strptime/i;
 /** Go 的时间格式样例，讲时间格式时常出现，不是线上的时间 */
@@ -448,9 +451,9 @@ export const BLOCKED_OPS_ANSWER =
 /**
  * 打回重做以后还是没查证就给出线上数据时，这个回答不发出去，换成 BLOCKED_OPS_ANSWER。
  * 2026-10-08 复测：用户回了「prod」以后模型两次都没调工具，第二次打回重做后照样编出了三次查询的结果。
- * Pod 名、定位结果这类只在线上数据里出现的，有就拦；带秒的时间也拦，问的是时间换算、时区、格式时除外。
- * 数量、就绪数、「没有报错」这类概念解释里也常见的，只在写成线上结论（「结论：…（把握：中）」）时才拦，
- * 「1GiB = 1024MiB」「Go 没有异常机制」「北京时间为 16:00:00」照常发。
+ * Pod 名、定位结果这类只在线上数据里出现的，有就拦；带秒的时间也拦，问的是时间换算、时区、格式时，只在问线上服务又写成线上结论时才拦。
+ * 数量、就绪数、「没有报错」这类概念解释里也常见的，只在写成线上结论（带「把握：中」这类把握）时才拦，
+ * 「结论：1GiB = 1024MiB」「Go 没有异常机制」「北京时间为 16:00:00」照常发。
  * 只是整理之前回答的请求放行（数据来自话题里之前的回答）。调过工具都失败了时，说调用失败的那一句不算，剩下的照样查。
  * attempted 是这次有没有调过工具，不管成没成功
  */
@@ -466,8 +469,9 @@ export function blockUnverifiedOps(
   }
   const text = attempted ? withoutToolFailures(answer) : answer;
   const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
-  const timeQuestion = TIME_QUESTION.test(question);
-  return live(OPS_STRONG) || (!timeQuestion && live(OPS_TIME)) || (OPS_CONCLUSION.test(answer) && (live(OPS_WEAK) || live(OPS_TIME)));
+  const conclusion = OPS_CONCLUSION.test(answer);
+  const liveTime = !TIME_QUESTION.test(question) || (conclusion && OPS_QUESTION.test(question));
+  return live(OPS_STRONG) || (liveTime && live(OPS_TIME)) || (conclusion && live(OPS_WEAK));
 }
 
 function rewriteOnly(question: string): boolean {

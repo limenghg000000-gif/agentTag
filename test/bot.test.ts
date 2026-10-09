@@ -857,15 +857,22 @@ test("重做以后的最后一道检查：哪些回答不发出去", () => {
   assert.equal(block("product-service-api 最近一小时报错多吗", "结论：最近一小时有 50 条请求超时，CPU 使用率 95%（把握：中）", true), true);
   assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询超时了，不过最近一小时有 50 条报错（把握：中）", true), true);
   assert.equal(block("product-service-api 最近一小时报错多吗", "结论：日志查询返回 50 条请求超时（把握：中）", true), true);
-  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询超时了，不过最近一小时有 50 条报错", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 查询超时了（把握：中），不过最近一小时有 50 条报错", true), true);
   // 没调过工具时说「查询 3 次都超时」也是编的
   assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询 3 次都超时（把握：低）"), true);
   // 概念解释、单位换算、反问照常发
   assert.equal(block("1GiB 是多少字节", "1GiB = 1024MiB = 1073741824 字节。"), false);
+  // 「先给结论」是所有回答的写法，只有带把握的才算线上结论
+  assert.equal(block("1GiB 是多少字节", "结论：1GiB = 1024MiB = 1073741824 字节。"), false);
+  assert.equal(block("Pod 内存 limit 怎么设", "要把握好余量：一般 512MiB 到 2GiB"), false);
+  assert.equal(block("Pod 副本数怎么定", "要把握高峰期流量：一般 3 个副本起步"), false);
+  assert.equal(block("prod", "结论：最近 1 小时 27 条报错（把握：中等）"), true);
+  assert.equal(block("prod", "**结论**：最近 1 小时 27 条报错（**把握**：中）"), true);
   assert.equal(block("Go 有异常机制吗", "Go 没有异常机制，错误靠返回值"), false);
   assert.equal(block("Go 的时间格式怎么写", "Go 用参考时间写格式：2006-01-02 15:04:05"), false);
   // 问的是时间本身：回答里的时间是算出来、举例的，写成线上结论时才拦
   assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "北京时间为 16:00:00。"), false);
+  assert.equal(block("UTC 的 08:00:00 对应北京时间几点？", "结论：北京时间为 16:00:00（把握：高）"), false);
   assert.equal(block("时间戳 1696752000 是北京时间几点", "2023-10-08 16:00:00"), false);
   assert.equal(block("Python 怎么格式化时间", "strftime('%Y-%m-%d %H:%M:%S') 输出类似 2024-01-01 12:00:00"), false);
   assert.equal(block("gateway-api 15:30 以后有报错吗", "结论：15:31:22 起有 3 条 error 日志（把握：中）"), true);
