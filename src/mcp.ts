@@ -164,7 +164,7 @@ export class McpHub {
     });
   }
 
-  /** 服务端有没有这个工具（不管开没开给模型）。没连上时为 false */
+  /** 服务端有没有这个能直接调的工具（不管开没开给模型；只能按 MCP 任务方式调的不算，这里不支持）。没连上时为 false */
   hasTool(serverName: string, tool: string): boolean {
     return this.find(serverName)?.catalog.has(tool) ?? false;
   }
@@ -279,7 +279,8 @@ export class McpHub {
       server.prompt = await this.readPrompt(server.config);
       const picked = pickTools(server.config, synced.tools);
       server.enabled = picked.enabled;
-      server.catalog = new Map(synced.tools.map((tool) => [tool.name, tool]));
+      // 程序直接调用的清单也不收只能按 MCP 任务（tasks）方式调用的：这里不支持，普通调用调不成
+      server.catalog = new Map(synced.tools.filter((tool) => tool.execution?.taskSupport !== "required").map((tool) => [tool.name, tool]));
       server.synced = true;
       server.failures = 0;
       const key = JSON.stringify([synced.version, picked, server.instructions?.length, server.prompt?.length]);

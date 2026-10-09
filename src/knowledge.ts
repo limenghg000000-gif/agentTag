@@ -306,7 +306,7 @@ export class KnowledgeBase {
         checkSeen(old, meta.seen);
         replaces = old.id;
       }
-      const next = Math.max(0, ...entries.map((entry) => numberOf(entry.id))) + 1;
+      const next = entries.reduce((max, entry) => Math.max(max, numberOf(entry.id)), 0) + 1;
       const entry: KnowledgeEntry = {
         ...draft,
         id: `K${next}`,
@@ -335,11 +335,13 @@ export class KnowledgeBase {
       if (!entry) {
         throw new KnowledgeError(`经验库里没有 ${id}`);
       }
+      // 先对卡片上的内容，再看是不是已经归档了：上次点确认归档成功、结果没传回来的，内容没变照样接着做；
+      // 卡片发出后有人改了内容又归档了的，卡片作废，不去归档它现在同步在 aiops 里的那条
+      checkSeen(entry, meta.seen);
       if (entry.status === "archived") {
         this.logger.info(`经验库 归档 ${entry.id}：已经是归档状态，不用再改`);
         return entry;
       }
-      checkSeen(entry, meta.seen);
       await this.backend.update(entry.id, { status: "archived" });
       this.cached = undefined;
       this.logger.info(`经验库 归档 ${entry.id} 确认人=${meta.confirmedBy ?? "未知"}`);
@@ -484,7 +486,9 @@ function cosine(a: readonly number[], b: readonly number[]): number {
 
 function numberOf(id: string): number {
   const match = /^K(\d+)$/i.exec(id);
-  return match ? Number(match[1]) : 0;
+  const number = match ? Number(match[1]) : 0;
+  // 表格里有人填了大得离谱的编号（超出能精确表示的整数）：不算，不然加一还是它自己（编号重复）或者变成 KInfinity
+  return Number.isSafeInteger(number + 1) ? number : 0;
 }
 
 /** 「k12」「K 12」「#K12」都认成 K12 */
@@ -600,11 +604,13 @@ function blockValues(text: string): string[] {
 }
 /**
  * 命令行里写在密钥选项后面、隔着空格的值：deployctl --password correcthorsebatterystaple、--api-key "…"、Go 的 -token …；
- * 也算 exec 数组（["deployctl", "--token", "…"]）和 YAML 的 args 列表（- --token 下一行 - …）。
+ * 也算 exec 数组（["deployctl", "--token", "…"]）、YAML 的 args 列表（- --token 下一行 - …）、行尾 \ 续到下一行的，
+ * 以及 shell 里用 \ 转义的空格（correct\ horse\ battery）。
  * 选项名要以密钥的词结尾（--password-stdin、--token-file 不算）；值以 - 开头的是下一个选项（--no-password --verbose）
  */
 const CLI_OPTION = new RegExp(
-  String.raw`(?<![\w.-])--?${CONFIG_KEY}(?:["']?[ \t]+|["'][ \t]*,[ \t]*|["']?[ \t]*\r?\n[ \t]*-[ \t]+)(?:${quotedValue(6)}|(?![-"'])(${VALUE_CHAR}{6,})${VALUE_END})`,
+  String.raw`(?<![\w.-])--?${CONFIG_KEY}(?:["']?[ \t]+|["'][ \t]*,[ \t]*|["']?[ \t]*\r?\n[ \t]*-[ \t]+|["']?[ \t]*\\\r?\n[ \t]*)` +
+    String.raw`(?:${quotedValue(6)}|(?![-"'])((?:${VALUE_CHAR}|\\[^\n]){6,})${VALUE_END})`,
   "gi",
 );
 /** 选项后面是 name=… 的（docker build --secret id=npmrc,src=…）是另一个赋值，里面的密钥由别的规则拦；base64 结尾补的 = 不算 */
@@ -630,8 +636,8 @@ function isPlaceholder(raw: string): boolean {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\$?\{\{.*\}\}$/.test(value)) {
     return true;
   }
-  // 家目录、当前目录、变量开头的文件路径（--private-key ~/.ssh/deploy.pem、$HOME/.npmrc）：说的是值放在哪个文件
-  if (/^(?:~|\.{1,2}|\$\{?[A-Za-z_]\w*\}?)\/\S*$/.test(value)) {
+  // 家目录、当前目录、变量、Windows 盘符开头的文件路径（--private-key ~/.ssh/deploy.pem、$HOME/.npmrc、C:\keys\deploy.pem）：说的是值放在哪个文件
+  if (/^(?:(?:~|\.{1,2}|\$\{?[A-Za-z_]\w*\}?)\/|[A-Za-z]:\\)\S*$/.test(value)) {
     return true;
   }
   const last = value.slice(value.lastIndexOf(".") + 1);
@@ -662,7 +668,10 @@ function findSecret(text: string): string | undefined {
     ...[...text.matchAll(TOKEN_ASSIGNMENT)].map(([, double, single, bare]) => double ?? single ?? bare),
     ...[...text.matchAll(ENV_ASSIGNMENT), ...text.matchAll(LINE_ASSIGNMENT)].flatMap(([, value]) => (value.length >= 8 ? [value] : [])),
     ...blockValues(text),
-    ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) => (bare !== undefined && OPTION_SPEC.test(bare) ? [] : [double ?? single ?? bare])),
+    // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
+    ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) =>
+      bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],
+    ),
   ];
   return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
 }

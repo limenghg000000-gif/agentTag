@@ -172,6 +172,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     'CMD ["deployctl", "--token", "correcthorsebattery"]',
     "args:\n  - --token\n  - correcthorsebattery",
     'args:\n  - "--password"\n  - "correcthorsebattery"',
+    // shell 里转义的空格、行尾 \ 续行
+    "deployctl --password correct\\ horse\\ battery\\ staple",
+    "deployctl \\\n  --password \\\n  correcthorsebatterystaple \\\n  --verbose",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -216,6 +219,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "ansible-playbook --private-key ~/.ssh/deploy.pem site.yml；docker build --secret id=npmrc,src=$HOME/.npmrc .",
     "用 --token 参数传进去；pass the --token option, then restart；use --api-key instead of --password",
     "args:\n  - --token\n  - $(MCP_AIOPS_TOKEN)",
+    "deployctl --token \\\n  $MCP_AIOPS_TOKEN \\\n  --private-key C:\\keys\\deploy.pem",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -260,6 +264,9 @@ test("经验库：编号按最大编号加一，记下发起人、确认人和�
   // 有人在表格里删了中间的行，编号还是往后排
   backend.entries.push({ ...backend.entries[1], id: "K7" });
   assert.equal((await base.save(normalizeDraft(dau))).id, "K8");
+  // 有人填了大得离谱的编号：不拿它往后排，免得加一还是它自己或者变成 KInfinity
+  backend.entries.push({ ...backend.entries[1], id: "K9007199254740993" }, { ...backend.entries[1], id: `K${"9".repeat(400)}` });
+  assert.equal((await base.save(normalizeDraft(dau))).id, "K9");
   assert.match(formatKnowledge(first), /^经验 K1 \[排查经验\]：gateway-api 报 code=8/);
   assert.match(formatKnowledge(first), /（确认人 ML，2026\/10\/9）$/);
 });
@@ -433,10 +440,29 @@ function deskSetup({
   const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 200 });
   const sent: { to: string; input: SendInput; opts?: SendOptions }[] = [];
   const updates: { messageId: string; card: any }[] = [];
+  // aiops 里各条经验排查过程末尾的出处：存进去的按存的时候写的；测试里直接在表格里记的 31、35 算 K1 同步过去的，别的（比如 40）是 Open WebUI 存的
+  const lessonPaths = new Map<number, string>([
+    [31, "（来自飞书团队经验库 K1）"],
+    [35, "（来自飞书团队经验库 K1）"],
+  ]);
   const { mcp, calls, handlers } = fakeMcp({
     search_knowledge: searchLessons,
-    get_knowledge: (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", root_cause: "旧结论" }),
-    save_lesson: saveLesson,
+    get_knowledge: (args) =>
+      JSON.stringify({
+        id: args.id,
+        title: "Open WebUI 存的",
+        status: "active",
+        root_cause: "旧结论",
+        ...(lessonPaths.has(Number(args.id)) ? { diagnosis_path: lessonPaths.get(Number(args.id)) } : {}),
+      }),
+    save_lesson: (args) => {
+      const raw = saveLesson(args);
+      const data = JSON.parse(raw) as { saved?: boolean; id?: number };
+      if (data.saved === true && typeof data.id === "number") {
+        lessonPaths.set(data.id, String(args.diagnosis_path));
+      }
+      return raw;
+    },
     archive_lesson: () => JSON.stringify({ archived: true }),
   });
   let now = 1_000_000;
@@ -475,7 +501,7 @@ function deskSetup({
     return { messageId: "om_card_1", chatId: "oc_1", operator: { openId, name }, action: { tag: "button", value } };
   };
   const lastCard = () => updates.at(-1)!.card;
-  return { backend, base, desk, sent, updates, calls, mcp, handlers, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
+  return { backend, base, desk, sent, updates, calls, mcp, handlers, lessonPaths, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
 }
 
 const cardText = (card: any) => JSON.stringify(card);
@@ -795,7 +821,7 @@ test("发起人可以取消，别人不行；同一个话题再起草时旧卡�
 });
 
 test("起草时经验库里有很像的，卡片上提示；带 replaces 时保存后归档旧的，连同 aiops 里同步的那条", async () => {
-  const { backend, base, desk, sent, calls, click, tool } = deskSetup();
+  const { backend, base, desk, sent, calls, click, tool } = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
   await base.save(normalizeDraft(code8));
   await base.linkAiops("K1", 31);
 
@@ -810,6 +836,7 @@ test("起草时经验库里有很像的，卡片上提示；带 replaces 时保�
   await desk.idle();
   assert.equal(backend.entries.find((e) => e.id === "K1")!.status, "archived");
   assert.equal(backend.entries.find((e) => e.id === "K2")!.status, "active");
+  assert.equal(backend.entries.find((e) => e.id === "K2")!.aiopsId, 32);
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /旧的经验 K1「.*」已归档。\naiops 经验库里同步的经验 #31 也已归档。/);
 
@@ -1217,7 +1244,7 @@ test("取代旧经验时归档旧的没做成：别的卡片不能再取代那�
   assert.deepEqual([again.id, again.replaces], ["K3", "K1"]);
 });
 
-test("归档、取代时用表格里现在的 aiops 编号：卡片发出后有人在表格里改了编号，归档改过的那条", async () => {
+test("归档、取代时用表格里现在的 aiops 编号：卡片发出后编号换成了这一条同步过去的另一条，归档换过的那条", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup();
   await base.save(normalizeDraft(code8));
   await base.linkAiops("K1", 31);
@@ -1227,7 +1254,7 @@ test("归档、取代时用表格里现在的 aiops 编号：卡片发出后有�
   await desk.idle();
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
 
-  const replace = deskSetup();
+  const replace = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
   await replace.base.save(normalizeDraft(code8));
   await replace.base.linkAiops("K1", 31);
   await replace.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
@@ -1235,6 +1262,40 @@ test("归档、取代时用表格里现在的 aiops 编号：卡片发出后有�
   await replace.desk.handleCardAction(replace.click((replace.sent[0].input as { card: any }).card, "save"));
   await replace.desk.idle();
   assert.deepEqual(replace.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 35 }]);
+});
+
+test("归档、取代时表格里的 aiops 编号被改成了别的经验（不是从这一条同步过去的）：不归档那条，卡片说明原因，表格改正后再试一次才归档", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  backend.entries[0].aiopsId = 40;
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0, "Open WebUI 存的 #40 不归档");
+  const partial = lastCard();
+  assert.match(cardText(partial), /aiops 经验库里同步的经验 #40 没能归档：它不是从 K1 同步过去的.*可能有人在表格里改了 K1 的 aiops 编号/);
+  backend.entries[0].aiopsId = 31;
+  await desk.handleCardAction(click(partial, "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+
+  const replace = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
+  await replace.base.save(normalizeDraft(code8));
+  await replace.base.linkAiops("K1", 31);
+  await replace.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  replace.backend.entries[0].aiopsId = 40;
+  await replace.desk.handleCardAction(replace.click((replace.sent[0].input as { card: any }).card, "save"));
+  await replace.desk.idle();
+  assert.equal(replace.calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.match(cardText(replace.lastCard()), /aiops 经验库里同步的经验 #40 没能归档：它不是从 K1 同步过去的/);
+  // 新的这条同步过去的 #32 是 K2 的，也不能当成 K1 的归档
+  replace.backend.entries[0].aiopsId = 32;
+  await replace.desk.handleCardAction(replace.click(replace.lastCard(), "save"));
+  await replace.desk.idle();
+  assert.equal(replace.calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.match(cardText(replace.lastCard()), /aiops 经验库里同步的经验 #32 没能归档：它不是从 K1 同步过去的/);
 });
 
 test("同步到 aiops 后记编号失败会再试；几次都不行时卡片可以再试一次，aiops 里不再存一条", async () => {
@@ -1632,6 +1693,18 @@ test("归档、取代卡片发出后有人在表格里改了那一条：点确�
   await archiving.desk.idle();
   assert.equal(archiving.backend.entries[0].status, "active");
   assert.match(cardText(archiving.lastCard()), /经验 K1 在卡片发出后在表格里改过/);
+
+  // 改了内容还顺手归档了：也不算这张卡片归档成功，不去归档它同步在 aiops 里的那条
+  const archived = deskSetup();
+  await archived.base.save(normalizeDraft(code8));
+  archived.backend.entries[0].aiopsId = 31;
+  await archived.tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  archived.backend.entries[0].conclusion = "改过的结论：user-rpc 改成 headless Service 后恢复";
+  archived.backend.entries[0].status = "archived";
+  await archived.desk.handleCardAction(archived.click((archived.sent[0].input as { card: any }).card, "archive"));
+  await archived.desk.idle();
+  assert.match(cardText(archived.lastCard()), /经验 K1 在卡片发出后在表格里改过/);
+  assert.equal(archived.calls.filter((call) => call.tool === "archive_lesson").length, 0);
 
   const replacing = deskSetup();
   await replacing.base.save(normalizeDraft(dau));

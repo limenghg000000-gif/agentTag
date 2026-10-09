@@ -193,6 +193,24 @@ export class AiopsLessons {
     return undefined;
   }
 
+  /**
+   * 归档团队经验库里一条经验同步过去的那条。编号是从表格里读的，有编辑权限的人能改成别的：先取出来看排查过程末尾的出处，
+   * 不是从这一条同步过去的不归档
+   */
+  async archiveSynced(id: number, teamId: string, confirmedBy: string, task: McpTaskContext): Promise<void> {
+    const lesson = await this.get(id, task);
+    if (!lesson.diagnosis_path?.includes(teamSourceNote(teamId))) {
+      throw new KnowledgeError(
+        `它不是从 ${teamId} 同步过去的（排查过程末尾没有注明「来自飞书团队经验库 ${teamId}」），可能有人在表格里改了 ${teamId} 的 aiops 编号。请在表格里改正后再点「再试一次」`,
+      );
+    }
+    if (lesson.status !== "active") {
+      this.logger.info(`aiops 经验库 经验 #${id} 已经是归档的`);
+      return;
+    }
+    await this.archive(id, confirmedBy, task);
+  }
+
   /** 归档。archive_lesson 只改有效的，对已经归档的报错：报错时看一下，已经归档了（比如上次归档成功、结果没传回来）就算成功 */
   async archive(id: number, confirmedBy: string, task: McpTaskContext): Promise<void> {
     try {

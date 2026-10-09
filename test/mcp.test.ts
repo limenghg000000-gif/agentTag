@@ -393,6 +393,9 @@ test("服务端要求按 MCP 任务方式调用的工具不开；工具清单分
     ["aiops_query_logs"],
   );
   assert.equal(log.find(/build_report 只能按 MCP 任务（tasks）方式调用/)?.level, "warn");
+  // 程序直接调用也不认它：经验库不会以为能同步，卡片上不答应
+  assert.ok(!hub.hasTool("aiops", "build_report"));
+  await assert.rejects(hub.callDirect("aiops", "build_report", {}, task), /aiops 没有 build_report 这个工具/);
 
   let pages = 0;
   const looping = await fake({
