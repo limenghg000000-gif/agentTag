@@ -90,6 +90,8 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   replaces?: string;
   createdAt: string;
   updatedAt?: string;
+  /** 有人直接在表格里写进了像密钥的东西（哪一项里像是有什么）：不拿来检索，也不给模型看 */
+  unsafe?: string;
 }
 
 export interface KnowledgeMeta {
@@ -168,6 +170,8 @@ export class KnowledgeBase {
   private readonly cacheMs: number;
   private readonly readTimeoutMs: number;
   private cached?: { at: number; entries: Promise<KnowledgeEntry[]> };
+  /** 写进了密钥、已经警告过的经验编号（每条只警告一次） */
+  private readonly warnedUnsafe = new Set<string>();
   private readonly vectors = new Map<string, number[]>();
   private embedFailedAt?: number;
   private lock: Promise<unknown> = Promise.resolve();
@@ -202,14 +206,32 @@ export class KnowledgeBase {
     return structuredClone(await this.cached.entries);
   }
 
-  /** 读整张表，超过 readTimeoutMs 就不等了、报错（还在读的那次回来了也不用） */
+  /**
+   * 读整张表，超过 readTimeoutMs 就不等了、报错（还在读的那次回来了也不用）。
+   * 表格能直接改，有人写进了密钥的行记下来（unsafe）：编号、去重照常算它，检索、给模型看时跳过
+   */
   private read(): Promise<KnowledgeEntry[]> {
     const timeout = timeoutSignal(this.readTimeoutMs);
-    const reading = raceAbort(this.backend.list(), timeout.signal).catch((err: unknown) => {
-      throw isTimeout(err) ? new KnowledgeError(`读经验库表格超过 ${this.readTimeoutMs / 1000} 秒没读完，这次没读到`) : err;
-    });
+    const reading = raceAbort(this.backend.list(), timeout.signal).then(
+      (entries) => entries.map((entry) => this.checkSecrets(entry)),
+      (err: unknown) => {
+        throw isTimeout(err) ? new KnowledgeError(`读经验库表格超过 ${this.readTimeoutMs / 1000} 秒没读完，这次没读到`) : err;
+      },
+    );
     void reading.then(timeout.clear, timeout.clear);
     return reading;
+  }
+
+  private checkSecrets(entry: KnowledgeEntry): KnowledgeEntry {
+    const unsafe = entrySecret(entry);
+    if (!unsafe) {
+      return entry;
+    }
+    if (!this.warnedUnsafe.has(entry.id)) {
+      this.warnedUnsafe.add(entry.id);
+      this.logger.warn(`经验库：表格里 ${entry.id} 的${unsafe}，不拿来检索、也不给模型看，请在表格里删掉`);
+    }
+    return { ...entry, unsafe };
   }
 
   async get(id: string): Promise<KnowledgeEntry | undefined> {
@@ -224,7 +246,7 @@ export class KnowledgeBase {
       return [];
     }
     const candidates = (await this.entries()).filter(
-      (entry) => (includeArchived || entry.status === "active") && (!category || entry.category === category),
+      (entry) => !entry.unsafe && (includeArchived || entry.status === "active") && (!category || entry.category === category),
     );
     if (candidates.length === 0) {
       return [];
@@ -612,6 +634,28 @@ function findSecret(text: string): string | undefined {
     ...blockValues(text),
   ];
   return values.some((value) => !isPlaceholder(value)) ? "密码或令牌" : undefined;
+}
+
+/** 表格里这一行哪一项里像是有密钥；没有时返回 undefined */
+function entrySecret(entry: KnowledgeEntry): string | undefined {
+  const fields: [string, string | undefined][] = [
+    ["标题", entry.title],
+    ["适用范围", entry.scope],
+    ["问题或场景", entry.question],
+    ["结论", entry.conclusion],
+    ["怎么处理", entry.handling],
+    ["依据或排查过程", entry.basis],
+    ["关键词", entry.keywords],
+    ["错误码", entry.errorCodes],
+    ["告警名", entry.alertname],
+  ];
+  for (const [name, text] of fields) {
+    const secret = text ? findSecret(text) : undefined;
+    if (secret) {
+      return `${name}里像是有${secret}`;
+    }
+  }
+  return undefined;
 }
 
 /** 去掉首尾空白、检查必填、长度和密钥 */

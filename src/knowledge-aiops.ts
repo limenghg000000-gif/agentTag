@@ -102,8 +102,9 @@ export class AiopsLessons {
   private async query(args: Record<string, unknown>, task: McpTaskContext, signal?: AbortSignal): Promise<AiopsLessonHit[]> {
     const raw = await this.mcp.callDirect(this.server, "search_knowledge", args, task, signal);
     const data = parseJson(raw) as { hits?: unknown } | undefined;
+    // 格式不对不能当成没查到：回答前的检索要算没查成，再试同步时要算没找成（不然会再存一条）
     if (!Array.isArray(data?.hits)) {
-      return [];
+      throw new KnowledgeError(`aiops 检索返回的格式不对：${raw.slice(0, 200)}`);
     }
     return data.hits.flatMap((hit): AiopsLessonHit[] => {
       const item = hit as Record<string, unknown>;

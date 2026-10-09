@@ -600,10 +600,16 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
         continue;
       }
       // 撤之前也先记成结果不明：撤掉了却没来得及记下就退出的话，以后再加回名单时按结果不明重新加一次，不会当成它还有权限。
-      // 没记下来也照样撤，撤权限要紧
+      // 没记下来就先不撤（不然撤掉了也没人知道，加回名单时就加不回来），下次启动或保存时再试
       if (!pending.has(key)) {
         pending.add(key);
-        await persist().catch((err: unknown) => this.logger.warn(`经验库：撤 ${member.id} 的权限之前没能记进数据目录`, err));
+        try {
+          await persist();
+        } catch (err) {
+          pending.delete(key);
+          this.logger.warn(`经验库：撤 ${member.id} 的权限之前没能记进数据目录，这次先不撤，下次启动或保存经验时再试`, err);
+          continue;
+        }
       }
       if (
         (

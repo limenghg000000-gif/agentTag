@@ -321,6 +321,24 @@ test("撤权限前也先记成不确定：撤掉了但结果没传回来、以�
   assert.equal(state.pending, undefined);
 });
 
+test("撤权限前没能记进数据目录时先不撤，下次记得下了再撤", async () => {
+  const stateFile = path.join(dir, "journal-remove-fail", "bitable.json");
+  const { api, calls } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  // 数据目录写不进去：临时文件的位置被一个目录占了
+  await mkdir(`${stateFile}.tmp`);
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }).syncSharing();
+  assert.equal(calls.filter((call) => call.startsWith("remove")).length, 0, "没记下来就不撤");
+  assert.match(warnings.join("\n"), /撤 ou_old 的权限之前没能记进数据目录，这次先不撤/);
+
+  await rm(`${stateFile}.tmp`, { recursive: true });
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(calls.filter((call) => call.startsWith("remove")), ["remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+});
+
 test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {
   const { api, tables, tokens } = fakeBitable();
   tables.set("tblX", { fields: [], records: [] });
