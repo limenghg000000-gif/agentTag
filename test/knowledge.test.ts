@@ -266,6 +266,16 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     ["machine api.example password", "CorrectHorseBatteryStaple9"].join(" "),
     ["machine localhost password", "correcthorsebatterystaple"].join(" "),
     ["default\n  password", "CorrectHorseBattery9"].join(" "),
+    // 没写用户名的连接地址（Redis 只要密码）
+    ["redis://:", "CorrectHorseBatteryStaple9", "@cache/0"].join(""),
+    // Azure 存储的连接字符串、环境变量
+    `DefaultEndpointsProtocol=https;AccountName=prod;AccountKey=${Buffer.from("correct horse battery staple, azure").toString("base64")};EndpointSuffix=core.windows.net`,
+    ["AZURE_STORAGE_ACCOUNT_KEY=correct horse", "battery staple"].join(" "),
+    // PostgreSQL 的 .pgpass：主机像主机的、端口是 5432 的、提到了 pgpass 的；密码里转义的冒号、反斜杠
+    ["db.example.com:5432:prod:svc", "CorrectHorseBatteryStaple9"].join(":"),
+    ["postgres:5432:app:app", "correcthorsebatterystaple"].join(":"),
+    ["~/.pgpass 里写的是 postgres:6432:app:app", "correcthorsebatterystaple"].join(":"),
+    ["/var/run/postgresql:*:*:svc", "pa\\:ss\\\\word9"].join(":"),
     // YAML 块写法里 # 开头的值：块里没有注释，# 是值本身
     ["password: |\n  #Correct", "HorseBatteryStaple9"].join(""),
     ["db:\n  password: >-\n    #correct horse", " battery staple"].join(""),
@@ -343,6 +353,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // 不是 .netrc 记录的句子；.netrc 里密码是占位、打码的
     "machine learning password reset 流程；default 账号要改密码；machine api.example.com login deploy password ${NETRC_PASSWORD}；machine x login y password ******",
     "machine learning password resetting 流程；default password rotation 策略；machine api.example password ********",
+    // Redis 的 key 也是几段冒号；.pgpass 里密码是变量、打码的；Azure 的 AccountKey 是变量的
+    "order:1001:item:detail:summary；user:10086:coupon:list:available；db.example.com:5432:prod:svc:${PGPASSWORD}；*:*:*:*:******；AccountName=prod;AccountKey=${AZURE_STORAGE_KEY}",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
     'token: "expired\n  session"\npassword: "请找\n  管理员重置"',
     // XML 元素里只有注释的
@@ -1264,9 +1276,11 @@ test("同步到 aiops 时结果没传回来：再试一次先找到已经存进�
   ];
   let lose = true;
   let broken = false;
-  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+  const stored = new Map<number, Record<string, unknown>>();
+  const { backend, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup({
     saveLesson: (args) => {
       lessons.push({ id: 31, title: String(args.title), score: 9.8, diagnosis_path: String(args.diagnosis_path) });
+      stored.set(31, args);
       if (lose) {
         lose = false;
         throw new Error("socket hang up");
@@ -1275,6 +1289,7 @@ test("同步到 aiops 时结果没传回来：再试一次先找到已经存进�
     },
     searchLessons: () => (broken ? "upstream error" : JSON.stringify({ hits: lessons })),
   });
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, status: "active", ...stored.get(Number(args.id)) });
   await tool("knowledge_propose").run(code8, { signal });
   await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
   await desk.idle();
@@ -1297,6 +1312,40 @@ test("同步到 aiops 时结果没传回来：再试一次先找到已经存进�
   assert.equal(backend.entries[0].aiopsId, 31);
   assert.equal(lastCard().header.title.content, "已存进经验库");
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已同步到 aiops 经验库（经验 #31）/);
+});
+
+test("同步到 aiops 时结果没传回来、再试前那条在 aiops 里被改过：检索到了也要取全文核对，归档它，按表格重新同步", async () => {
+  let lose = true;
+  const stored = new Map<number, Record<string, unknown>>();
+  const { backend, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup({
+    saveLesson: (args) => {
+      if (lose) {
+        lose = false;
+        stored.set(31, { ...args });
+        throw new Error("socket hang up");
+      }
+      return JSON.stringify({ saved: true, id: 32 });
+    },
+    searchLessons: () =>
+      JSON.stringify({ hits: [...stored].map(([id, lesson]) => ({ id, title: lesson.title, score: 9.8, diagnosis_path: lesson.diagnosis_path })) }),
+  });
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, status: "active", ...stored.get(Number(args.id)) });
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /没能同步到 aiops 经验库：socket hang up/);
+
+  // 别处（Open WebUI）改了 aiops 里那条的根因，出处还留着
+  stored.get(31)!.root_cause = "被改过的根因";
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 2);
+  assert.equal(backend.entries[0].aiopsId, 32);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  const result = (sent.at(-1)!.input as { markdown: string }).markdown;
+  assert.match(result, /aiops 里存的和经验 K1 在表格里的不一样，之前同步到 aiops 的经验 #31 已经不对了，已归档/);
+  assert.match(result, /已同步到 aiops 经验库（经验 #32）/);
 });
 
 test("同步到 aiops 时结果没传回来、再试时检索没排到存进去的那条：aiops 说重复的正是它（排查过程末尾是这一条的出处），记下它的编号，不当成别的相近经验", async () => {

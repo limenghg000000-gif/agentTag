@@ -188,7 +188,8 @@ export class AiopsLessons {
 
   /**
    * 团队经验库里这一条之前同步到 aiops 的经验和当时发过去的内容，看排查过程末尾的出处；没有时返回 undefined。
-   * aiops 不能按出处查，只能检索：用当时发过去的内容查（表格后来改过也不影响），带上服务名和关键词让那一条排在前面，不按分数筛
+   * aiops 不能按出处查，只能检索：用当时发过去的内容查（表格后来改过也不影响），带上服务名和关键词让那一条排在前面，不按分数筛。
+   * 找到的那条之后可能在 aiops 里被改过：和 ownDuplicate 一样取出全文对一遍，对不上的按 aiops 里存的内容算
    */
   async findSynced(sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<{ id: number; draft: KnowledgeDraft } | undefined> {
     for (const draft of sent) {
@@ -202,17 +203,18 @@ export class AiopsLessons {
         task,
       );
       const found = hits.find((hit) => syncedFrom(hit.diagnosis_path, teamId));
-      if (found) {
-        return { id: found.id, draft };
+      const own = found && (await this.ownDuplicate(found.id, sent, teamId, task));
+      if (own) {
+        return own;
       }
     }
     return undefined;
   }
 
   /**
-   * aiops 说和已有的经验 #id 重复时，看它是不是团队经验库这一条之前同步过去的（排查过程最后一行是出处）：上次存进去了、结果没传回来，
-   * findSynced 又没检索到它（aiops 检索只给前几条）。是的话返回它和发过去的内容里对得上的那份；都对不上的按 aiops 里存的内容算，
-   * 和表格里的不一样时会归档它、按表格重新同步。不是的返回 undefined
+   * aiops 里的经验 #id 是不是团队经验库这一条之前同步过去、还有效的（排查过程最后一行是出处）：findSynced 检索到的，
+   * 或者 aiops 说和它重复的（上次存进去了、结果没传回来，检索又没排到它）。是的话返回它和发过去的内容里对得上的那份；
+   * 都对不上的（在 aiops 里改过）按 aiops 里存的内容算，和表格里的不一样时会归档它、按表格重新同步。不是的返回 undefined
    */
   async ownDuplicate(id: number, sent: readonly KnowledgeDraft[], teamId: string, task: McpTaskContext): Promise<{ id: number; draft: KnowledgeDraft } | undefined> {
     const lesson = await this.get(id, task);

@@ -526,8 +526,11 @@ export function normalizeId(id: string): string {
   return id.replace(/[#\s]/g, "").toUpperCase();
 }
 
-/** 写明了是密钥的名字：token、secret、API Key（MODEL_API_KEY、apiKey、x-api-key）、AccessKey、私钥，也算 secret_key、token_key 这类 */
-const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-]?(?:access[_-]?)?key)?`;
+/**
+ * 写明了是密钥的名字：token、secret、API Key（MODEL_API_KEY、apiKey、x-api-key）、AccessKey、私钥、Azure 存储的 AccountKey，
+ * 也算 secret_key、token_key 这类
+ */
+const SECRET_LABEL = String.raw`(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key|account[_-]?key)(?:[_-]?(?:access[_-]?)?key)?`;
 /**
  * 等号、冒号后面到值之前的空白不跨行：下一行是别的配置（.env 里空着的 MCP_AIOPS_TOKEN= 下面一行的 KNOWLEDGE=off）
  * 或者嵌套的子项（k8s 的 secret: 下面一行的 secretName: …），不是它的值。YAML 里值写在下面几行的见 blockValues
@@ -574,8 +577,8 @@ const SECRET_PATTERNS: [RegExp, string][] = [
 
 /** 写明了是密钥、密码的名字后面的值（取出来的组里有一个是值），整个打了码的（isMasked）不算 */
 const LABELED_SECRETS: [RegExp, string][] = [
-  // 连接地址里的密码（postgres://deploy:…@db）；打了码的（postgres://deploy:******@db）不算
-  [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:([^\s@/]+)@/gi, "带密码的连接地址"],
+  // 连接地址里的密码（postgres://deploy:…@db），没写用户名的也算（redis://:…@cache）；打了码的（postgres://deploy:******@db）不算
+  [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]*:([^\s@/]+)@/gi, "带密码的连接地址"],
   // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
   [
     new RegExp(String.raw`(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)[^\S\r\n]*[:=：]${BEFORE_VALUE}([^\s,，;；\u4e00-\u9fff]{16,})`, "gi"),
@@ -609,7 +612,7 @@ const LINE_VALUE = String.raw`[ \t]*(?![ \t"'])([^\n\`\u3000-\u303f\u4e00-\u9fff
  * 单独的 PWD 是当前目录、PASS 是一个词，前面带别的词的（MYSQL_PWD、DB_PASS）才是密码
  */
 const ENV_ASSIGNMENT = new RegExp(
-  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+(?:PWD|PASS))(?:_[A-Z0-9]+)*[ \t]*=${LINE_VALUE}`,
+  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|ACCOUNT_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+(?:PWD|PASS))(?:_[A-Z0-9]+)*[ \t]*=${LINE_VALUE}`,
   "gm",
 );
 /**
@@ -742,6 +745,28 @@ function netrcPasswords(text: string): string[] {
     }
   });
   return found;
+}
+/**
+ * PostgreSQL 的密码文件（~/.pgpass）里的一行：主机:端口:库:用户:密码，没有写明是密码的名字。字段里的 : 和 \ 用 \ 转义（\: \\），
+ * 前四段可以是 *；密码取到空白、引号或者中文为止。第 1 组是主机，第 2 组是端口，第 3 组是密码
+ */
+const PGPASS_ENTRY =
+  /(?<![^\s"'`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])((?:[^\s:\\]|\\.)+):(\d{1,5}|\*):(?:[^\s:\\]|\\.)+:(?:[^\s:\\]|\\.)+:((?:[^\s"'`\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\.)+)(?=$|[\s"'`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])/g;
+
+/**
+ * .pgpass 里的密码。这种一行几段冒号的写法 Redis 的 key 也会用（order:1001:item:detail:summary），所以主机要像主机
+ * （带点、localhost、*、套接字目录），或者端口是 PostgreSQL 默认的 5432，或者这段文字里提到了 .pgpass 文件，才算
+ */
+function pgpassPasswords(text: string): string[] {
+  // 提到的是密码文件（~/.pgpass、PGPASSFILE），不是 PGPASSWORD 这个变量
+  const named = /\.pgpass(?!\w)|\bPGPASSFILE\b/i.test(text);
+  return [...text.matchAll(PGPASS_ENTRY)].flatMap(([, host, port, raw]) => {
+    if (!named && port !== "5432" && !/\.|^(?:localhost|\*)$|^\//i.test(host)) {
+      return [];
+    }
+    const value = raw.replace(/\\(.)/g, "$1");
+    return value.length >= 6 ? [value] : [];
+  });
 }
 /**
  * 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY、cfg.redis_pass）：说的是值从哪读，不是值本身。
@@ -950,6 +975,7 @@ function findSecret(text: string): string | undefined {
     ...xmlValues(text),
     ...curlPasswords(text),
     ...netrcPasswords(text),
+    ...pgpassPasswords(text),
     // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
     ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) =>
       bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],
