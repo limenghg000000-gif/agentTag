@@ -247,11 +247,12 @@ export class AiopsLessons {
 
   /**
    * 归档团队经验库里一条经验同步过去的那条。编号是从表格里读的，有编辑权限的人能改成别的：先取出来看排查过程末尾的出处，
-   * 不是从这一条同步过去的不归档
+   * 不是从这一条同步过去的不归档。teamIds 是这一条现在的编号，以及卡片上的编号（卡片发出后这一行的编号被改了，出处还是原来的）
    */
-  async archiveSynced(id: number, teamId: string, confirmedBy: string, task: McpTaskContext): Promise<void> {
+  async archiveSynced(id: number, teamIds: readonly string[], confirmedBy: string, task: McpTaskContext): Promise<void> {
     const lesson = await this.get(id, task);
-    if (!syncedFrom(lesson.diagnosis_path, teamId)) {
+    const teamId = teamIds[0];
+    if (!teamIds.some((candidate) => syncedFrom(lesson.diagnosis_path, candidate))) {
       throw new KnowledgeError(
         `它不是从 ${teamId} 同步过去的（排查过程末尾没有注明「来自飞书团队经验库 ${teamId}」），可能有人在表格里改了 ${teamId} 的 aiops 编号。请在表格里改正后再点「再试一次」`,
       );

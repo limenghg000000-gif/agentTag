@@ -832,7 +832,7 @@ export class KnowledgeDesk {
     const entry = await this.options.base.archive(target.entry.id, { confirmedBy, seen: target.entry });
     const out: Outcome = { done: [`已归档经验 ${entry.id}「${entry.title}」，确认人 ${confirmedBy}。以后检索不到它。`], unfinished: [] };
     if (entry.aiopsId !== undefined) {
-      await this.archiveLinked(entry.id, entry.aiopsId, confirmedBy, task, out);
+      await this.archiveLinked([entry.id], entry.aiopsId, confirmedBy, task, out);
     }
     return out;
   }
@@ -924,17 +924,21 @@ export class KnowledgeDesk {
       out.done.push(`aiops 经验库里同步的旧经验 #${entry.aiopsId} 留着没归档：新的这条没有同步过去，归档了 aiops 里就没有这个问题的经验了。`);
       return;
     }
-    await this.archiveLinked(entry.id, entry.aiopsId, confirmedBy, task, out);
+    // 卡片发出后有人改了旧的那一行的编号（按草稿编号认出的它）：aiops 里那条的出处还是卡片上的编号
+    await this.archiveLinked([entry.id, seen.id], entry.aiopsId, confirmedBy, task, out);
   }
 
-  /** 团队经验库里归档的排查经验，aiops 里同步的那条也归档。编号是表格里记的：aiops 里那条不是从这一条同步过去的不归档 */
-  private async archiveLinked(teamId: string, aiopsId: number, confirmedBy: string, task: McpTaskContext, out: Outcome): Promise<void> {
+  /**
+   * 团队经验库里归档的排查经验，aiops 里同步的那条也归档。编号是表格里记的：aiops 里那条不是从这一条同步过去的不归档。
+   * teamIds 是这一条现在的编号，取代时还有卡片上的编号
+   */
+  private async archiveLinked(teamIds: readonly string[], aiopsId: number, confirmedBy: string, task: McpTaskContext, out: Outcome): Promise<void> {
     const { aiops } = this.options;
     try {
       if (!aiops?.writable) {
         throw new KnowledgeError(aiops?.lacksWriteTools ? lacksToolsNote(aiops) : "aiops 现在连不上");
       }
-      await aiops.archiveSynced(aiopsId, teamId, confirmedBy, task);
+      await aiops.archiveSynced(aiopsId, teamIds, confirmedBy, task);
       out.done.push(`aiops 经验库里同步的经验 #${aiopsId} 也已归档。`);
     } catch (err) {
       out.unfinished.push(`aiops 经验库里同步的经验 #${aiopsId} 没能归档：${describe(err)}`);

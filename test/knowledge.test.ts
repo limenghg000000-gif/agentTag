@@ -595,9 +595,9 @@ test("aiops 里的经验只有排查过程最后一行是这一条的出处才�
   });
   const lessons = new AiopsLessons(mcp, "aiops", quiet);
   for (const id of [40, 41]) {
-    await assert.rejects(lessons.archiveSynced(id, "K1", "ML", task), /它不是从 K1 同步过去的/, String(id));
+    await assert.rejects(lessons.archiveSynced(id, ["K1"], "ML", task), /它不是从 K1 同步过去的/, String(id));
   }
-  await lessons.archiveSynced(31, "K1", "ML", task);
+  await lessons.archiveSynced(31, ["K1"], "ML", task);
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
   assert.equal((await lessons.findSynced([normalizeDraft(code8)], "K1", task))?.id, 31);
 });
@@ -1096,6 +1096,33 @@ test("取代旧的排查经验、新的还没进 aiops 时旧的那一行被删�
   assert.equal(lastCard().header.title.content, "已存进经验库");
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /旧的经验 K1 已经从表格里删掉了，不用再归档。\naiops 经验库里同步的经验 #31 也已归档。/);
+});
+
+test("取代旧的排查经验：再试一次前有人在表格里改了旧的那一行的编号，按草稿编号认出它；aiops 里同步的旧经验按卡片上的编号核对出处，照样归档", async () => {
+  let down = true;
+  const setup = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 32 });
+    },
+  });
+  await setup.base.save(normalizeDraft(code8), { requestId: "req-old" });
+  await setup.base.linkAiops("K1", 31);
+  await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+  await setup.desk.idle();
+  const partial = setup.lastCard();
+  assert.match(cardText(partial), /aiops 经验库里同步的旧经验 #31 先留着没归档/);
+
+  setup.backend.entries.find((e) => e.id === "K1")!.id = "K9";
+  down = false;
+  await setup.desk.handleCardAction(setup.click(partial, "save"));
+  await setup.desk.idle();
+  assert.deepEqual(setup.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal(setup.lastCard().header.title.content, "已存进经验库");
+  assert.match((setup.sent.at(-1)!.input as { markdown: string }).markdown, /aiops 经验库里同步的经验 #31 也已归档/);
 });
 
 test("取代旧的排查经验：aiops 不认 force、强制保存还说重复时不算进了 aiops，旧的在 aiops 里那条留着，卡片可以再试一次", async () => {
