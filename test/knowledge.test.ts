@@ -207,6 +207,15 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "<entry key='api_key'><![CDATA[correct horse battery staple]]></entry>",
     '<property name="db.password">\n  <value>correct horse battery</value>\n</property>',
     '<constructor-arg name="token"><value><![CDATA[correcthorsebattery]]></value></constructor-arg>',
+    // 密码的简写 _PASS、.pass、-pass：环境变量、配置项、JSON、命令行选项、XML 里的
+    "设置 DB_PASS=correcthorsebatterystaple 后重启",
+    "smtp.pass: correct horse battery staple",
+    '{"db_pass": "correct horse battery"}',
+    "deployctl --db-pass correcthorsebatterystaple",
+    '<entry key="redis_pass">correcthorsebatterystaple</entry>',
+    // 值前面有 XML 注释的
+    '<property name="password"><!-- 生产库 --><value>correcthorsebatterystaple</value></property>',
+    '<entry key="token">\n  <!-- rotated monthly -->\n  correcthorsebatterystaple\n</entry>',
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -261,6 +270,8 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<add value="correcthorsebatterystaple" key="Timeout"/><property value="${DB_PASSWORD}" name="password"/>',
     '<entry key="password">${DB_PASSWORD}</entry><entry key="timeout">correcthorsebatterystaple</entry><property name="password"><value>******</value></property>',
     '<property name="password"><description>找管理员要</description></property><entry key="token"/>',
+    // _PASS 后面是变量、占位、读配置的，名字里 pass 前面没有分隔符的（bypass），值太短的
+    "bypass: correcthorsebatterystaple\nDB_PASS=${DB_PASS}\nsmtp_pass: <your-smtp-pass>\nredis_pass=cfg.redis_pass\nfirst_pass: done",
   ]) {
     assert.ok(normalizeDraft({ ...code8, basis: prose }), prose);
   }
@@ -1799,7 +1810,7 @@ test("aiops 经验写进提示词：根因和处理办法在前面，每一项�
     { id: 12, title: "user-rpc 降载", score: 9, symptom: "接口返回空".repeat(300), root_cause: "单 Pod 被打满", solution: "改 headless Service", diagnosis_path: "看 Pod CPU" },
   ]);
   assert.match(text, /^aiops 经验 #12：user-rpc 降载\n- 根因：单 Pod 被打满\n- 处理办法：改 headless Service\n- 现象：/);
-  assert.match(text, /- 现象：(接口返回空)+…（这一项后面省略，要看全文用 aiops_get_knowledge）\n- 排查过程：看 Pod CPU/);
+  assert.match(text, /- 现象：(接口返回空)+…（这一项后面省略）\n- 排查过程：看 Pod CPU/);
 });
 
 test("模型查经验库、看经验时任务停了不等表格", async () => {
@@ -1857,6 +1868,24 @@ test("归档：团队经验库的按编号，aiops 经验库的按 aiops_id；�
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 40 }]);
 });
 
+test("归档 aiops 经验的卡片上列出排查过程和关键词，太长的截断", async () => {
+  const { sent, tool, handlers } = deskSetup();
+  handlers.get_knowledge = (args) =>
+    JSON.stringify({
+      id: args.id,
+      title: "user-rpc 降载",
+      status: "active",
+      root_cause: "单 Pod 被打满",
+      keywords: "code=8,load shedding",
+      diagnosis_path: `${"看 Pod CPU，".repeat(400)}\n（来自飞书团队经验库 K9）`,
+    });
+  await tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal });
+  const text = cardText((sent.at(-1)!.input as { card: any }).card);
+  assert.match(text, /\*\*关键词\*\*：code=8,load shedding/);
+  assert.match(text, /\*\*排查过程\*\*：(看 Pod CPU，)+…（后面省略，全文见 aiops 经验库里的 #40）/);
+  assert.doesNotMatch(text, /来自飞书团队经验库 K9/);
+});
+
 test("归档时表格改成功了、结果没传回来：再点一次照常完成，aiops 里同步的那条也归档", async () => {
   const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
   await base.save(normalizeDraft(code8));
@@ -1891,6 +1920,7 @@ test("回答前检索：两个库一起查，已同步到 aiops 的只列团队�
 
   const found = await desk.lookup("gateway-api 报 code=8 ResourceExhausted", task);
   assert.deepEqual(found?.ids, ["K1", "aiops#40"]);
+  assert.equal(found?.aiops, true, "查到的里有 aiops 的经验");
   assert.match(found!.text, /^经验 K1 \[排查经验\]/);
   assert.match(found!.text, /aiops 经验 #40：Open WebUI 存的/);
   assert.doesNotMatch(found!.text, /aiops 经验 #31/);
@@ -1986,7 +2016,7 @@ test("没接 aiops 时：经验库的工具说明和提示词都不提 aiops 的
   assert.match(specs(withAiops), /aiops_id/);
   assert.match(specs(withAiops, ["aiops_search_knowledge"]), /aiops 自带的经验库用 aiops_search_knowledge 查/);
 
-  const prompt = (toolNames: string[], knowledge: { hits?: string; missed?: string[]; failed?: boolean }) =>
+  const prompt = (toolNames: string[], knowledge: { hits?: string; aiopsHits?: boolean; missed?: string[]; failed?: boolean }) =>
     buildSystemPrompt({ botName: "飞书 CLI", now: new Date(0), toolNames, knowledge });
   const team = ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"];
   for (const knowledge of [{ hits: "经验 K1 …" }, { hits: "", missed: ["团队经验库"] }, { failed: true }]) {
@@ -1996,6 +2026,13 @@ test("没接 aiops 时：经验库的工具说明和提示词都不提 aiops 的
   const both = prompt([...team, "aiops_search_knowledge", "aiops_get_knowledge"], { hits: "经验 K1 …" });
   assert.match(both, /参考 aiops 经验 #N/);
   assert.match(both, /aiops 的用 aiops_get_knowledge/);
+
+  // 模型没有 aiops 的检索工具（MCP_AIOPS_TOOLS 没开），回答前自动查到的里却有 aiops 的经验：照样说清怎么引用，不叫模型去调 aiops 的工具
+  const hidden = prompt(team, { hits: "aiops 经验 #40：Open WebUI 存的", aiopsHits: true });
+  assert.match(hidden, /aiops 的「案例 #N」「经验 #N」都不是一套编号/);
+  assert.match(hidden, /写「参考经验 K3」或「参考 aiops 经验 #N」/);
+  assert.doesNotMatch(hidden, /aiops_search_knowledge|aiops_get_knowledge/);
+  assert.match(prompt([...team, "aiops_search_knowledge", "aiops_get_knowledge"], { hits: "aiops 经验 #40：…", aiopsHits: true }), /后面省略」的，要看全文用 aiops_get_knowledge/);
 });
 
 test("模型查经验库时向量服务卡住：到期限就只按关键词，不一直等", async () => {
@@ -2126,6 +2163,9 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   // 还有一行的处理办法里贴了 Spring 配置，密码写在 <value> 里
   await base.save(normalizeDraft({ ...dau, title: "日活的口径（TV）", keywords: "日活,TV" }));
   backend.entries[5].handling = ['<property name="db.password"><value>correct horse', "battery staple</value></property>"].join(" ");
+  // 再一行的依据里写了 DB_PASS=…
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（车机）", keywords: "日活,车机" }));
+  backend.entries[6].basis = ["连库用 DB_PASS", "correcthorsebatterystaple"].join("=");
   const fresh = new KnowledgeBase(backend, { logger: quiet });
   const hits = await fresh.search("日活");
   assert.deepEqual(
@@ -2134,14 +2174,15 @@ test("有人直接在表格里写进了密钥：这一行不拿来检索、不�
   );
   const desk = deskSetup();
   desk.backend.entries = structuredClone(backend.entries);
-  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|K6|horse/);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|K4|K5|K6|K7|horse/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里被改过，结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /结论里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K3" }, { signal }), /经验 K3 在表格里被改过，怎么处理里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K4" }, { signal }), /经验 K4 在表格里被改过，依据或排查过程里像是有密码或令牌/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K5" }, { signal }), /经验 K5 在表格里被改过，确认人里像是有密码/);
   await assert.rejects(desk.tool("knowledge_get").run({ id: "K6" }, { signal }), /经验 K6 在表格里被改过，怎么处理里像是有密码或令牌/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K7" }, { signal }), /经验 K7 在表格里被改过，依据或排查过程里像是有密码或令牌/);
   assert.equal(desk.sent.length, 0);
-  // 新存的不会占掉 K2 到 K6
-  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K7");
+  // 新存的不会占掉 K2 到 K7
+  assert.equal((await fresh.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K8");
 });

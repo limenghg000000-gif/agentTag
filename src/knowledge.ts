@@ -576,23 +576,28 @@ const SECRET_PATTERNS: [RegExp, string][] = [
  */
 const VALUE_CHAR = String.raw`[^\s"'\`,;*()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]`;
 const VALUE_END = String.raw`(?=$|[\s"'\`,;*)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
-const TOKEN_ASSIGNMENT = new RegExp(String.raw`${SECRET_LABEL}${ASSIGN}(?:${quotedValue(8)}|["']?(${VALUE_CHAR}{8,})${VALUE_END})`, "gi");
+/** 密码的简写：DB_PASS、smtp.pass、redis-pass，要有分隔符（bypass、compass 不算） */
+const PASS_ALIAS = String.raw`[_.-]pass`;
+const TOKEN_ASSIGNMENT = new RegExp(String.raw`(?:${SECRET_LABEL}|${PASS_ALIAS})${ASSIGN}(?:${quotedValue(8)}|["']?(${VALUE_CHAR}{8,})${VALUE_END})`, "gi");
 /**
  * .env、shell、YAML 里不带引号的值也可以有空格（process.loadEnvFile 认到行尾，YAML 的普通标量也是），所以取到行尾。
  * 中文、反引号、行内注释（空格加 #）、同一行的下一个赋值（, refresh_token=…）前面截断，那是说明不是值；
  * 带 * 的是打了码的，不算。值短于 8 个字符的不算（token=xxx），在 findSecret 里筛
  */
 const LINE_VALUE = String.raw`[ \t]*(?!["'])([^\n*\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
-/** 大写的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；单独的 PWD 是当前目录，前面带别的词的（MYSQL_PWD）才是密码 */
+/**
+ * 大写的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；
+ * 单独的 PWD 是当前目录、PASS 是一个词，前面带别的词的（MYSQL_PWD、DB_PASS）才是密码
+ */
 const ENV_ASSIGNMENT = new RegExp(
-  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+PWD)(?:_[A-Z0-9]+)*[ \t]*=${LINE_VALUE}`,
+  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+(?:PWD|PASS))(?:_[A-Z0-9]+)*[ \t]*=${LINE_VALUE}`,
   "gm",
 );
 /**
  * 一行开头的配置项，大小写都算：db_password=…、export api_key=…、YAML 的 api_key: …、- token: …、spring.datasource.password=…。
  * 名字要以密钥的词结尾（token_ttl、tokenizer 说的不是密钥）；句子中间小写的 token=…、token: … 是报错原文，不在这里认
  */
-const CONFIG_KEY = String.raw`[\w.-]*(?:${SECRET_LABEL}|password|passwd|[_.-]pwd)\d*`;
+const CONFIG_KEY = String.raw`[\w.-]*(?:${SECRET_LABEL}|password|passwd|[_.-]pwd|${PASS_ALIAS})\d*`;
 const LINE_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?${CONFIG_KEY}[ \t]*(?:=|:(?!:))${LINE_VALUE}`, "gim");
 /**
  * YAML 里值写在下面几行的配置项：块写法（api_key: |-、api_key: >）或者冒号后面空着、下一行缩进着写。
@@ -641,13 +646,13 @@ const CLI_OPTION = new RegExp(
 /** 选项后面是 name=… 的（docker build --secret id=npmrc,src=…）是另一个赋值，里面的密钥由别的规则拦；base64 结尾补的 = 不算 */
 const OPTION_SPEC = /^[A-Za-z_][\w.-]*=(?!=|$)/;
 /** 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY）：说的是值从哪读，不是值本身 */
-const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|${SECRET_LABEL})$`, "i");
+const CREDENTIAL_NAME = new RegExp(String.raw`^\w*(?:password|passwd|pwd|pass|${SECRET_LABEL})$`, "i");
 /**
  * 报错原文、占位符里用的词。整个值都由这些词组成时不算密钥（token=expired_session、your_token_here、token: signature is invalid）；
  * 夹着别的词的照样算（prod-secret-abcdefghijkl、my correct horse battery staple）
  */
 const PLACEHOLDER_WORD =
-  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|placeholder|is|are|was|were|be|been|has|have|had|do|does|did|no|cannot|can|could|the|a|an|of|for|to|from|in|on|with|by|and|or|please|again|login|relogin|retry|provided|given|received|options?|arguments?|args?|parameters?|params?|flags?|switch|instead|prompts?|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
+  /^(?:expired?|expires|invalid|missing|revoked|empty|null|nil|none|undefined|unset|required|mismatch(?:ed)?|errors?|denied|unauthori[sz]ed|forbidden|not|found|notfound|timeout|timed|out|stale|bad|wrong|fail(?:ed|ure|s)?|malformed|unknown|absent|disabled|session|signature|token|key|secret|access|api|auth|app|user|id|value|format|request|header|password|passwd|pwd|pass|placeholder|is|are|was|were|be|been|has|have|had|do|does|did|no|cannot|can|could|the|a|an|of|for|to|from|in|on|with|by|and|or|please|again|login|relogin|retry|provided|given|received|options?|arguments?|args?|parameters?|params?|flags?|switch|instead|prompts?|redacted|masked|hidden|example|sample|dummy|your|my|here|x{3,})$/i;
 /** 环境变量名（FEISHU_APP_SECRET、MODEL_API_KEY）：说的是值放在哪，不是值本身 */
 const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
 /** 整个值是 a.b.c 这样的属性引用 */
@@ -716,11 +721,16 @@ const XML_ATTRIBUTES = /[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*')(?:\s+[\w.:-]+\s*=\s*(
 const XML_ATTRIBUTE = /([\w.:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 /** 带属性的开始标签。第 1 组是全部属性，第 2 组是自闭合的 / */
 const XML_OPEN_TAG = /<[\w.:-]+((?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))+)\s*(\/?)>/g;
+/** 值前面可以有空白和 XML 注释（<!-- 生产库 -->） */
+const XML_GAP = String.raw`(?:\s|<!--[\s\S]*?-->)*`;
 /**
  * 开始标签后面紧跟的内容（从 lastIndex 开始匹配）：CDATA 里的、Spring 的 <value> 子元素里的（CDATA 或直接写的），或者直接写的文字。
  * 第 1 到 4 组，有一个是值
  */
-const XML_BODY = /\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|<(?:[\w.-]+:)?value(?:\s[^<>]*)?>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))|([^<]*))/iy;
+const XML_BODY = new RegExp(
+  String.raw`${XML_GAP}(?:<!\[CDATA\[([\s\S]*?)\]\]>|<(?:[\w.-]+:)?value(?:\s[^<>]*)?>${XML_GAP}(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))|([^<]*))`,
+  "iy",
+);
 const CONFIG_NAME = new RegExp(String.raw`^${CONFIG_KEY}$`, "i");
 
 /** 一串属性按名字（小写、去掉命名空间前缀）取值 */

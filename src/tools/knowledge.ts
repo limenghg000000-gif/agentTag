@@ -42,6 +42,8 @@ const LINK_RETRY_MS = 2000;
 const RENDER_ATTEMPTS = 3;
 /** 同步到 aiops 时一次点击最多存几次（上次结果没传回来、找到的是旧内容时再存一次） */
 const SYNC_ROUNDS = 2;
+/** 归档 aiops 经验的卡片上每一项最多列多少字（aiops 里的经验不限长） */
+const CARD_LESSON_FIELD_CHARS = 1500;
 
 /** 这次任务的信息 */
 export interface KnowledgeTaskContext {
@@ -58,6 +60,8 @@ export interface KnowledgeLookup {
   ids: string[];
   /** 超时或出错、这次没查成的库（「团队经验库」「aiops 经验库」） */
   missed?: string[];
+  /** 查到的里有 aiops 经验库的经验（编号写成「aiops 经验 #N」） */
+  aiops?: boolean;
 }
 
 interface Person {
@@ -224,6 +228,7 @@ export class KnowledgeDesk {
         text: parts.join("\n\n"),
         ids: [...teamHits.map((hit) => hit.entry.id), ...aiopsHits.map((hit) => `aiops#${hit.id}`)],
         missed,
+        ...(aiopsHits.length > 0 ? { aiops: true } : {}),
       };
     } finally {
       timeout.clear();
@@ -1082,6 +1087,7 @@ export function renderProposalCard(proposal: Proposal): object {
     body = [["编号", entry.id], ["类别", KNOWLEDGE_CATEGORIES[entry.category]], ["标题", entry.title], ...fieldLines(entry)];
   } else {
     const { lesson } = proposal.target;
+    // 排查过程、关键词也列出来：标题相近的经验靠它们区分，排查过程末尾还注明了是不是从团队经验库同步的。aiops 里的不限长，每项截一下
     body = (
       [
         ["编号", `aiops 经验 #${lesson.id}`],
@@ -1090,8 +1096,15 @@ export function renderProposalCard(proposal: Proposal): object {
         ["现象", lesson.symptom],
         ["根因", lesson.root_cause],
         ["处理办法", lesson.solution],
+        ["排查过程", lesson.diagnosis_path],
+        ["关键词", lesson.keywords],
       ] as [string, string | undefined][]
-    ).filter((pair): pair is [string, string] => Boolean(pair[1]));
+    )
+      .filter((pair): pair is [string, string] => Boolean(pair[1]))
+      .map(([name, value]) => [
+        name,
+        value.length > CARD_LESSON_FIELD_CHARS ? `${value.slice(0, CARD_LESSON_FIELD_CHARS)}…（后面省略，全文见 aiops 经验库里的 #${lesson.id}）` : value,
+      ]);
   }
   if (proposal.kind === "archive" && proposal.reason) {
     notes.push(`归档原因：${proposal.reason}`);

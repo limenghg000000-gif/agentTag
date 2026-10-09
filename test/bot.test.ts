@@ -426,6 +426,14 @@ test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有�
   assert.doesNotMatch(second.requests[0].system, /这次提问在经验库里没查到相近的经验/);
 });
 
+test("回答前查到了 aiops 的经验、模型却没有 aiops 的检索工具：提示词里照样说清 aiops 经验怎么引用", async () => {
+  const knowledge = { lookup: async () => ({ text: "aiops 经验 #40：Open WebUI 存的", ids: ["aiops#40"], aiops: true }), tools: () => [] };
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model, knowledge }).handle(message("code=8 是怎么回事"));
+  assert.match(requests[0].system, /或「参考 aiops 经验 #N」/);
+  assert.doesNotMatch(requests[0].system, /aiops_search_knowledge/);
+});
+
 test("同一话题里的追问排队，等上一个回答发出后再处理", async () => {
   const order: string[] = [];
   let release!: () => void;

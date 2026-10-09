@@ -252,7 +252,10 @@ function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean 
   return diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() === teamSourceNote(teamId);
 }
 
-/** 写进系统提示词的「aiops 经验库里可能相关的经验」 */
+/**
+ * 写进系统提示词的「aiops 经验库里可能相关的经验」。省略处不写用哪个工具看全文：模型不一定有 aiops_get_knowledge（MCP_AIOPS_TOOLS 可以不开），
+ * 有的时候提示词里另外说
+ */
 export function renderAiopsHitsForPrompt(hits: readonly AiopsLessonHit[]): string {
   return hits
     .map((hit) => {
@@ -270,10 +273,10 @@ export function renderAiopsHitsForPrompt(hits: readonly AiopsLessonHit[]): strin
           .filter((pair): pair is [string, string] => Boolean(pair[1]))
           .map(
             ([name, value]) =>
-              `- ${name}：${value.length > PROMPT_FIELD_CHARS ? `${value.slice(0, PROMPT_FIELD_CHARS)}…（这一项后面省略，要看全文用 aiops_get_knowledge）` : value}`,
+              `- ${name}：${value.length > PROMPT_FIELD_CHARS ? `${value.slice(0, PROMPT_FIELD_CHARS)}…（这一项后面省略）` : value}`,
           ),
       ].join("\n");
-      return text.length > PROMPT_HIT_CHARS ? `${text.slice(0, PROMPT_HIT_CHARS)}…（后面省略，要看全文用 aiops_get_knowledge）` : text;
+      return text.length > PROMPT_HIT_CHARS ? `${text.slice(0, PROMPT_HIT_CHARS)}…（后面省略）` : text;
     })
     .join("\n\n");
 }

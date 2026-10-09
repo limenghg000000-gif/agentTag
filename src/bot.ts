@@ -286,7 +286,11 @@ async function runTask(
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
         ...(deps.knowledge
-          ? { knowledge: knowledge ? { hits: knowledge.text, ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}) } : { failed: true } }
+          ? {
+              knowledge: knowledge
+                ? { hits: knowledge.text, ...(knowledge.aiops ? { aiopsHits: true } : {}), ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}) }
+                : { failed: true },
+            }
           : {}),
       }),
       messages: [...history, { role: "user", content: prompt }],
