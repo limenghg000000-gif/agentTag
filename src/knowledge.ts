@@ -128,6 +128,10 @@ export interface KnowledgeBackend {
   list(): Promise<KnowledgeEntry[]>;
   add(entry: KnowledgeEntry): Promise<void>;
   update(id: string, changes: Partial<Pick<KnowledgeEntry, "status" | "aiopsId">>): Promise<void>;
+  /** 发出过的最大编号，表格里删掉的行也算。不记的后端不实现，编号只按表格里现有的往后排 */
+  issued?(): Promise<number>;
+  /** 写进表格之前先记下要发的编号 */
+  issue?(number: number): Promise<void>;
 }
 
 /** 把文字转成向量，用来按意思检索 */
@@ -168,7 +172,7 @@ export interface KnowledgeBaseOptions {
 
 /**
  * 团队经验库：所有群共用，人确认过的结论才存进来。检索按关键词加语义（配了向量模型时），
- * 列表缓存一分钟，向量按内容缓存，内容没变不重算。保存排队进行，编号按已有的最大编号加一
+ * 列表缓存一分钟，向量按内容缓存，内容没变不重算。保存排队进行，编号按发过的最大编号加一（删掉的行的编号不再发）
  */
 export class KnowledgeBase {
   private readonly embedder?: Embedder;
@@ -306,7 +310,11 @@ export class KnowledgeBase {
         checkSeen(old, meta.seen);
         replaces = old.id;
       }
-      const next = entries.reduce((max, entry) => Math.max(max, numberOf(entry.id)), 0) + 1;
+      // 表格里删掉的行的编号也不再发：旧消息里提到的 K 编号、aiops 里注明的出处还指着原来那条。
+      // 先记下再写表格，写失败了跳过一个号，不会重复
+      const issued = (await this.backend.issued?.()) ?? 0;
+      const next = entries.reduce((max, entry) => Math.max(max, numberOf(entry.id)), issued) + 1;
+      await this.backend.issue?.(next);
       const entry: KnowledgeEntry = {
         ...draft,
         id: `K${next}`,

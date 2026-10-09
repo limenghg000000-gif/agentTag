@@ -413,8 +413,12 @@ export class KnowledgeDesk {
     const approver = !this.options.approvers || this.options.approvers.has(operator.openId);
     const who = operator.name ?? "有人";
     if (value.op === "cancel") {
-      if (!approver && operator.openId !== proposal.proposer.openId) {
-        proposal.note = `${who}点了取消：只有发起人或写权限名单里的人能取消`;
+      // 做了一半的是写权限名单里的人确认过的：剩下的不再做，也要名单里的人说了算，发起人只能取消还没确认的
+      if (!approver && (proposal.state === "partial" || operator.openId !== proposal.proposer.openId)) {
+        proposal.note =
+          proposal.state === "partial"
+            ? `${who}点了「不用了」：做了一半的卡片只有写权限名单里的人能决定不再试`
+            : `${who}点了取消：只有发起人或写权限名单里的人能取消`;
         await this.render(proposal);
         return true;
       }
@@ -520,7 +524,7 @@ export class KnowledgeDesk {
     // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "archive";
     if (replaced) {
-      await this.archiveReplaced(replaced, confirmedBy, task, oldLesson, out);
+      await this.archiveReplaced(replaced, proposal.replaces!, confirmedBy, task, oldLesson, out);
     }
     const location = await base.location().catch(() => undefined);
     if (location) {
@@ -704,12 +708,29 @@ export class KnowledgeDesk {
     }
   }
 
-  /** 保存新经验后归档被取代的旧经验；它在 aiops 里同步的那条按 oldLesson 归档或者留着 */
-  private async archiveReplaced(old: KnowledgeEntry, confirmedBy: string, task: McpTaskContext, oldLesson: OldLesson, out: Outcome): Promise<void> {
+  /**
+   * 保存新经验后归档被取代的旧经验；它在 aiops 里同步的那条按 oldLesson 归档或者留着。
+   * 旧的按卡片上的样子核对（seen）：存好新的以后、归档旧的之前（比如同步 aiops 的时候）有人在表格里改了它，就不归档改过的
+   */
+  private async archiveReplaced(
+    old: KnowledgeEntry,
+    seen: KnowledgeEntry,
+    confirmedBy: string,
+    task: McpTaskContext,
+    oldLesson: OldLesson,
+    out: Outcome,
+  ): Promise<void> {
     let entry: KnowledgeEntry;
     try {
-      entry = await this.options.base.archive(old.id, { confirmedBy });
+      entry = await this.options.base.archive(old.id, { confirmedBy, seen });
     } catch (err) {
+      if (err instanceof StaleProposalError) {
+        // 再试也还是改过的，不算没做成：说清楚，要归档的话按现在的内容另外起草
+        out.done.push(
+          `旧的经验 ${old.id} 在卡片发出后在表格里改过，卡片上确认取代的不是现在这条，没有归档它，aiops 里同步的那条也没动。要归档的话请按现在的内容另外起草归档。`,
+        );
+        return;
+      }
       out.unfinished.push(`旧的经验 ${old.id} 没能归档：${describe(err)}。不归档的话新旧两条都会被检索到`);
       return;
     }
@@ -1049,7 +1070,8 @@ function optionalInteger(value: unknown, name: string): number | undefined {
     return undefined;
   }
   const n = typeof value === "string" ? Number(value.replace(/^#/, "")) : value;
-  if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
+  // 超出能精确表示的整数（9007199254740993 会变成 …992）时拒绝，不然会指到别的经验
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) {
     throw new KnowledgeError(`${name} 要填正整数`);
   }
   return n;

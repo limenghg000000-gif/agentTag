@@ -634,16 +634,40 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     }
   }
 
-  private async writeState(state: BitableState): Promise<void> {
-    await mkdir(path.dirname(this.options.stateFile), { recursive: true, mode: 0o700 });
-    const tmp = `${this.options.stateFile}.tmp`;
+  private writeState(state: BitableState): Promise<void> {
+    return writeJson(this.options.stateFile, state);
+  }
+
+  /** 发出过的最大编号记在数据目录里（和 bitable.json 放在一起），换了表也接着往后排 */
+  private get issuedFile(): string {
+    return path.join(path.dirname(this.options.stateFile), "issued.json");
+  }
+
+  async issued(): Promise<number> {
+    let raw: string;
     try {
-      await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-      await rename(tmp, this.options.stateFile);
+      raw = await readFile(this.issuedFile, "utf8");
     } catch (err) {
-      await rm(tmp, { force: true });
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return 0;
+      }
       throw err;
     }
+    let highest: unknown;
+    try {
+      highest = (JSON.parse(raw) as { highest?: unknown }).highest;
+    } catch {
+      highest = undefined;
+    }
+    // 记坏了就不存：按表格里现有的排可能把删掉的行的编号再发一遍
+    if (typeof highest !== "number" || !Number.isSafeInteger(highest + 1) || highest < 0) {
+      throw new KnowledgeError(`数据目录里记的发过的最大经验编号（${this.issuedFile}）格式不对，先不保存。请检查这个文件，内容应该像 {"highest": 12}`);
+    }
+    return highest;
+  }
+
+  issue(number: number): Promise<void> {
+    return writeJson(this.issuedFile, { highest: number });
   }
 
   private async explain<T>(run: () => Promise<T>): Promise<T> {
@@ -812,4 +836,17 @@ export function describeBitableError(err: unknown): string {
     return `机器人没有经验库这张多维表格的权限（${raw}）。请表格所有者在多维表格右上角「…」→「更多」→「添加文档应用」里添加机器人`;
   }
   return raw;
+}
+
+/** 先写临时文件再改名，写到一半出错或者进程退出也不会留下半个文件 */
+async function writeJson(file: string, data: unknown): Promise<void> {
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, file);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
 }

@@ -28,6 +28,8 @@ class MemoryBackend implements KnowledgeBackend {
   failUpdates = 0;
   /** 前几次 update 改成功了，但结果没传回来 */
   lostUpdates = 0;
+  /** 发出过的最大编号 */
+  highest = 0;
 
   async location() {
     return "https://example.feishu.cn/base/app1?table=tbl1";
@@ -36,6 +38,14 @@ class MemoryBackend implements KnowledgeBackend {
   async list() {
     this.lists++;
     return structuredClone(this.entries);
+  }
+
+  async issued() {
+    return this.highest;
+  }
+
+  async issue(number: number) {
+    this.highest = number;
   }
 
   async add(entry: KnowledgeEntry) {
@@ -240,7 +250,7 @@ function fakeEmbedder(topics: string[]) {
   return { embedder, calls };
 }
 
-test("经验库：编号按最大编号加一，记下发起人、确认人和来源；归档后检索不到，不能重复归档", async () => {
+test("经验库：编号按发过的最大编号加一（删掉的行的编号不再发），记下发起人、确认人和来源；归档后检索不到，不能重复归档", async () => {
   const backend = new MemoryBackend();
   const base = new KnowledgeBase(backend, { logger: quiet, now: () => new Date("2026-10-09T10:00:00Z") });
 
@@ -267,6 +277,14 @@ test("经验库：编号按最大编号加一，记下发起人、确认人和�
   // 有人填了大得离谱的编号：不拿它往后排，免得加一还是它自己或者变成 KInfinity
   backend.entries.push({ ...backend.entries[1], id: "K9007199254740993" }, { ...backend.entries[1], id: `K${"9".repeat(400)}` });
   assert.equal((await base.save(normalizeDraft(dau))).id, "K9");
+  // 有人在表格里删了编号最大的那几行：发过的编号不再发，旧消息里的 K9 还是指原来那条
+  backend.entries = backend.entries.filter((entry) => !["K8", "K9"].includes(entry.id));
+  assert.equal((await base.save(normalizeDraft(dau))).id, "K10");
+  // 写表格失败：这个编号跳过，不会再发给下一条
+  backend.failAdd = new Error("飞书接口限流");
+  await assert.rejects(base.save(normalizeDraft(dau)), /飞书接口限流/);
+  backend.failAdd = undefined;
+  assert.equal((await base.save(normalizeDraft(dau))).id, "K12");
   assert.match(formatKnowledge(first), /^经验 K1 \[排查经验\]：gateway-api 报 code=8/);
   assert.match(formatKnowledge(first), /（确认人 ML，2026\/10\/9）$/);
 });
@@ -1130,7 +1148,7 @@ test("同步到 aiops 没做成、有人在表格里改了这一行再点再试�
   assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1「gateway-api 报 code=8：user-rpc 只连一个 Pod」/);
 });
 
-test("没做成的卡片：点「不用了」或者超过 24 小时就不再试，结果里写上没做成的", async () => {
+test("没做成的卡片：写权限名单里的人点「不用了」或者超过 24 小时就不再试，结果里写上没做成的；发起人不在名单里时不能放弃", async () => {
   const fail = () => {
     throw new Error("aiops 现在连不上");
   };
@@ -1139,13 +1157,19 @@ test("没做成的卡片：点「不用了」或者超过 24 小时就不再试�
   await quit.desk.handleCardAction(quit.click((quit.sent[0].input as { card: any }).card, "save"));
   await quit.desk.idle();
   const partial = quit.lastCard();
-  await quit.desk.handleCardAction(quit.click(partial, "cancel", "ou_2", "李四"));
-  assert.match(cardText(quit.lastCard()), /只有发起人或写权限名单里的人能取消/);
-  await quit.desk.handleCardAction(quit.click(partial, "cancel", "ou_1", "张三"));
+  for (const [openId, name] of [
+    ["ou_2", "李四"],
+    ["ou_1", "张三"],
+  ]) {
+    await quit.desk.handleCardAction(quit.click(partial, "cancel", openId, name));
+    assert.match(cardText(quit.lastCard()), new RegExp(`${name}点了「不用了」：做了一半的卡片只有写权限名单里的人能决定不再试`));
+    assert.match(cardText(quit.lastCard()), /"tag":"button"/, "卡片还能再试");
+  }
+  await quit.desk.handleCardAction(quit.click(partial, "cancel"));
   const given = quit.lastCard();
   assert.equal(given.header.title.content, "已存进经验库");
   assert.match(cardText(given), /已存进团队经验库：经验 K1/);
-  assert.match(cardText(given), /张三点了「不用了」，下面没做成的不再试了：\\n- 没能同步到 aiops 经验库：aiops 现在连不上/);
+  assert.match(cardText(given), /ML点了「不用了」，下面没做成的不再试了：\\n- 没能同步到 aiops 经验库：aiops 现在连不上/);
   assert.doesNotMatch(cardText(given), /"tag":"button"/);
   assert.equal(quit.backend.entries.length, 1);
 
@@ -1296,6 +1320,42 @@ test("归档、取代时表格里的 aiops 编号被改成了别的经验（不�
   await replace.desk.idle();
   assert.equal(replace.calls.filter((call) => call.tool === "archive_lesson").length, 0);
   assert.match(cardText(replace.lastCard()), /aiops 经验库里同步的经验 #32 没能归档：它不是从 K1 同步过去的/);
+});
+
+test("取代旧经验：存好新的以后、归档旧的之前有人在表格里改了旧的（同步 aiops 的时候）：不归档改过的，aiops 里旧的那条也不动，结果里说明", async () => {
+  let setup: ReturnType<typeof deskSetup>;
+  setup = deskSetup({
+    saveLesson: () => {
+      setup.backend.entries[0].conclusion = "有人在表格里改过的结论";
+      return JSON.stringify({ saved: true, id: 32 });
+    },
+  });
+  const { backend, base, desk, sent, calls, click, tool, lastCard } = setup;
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.deepEqual(
+    backend.entries.map((e) => [e.id, e.status, e.aiopsId]),
+    [
+      ["K1", "active", 31],
+      ["K2", "active", 32],
+    ],
+  );
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
+  assert.match(
+    (sent.at(-1)!.input as { markdown: string }).markdown,
+    /旧的经验 K1 在卡片发出后在表格里改过，卡片上确认取代的不是现在这条，没有归档它，aiops 里同步的那条也没动/,
+  );
+});
+
+test("aiops 编号、案例编号超出能精确表示的整数时报错，不会四舍五入到别的经验", async () => {
+  const { tool } = deskSetup();
+  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: "9007199254740993" }, { signal }), /aiops_id 要填正整数/);
+  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 2 ** 53 }, { signal }), /aiops_id 要填正整数/);
+  await assert.rejects(tool("knowledge_propose").run({ ...code8, case_id: "#9007199254740993" }, { signal }), /case_id 要填正整数/);
 });
 
 test("同步到 aiops 后记编号失败会再试；几次都不行时卡片可以再试一次，aiops 里不再存一条", async () => {
