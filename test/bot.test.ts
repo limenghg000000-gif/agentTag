@@ -1251,27 +1251,36 @@ test("代码引用：带空格的路径、diff 和开 PR 结果里的改动统�
     [
       { tool: "code_list_files", output: "共 1 个文件（master 分支 @ 3f2a1c9）：\nsrc/my files/app.ts" },
       { tool: "code_read_file", output: "src/my files/app.ts（共 2 行，下面是第 1 到 2 行）\n1| a\n2| b" },
+      // 模型传的路径前后带空格：工具读的是整理过的 src/foo.ts，结果里写的是原样
+      { tool: "code_read_file", output: " src/foo.ts （共 1 行，下面是第 1 到 1 行）\n1| a" },
+      // 统计整体 trim 过：只改了一个文件时，唯一的一行前面没有空格
+      { tool: "code_open_pr", output: "已开合并请求 !11：https://lab.example.com/x/-/merge_requests/11\n\n改动统计：\nsrc/one.ts | 1 +\n 1 file changed, 1 insertion(+)" },
       {
         tool: "code_open_pr",
         output:
-          "已开合并请求 !12：https://lab.example.com/x/-/merge_requests/12\n\n改动统计：\n src/a.ts | 3 ++-\n assets/logo.png | Bin 0 -> 1234 bytes\n" +
+          "已开合并请求 !12：https://lab.example.com/x/-/merge_requests/12\n\n改动统计：\nsrc/a.ts | 3 ++-\n assets/logo.png | Bin 0 -> 1234 bytes\n" +
           " .../deep/name.ts | 1 +\n 3 files changed, 3 insertions(+), 1 deletion(-)",
       },
       // 统计在空行以前；diff 里的上下文行也以空格开头，长得像统计的不算
       {
         tool: "code_diff",
         output:
-          " src/c.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/src/c.ts b/src/c.ts\n@@ -1,3 +1,3 @@\n fake/path.ts | 9 +\n-x\n+y\n" +
+          "src/c.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/src/c.ts b/src/c.ts\n@@ -1,3 +1,3 @@\n fake/path.ts | 9 +\n-x\n+y\n" +
           "diff --git a/src/my dir/d.ts b/src/my dir/d.ts",
       },
     ],
   );
-  // 回答里认得出的是空格后面那段
+  // 反引号里带空格的路径按整段认；空格后面那段（files/app.ts）是另一个路径，不认
   assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:2`", seen), []);
-  assert.equal(seen("files/app.ts"), true);
-  assert.equal(seen("files/app.ts", 2), true);
-  assert.equal(seen("files/app.ts", 3), false);
-  assert.equal(seen("les/app.ts"), false);
+  assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:3`", seen), [{ text: "files/app.ts:3", located: true }]);
+  assert.deepEqual(unseenCodeCitations("在 files/app.ts 和 `files/app.ts`", seen), [{ text: "files/app.ts", located: false }]);
+  // 反引号里是几个路径，整段不是一个路径时照常一个个认
+  assert.deepEqual(unseenCodeCitations("见 `src/a.ts or src/c.ts`", seen), []);
+  assert.deepEqual(unseenCodeCitations("见 `src/a.ts or src/zzz.ts`", seen), [{ text: "src/zzz.ts", located: false }]);
+  assert.equal(seen("src/my files/app.ts", 2), true);
+  assert.equal(seen("files/app.ts"), false);
+  assert.equal(seen("src/foo.ts", 1), true);
+  assert.equal(seen("src/one.ts"), true);
   assert.equal(seen("src/a.ts"), true);
   assert.equal(seen("src/a.ts", 1), false);
   assert.equal(seen("assets/logo.png"), true);
@@ -1370,18 +1379,33 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     describe: () => "按路径搜",
     run: async () => "没有搜到「src/legacy/user.ts」（master 分支 @ 1a2b3c4）。",
   };
+  // 不是代码工具：报错写成「路径 是目录」也不算查到这个文件
+  const otherTool: Tool = {
+    spec: { name: "aiops_get_file", description: "别的工具", parameters: { type: "object", properties: {} } },
+    describe: () => "别的工具",
+    run: async () => {
+      throw new Error("src/legacy/user.ts 是目录");
+    },
+  };
   const made =
     "结论：code=8 是 user-rpc 定义的「用户不存在」（把握：高）。依据：ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`";
-  const ask = async (answers: string[], { question = "去 gateway-api 和 user-rpc 服务代码去排查一下", tool = "code_search" } = {}) => {
+  const ask = async (
+    answers: string[],
+    { question = "去 gateway-api 和 user-rpc 服务代码去排查一下", tool = "code_search", also = [] as string[] } = {},
+  ) => {
     const results: ChatResult[] = [
-      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: tool, arguments: "{}" }] },
+      {
+        text: "",
+        finish: "tool_calls",
+        toolCalls: [tool, ...also].map((name, i) => ({ id: `c${i + 1}`, name, arguments: "{}" })),
+      },
       ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
     ];
     const { model, requests } = fakeModel(() => results.shift()!);
     const warnings: string[] = [];
     const { sent, handle } = setup({
       model,
-      taskTools: () => [codeSearch, codeRead, longList, searchPath, readBig],
+      taskTools: () => [codeSearch, codeRead, longList, searchPath, readBig, otherTool],
       codeRepos: ["ai/aiops-mcp", "ai/agent-tag"],
       logger: { ...quiet, warn: (line: string) => warnings.push(line) },
     });
@@ -1430,6 +1454,10 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.deepEqual(tooBig.replies, ["src/generated.ts 太大，读不了"]);
   const bigLine = await ask(["src/generated.ts:10 初始化配置", "src/generated.ts:10 初始化配置"], { tool: "code_read_big" });
   assert.deepEqual(bigLine.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
+  // 同样的报错出自别的工具（比如 MCP），不算查到文件
+  const notCode = await ask(["src/legacy/user.ts 是个目录", "src/legacy/user.ts 是个目录"], { also: ["aiops_get_file"] });
+  assert.equal(notCode.requests.length, 3);
+  assert.deepEqual(notCode.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
 
   // code_search 搜的是文件内容：没搜到这个路径，不能拿来说没有这个文件
   const notSearched = await ask(["实现在 src/legacy/user.ts 里", "仓库里不存在 src/legacy/user.ts"], { tool: "code_find" });

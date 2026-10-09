@@ -229,9 +229,9 @@ async function runTask(
           try {
             output = await tool.run(args, ctx);
           } catch (err) {
-            // 读到了文件、只是读不了（太大、二进制）的报错说明这个文件是有的，算查到了路径，不算查到哪一行
+            // 代码工具读到了文件、只是读不了（太大、二进制）的报错说明这个文件是有的，算查到了路径，不算查到哪一行
             const message = err instanceof Error ? err.message : String(err);
-            if (EXISTING_FILE_ERROR.test(message)) {
+            if (isCodeTool(tool.spec.name) && EXISTING_FILE_ERROR.test(message)) {
               evidence.push({ tool: tool.spec.name, output: message, failed: true });
             }
             throw err;
@@ -428,8 +428,10 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 
 const CODE_TOOL_PREFIX = "code_";
 /** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
-const CODE_PATHS =
-  /(?:^|[\s`'"(（:：,，、])((?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto))\b/g;
+const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
+const CODE_PATHS = new RegExp(`(?:^|[\\s\`'"(（:：,，、])((?:[\\w.-]+\\/)+[\\w.-]+\\.${CODE_EXT})\\b`, "g");
+/** 反引号里带空格的路径（`src/my files/app.ts:12`）：CODE_PATHS 只认得出空格后面那段，这种先按整段认 */
+const SPACED_CODE_PATHS = new RegExp(`(?<=\`)((?:[\\w.-]+(?: [\\w.-]+)*\\/)+[\\w.-]+(?: [\\w.-]+)*\\.${CODE_EXT})(?=[\`:#])`, "g");
 /** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
 const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
 /** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
@@ -473,11 +475,21 @@ export type CitationCheck = (text: string, line?: number) => boolean;
  * 和 userlogic.go:35 这些仓库里根本没有的提交和文件，把握写高
  */
 export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCitation[] {
+  const lineAfter = (end: number) => {
+    const at = LINE_AFTER_PATH.exec(answer.slice(end));
+    return at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
+  };
+  // 带空格的整段路径查到过，里面空格后面那段就不再单独认；没查到的照常按 CODE_PATHS 认出来的那段查
+  const spaced = [...answer.matchAll(SPACED_CODE_PATHS)].filter(
+    (match) => match[1].includes(" ") && seen(match[1], lineAfter(match.index + match[1].length)),
+  );
   const cites = new Map<string, CodeCitation>();
   for (const match of answer.matchAll(CODE_PATHS)) {
+    if (spaced.some((span) => match.index >= span.index && match.index < span.index + span[1].length)) {
+      continue;
+    }
     const path = match[1];
-    const at = LINE_AFTER_PATH.exec(answer.slice(match.index + match[0].length));
-    const line = at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
+    const line = lineAfter(match.index + match[0].length);
     if (!seen(path, line)) {
       const text = line === undefined ? path : `${path}:${line}`;
       cites.set(text, { text, located: line !== undefined });
@@ -529,10 +541,7 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
         const sha = form.toLowerCase();
         found = facts.commits.some((seen) => seen.startsWith(sha));
       } else {
-        // 带空格的路径（src/my files/app.ts），回答里只认得出空格后面那段（files/app.ts）
-        const files = [...facts.paths].filter((seen) => seen === form || seen.endsWith(` ${form}`));
-        found =
-          line === undefined ? files.length > 0 : files.some((file) => (facts.lines.get(file) ?? []).some(([from, to]) => line >= from && line <= to));
+        found = line === undefined ? facts.paths.has(form) : (facts.lines.get(form) ?? []).some(([from, to]) => line >= from && line <= to);
       }
       return found || facts.text.some((output) => (line === undefined ? mentions(output, form) : hasLine(output, form, line)));
     });
@@ -576,7 +585,7 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     const [head, ...rows] = output.split("\n");
     switch (tool) {
       case "code_read_file": {
-        const read = /^(\S.*?)（(?:([^（）]*?)，)?共 \d+ 行，/.exec(head);
+        const read = /^(.+?)（(?:([^（）]*?)，)?共 \d+ 行，/.exec(head);
         if (read) {
           addPath(read[1]);
           addCommit(BRANCH_SHA.exec(read[2] ?? ""));
@@ -587,7 +596,7 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
             }
           }
         }
-        const short = /^(\S.*?) 只有 \d+ 行。$/.exec(head);
+        const short = /^(.+?) 只有 \d+ 行。$/.exec(head);
         if (short) {
           addPath(short[1]);
         }
@@ -621,12 +630,12 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
         }
         break;
       case "code_edit_file": {
-        const edited = /^已修改 (\S.*?) 第 (\d+) 行起的内容。$/.exec(output);
+        const edited = /^已修改 (.+?) 第 (\d+) 行起的内容。$/.exec(output);
         if (edited) {
           addLines(edited[1], Number(edited[2]));
         }
         // 机器人新建、覆盖的文件，第 1 到 N 行都是它自己写的
-        const written = /^(?:已新建|已覆盖) (\S.*?)（(\d+) 行）。$/.exec(output);
+        const written = /^(?:已新建|已覆盖) (.+?)（(\d+) 行）。$/.exec(output);
         if (written) {
           addLines(written[1], 1, Number(written[2]));
         }
@@ -671,7 +680,7 @@ const BRANCH_SHA = /分支 @ ([0-9a-f]{7,40})/;
 /** 文件列表标题里的提交号：「共 12 个文件（aiops 分支 @ 3f2a1c9）：」「没有匹配的文件（aiops 分支 @ 3f2a1c9）。」 */
 const LIST_SHA = /^(?:共 \d+ 个文件|没有匹配的文件)（\S+ 分支 @ ([0-9a-f]{7,40})/;
 /** src/repo.ts 读、改文件时，文件在但读不了、改不了的报错（「src/a.ts 有 2048 KB，太大了不读」） */
-const EXISTING_FILE_ERROR = /^([^\s：][^：]*?) (?:有 \d+ KB，太大了|是二进制文件|是子模块|是符号链接|是目录|太大了|里没找到 old_text|里 old_text 出现了)/;
+const EXISTING_FILE_ERROR = /^([^：]+?) (?:有 \d+ KB，太大了|是二进制文件|是子模块|是符号链接|是目录|太大了|里没找到 old_text|里 old_text 出现了)/;
 /**
  * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、src/a.tsx 都不是 src/a.ts）。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算
@@ -704,14 +713,20 @@ function seenByModel(output: string, limit: number): string {
   return /[\w./:-]/.test(output[limit]) ? kept.replace(/[\w./:-]+$/, "") : kept;
 }
 
-/** 和 src/repo.ts 读写文件时一样整理路径：去掉开头的 ./ 和 /，合并多余的 / 和 ./（src//a.ts、src/./a.ts 都是 src/a.ts） */
+/**
+ * 和 src/repo.ts 读写文件时一样整理路径（见 Workspace.relative）：去掉前后的空格和开头的 ./、/，合并多余的 / 和 ./。
+ * 工具结果里写的是模型传的原样（「 src//a.ts 」），读的是整理过的 src/a.ts
+ */
 function repoPath(file: string): string {
-  return posix.normalize(file.replace(/^\.?\/+/, ""));
+  return posix.normalize(file.trim().replace(/\\/g, "/").replace(/^\.?\/+/, ""));
 }
 
-/** git diff --stat 统计里的文件：「 src/a.ts | 12 +++---」「 assets/logo.png | Bin 0 -> 1234 bytes」。路径太长被缩写的（.../a.ts）对不上回答里的路径，自然不认 */
+/**
+ * git diff --stat 统计里的文件：「 src/a.ts | 12 +++---」「 assets/logo.png | Bin 0 -> 1234 bytes」，统计整体 trim 过，第一行前面没有空格。
+ * 路径太长被缩写的（.../a.ts）对不上回答里的路径，自然不认
+ */
 function statPaths(rows: readonly string[]): string[] {
-  return rows.flatMap((row) => /^ (\S.*?) +\| +(?:\d+|Bin)\b/.exec(row)?.[1] ?? []);
+  return rows.flatMap((row) => /^ ?(\S.*?) +\| +(?:\d+|Bin)\b/.exec(row)?.[1] ?? []);
 }
 
 function isCodeTool(name: string): boolean {
