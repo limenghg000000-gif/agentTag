@@ -782,7 +782,7 @@ test("有代码工具时，没读代码就说仓库内容的回答被打回去�
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
     describe: () => "搜代码",
-    run: async () => "internal/k8s/tools.go:12: func GetPods()",
+    run: async () => "共 1 处（aiops 分支 @ 9d8e7f6）：\ninternal/k8s/tools.go:12: func GetPods()",
   };
   const results: ChatResult[] = [
     { text: "在 ai/aiops-mcp 里，K8s tool 注册在 `src/index.ts:30-36`", finish: "stop" },
@@ -817,9 +817,17 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
     describe: () => "aiops · 查 Pod 日志",
     run: async () => "panic: nil map\n\tinternal/logic/order.go:88 +0x1d",
   };
-  const ask = async (answers: string[]) => {
+  // 一整行的 JSON 被截断在 user.go:123 的「12」处
+  const json = '{"logs":[{"msg":"panic: nil map","caller":"internal/logic/order.go:88"},{"caller":"internal/logic/user.go:123"}]}';
+  const longLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    maxOutputChars: json.indexOf("user.go:123") + "user.go:12".length,
+    run: async () => json,
+  };
+  const ask = async (answers: string[], tool = "aiops_get_pod_logs") => {
     const results: ChatResult[] = [
-      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_get_pod_logs", arguments: "{}" }] },
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: tool, arguments: "{}" }] },
       ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
     ];
     const { model, requests } = fakeModel(() => results.shift()!);
@@ -827,7 +835,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
       model,
       taskTools: () => [codeSearch],
       codeRepos: ["ai/aiops-mcp"],
-      mcp: { names: ["aiops"], tools: () => [podLogs], prompt: () => undefined },
+      mcp: { names: ["aiops"], tools: () => [podLogs, longLogs], prompt: () => undefined },
     });
     await handle(message("order-api 的 Pod 为什么重启"));
     return { requests, replies: markdowns(sent) };
@@ -841,6 +849,12 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   assert.equal(guessed.requests.length, 3);
   assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
   assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
+
+  // 截断以前的部分照样算，截断处被切开的「user.go:12」不算（其实是 123 行）
+  const clipped = await ask(["panic 在 `internal/logic/order.go:88`，`internal/logic/user.go:12` 也报错", "panic 在 `internal/logic/order.go:88`"], "aiops_query_logs");
+  assert.equal(clipped.requests.length, 3);
+  assert.match(String(clipped.requests[1].messages.at(-1)?.content), /user\.go:12/);
+  assert.deepEqual(clipped.replies, ["panic 在 `internal/logic/order.go:88`"]);
 });
 
 test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
@@ -1155,8 +1169,7 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
 });
 
 test("代码回答检查：调过代码工具也要核对，回答里的文件、行号和提交号得在工具结果里出现过", () => {
-  const outputs = ["共 1 处（master 分支 @ 3f2a1c9）：\ninternal/k8s/tools.go:12: func GetPods()"];
-  const seen = codeEvidence(["ai/aiops-mcp"], outputs);
+  const seen = codeEvidence(["ai/aiops-mcp"], [{ tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9）：\ninternal/k8s/tools.go:12: func GetPods()" }]);
   const review = reviewCodeAnswer("k8s 工具在哪定义", ["ai/aiops-mcp", "ai/agent-tag"], seen);
   const searched = new Set(["code_search"]);
   assert.equal(review("定义在 `internal/k8s/tools.go:12`（master 分支 @ 3f2a1c9）", searched), undefined);
@@ -1178,7 +1191,14 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
 
 test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行", () => {
   const read = "src/app.ts（master 分支 @ 3f2a1c9，共 80 行，下面是第 1 到 40 行）\n1| import x\n35| export function start() {}";
-  const seen = codeEvidence([], [read, 'Traceback\n  File "app/jobs/sync.py", line 88, in run', "panic\n\tinternal/logic/order.go:88 +0x1d"]);
+  const seen = codeEvidence(
+    [],
+    [
+      { tool: "code_read_file", output: read },
+      { tool: "aiops_query_logs", output: 'Traceback\n  File "app/jobs/sync.py", line 88, in run' },
+      { tool: "aiops_query_logs", output: "panic\n\tinternal/logic/order.go:88 +0x1d" },
+    ],
+  );
   assert.equal(seen("src/app.ts", 35), true);
   assert.equal(seen("src/app.ts", 60), false);
   assert.equal(seen("src/app.ts", 3), false);
@@ -1193,12 +1213,13 @@ test("代码引用的路径要整段对上，改文件的结果里写的行也�
   const seen = codeEvidence(
     [],
     [
-      "共 3 个文件（master 分支 @ 3f2a1c9）：\nsrc/index.tsx\npkg/mysrc/util.ts\nsrc/app.ts.map",
-      "共 1 处（master 分支 @ 3f2a1c9）：\npkg/src/nested.ts:12: export const x = 1",
-      "已修改 src/foo.ts 第 10 行起的内容。",
-      "已新建 src/util/new.ts（12 行）。",
-      "goroutine 1 [running]:\n/app/internal/logic/order.go:88 +0x1d",
-      "Error: boom\n    at start (/app/src/server.ts:12:5)",
+      { tool: "code_list_files", output: "共 3 个文件（master 分支 @ 3f2a1c9）：\nsrc/index.tsx\npkg/mysrc/util.ts\nsrc/app.ts.map" },
+      { tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9）：\npkg/src/nested.ts:12: export const x = 1" },
+      { tool: "code_edit_file", output: "已修改 src/foo.ts 第 10 行起的内容。" },
+      { tool: "code_edit_file", output: "已新建 src/util/new.ts（12 行）。" },
+      { tool: "aiops_query_logs", output: "goroutine 1 [running]:\n/app/internal/logic/order.go:88 +0x1d" },
+      { tool: "aiops_query_logs", output: "Error: boom\n    at start (/app/src/server.ts:12:5)" },
+      { tool: "aiops_query_logs", output: "caller=./internal/svc/ctx.go:21" },
     ],
   );
   // 结果里只有 src/index.tsx、pkg/mysrc/util.ts、src/app.ts.map、pkg/src/nested.ts，不能认 src/index.ts、src/util.ts、src/app.ts、src/nested.ts
@@ -1216,8 +1237,52 @@ test("代码引用的路径要整段对上，改文件的结果里写的行也�
   assert.equal(seen("src/foo.ts", 11), false);
   assert.equal(seen("src/util/new.ts", 12), true);
   assert.equal(seen("src/util/new.ts", 13), false);
+  assert.equal(seen("internal/svc/ctx.go", 21), true);
   // 提交号可以只写前几位
-  assert.equal(codeEvidence([], ["master 分支 @ 3f2a1c9d8e7b"])("3f2a1c9"), true);
+  assert.equal(codeEvidence([], [{ tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9d8e7b）：\na/b.go:1: x" }])("3f2a1c9"), true);
+});
+
+test("代码工具的结果只认工具自己写的部分，读到、搜到的代码正文里写的路径、行号、提交号不算", () => {
+  const seen = codeEvidence(
+    [],
+    [
+      // 搜到的是测试文件里的字符串：认 test/bot.test.ts 第 97 行，不认字符串里写的 src/foo.ts 第 10 行、userlogic.go:35、2c6a7d9
+      {
+        tool: "code_search",
+        output:
+          "共 2 处（master 分支 @ 3f2a1c9）：\ntest/bot.test.ts:97:  assert.equal(x, \"已修改 src/foo.ts 第 10 行起的内容。\");\n" +
+          "test/bot.test.ts:1169:  const made = \"ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`\";",
+      },
+      { tool: "code_read_file", output: "./src/bar.ts（共 3 行，下面是第 1 到 3 行）\n1| // 见 src/other.ts:2\n2| export {};\n3| " },
+      // 没搜到时照抄的搜索内容里写什么都不算，结尾的提交号算
+      { tool: "code_search", output: "没有搜到「x」：src/fake.ts:10」（aiops 分支 @ 9d8e7f6）。" },
+      // 搜多个分支：每组开头的分支和提交号算，搜到的那行正文里写的不算
+      {
+        tool: "code_search",
+        output: "在 2 个分支上共搜到 2 处：\n【master 分支 @ 1a2b3c4，1 处】\nsrc/a.ts:3: // 【dev 分支 @ 2c6a7d9，1 处】\n【dev 分支 @ 5e6f7a8，1 处】\nsrc/b.ts:4: y",
+      },
+      // 读文件时路径写成 src/./baz.ts，和读文件时一样整理成 src/baz.ts
+      { tool: "code_read_file", output: "src/./baz.ts（共 1 行，下面是第 1 到 1 行）\n1| export {};" },
+    ],
+  );
+  assert.equal(seen("test/bot.test.ts", 97), true);
+  assert.equal(seen("src/foo.ts", 10), false);
+  assert.equal(seen("src/foo.ts"), false);
+  assert.equal(seen("yuebai-user/rpc/internal/logic/common/userlogic.go", 35), false);
+  assert.equal(seen("2c6a7d9"), false);
+  assert.equal(seen("3f2a1c9"), true);
+  // 读文件时写成 ./src/bar.ts 的照样认；正文里写的 src/other.ts:2 不算
+  assert.equal(seen("src/bar.ts"), true);
+  assert.equal(seen("src/bar.ts", 2), true);
+  assert.equal(seen("src/other.ts", 2), false);
+  assert.equal(seen("src/fake.ts", 10), false);
+  assert.equal(seen("9d8e7f6"), true);
+  assert.equal(seen("1a2b3c4"), true);
+  assert.equal(seen("5e6f7a8"), true);
+  assert.equal(seen("src/a.ts", 3), true);
+  assert.equal(seen("src/b.ts", 4), true);
+  assert.equal(seen("src/baz.ts", 1), true);
+  assert.equal(seen("./src/baz.ts", 1), true);
 });
 
 test("没查到的代码位置：带行号的路径和提交号算「说查过」，举例的路径不算", () => {
