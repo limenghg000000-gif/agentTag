@@ -9,11 +9,11 @@ import {
   blockedCodeAnswer,
   blockUnverifiedOps,
   type BotDeps,
+  codeEvidence,
   createCardActionHandler,
   createMessageHandler,
   reviewCodeAnswer,
   reviewOpsAnswer,
-  seenCitation,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
   unseenCodeAnswer,
@@ -1154,22 +1154,42 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
 });
 
-test("代码回答检查：调过代码工具也要核对，回答里的文件和提交号得在工具结果里出现过", () => {
-  const outputs = ["internal/k8s/tools.go:12: func GetPods()（master 分支 @ 3f2a1c9）"];
-  const seen = seenCitation(["ai/aiops-mcp"], (text) => outputs.some((output) => output.includes(text)));
+test("代码回答检查：调过代码工具也要核对，回答里的文件、行号和提交号得在工具结果里出现过", () => {
+  const outputs = ["共 1 处（master 分支 @ 3f2a1c9）：\ninternal/k8s/tools.go:12: func GetPods()"];
+  const seen = codeEvidence(["ai/aiops-mcp"], outputs);
   const review = reviewCodeAnswer("k8s 工具在哪定义", ["ai/aiops-mcp", "ai/agent-tag"], seen);
   const searched = new Set(["code_search"]);
   assert.equal(review("定义在 `internal/k8s/tools.go:12`（master 分支 @ 3f2a1c9）", searched), undefined);
-  // 写成「仓库名/路径」也认
+  // 写成「仓库名/路径」「./路径」也认
   assert.equal(review("在 ai/aiops-mcp/internal/k8s/tools.go 第 12 行", searched), undefined);
   assert.equal(review("在 ./internal/k8s/tools.go:12", searched), undefined);
+  // 文件是真的，行号是编的
+  assert.equal(review("在 internal/k8s/tools.go:99", searched), unseenCodeAnswer(["internal/k8s/tools.go:99"], ["ai/aiops-mcp", "ai/agent-tag"]));
   // 2026-10-09：调了一次代码工具，回答里的仓库提交和文件都是编的
   const made = "code=8 是用户不存在（ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`）";
   assert.equal(
     review(made, searched),
-    unseenCodeAnswer(["yuebai-user/rpc/internal/logic/common/userlogic.go", "2c6a7d9"], ["ai/aiops-mcp", "ai/agent-tag"]),
+    unseenCodeAnswer(["yuebai-user/rpc/internal/logic/common/userlogic.go:35", "2c6a7d9"], ["ai/aiops-mcp", "ai/agent-tag"]),
   );
   assert.match(unseenCodeAnswer(["a/b.go"], ["ai/aiops-mcp"]), /工具结果里都没有出现：a\/b\.go.*直说读不到这部分代码/);
+  // 群成员在提问里写的路径不算查证：没读代码就照着提问讲，照样要先读
+  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), UNVERIFIED_CODE_ANSWER);
+});
+
+test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行；报错里提到的路径也认", () => {
+  const read = "src/app.ts（master 分支 @ 3f2a1c9，共 80 行，下面是第 1 到 40 行）\n1| import x\n35| export function start() {}";
+  const seen = codeEvidence([], [read, 'Traceback\n  File "app/jobs/sync.py", line 88, in run', "panic\n\tinternal/logic/order.go:88 +0x1d"], [
+    "没有这个文件：src/legacy/user.ts。可以先用 code_list_files 或 code_search 找找",
+  ]);
+  assert.equal(seen("src/app.ts", 35), true);
+  assert.equal(seen("src/app.ts", 60), false);
+  assert.equal(seen("src/app.ts", 3), false);
+  assert.equal(seen("src/app.ts"), true);
+  assert.equal(seen("app/jobs/sync.py", 88), true);
+  assert.equal(seen("internal/logic/order.go", 88), true);
+  assert.equal(seen("internal/logic/order.go", 8), false);
+  assert.equal(seen("src/legacy/user.ts", 10), true);
+  assert.equal(seen("src/other.ts"), false);
 });
 
 test("没查到的代码位置：带行号的路径和提交号算「说查过」，举例的路径不算", () => {
@@ -1177,8 +1197,8 @@ test("没查到的代码位置：带行号的路径和提交号算「说查过�
   assert.deepEqual(
     unseenCodeCitations("ErrUserNotFound 在 rpc/logic/user.go:35，降级在 app/gateway/remote.go 第 47 行，对照 k8s/deployment.yaml，提交 9c1e2f3a", none),
     [
-      { text: "rpc/logic/user.go", located: true },
-      { text: "app/gateway/remote.go", located: true },
+      { text: "rpc/logic/user.go:35", located: true },
+      { text: "app/gateway/remote.go:47", located: true },
       { text: "k8s/deployment.yaml", located: false },
       { text: "9c1e2f3a", located: true },
     ],
@@ -1193,19 +1213,31 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     describe: () => "搜代码",
     run: async () => "没有搜到「getUserCenterFromRemote」（master 分支 @ 1a2b3c4）。",
   };
+  const codeRead: Tool = {
+    spec: { name: "code_read_file", description: "读代码", parameters: { type: "object", properties: {} } },
+    describe: () => "读代码",
+    run: async () => {
+      throw new Error("没有这个文件：src/legacy/user.ts。可以先用 code_list_files 或 code_search 找找");
+    },
+  };
+  const longList: Tool = {
+    spec: { name: "code_list_files", description: "列文件", parameters: { type: "object", properties: {} } },
+    describe: () => "列文件",
+    maxOutputChars: 50,
+    run: async () => `共 2 个文件（master 分支 @ 1a2b3c4）：\nsrc/index.ts\n${"x".repeat(60)}\nsrc/hidden/tail.ts`,
+  };
   const made =
     "结论：code=8 是 user-rpc 定义的「用户不存在」（把握：高）。依据：ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`";
-  const ask = async (second: string, question = "去 gateway-api 和 user-rpc 服务代码去排查一下") => {
+  const ask = async (answers: string[], { question = "去 gateway-api 和 user-rpc 服务代码去排查一下", tool = "code_search" } = {}) => {
     const results: ChatResult[] = [
-      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
-      { text: made, finish: "stop" },
-      { text: second, finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: tool, arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
     ];
     const { model, requests } = fakeModel(() => results.shift()!);
     const warnings: string[] = [];
     const { sent, handle } = setup({
       model,
-      taskTools: () => [codeSearch],
+      taskTools: () => [codeSearch, codeRead, longList],
       codeRepos: ["ai/aiops-mcp", "ai/agent-tag"],
       logger: { ...quiet, warn: (line: string) => warnings.push(line) },
     });
@@ -1213,16 +1245,50 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     return { requests, replies: markdowns(sent), warnings: warnings.join("\n") };
   };
 
-  const stillMade = await ask(made);
+  const stillMade = await ask([made, made]);
   assert.equal(stillMade.requests.length, 3);
   assert.match(String(stillMade.requests[2].messages.at(-1)?.content), /2c6a7d9/);
   assert.deepEqual(stillMade.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
-  assert.match(stillMade.warnings, /还是引用了没查到的代码位置，没有发出 message=om_1：yuebai-user\/rpc\/internal\/logic\/common\/userlogic\.go、2c6a7d9/);
+  assert.match(
+    stillMade.warnings,
+    /还是引用了没查到的代码位置，没有发出 message=om_1：yuebai-user\/rpc\/internal\/logic\/common\/userlogic\.go:35、2c6a7d9/,
+  );
 
-  const honest = await ask("gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。");
+  // 重做后去掉了行号，只说「实现在某个文件里」：读过代码的这次，路径也得是真的
+  const noLine = await ask([made, "实现在 `yuebai-user/rpc/internal/logic/common/userlogic.go` 里"]);
+  assert.deepEqual(noLine.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
+
+  const honest = await ask([made, "gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。"]);
   assert.deepEqual(honest.replies, ["gateway-api 和 user-rpc 的代码不在机器人能读的仓库（ai/aiops-mcp、ai/agent-tag）里，读不到。"]);
 
-  // 群成员自己问到的路径，回答说没有这个文件，不算编
-  const asked = await ask("src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件", "src/legacy/user.ts 第 10 行是干嘛的");
-  assert.deepEqual(asked.replies, ["src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件"]);
+  // 读文件报「没有这个文件」以后，说这个文件不存在不算编
+  const missing = await ask(["src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件"], {
+    question: "src/legacy/user.ts 第 10 行是干嘛的",
+    tool: "code_read_file",
+  });
+  assert.equal(missing.requests.length, 2);
+  assert.deepEqual(missing.replies, ["src/legacy/user.ts 第 10 行在仓库里找不到，没有这个文件"]);
+
+  // 结果里被截掉、模型没看到的路径不算查到
+  const clipped = await ask(["入口在 src/index.ts，另外 src/hidden/tail.ts 里有初始化", "入口在 src/index.ts"], { tool: "code_list_files" });
+  assert.equal(clipped.requests.length, 3);
+  assert.match(String(clipped.requests[2].messages.at(-1)?.content), /src\/hidden\/tail\.ts/);
+  assert.deepEqual(clipped.replies, ["入口在 src/index.ts"]);
+});
+
+test("没读代码、也没问仓库时，重做后还写着举例的路径照常发出", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const results: ChatResult[] = [
+    { text: "可以把配置写在 k8s/deployment.yaml 里", finish: "stop" },
+    { text: "比如写在 k8s/deployment.yaml 里，用 envFrom 引用 ConfigMap", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, taskTools: () => [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+  await handle(message("K8s 里环境变量一般怎么配"));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), ["比如写在 k8s/deployment.yaml 里，用 envFrom 引用 ConfigMap"]);
 });
