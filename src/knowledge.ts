@@ -532,10 +532,18 @@ const BEFORE_VALUE = String.raw`[^\S\r\n]*`;
 const ASSIGN = String.raw`["']?[^\S\r\n]*(?:=>|[:=：])${BEFORE_VALUE}`;
 /**
  * 引号里的一整段值，中间有空格的口令也是一整段（"correct horse battery staple"），转义的引号（"ab\"cd…"）不算结束；
- * 里面有中文的是说明，有 * 的是打了码的，不算
+ * 里面有中文的是说明，不算。带 * 的也取出来，整个打了码的（"******"）由 isMasked 筛掉
  */
 const quotedValue = (min: number) =>
-  String.raw`"((?:[^"\\\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\[^\n]){${min},})"|'((?:[^'\\\n*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\[^\n]){${min},})'`;
+  String.raw`"((?:[^"\\\n\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\[^\n]){${min},})"|'((?:[^'\\\n\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|\\[^\n]){${min},})'`;
+
+/**
+ * 打了码的值：连着三个以上的 *，露出来的字符不超过 8 个（******、ab***cd、sk-****wxyz，提示里也让人「换成 ***」）。
+ * 只夹着一两个 * 的（Ab*CorrectHorseBatteryStaple9!）、露出一大段的（correct***horsebatterystaple）是密码本身，照样算
+ */
+function isMasked(value: string): boolean {
+  return /\*{3,}/.test(value) && value.replace(/[\s*]/g, "").length <= 8;
+}
 
 /**
  * 经验库所有群都能看，排查经验还会同步给 aiops 的告警自动排查，所以明显的密钥、密码不让存。
@@ -556,35 +564,40 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\bAIza[\w-]{35}/, "Google API 密钥"],
   [/\b[rs]k_live_[A-Za-z0-9]{16,}/, "Stripe 密钥"],
   [/\beyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}/, "JWT 令牌"],
-  // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
-  [
-    new RegExp(String.raw`(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)[^\S\r\n]*[:=：]${BEFORE_VALUE}[^\s,，;；*\u4e00-\u9fff]{16,}`, "i"),
-    "云服务的 AccessKey Secret",
-  ],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
   [/\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@/i, "带密码的连接地址"],
-  // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple、{"password": "correct horse battery staple"}）；中文说明（「密码：请找管理员重置」）和 *** 不算
-  [new RegExp(String.raw`(?:password|passwd|pwd|密码|口令)${ASSIGN}(?:${quotedValue(6)}|["']?[^\s"',，;；*\u4e00-\u9fff]{6,})`, "i"), "密码"],
+];
+
+/** 写明了是密钥、密码的名字后面的值（取出来的组里有一个是值），整个打了码的（isMasked）不算 */
+const LABELED_SECRETS: [RegExp, string][] = [
+  // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
+  [
+    new RegExp(String.raw`(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)[^\S\r\n]*[:=：]${BEFORE_VALUE}([^\s,，;；\u4e00-\u9fff]{16,})`, "gi"),
+    "云服务的 AccessKey Secret",
+  ],
+  // 写明了是密码的，值里没有数字也算（correcthorsebatterystaple、{"password": "correct horse battery staple"}）；中文说明（「密码：请找管理员重置」）不算
+  [new RegExp(String.raw`(?:password|passwd|pwd|密码|口令)${ASSIGN}(?:${quotedValue(6)}|["']?([^\s"',，;；\u4e00-\u9fff]{6,}))`, "gi"), "密码"],
   // 写明了是密钥的，值里带数字的都算（不带数字的见下面的 TOKEN_ASSIGNMENT）
-  [new RegExp(String.raw`${SECRET_LABEL}[^\S\r\n]*[:=：]${BEFORE_VALUE}(?=[^\s,，;；*]*\d)[^\s,，;；*]{8,}`, "i"), "密码或令牌"],
+  [new RegExp(String.raw`${SECRET_LABEL}[^\S\r\n]*[:=：]${BEFORE_VALUE}(?=[^\s,，;；]*\d)([^\s,，;；]{8,})`, "gi"), "密码或令牌"],
 ];
 
 /**
  * 写明了是密钥的名字后面直接写的值，没有数字也算（MCP_AIOPS_TOKEN=correcthorsebatterystaple、MODEL_API_KEY=correct.horse.battery.staple，
- * 这些配置什么样的值都能填）。引号里的值取引号里的一整段（"correct horse battery staple"）；没引号的到空白、引号、逗号分号、右括号、星号、中文为止，
+ * 这些配置什么样的值都能填）。引号里的值取引号里的一整段（"correct horse battery staple"）；没引号的到空白、引号、逗号分号、右括号、中文为止，
  * 中间的标点都算（abc:def!ghi），紧跟着 ( [ { < \ 的不算：那是代码、占位或者路径（getToken()、${MCP_AIOPS_TOKEN}、<token>、os.environ["X"]）
  */
-const VALUE_CHAR = String.raw`[^\s"'\`,;*()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]`;
-const VALUE_END = String.raw`(?=$|[\s"'\`,;*)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
+const VALUE_CHAR = String.raw`[^\s"'\`,;()[\]{}<>\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]`;
+const VALUE_END = String.raw`(?=$|[\s"'\`,;)\]}>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])`;
 /** 密码的简写：DB_PASS、smtp.pass、redis-pass，要有分隔符（bypass、compass 不算） */
 const PASS_ALIAS = String.raw`[_.-]pass`;
 const TOKEN_ASSIGNMENT = new RegExp(String.raw`(?:${SECRET_LABEL}|${PASS_ALIAS})${ASSIGN}(?:${quotedValue(8)}|["']?(${VALUE_CHAR}{8,})${VALUE_END})`, "gi");
 /**
  * .env、shell、YAML 里不带引号的值也可以有空格（process.loadEnvFile 认到行尾，YAML 的普通标量也是），所以取到行尾。
  * 中文、反引号、行内注释（空格加 #）、同一行的下一个赋值（, refresh_token=…）前面截断，那是说明不是值；
- * 带 * 的是打了码的，不算。值短于 8 个字符的不算（token=xxx），在 findSecret 里筛
+ * 整个打了码的、值短于 8 个字符的不算（token=******、token=xxx），在 findSecret 里筛。
+ * 引号开头的不在这里取（等号后面的空白也不让它退回去取），由 quotedValue 取引号里的
  */
-const LINE_VALUE = String.raw`[ \t]*(?!["'])([^\n*\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
+const LINE_VALUE = String.raw`[ \t]*(?![ \t"'])([^\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
 /**
  * 大写的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；
  * 单独的 PWD 是当前目录、PASS 是一个词，前面带别的词的（MYSQL_PWD、DB_PASS）才是密码
@@ -611,7 +624,7 @@ const COMMENT_LINE = /^[ \t]*#/;
 /** 值里中文、反引号、行内注释以后是说明 */
 const NOTE_START = /[`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]|[ \t]#/;
 
-/** YAML 里写在下面几行的值：下面缩进比配置项深的几行连起来。带 * 的是打了码的，不算 */
+/** YAML 里写在下面几行的值：下面缩进比配置项深的几行连起来。整个打了码的不算 */
 function blockValues(text: string): string[] {
   const lines = text.split(/\r?\n/);
   return lines.flatMap((line, i) => {
@@ -631,7 +644,7 @@ function blockValues(text: string): string[] {
       body.push((note ? next.slice(0, note.index) : next).trim());
     }
     const value = body.join(" ").trim();
-    return value.length >= 8 && !value.includes("*") ? [value] : [];
+    return value.length >= 8 && !isMasked(value) ? [value] : [];
   });
 }
 /**
@@ -663,10 +676,13 @@ const ENV_NAME = /^[A-Z]+(?:_[A-Z]+)+$/;
 /** 整个值是 a.b.c 这样的属性引用 */
 const PROPERTY_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
 
-/** 写在密钥名字后面的值是不是占位：环境变量名、读密钥的属性引用、说密钥放在哪的地址，或者整个由报错、占位用词组成 */
+/** 写在密钥名字后面的值是不是占位：打了码的、环境变量名、读密钥的属性引用、说密钥放在哪的地址，或者整个由报错、占位用词组成 */
 function isPlaceholder(raw: string): boolean {
   // 句末的标点不算值的一部分（token: expired.、token=expired!）
   const value = raw.replace(/[.!?:]+$/, "");
+  if (isMasked(value)) {
+    return true;
+  }
   // 地址里带的密码、查询参数里的 token=… 由别的规则拦；变量引用（$NAME、${NAME}）、尖括号占位（<your-token>）、模板（{{ .Values.token }}）
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value) || /^<[^<>]+>$/.test(value) || /^\$?\{\{.*\}\}$/.test(value)) {
     return true;
@@ -679,7 +695,8 @@ function isPlaceholder(raw: string): boolean {
   if (PROPERTY_PATH.test(value) && (CREDENTIAL_NAME.test(last) || ENV_NAME.test(last))) {
     return true;
   }
-  return ENV_NAME.test(value) || value.split(/[\s_+/~=.,;:!?-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
+  // 词之间的 * 是 Markdown 的加粗（**expired**），夹在字母中间的（Ab*Correct）分出来的不是占位词，照样算
+  return ENV_NAME.test(value) || value.split(/[\s_+/~=.,;:!?*-]+/).every((part) => part === "" || PLACEHOLDER_WORD.test(part));
 }
 
 /** HTTP Basic 认证（Authorization: Basic …）：后面是「用户名:密码」的 base64 */
@@ -701,7 +718,7 @@ const TRIPLE_QUOTED = new RegExp(
 
 /**
  * 三个引号里的值：开头紧跟的换行去掉，行尾 \ 续到下一行的连起来，换行和连续的空白算一个空格。
- * 和单个引号里的一样，有中文的是说明，有 * 的是打了码的，不算
+ * 和单个引号里的一样，有中文的是说明，整个打了码的，不算
  */
 function tripleQuotedValues(text: string): string[] {
   return [...text.matchAll(TRIPLE_QUOTED)].flatMap(([, double, single]) => {
@@ -710,7 +727,7 @@ function tripleQuotedValues(text: string): string[] {
       .replace(/\\\r?\n\s*/g, "")
       .replace(/\s+/g, " ")
       .trim();
-    return value.length >= 6 && !/[*　-〿一-鿿＀-￯]/.test(value) ? [value] : [];
+    return value.length >= 6 && !/[　-〿一-鿿＀-￯]/.test(value) && !isMasked(value) ? [value] : [];
   });
 }
 
@@ -782,17 +799,19 @@ function xmlNamedValues(text: string): string[] {
   return values;
 }
 
-/** XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，有 * 的是打了码的，不算 */
+/** XML 元素和属性里的值：换行和连续的空白算一个空格。和引号里的一样，有中文的是说明，整个打了码的，不算 */
 function xmlValues(text: string): string[] {
   return [...[...text.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlNamedValues(text)].flatMap((raw) => {
     const value = raw.replace(/\s+/g, " ").trim();
-    return value.length >= 6 && !/[*　-〿一-鿿＀-￯]/.test(value) ? [value] : [];
+    return value.length >= 6 && !/[　-〿一-鿿＀-￯]/.test(value) && !isMasked(value) ? [value] : [];
   });
 }
 
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
 function findSecret(text: string): string | undefined {
-  const known = SECRET_PATTERNS.find(([pattern]) => pattern.test(text));
+  const known =
+    SECRET_PATTERNS.find(([pattern]) => pattern.test(text)) ??
+    LABELED_SECRETS.find(([pattern]) => [...text.matchAll(pattern)].some((match) => !isMasked(match.slice(1).find((value) => value !== undefined) ?? "")));
   if (known) {
     return known[1];
   }

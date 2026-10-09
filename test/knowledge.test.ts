@@ -224,6 +224,18 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<entry key="token">\n  <!-- rotated monthly -->\n  correcthorsebatterystaple\n</entry>',
     "<password><!-- 生产库 -->correcthorsebatterystaple</password>",
     "<api-key>\n  <!-- rotated -->\n  <![CDATA[correct horse battery staple]]>\n  <!-- 下次换 -->\n</api-key>",
+    // 值里夹着 * 的是密码本身，露出一大段的也不是打码
+    'db_password="Ab*CorrectHorseBatteryStaple9!"',
+    "password: Ab*CorrectHorse",
+    "设置 MCP_AIOPS_TOKEN=correct*horse*battery 后重启",
+    "api_key: correct***horsebatterystaple",
+    'deployctl --token "Ab*correcthorsebattery"',
+    "<password>Ab*correcthorsebattery</password>",
+    '<add key="ApiKey" value="correct*horse*battery"/>',
+    'token = """Ab*correct horse"""',
+    "AccessKeySecret: Ab*cdefghijklmnopqrst",
+    "这次 token: Ab*cd1234efgh 过期了",
+    "api_key: |-\n  Ab*correct horse battery",
     // HTTP Basic 认证：后面是「用户名:密码」的 base64
     `curl -H "Authorization: Basic ${Buffer.from(["admin", "correcthorsebatterystaple"].join(":")).toString("base64")}"`,
     `Basic ${Buffer.from(["运维", "密码很长很长"].join(":")).toString("base64")}`,
@@ -282,6 +294,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     '<property name="password"><description>找管理员要</description></property><entry key="token"/>',
     // _PASS 后面是变量、占位、读配置的，名字里 pass 前面没有分隔符的（bypass），值太短的
     "bypass: correcthorsebatterystaple\nDB_PASS=${DB_PASS}\nsmtp_pass: <your-smtp-pass>\nredis_pass=cfg.redis_pass\nfirst_pass: done\nDB_PASS=settings.smtp.pass",
+    // 整个打了码的（连着三个以上的 *，露出来的不超过 8 个字符），和 Markdown 加粗的报错词
+    "token=ab***cd；MCP_AIOPS_TOKEN=sk-****wxyz；password: ab***cdef；这次 token: sk-****1234 过期了",
+    'api_key: "**********"\nAccessKeySecret: ****************\ntoken: **expired**\napi_key: |-\n  ********\nsecret = """sk-****wxyz"""',
+    '<password>sk-****wxyz</password>；deployctl --token "****abcd"',
     // XML 元素里只有注释的
     "<password><!-- 找管理员要 --></password><token>\n  <!-- 放在 vault 里 -->\n</token>",
   ]) {
