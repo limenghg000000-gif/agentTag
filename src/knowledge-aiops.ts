@@ -1,5 +1,5 @@
 import type { Logger } from "./history.js";
-import { containsSecret, type KnowledgeDraft, KnowledgeError } from "./knowledge.js";
+import { containsSecret, type KnowledgeDraft, KnowledgeError, StaleProposalError } from "./knowledge.js";
 import type { McpTaskContext } from "./mcp.js";
 
 /** 回答前检索时，提问最多取多少字 */
@@ -257,6 +257,23 @@ export class AiopsLessons {
     await this.archive(id, confirmedBy, task);
   }
 
+  /**
+   * 归档卡片上的那条：先取出来和卡片上的核对，卡片发出后在 aiops 里改过的不归档（卡片作废）。
+   * 已经归档了的（上次归档成功、结果没传回来，或者别人归档了）算成功
+   */
+  async archiveSeen(seen: AiopsLesson, confirmedBy: string, task: McpTaskContext): Promise<void> {
+    const current = await this.get(seen.id, task);
+    if (current.status !== "active") {
+      this.logger.info(`aiops 经验库 经验 #${seen.id} 已经是归档的`);
+      return;
+    }
+    const stored = (lesson: AiopsLesson, key: LessonField) => (lesson[key] ?? "").trim();
+    if (!LESSON_FIELDS.every((key) => stored(current, key) === stored(seen, key))) {
+      throw new StaleProposalError(`aiops 经验 #${seen.id} 在卡片发出后改过，卡片上的已经不是现在这条，这张卡片不能再用。需要的话请按现在的内容重新起草`);
+    }
+    await this.archive(seen.id, confirmedBy, task);
+  }
+
   /** 归档。archive_lesson 只改有效的，对已经归档的报错：报错时看一下，已经归档了（比如上次归档成功、结果没传回来）就算成功 */
   async archive(id: number, confirmedBy: string, task: McpTaskContext): Promise<void> {
     try {
@@ -313,7 +330,10 @@ function teamSourceNote(teamId: string): string {
  * 只是在中间引用了别的经验出处的（排查过程里贴了另一条经验）不算
  */
 export function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean {
-  return diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() === teamSourceNote(teamId);
+  const last = diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
+  // 编号不分大小写，和团队经验库里一样（表格里把 K1 改成 k1 还是同一条）
+  const id = /^（来自飞书团队经验库 (\S+)）$/.exec(last)?.[1];
+  return id !== undefined && id.toUpperCase() === teamId.toUpperCase();
 }
 
 /**

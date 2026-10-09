@@ -714,6 +714,31 @@ function curlPasswords(text: string): string[] {
     return value.length >= 6 && !/[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/.test(value) ? [value] : [];
   });
 }
+/** .netrc 一条记录里成对出现的关键字（machine、default 开始一条新的） */
+const NETRC_KEYS = new Set(["login", "password", "account", "port"]);
+
+/**
+ * .netrc 里的密码：machine 主机 login 用户 password 密码，写在一行或者分几行都行。按「关键字 值」成对读，
+ * 一条记录里 login 和 password 都有、密码不短于 6 个字符才算，「machine learning password reset」这样的句子对不上
+ */
+function netrcPasswords(text: string): string[] {
+  const tokens = text.split(/\s+/);
+  const found: string[] = [];
+  tokens.forEach((token, i) => {
+    if (token !== "machine" && token !== "default") {
+      return;
+    }
+    const record = new Map<string, string>();
+    for (let j = token === "machine" ? i + 2 : i + 1; j + 1 < tokens.length && NETRC_KEYS.has(tokens[j]); j += 2) {
+      record.set(tokens[j], tokens[j + 1]);
+    }
+    const password = record.get("password");
+    if (record.has("login") && password !== undefined && password.length >= 6) {
+      found.push(password);
+    }
+  });
+  return found;
+}
 /**
  * 属性引用的最后一段是密钥的名字（cfg.Token、settings.apiKey、process.env.MODEL_API_KEY、cfg.redis_pass）：说的是值从哪读，不是值本身。
  * pass 和 PASS_ALIAS 一样要用 _ 隔开或者就是这一段（compass、bypass 不是，correct.horse.compass 是密码）
@@ -766,8 +791,12 @@ function isBasicCredential(value: string): boolean {
  * Yarn 的 npmAuthIdent 也可以直接写「用户名:密码」。第 1 组是名字，第 2 组是值
  */
 const AUTH_FIELD = new RegExp(String.raw`(?<![\w.-])["']?(\w*auth(?:[_-]?ident)?)${ASSIGN}["']?([^\s"',;，；]+)`, "gi");
-/** Kubernetes 镜像仓库的 Secret（.dockerconfigjson: …）：整个 config.json 编成了 base64，要解开再查 */
-const DOCKER_CONFIG = /\.docker(?:configjson|cfg)["']?[^\S\r\n]*[:=][^\S\r\n]*["']?([A-Za-z0-9+/]{16,}={0,2})(?![\w+/=])/gi;
+/**
+ * Kubernetes 镜像仓库的 Secret（.dockerconfigjson: …）：整个 config.json 编成了 base64，要解开再查。
+ * 也认 YAML 块写法（.dockerconfigjson: |- 下一行缩进着写，可以折成几行）
+ */
+const DOCKER_CONFIG =
+  /\.docker(?:configjson|cfg)["']?[^\S\r\n]*[:=][^\S\r\n]*(?:[|>][-+0-9]*[^\S\r\n]*\r?\n[ \t]+)?["']?([A-Za-z0-9+/]{16,}(?:\r?\n[ \t]+[A-Za-z0-9+/]+)*={0,2})(?![\w+/=])/gi;
 
 /** auth 配置项里写的是不是登录用的用户名和密码 */
 function isAuthCredential(name: string, value: string): boolean {
@@ -903,7 +932,7 @@ function findSecret(text: string): string | undefined {
   }
   // 解开的 config.json 比原文短，递归会停下来
   const dockerConfig = [...text.matchAll(DOCKER_CONFIG)]
-    .map(([, value]) => findSecret(Buffer.from(value, "base64").toString("utf8")))
+    .map(([, value]) => findSecret(Buffer.from(value.replace(/\s+/g, ""), "base64").toString("utf8")))
     .find((label) => label !== undefined);
   if (dockerConfig) {
     return dockerConfig;
@@ -916,6 +945,7 @@ function findSecret(text: string): string | undefined {
     ...tripleQuotedValues(text),
     ...xmlValues(text),
     ...curlPasswords(text),
+    ...netrcPasswords(text),
     // shell 里转义的空格（correct\ horse）还原成空格再看是不是占位
     ...[...text.matchAll(CLI_OPTION)].flatMap(([, double, single, bare]) =>
       bare === undefined ? [double ?? single] : OPTION_SPEC.test(bare) ? [] : [bare.replace(/\\(?=[ \t])/g, "")],

@@ -567,22 +567,38 @@ export class KnowledgeDesk {
       });
       proposal.savedId = entry.id;
     }
+    if (entry.unsafe) {
+      // 存进去的那一行后来在表格里被写进了像密钥的东西（可能在编号、标题、确认人里）：卡片上、话题里都不列它的内容，后面的步骤等改好了再做
+      return {
+        done: [`已存进团队经验库「${draft.title}」。`],
+        unfinished: [`存进去的那一行在表格里被改过，${entry.unsafe}，卡片上先不列它。同步 aiops、归档旧经验这几步先没做，请在表格里删掉后再点「再试一次」`],
+      };
+    }
     const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title || draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号。读不到时不拿卡片上的旧编号凑合
     // （aiops 说重复的那条认不出是要取代的，后面又按表格里的编号归档，aiops 里这个问题就一条都不剩了），后面的步骤等再试一次
     let replaced: KnowledgeEntry | undefined;
+    let replacedGone = false;
     if (proposal.replaces) {
       try {
-        replaced = (await base.get(proposal.replaces.id, { fresh: true })) ?? proposal.replaces;
+        // 按草稿编号找：表格里改了编号也认得出
+        replaced = proposal.replaces.requestId
+          ? await base.saved(proposal.replaces.requestId, proposal.replaces.id)
+          : await base.get(proposal.replaces.id, { fresh: true });
       } catch (err) {
         out.unfinished.push(`没能重新读取要取代的旧经验 ${proposal.replaces.id}：${describe(err)}。同步 aiops、归档旧经验这几步先没做`);
         return out;
+      }
+      // 存好新的以后旧的那一行被删了：不用再归档它；它在 aiops 里同步的那条按卡片上的编号，照样等新的进了 aiops、核对过出处再归档
+      if (!replaced) {
+        replaced = proposal.replaces;
+        replacedGone = true;
       }
     }
     // aiops 里没有新的这条时，不归档被取代的旧经验在 aiops 里的那条，免得 aiops 里这个问题一条都不剩
     const oldLesson = proposal.syncAiops ? await this.syncAiops(proposal, entry, replaced?.aiopsId, confirmedBy, task, out) : "keep";
     if (replaced && (await this.replacementReady(proposal, entry.id, replaced.id, out))) {
-      await this.archiveReplaced(replaced, proposal.replaces!, confirmedBy, task, oldLesson, out);
+      await this.archiveReplaced(replaced, proposal.replaces!, confirmedBy, task, oldLesson, out, replacedGone);
     }
     const location = await base.location().catch(() => undefined);
     if (location) {
@@ -806,7 +822,7 @@ export class KnowledgeDesk {
   private async archive(proposal: ArchiveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
     const { target } = proposal;
     if (target.type === "aiops") {
-      await this.options.aiops!.archive(target.lesson.id, confirmedBy, task);
+      await this.options.aiops!.archiveSeen(target.lesson, confirmedBy, task);
       return {
         done: [`已归档 aiops 经验 #${target.lesson.id}「${target.lesson.title}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`],
         unfinished: [],
@@ -875,22 +891,28 @@ export class KnowledgeDesk {
     task: McpTaskContext,
     oldLesson: OldLesson,
     out: Outcome,
+    gone = false,
   ): Promise<void> {
     let entry: KnowledgeEntry;
-    try {
-      entry = await this.options.base.archive(old.id, { confirmedBy, seen });
-    } catch (err) {
-      if (err instanceof StaleProposalError) {
-        // 再试也还是改过的，不算没做成：说清楚，要归档的话按现在的内容另外起草
-        out.done.push(
-          `旧的经验 ${old.id} 在卡片发出后在表格里改过，卡片上确认取代的不是现在这条，没有归档它，aiops 里同步的那条也没动。要归档的话请按现在的内容另外起草归档。`,
-        );
+    if (gone) {
+      entry = old;
+      out.done.push(`旧的经验 ${old.id} 已经从表格里删掉了，不用再归档。`);
+    } else {
+      try {
+        entry = await this.options.base.archive(old.id, { confirmedBy, seen });
+      } catch (err) {
+        if (err instanceof StaleProposalError) {
+          // 再试也还是改过的，不算没做成：说清楚，要归档的话按现在的内容另外起草
+          out.done.push(
+            `旧的经验 ${old.id} 在卡片发出后在表格里改过，卡片上确认取代的不是现在这条，没有归档它，aiops 里同步的那条也没动。要归档的话请按现在的内容另外起草归档。`,
+          );
+          return;
+        }
+        out.unfinished.push(`旧的经验 ${old.id} 没能归档：${describe(err)}。不归档的话新旧两条都会被检索到`);
         return;
       }
-      out.unfinished.push(`旧的经验 ${old.id} 没能归档：${describe(err)}。不归档的话新旧两条都会被检索到`);
-      return;
+      out.done.push(`旧的经验 ${entry.id}「${entry.title}」已归档。`);
     }
-    out.done.push(`旧的经验 ${entry.id}「${entry.title}」已归档。`);
     if (entry.aiopsId === undefined) {
       return;
     }
