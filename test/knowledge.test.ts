@@ -2783,6 +2783,63 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前有人�
   assert.match((copied.sent.at(-1)!.input as { markdown: string }).markdown, /经验 K1 上次已经在表格里归档了。\naiops 经验库里同步的经验 #31 也已归档/);
 });
 
+test("归档：表格里归档了、aiops 那步没做成，再试之前这一行被删了、编号给了别的有效的行：不按那一行记的 aiops 编号归档，按归档时记下的", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops("K1", 31);
+  await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  const archiveLesson = handlers.archive_lesson;
+  handlers.archive_lesson = () => {
+    throw new Error("aiops 现在连不上");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /aiops 经验库里同步的经验 #31 没能归档/);
+
+  // 这一行删掉了，另一条有效的经验改成了 K1，它同步到 aiops 的 #35 出处也写着 K1
+  backend.entries.splice(0, 1);
+  await base.save(normalizeDraft(dau));
+  backend.entries[0].id = "K1";
+  backend.entries[0].aiopsId = 35;
+  handlers.archive_lesson = archiveLesson;
+  const tried = calls.filter((call) => call.tool === "archive_lesson").length;
+  await desk.handleCardAction(click(lastCard(), "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").slice(tried).map((call) => call.args), [{ id: 31 }]);
+  assert.equal(backend.entries[0].status, "active");
+});
+
+test("取代旧经验：旧的在表格里归档了、它在 aiops 里那条没归档成，再试之前有人改了旧的那一行、或者复制出草稿编号一样的行：照样接着归档 aiops 里那条", async () => {
+  for (const change of ["edit", "copy"] as const) {
+    const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 33 }) });
+    await setup.base.save(normalizeDraft(code8), { requestId: "req-0" });
+    await setup.base.linkAiops("K1", 31);
+    await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+    const archiveLesson = setup.handlers.archive_lesson;
+    setup.handlers.archive_lesson = () => {
+      throw new Error("aiops 现在连不上");
+    };
+    await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+    await setup.desk.idle();
+    const old = setup.backend.entries.find((entry) => entry.requestId === "req-0")!;
+    assert.equal(old.status, "archived");
+    assert.match(cardText(setup.lastCard()), /aiops 经验库里同步的经验 #31 没能归档/);
+
+    if (change === "edit") {
+      old.conclusion = "归档以后有人在表格里补了一句";
+    } else {
+      setup.backend.entries.push({ ...structuredClone(old), id: "K9" });
+    }
+    setup.handlers.archive_lesson = archiveLesson;
+    const tried = setup.calls.filter((call) => call.tool === "archive_lesson").length;
+    await setup.desk.handleCardAction(setup.click(setup.lastCard(), "save"));
+    await setup.desk.idle();
+    assert.deepEqual(setup.calls.filter((call) => call.tool === "archive_lesson").slice(tried).map((call) => call.args), [{ id: 31 }], change);
+    assert.equal(setup.lastCard().header.title.content, "已存进经验库", change);
+    assert.match((setup.sent.at(-1)!.input as { markdown: string }).markdown, /旧的经验 K1.*已归档。\naiops 经验库里同步的经验 #31 也已归档。/, change);
+  }
+});
+
 test("归档没有草稿编号的行（表格里手动加的）：卡片发出后改了编号的按内容认出来归档；找不到时不当成删了，卡片留着；内容一样的好几行分不清时也留着", async () => {
   const renamed = deskSetup({ aiops: false });
   await renamed.base.save(normalizeDraft(dau));
