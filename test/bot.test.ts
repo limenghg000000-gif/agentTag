@@ -831,21 +831,33 @@ test("打回重做以后没再给线上数据、查过工具、或者是整理�
 test("重做以后的最后一道检查：哪些回答不发出去", () => {
   const block = (question: string, answer: string, attempted = false, succeeded: string[] = []) =>
     blockUnverifiedOps(question, ["aiops"], new Set(succeeded), answer, attempted);
-  // 编出来的数据、定位候选、带把握的「没有报错」
+  // 只在线上数据里出现的：带秒的时间、日期加时间、定位结果
   assert.equal(block("prod", "宽泛关键词查到 50 条，时间 2026-10-08 17:03～18:03"), true);
   assert.equal(block("诊断一下 network-tester", "network-tester 在 default、kube-system、monitoring 都有部署，请选择命名空间"), true);
+  // 数量、「没有报错」写成线上结论时拦
   assert.equal(block("prod", "结论：最近 1 小时没有报错（把握：中）"), true);
+  assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）"), true);
   // 查过就放行；只调了群记忆不算
-  assert.equal(block("prod", "宽泛关键词查到 50 条", true, ["aiops_query_logs"]), false);
-  assert.equal(block("prod", "宽泛关键词查到 50 条", true, ["memory_search"]), true);
+  assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）", true, ["aiops_query_logs"]), false);
+  assert.equal(block("prod", "结论：宽泛关键词查到 50 条（把握：中）", true, ["memory_search"]), true);
   // 整理之前的内容放行；要求重新查的不放行
-  assert.equal(block("总结一下上面查到的情况", "最近 1 小时有 27 条报错"), false);
-  assert.equal(block("不要总结旧结果，重新排查 gateway-api 的告警", "最近 1 小时有 27 条报错"), true);
-  // 调过工具都失败了，回答在说失败
+  assert.equal(block("总结一下上面查到的情况", "结论：最近 1 小时有 27 条报错（把握：中）"), false);
+  assert.equal(block("不要总结旧结果，重新排查 gateway-api 的告警", "结论：最近 1 小时有 27 条报错（把握：中）"), true);
+  // 调过工具都失败了：说调用失败的那句不算，剩下的照样查
   assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 连续 3 次查询都超时，无法确认线上状态", true), false);
-  assert.equal(block("product-service-api 最近一小时报错多吗", "aiops 连续 3 次查询都超时，无法确认线上状态"), true);
-  // 概念解释：没有「把握」的「没有异常」、反问
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询 3 次都超时，无法确认（把握：低）", true), false);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：最近一小时有 50 条请求超时，CPU 使用率 95%（把握：中）", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询超时了，不过最近一小时有 50 条报错（把握：中）", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：日志查询返回 50 条请求超时（把握：中）", true), true);
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询超时了，不过最近一小时有 50 条报错", true), true);
+  // 没调过工具时说「查询 3 次都超时」也是编的
+  assert.equal(block("product-service-api 最近一小时报错多吗", "结论：aiops 查询 3 次都超时（把握：低）"), true);
+  // 概念解释、单位换算、反问照常发
+  assert.equal(block("1GiB 是多少字节", "1GiB = 1024MiB = 1073741824 字节。"), false);
   assert.equal(block("Go 有异常机制吗", "Go 没有异常机制，错误靠返回值"), false);
+  assert.equal(block("Go 的时间格式怎么写", "Go 用参考时间写格式：2006-01-02 15:04:05"), false);
+  assert.equal(block("命名空间有什么用", "可以把同一个服务部署在多个命名空间里，隔开测试和生产"), false);
+  assert.equal(block("Pod 内存 limit 一般设多少", "一般 512MiB 到 2GiB，CPU 0.5 核起步，看压测结果调"), false);
   assert.equal(block("Pod 重启一般什么原因", "常见原因是 OOM、探针失败、镜像拉取失败"), false);
 });
 
