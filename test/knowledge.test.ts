@@ -103,6 +103,15 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "mysql://agent:p4ssw0rd@10.0.0.5:3306/aiops",
     "数据库密码：Abc12345678",
     "-----BEGIN RSA PRIVATE KEY-----",
+    // 拼出来的，免得源码里出现像真密钥的字符串
+    ["xox", "b-1234567890-0987654321-AbCdEfGhIjKlMnOp"].join(""),
+    ["xox", "e.xox", "p-1-AbCdEfGhIjKlMnOpQr"].join(""),
+    ["xapp", "-1-A0123456789-0123456789-abcdef"].join(""),
+    ["https://open.feishu.cn/open-apis/bot/v2/hook/", "3fa85f64-5717-4562-b3fc-2c963f66afa6"].join(""),
+    ["https://hooks.slack.com/services/", "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"].join(""),
+    ["AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"].join(""),
+    ["sk", "_live_", "abcdefghijklmnop0123"].join(""),
+    ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "abcdefghijklmnopqrstuv"].join("."),
   ]) {
     assert.throws(
       () => normalizeDraft({ ...code8, basis: secret }),
@@ -114,6 +123,7 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
   assert.ok(normalizeDraft({ ...code8, basis: "密码：请找管理员重置；token=expired_session" }));
   assert.ok(normalizeDraft({ ...code8, basis: "用 sk-learn-preprocessing-pipeline 处理的数据" }));
   assert.ok(normalizeDraft({ ...code8, basis: "这次调用 total_tokens: 123456789" }));
+  assert.ok(normalizeDraft({ ...code8, basis: "群机器人的 Webhook 地址在飞书群设置里，xoxo 不是令牌" }));
 });
 
 function fakeEmbedder(topics: string[]) {

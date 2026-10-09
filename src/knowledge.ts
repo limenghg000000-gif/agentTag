@@ -440,6 +440,13 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   // sk-proj-…、sk-ant-api03-…、sk-svcacct-… 中间带连字符的也算，这种要带数字，免得把 sk- 开头的长名字当成密钥
   [/\bsk-(?:[A-Za-z0-9]{20,}|(?=[\w-]*\d)[\w-]{20,})/, "API 密钥"],
   [/\b(?:AKIA|LTAI)[A-Za-z0-9]{12,}/, "云服务的 AccessKey"],
+  // Slack 的 xoxb-、xoxp-、xoxe.xoxp-、xapp- 令牌
+  [/\bxox(?:e\.xox)?[a-z]-[A-Za-z0-9-]{10,}|\bxapp-\d+-[A-Za-z0-9-]{10,}/, "Slack 令牌"],
+  // 拿到地址就能往群里发消息：飞书、Lark、Slack 的群机器人 Webhook
+  [/\/open-apis\/bot\/v2\/hook\/[\w-]{8,}|hooks\.slack\.com\/services\/[\w/]{10,}/, "群机器人 Webhook 地址"],
+  [/\bAIza[\w-]{35}/, "Google API 密钥"],
+  [/\b[rs]k_live_[A-Za-z0-9]{16,}/, "Stripe 密钥"],
+  [/\beyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}/, "JWT 令牌"],
   // AccessKey 的 Secret（AWS_SECRET_ACCESS_KEY、阿里云 AccessKeySecret）：写明了是它的，值里没有数字也算
   [/(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)\s*[:=：]\s*[^\s,，;；*\u4e00-\u9fff]{16,}/i, "云服务的 AccessKey Secret"],
   [/\bBearer\s+[\w.~+/-]{20,}/i, "Bearer 令牌"],
