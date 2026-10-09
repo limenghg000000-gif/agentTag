@@ -192,7 +192,7 @@ export class AiopsLessons {
         },
         task,
       );
-      const found = hits.find((hit) => hit.diagnosis_path?.includes(teamSourceNote(teamId)));
+      const found = hits.find((hit) => syncedFrom(hit.diagnosis_path, teamId));
       if (found) {
         return { id: found.id, draft };
       }
@@ -206,7 +206,7 @@ export class AiopsLessons {
    */
   async archiveSynced(id: number, teamId: string, confirmedBy: string, task: McpTaskContext): Promise<void> {
     const lesson = await this.get(id, task);
-    if (!lesson.diagnosis_path?.includes(teamSourceNote(teamId))) {
+    if (!syncedFrom(lesson.diagnosis_path, teamId)) {
       throw new KnowledgeError(
         `它不是从 ${teamId} 同步过去的（排查过程末尾没有注明「来自飞书团队经验库 ${teamId}」），可能有人在表格里改了 ${teamId} 的 aiops 编号。请在表格里改正后再点「再试一次」`,
       );
@@ -242,6 +242,14 @@ function lessonId(value: unknown): number | undefined {
 /** 同步到 aiops 的经验在排查过程末尾注明的出处 */
 function teamSourceNote(teamId: string): string {
   return `（来自飞书团队经验库 ${teamId}）`;
+}
+
+/**
+ * aiops 里这条经验是不是从团队经验库的这一条同步过去的：排查过程的最后一行正好是出处。
+ * 只是在中间引用了别的经验出处的（排查过程里贴了另一条经验）不算
+ */
+function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean {
+  return diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() === teamSourceNote(teamId);
 }
 
 /** 写进系统提示词的「aiops 经验库里可能相关的经验」 */

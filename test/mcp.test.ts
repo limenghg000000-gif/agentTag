@@ -184,6 +184,26 @@ test("程序自己调用：结果只放在 structuredContent 里、没有文字�
   assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
 });
 
+test("报错只放在 structuredContent 里、没有文字时：照样认出服务繁忙去重试，报错和审计日志里带上它", async () => {
+  let busy = 1;
+  const server = await fake({
+    call: (name) =>
+      name === "archive_lesson"
+        ? { content: [], structuredContent: { error: "经验 #9 不存在" }, isError: true }
+        : busy-- > 0
+          ? { content: [], structuredContent: { error: "服务繁忙，请稍后重试" }, isError: true }
+          : { content: [], structuredContent: { saved: true, id: 31 } },
+  });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+  assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+  assert.equal(server.calls.filter((call) => call.name === "save_lesson").length, 2);
+  assert.match(log.find(/MCP 调用 aiops\.save_lesson/)!.text, /繁忙重试=1$/);
+
+  await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /aiops 返回错误：\{"error":"经验 #9 不存在"\}/);
+  assert.match(log.find(/MCP 调用 aiops\.archive_lesson/)!.text, /出错 结果=\d+字：\{"error":"经验 #9 不存在"\}/);
+});
+
 test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
   let busy = 2;
   const server = await fake({

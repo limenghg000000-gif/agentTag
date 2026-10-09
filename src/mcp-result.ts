@@ -55,9 +55,13 @@ export function formatToolResult(result: CallToolResult, limit = MCP_RESULT_LIMI
   return parts.map((part) => compactText(part, share)).join("\n\n");
 }
 
-/** 结果里的全部文本，不截短（判断「服务繁忙」、记日志用） */
+/**
+ * 结果里的全部文本，不截短（判断「服务繁忙」、报错、记日志、程序调用时用）。
+ * 只放在 structuredContent 里、没有文字的（MCP 规范允许，报错的也可能这样）按 JSON 返回
+ */
 export function resultText(result: CallToolResult): string {
-  return (result.content ?? []).map(describeContent).join("\n");
+  const text = (result.content ?? []).map(describeContent).join("\n");
+  return !text.trim() && result.structuredContent ? JSON.stringify(result.structuredContent) : text;
 }
 
 export function compactText(text: string, limit = MCP_RESULT_LIMIT): string {

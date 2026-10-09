@@ -471,6 +471,26 @@ test("aiops 经验库：检索只留够相近的；排查经验同步过去时�
   assert.equal(calls.filter((call) => call.tool === "save_lesson").at(-1)!.args.force, true);
 });
 
+test("aiops 里的经验只有排查过程最后一行是这一条的出处才算从它同步过去的：中间引用了出处的不归档，也不当成上次存进去的", async () => {
+  const paths: Record<number, string> = {
+    31: "看了 user-rpc 每个 Pod 的连接数\r\n（来自飞书团队经验库 K1）\n",
+    40: "参考了（来自飞书团队经验库 K1）那条，后来查明是别的原因",
+    41: "（来自飞书团队经验库 K1）\n补充：网关也要改",
+  };
+  const { mcp, calls } = fakeMcp({
+    get_knowledge: (args) => JSON.stringify({ id: args.id, title: "t", status: "active", diagnosis_path: paths[Number(args.id)] }),
+    search_knowledge: () => JSON.stringify({ hits: [40, 41, 31].map((id) => ({ id, title: "t", score: 9, diagnosis_path: paths[id] })) }),
+    archive_lesson: () => JSON.stringify({ archived: true }),
+  });
+  const lessons = new AiopsLessons(mcp, "aiops", quiet);
+  for (const id of [40, 41]) {
+    await assert.rejects(lessons.archiveSynced(id, "K1", "ML", task), /它不是从 K1 同步过去的/, String(id));
+  }
+  await lessons.archiveSynced(31, "K1", "ML", task);
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
+  assert.equal((await lessons.findSynced([normalizeDraft(code8)], "K1", task))?.id, 31);
+});
+
 function deskSetup({
   aiops = true,
   approvers = new Set(["ou_admin"]),
@@ -960,7 +980,7 @@ test("取代旧的排查经验：aiops 不认 force、强制保存还说重复�
   assert.equal(setup.backend.entries.find((e) => e.id === "K2")!.aiopsId, undefined);
 });
 
-test("aiops 连上了却少了同步、归档经验要用的工具（存、归档，或者再试时要用的检索、取详情）：起草时不答应同步，保存不调 aiops；起草后才发现没有的，保存时说明没同步，卡片照常做完", async () => {
+test("aiops 连上了却少了同步、归档经验要用的工具（存、归档，或者再试时要用的检索、取详情）：起草时不答应同步，保存不调 aiops；卡片答应了同步、之后才少了的，算没做完，补上工具后再试一次接着同步", async () => {
   for (const tools of [["save_lesson", "archive_lesson"], ["search_knowledge"], ["get_knowledge"]]) {
     const missing = deskSetup();
     for (const tool of tools) {
@@ -985,11 +1005,23 @@ test("aiops 连上了却少了同步、归档经验要用的工具（存、归�
 
   const dropped = deskSetup();
   await dropped.tool("knowledge_propose").run(code8, { signal });
+  const saveLesson = dropped.handlers.save_lesson;
   delete dropped.handlers.save_lesson;
   await dropped.desk.handleCardAction(dropped.click((dropped.sent[0].input as { card: any }).card, "save"));
   await dropped.desk.idle();
+  const partial = dropped.lastCard();
+  assert.equal(partial.header.title.content, "已存进经验库，还有没做成的");
+  assert.match(cardText(partial), /aiops 少了同步、归档经验要用的工具（save_lesson），还没同步到 aiops 经验库。aiops 补上这些工具后点「再试一次」/);
+  assert.match(cardText(partial), /"content":"再试一次"/);
+  assert.equal(dropped.sent.length, 1, "没做完时话题里不发结果");
+
+  dropped.handlers.save_lesson = saveLesson;
+  await dropped.desk.handleCardAction(dropped.click(partial, "save"));
+  await dropped.desk.idle();
   assert.equal(dropped.lastCard().header.title.content, "已存进经验库");
-  assert.match((dropped.sent.at(-1)!.input as { markdown: string }).markdown, /aiops 少了同步、归档经验要用的工具（save_lesson），没有同步到 aiops 经验库/);
+  assert.equal(dropped.backend.entries[0].aiopsId, 31);
+  assert.equal(dropped.calls.filter((call) => call.tool === "save_lesson").length, 1);
+  assert.match((dropped.sent.at(-1)!.input as { markdown: string }).markdown, /已同步到 aiops 经验库（经验 #31）/);
 });
 
 test("同步到 aiops 没做成，再试一次前有人在表格里归档了这一行或者改了类别：不再同步过去", async () => {

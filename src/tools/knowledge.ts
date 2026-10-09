@@ -598,10 +598,16 @@ export class KnowledgeDesk {
           break;
         }
       }
-      const skip = this.skipSync(entry);
+      const skip = this.rowChange(entry);
       if (skip) {
         out.done.push(`${skip}，没有同步到 aiops 经验库。`);
         return "keep";
+      }
+      // 卡片上答应了同步，aiops 后来少了工具（换了版本）：和连不上一样算没做完，补上工具后可以再试一次
+      const { aiops } = this.options;
+      if (aiops?.lacksWriteTools) {
+        out.unfinished.push(`${lacksToolsNote(aiops)}，还没同步到 aiops 经验库。aiops 补上这些工具后点「再试一次」`);
+        return "keep-until-synced";
       }
       // 再试一次前有人在表格里清空了标题、结论，或者写进了密钥：不按卡片上的草稿同步，等表格里改好了再试
       if (!usable(entry)) {
@@ -714,11 +720,6 @@ export class KnowledgeDesk {
       `经验 ${entry.id} 在表格里改过，和确认的内容不一样，改过的没有同步到 aiops 经验库（告警自动排查会引用，要写权限名单里的人确认）。卡片上列出了表格里现在的内容，核对后点「再试一次」就按它同步`,
     );
     return undefined;
-  }
-
-  /** 表格里这一行现在不该或者不能同步到 aiops 的原因：再试一次前有人在表格里归档了它、改了类别，或者 aiops 没有写入工具 */
-  private skipSync(entry: KnowledgeEntry): string | undefined {
-    return this.rowChange(entry) ?? (this.options.aiops?.lacksWriteTools ? lacksToolsNote(this.options.aiops) : undefined);
   }
 
   /** 表格里这一行已经不是有效的排查经验了：再试一次前有人在表格里归档了它、改了类别 */
