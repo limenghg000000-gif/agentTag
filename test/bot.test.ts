@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
+  BLOCKED_OPS_ANSWER,
   type BotDeps,
   createCardActionHandler,
   createMessageHandler,
@@ -741,6 +742,8 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
     "CPU 使用率 95%",
     "93 个 Pod 都在运行",
     "无明显异常",
+    "最近 1 小时没有 error 级别日志",
+    "未发现 panic",
     "default：1/1 就绪（Deployment）",
     "prod：Ready 4/4",
     "3/3 Running",
@@ -768,6 +771,57 @@ test("线上数据检查：提问看不出是线上问题时，没成功调过�
   assert.equal(concept("1 / 2 ready 表示两个容器里只有一个就绪"), undefined);
   assert.equal(concept("1/2 表示一个就绪，prod 那边现在是 4/4 就绪"), flagged);
   assert.equal(reviewOpsAnswer("READY 11/20 是什么意思", ["aiops"], new Set())("1/2 就绪"), flagged);
+});
+
+test("打回重做以后还是没查证就给出线上数据：不发出去，换成说明，话题里记下的也是说明", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  // 2026-10-08 复测：用户回了「prod」，模型两次都没调工具，第二次照样编出了查询结果
+  const results: ChatResult[] = [
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop" },
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）。按 detected_level 查询返回 0 条，宽泛关键词查到 50 条", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const context = fakeContext();
+  const { sent, handle } = setup({ model, context: context.source, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("prod"));
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
+  assert.deepEqual(context.remembered, [{ question: "[群成员] prod", answer: BLOCKED_OPS_ANSWER }]);
+});
+
+test("打回重做以后没再给线上数据、查过工具、或者是整理之前内容的请求时，照常发出", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const ask = async (question: string, answers: ChatResult[]) => {
+    const { model } = fakeModel(() => answers.shift()!);
+    const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+    await handle(message(question));
+    return markdowns(sent);
+  };
+  const withData = "最近 1 小时有 27 条报错，集中在 16:43:26";
+
+  // 重做以后改成反问
+  assert.deepEqual(await ask("prod", [{ text: withData, finish: "stop" }, { text: "要查哪个服务？", finish: "stop" }]), ["要查哪个服务？"]);
+  // 重做时查了
+  assert.deepEqual(
+    await ask("prod", [
+      { text: withData, finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+      { text: withData, finish: "stop" },
+    ]),
+    [withData],
+  );
+  // 整理话题里之前的回答
+  assert.deepEqual(await ask("总结一下上面查到的情况", [{ text: withData, finish: "stop" }, { text: withData, finish: "stop" }]), [withData]);
 });
 
 test("调了 aiops 和搜索都失败（超时、工具不存在）时不算查过，给出线上结论照样打回", async () => {
