@@ -1229,7 +1229,8 @@ test("回答因为没查证被拦下时，卡片上的思考也去掉", async ()
   await handle(message("prod"));
 
   assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
-  assert.ok(updates.some((u) => /不用查/.test(cardText(u.card))));
+  // 被打回的那一轮的思考：打回紧跟在这一轮后面，卡片还没推出去就去掉了，过程中也不显示
+  assert.ok(!updates.some((u) => /不用查/.test(cardText(u.card))));
   assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|不用查|还是不查了/);
 });
 
@@ -1251,6 +1252,36 @@ test("引用了没查到的代码位置被拦下时，卡片上的思考也去�
 
   assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
   assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|user\.go/);
+});
+
+test("打回重做以后通过了：被打回的那一轮的思考不留在卡片上，前面几轮的照样留", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const ask = async (rejected: ChatResult) => {
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }], reasoning: "搜一下用户服务" },
+      rejected,
+      { text: "代码里没搜到相关的位置", finish: "stop", reasoning: "查不到就直说" },
+    ];
+    const { model } = fakeModel(() => results.shift()!);
+    const { sent, updates, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+    await handle(message("user 服务为什么报错"));
+    return { replies: markdowns(sent), updates };
+  };
+
+  const { replies, updates } = await ask({ text: "问题在 src/user.go:99", finish: "stop", reasoning: "多半是 src/user.go:99" });
+  assert.deepEqual(replies, ["代码里没搜到相关的位置"]);
+  const final = cardText(updates.at(-1)!.card);
+  assert.match(final, /搜一下用户服务/);
+  assert.match(final, /查不到就直说/);
+  assert.doesNotMatch(final, /多半是/);
+  // 被打回的那一轮没有思考时，不去动前面几轮的
+  const quiet = await ask({ text: "问题在 src/user.go:99", finish: "stop" });
+  assert.deepEqual(quiet.replies, ["代码里没搜到相关的位置"]);
+  assert.match(cardText(quiet.updates.at(-1)!.card), /搜一下用户服务[\s\S]*查不到就直说/);
 });
 
 test("打回重做以后没再给线上数据、查过工具、或者是整理之前内容的请求时，照常发出", async () => {

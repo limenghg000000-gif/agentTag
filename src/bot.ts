@@ -279,6 +279,8 @@ async function runTask(
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
+    // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
+    let lastRound = 0;
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
@@ -306,11 +308,18 @@ async function runTask(
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
+        if (event.type === "model") {
+          lastRound = event.round;
+        }
         if (event.type === "tool_start" || event.type === "tool_end") {
           applyEvent(state, event);
           card?.update(render());
         } else if (event.type === "model" && event.reasoning && deps.showThinking !== false) {
           (state.thoughts ??= []).push({ round: event.round, ms: event.ms, text: event.reasoning, at: state.steps.length });
+          card?.update(render());
+        } else if (event.type === "retry" && state.thoughts?.some((thought) => thought.round === lastRound)) {
+          // 被打回的那版回答是紧挨着的上一轮想出来的，多半就是没查证的说法：重做通过以后卡片上也不留这一轮的思考
+          state.thoughts = state.thoughts.filter((thought) => thought.round !== lastRound);
           card?.update(render());
         }
       },
