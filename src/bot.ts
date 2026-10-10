@@ -558,6 +558,22 @@ export const UNVERIFIED_CODE_ANSWER =
   "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
   "如果和仓库无关，去掉没查证的文件路径后重新回答。不要提这段检查。";
 
+/**
+ * 没调代码工具，回答里却有没查证的文件、提交号时，点名是哪几处让模型重做。2026-10-10 复测转链：模型把剧本里的核对记录
+ * （「提交 fa02ac8」）抄进了回答，打回时只说「去掉没查证的文件路径」，它不知道是哪处，重做后照样带着，整条回答被拦
+ */
+export function unverifiedCodeAnswer(cites: readonly string[]): string {
+  if (cites.length === 0) {
+    return UNVERIFIED_CODE_ANSWER;
+  }
+  return (
+    `（系统检查）你的回答引用了这些代码位置：${cites.join("、")}，但这次一次代码工具都没调用，它们没有经过查证；` +
+    "排查剧本和使用说明里写的文件路径、提交号是写说明的人核对时用的，也不算这次查到过。" +
+    "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
+    "如果和仓库无关，去掉这几处，其余查到的结论照常写，重新回答。不要提这段检查。"
+  );
+}
+
 /** 调过代码工具，回答里却引用了工具结果里没有的文件、提交号时，让模型重做 */
 export function unseenCodeAnswer(cites: readonly string[], repos: readonly string[]): string {
   return (
@@ -914,7 +930,7 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
     if ([...usedTools].some(isCodeTool)) {
       return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
     }
-    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? UNVERIFIED_CODE_ANSWER : undefined;
+    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;
   };
 }
 

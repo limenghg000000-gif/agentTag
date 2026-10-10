@@ -17,6 +17,7 @@ import {
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
   unseenCodeAnswer,
+  unverifiedCodeAnswer,
   unseenCodeCitations,
   unverifiedOpsAnswer,
 } from "../src/bot.js";
@@ -850,7 +851,7 @@ test("有代码工具时，没读代码就说仓库内容的回答被打回去�
   await handle(message("在 ai/aiops-mcp 里搜一下 k8s 相关的 tool 在哪里定义？"));
 
   assert.equal(requests.length, 3);
-  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["src/index.ts:30"]) });
   assert.deepEqual(markdowns(sent), ["定义在 `internal/k8s/tools.go:12`"]);
   assert.match(warnings.join("\n"), /回答没通过检查，已让模型重做 message=om_1/);
 });
@@ -933,7 +934,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
 
   const guessed = await ask(["panic 在 `internal/logic/order.go:88`，是 `internal/svc/context.go` 里没初始化", "panic 在 `internal/logic/order.go:88`"]);
   assert.equal(guessed.requests.length, 3);
-  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["internal/svc/context.go"]) });
   assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
 
   // 截断以前的部分照样算，截断处被切开的「user.go:12」不算（其实是 123 行）
@@ -1110,6 +1111,33 @@ test("打回重做以后还是没查证就给出线上数据：不发出去，�
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
   assert.deepEqual(context.remembered, [{ question: "[群成员] prod", answer: BLOCKED_OPS_ANSWER }]);
+});
+
+test("回答照抄了剧本里的核对记录（提交号）：打回时点名是哪处，去掉以后照常发出", async () => {
+  // 2026-10-10 复测转链：剧本开头写着「按 golang/appservice 的 master，提交 fa02ac8 核对」，模型抄进了回答，整条被拦
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":["淘口令生成：链接不符合规范"]}',
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "淘宝返回「淘口令生成：链接不符合规范」（错误码表按 appservice 提交 fa02ac8 核对）", finish: "stop" },
+    { text: "淘宝返回「淘口令生成：链接不符合规范」", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [{ ...queryLogs, spec: { ...queryLogs.spec, name: "code_search" } }],
+    codeRepos: ["ai/aiops-mcp"],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("转链失败了，排查一下"));
+
+  assert.equal(requests.length, 3);
+  assert.match(requests[2].messages.at(-1)!.content, /引用了这些代码位置：fa02ac8.*去掉这几处，其余查到的结论照常写/);
+  assert.deepEqual(markdowns(sent), ["淘宝返回「淘口令生成：链接不符合规范」"]);
 });
 
 test("回答因为没查证被拦下时，卡片上的思考也去掉", async () => {
@@ -1324,7 +1352,7 @@ test("代码和线上数据两项检查都没过时，重做时一起告诉模�
 
   await handle(message("order-api 为什么重启"));
 
-  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${unverifiedOpsAnswer(["aiops"])}` });
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${unverifiedCodeAnswer(["internal/logic/order.go:88"])}\n${unverifiedOpsAnswer(["aiops"])}` });
 });
 
 test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {
@@ -1336,7 +1364,7 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   assert.equal(byShortName("Go", new Set()), UNVERIFIED_CODE_ANSWER);
   // 没提仓库，但回答里写了代码文件路径
   const general = reviewCodeAnswer("这个服务怎么启动", ["ai/aiops-mcp"]);
-  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), unverifiedCodeAnswer(["cmd/server/main.go"]));
   // 和仓库无关的一般问题不管
   assert.equal(general("用 systemctl 重启，配置写在 tsconfig.json", new Set()), undefined);
   assert.equal(reviewCodeAnswer("今天周几", ["ai/api"])("周一，api 文档见 https://x.com/a/b.js", new Set()), undefined);
@@ -1345,9 +1373,9 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   const seen = (path: string) => logs.some((output) => output.includes(path));
   const crash = reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"], seen);
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["aiops_get_pod_logs"])), undefined);
-  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), unverifiedCodeAnswer(["cmd/server/main.go"]));
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["web_search"])), undefined);
-  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), UNVERIFIED_CODE_ANSWER);
+  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), unverifiedCodeAnswer(["internal/logic/order.go:88"]));
   // 问的是配置的仓库，结果里出现过路径也不算读过代码
   const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], () => true);
   assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
@@ -1444,8 +1472,11 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
     unseenCodeAnswer(["yuebai-user/rpc/internal/logic/common/userlogic.go:35", "2c6a7d9"], ["ai/aiops-mcp", "ai/agent-tag"]),
   );
   assert.match(unseenCodeAnswer(["a/b.go"], ["ai/aiops-mcp"]), /工具结果里都没有出现：a\/b\.go.*直说读不到这部分代码/);
+  // 没调代码工具时也点名是哪几处，模型才知道去掉什么；只是提到了仓库、没写具体位置时还是原来那段
+  assert.match(unverifiedCodeAnswer(["fa02ac8", "a/b.go:3"]), /引用了这些代码位置：fa02ac8、a\/b\.go:3.*剧本和使用说明里写的文件路径、提交号.*去掉这几处，其余查到的结论照常写/);
+  assert.equal(unverifiedCodeAnswer([]), UNVERIFIED_CODE_ANSWER);
   // 群成员在提问里写的路径不算查证：没读代码就照着提问讲，照样要先读
-  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), UNVERIFIED_CODE_ANSWER);
+  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), unverifiedCodeAnswer(["src/foo.ts:10"]));
 });
 
 test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行", () => {
