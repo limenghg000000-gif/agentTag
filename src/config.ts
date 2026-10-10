@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Domain } from "@larksuiteoapi/node-sdk";
+import { type BitableTarget, parseBitableUrl } from "./knowledge-bitable.js";
 import type { LlmConfig } from "./llm.js";
 
 export interface Config {
@@ -44,6 +45,15 @@ export interface Config {
   };
   /** 通过 MCP 接入的服务（MCP_SERVERS），没配时为空数组 */
   mcp: McpServerConfig[];
+  /** 团队经验库（飞书多维表格）。KNOWLEDGE=off 时为空 */
+  knowledge?: {
+    /** KNOWLEDGE_BITABLE 指定的表。不填时第一次保存经验时机器人自己建一张 */
+    bitable?: BitableTarget;
+    /** 机器人自己建的表记在这个文件里，重启后接着用 */
+    stateFile: string;
+    /** 按意思检索用的向量模型（和主模型同一个服务、同一个 Key）。关掉，或者模型服务不是百炼又没配时为空，只按关键词检索 */
+    embeddingModel?: string;
+  };
 }
 
 export interface McpServerConfig {
@@ -70,6 +80,8 @@ export interface McpServerConfig {
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
 export const DEFAULT_MODEL_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 export const DEFAULT_MODEL_ID = "qwen3.8-max";
+/** 团队经验库按意思检索用的百炼向量模型 */
+export const DEFAULT_EMBEDDING_MODEL = "text-embedding-v4";
 /** 用百炼时，打开思考后最多思考多少 token */
 export const DEFAULT_THINKING_BUDGET = 4000;
 /** 数据目录，相对路径按启动时的工作目录算 */
@@ -82,7 +94,9 @@ export const DEFAULT_MEMORY_BACKUP_DAYS = 14;
 /**
  * aiops 第一批开放的只读工具（阶段 3.5 方案第 4 条）。服务端新加的工具要在 MCP_AIOPS_TOOLS 里点名才开。
  * 先不开：get_log_labels（和 get_label_values 重复）、get_targets_health（采集目标体检）、两个资源配额工具（diagnose_service 里已经在用）、
- * 两个 Grafana 工具（只返回面板名称和链接）；会写东西的 save_lesson、archive_lesson、create_annotation 和 promote_case 等第二批
+ * 两个 Grafana 工具（只返回面板名称和链接）；会写东西的 save_lesson、archive_lesson、create_annotation 不给模型：
+ * 沉淀和归档经验由模型起草、群成员在确认卡片上点了以后程序去调（tools/knowledge.ts），create_annotation 暂时不接。
+ * promote_case 只读出案例、生成草稿，不写东西，给模型用来起草
  */
 export const AIOPS_DEFAULT_TOOLS = [
   "diagnose_service",
@@ -104,14 +118,15 @@ export const AIOPS_DEFAULT_TOOLS = [
   "search_knowledge",
   "get_case",
   "get_knowledge",
+  "promote_case",
 ] as const;
 
 /** 已知 MCP 服务的默认配置。别的服务要在 MCP_<名字>_TOOLS 里写明开哪些工具 */
 const MCP_SERVER_DEFAULTS: Record<string, Pick<McpServerConfig, "tools" | "writeTools" | "timeoutsMs" | "labels">> = {
   aiops: {
     tools: AIOPS_DEFAULT_TOOLS,
-    // promote_case 只生成草稿，但它是沉淀经验的第一步，和 save_lesson 一起放到第二批（确认卡片）；别的写工具名字里带动词，程序自己认
-    writeTools: ["promote_case"],
+    // 写工具名字里都带动词（save、archive、create），程序自己认
+    writeTools: [],
     // 服务端 diagnose_service 最长跑 90 秒，其余工具 30 秒
     timeoutsMs: { diagnose_service: 120_000 },
     labels: {
@@ -134,12 +149,13 @@ const MCP_SERVER_DEFAULTS: Record<string, Pick<McpServerConfig, "tools" | "write
       search_knowledge: "查知识库",
       get_case: "查看案例",
       get_knowledge: "查看经验",
+      promote_case: "案例转经验草稿",
     },
   },
 };
 
 /** 内置工具名的前缀（code_read_file、memory_save 等），MCP 服务不能用这些名字 */
-const RESERVED_MCP_NAMES = new Set(["code", "memory", "feishu", "web", "fetch"]);
+const RESERVED_MCP_NAMES = new Set(["code", "memory", "feishu", "web", "fetch", "knowledge"]);
 /** 地址里像令牌的参数名：t（aiops 的写法），或者按 _ - . 和大小写拆开后有一段像密钥，如 api_key、X-Amz-Signature、authToken */
 const SECRET_PARAM_PARTS = /^(token|secret|key|apikey|auth|authorization|password|passwd|pwd|sig|signature|credential|credentials|session|jwt|bearer)$/;
 
@@ -197,6 +213,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const code = loadCodeConfig(env);
+  const knowledgeEnv = env.KNOWLEDGE?.trim().toLowerCase();
+  if (knowledgeEnv && !["on", "off"].includes(knowledgeEnv)) {
+    throw new Error(`KNOWLEDGE 只能是 on 或 off，当前为 ${env.KNOWLEDGE}`);
+  }
+  const knowledgeOff = knowledgeEnv === "off";
   const writers = (env.WRITE_ALLOWED_USERS ?? "").split(",").map((id) => id.trim()).filter(Boolean);
   const badWriter = writers.find((id) => !/^ou_[\w-]+$/.test(id));
   if (badWriter) {
@@ -237,6 +258,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : undefined,
     code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
     mcp: loadMcpConfig(env),
+    ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),
+  };
+}
+
+/** KNOWLEDGE_BITABLE 是多维表格链接；KNOWLEDGE_EMBEDDING_MODEL 不配时百炼用 text-embedding-v4，off 表示只按关键词检索 */
+function loadKnowledgeConfig(env: NodeJS.ProcessEnv, baseURL: string): NonNullable<Config["knowledge"]> {
+  const bitable = env.KNOWLEDGE_BITABLE?.trim();
+  const embeddingEnv = env.KNOWLEDGE_EMBEDDING_MODEL?.trim();
+  const embeddingModel =
+    embeddingEnv?.toLowerCase() === "off" ? undefined : embeddingEnv || (isBailian(baseURL) ? DEFAULT_EMBEDDING_MODEL : undefined);
+  return {
+    ...(bitable ? { bitable: parseBitableUrl(bitable) } : {}),
+    stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "knowledge", "bitable.json"),
+    ...(embeddingModel ? { embeddingModel } : {}),
   };
 }
 

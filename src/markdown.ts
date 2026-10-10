@@ -1,5 +1,10 @@
 const FENCE = /^\s*```/;
 
+/** 飞书卡片 markdown 里的尖括号会被当成标签（<at id=all></at> 会 @所有人，还有 <font> 这些）：别处来的文字转成实体再放进卡片 */
+export function escapeCardMarkdown(text: string): string {
+  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 /**
  * 把较长的 Markdown 按行切成不超过 limit 字的片段，逐条发送。
  * 切点落在代码块内部时，先补上结束标记，下一片再重新打开，保证每片单独渲染都正确。

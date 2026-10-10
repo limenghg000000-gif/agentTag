@@ -12,6 +12,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
+import { findSensitive } from "./knowledge.js";
 import { RESULT_NOTES } from "./mcp-notes.js";
 import { COMMON_SUFFIX, compactText, formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
 import type { Tool } from "./tools/tool.js";
@@ -48,6 +49,8 @@ export const MAX_PLAYBOOKS_PER_TASK = 3;
 const MAX_PLAYBOOK_DESCRIPTION_CHARS = 300;
 
 const BUSY = /服务繁忙|server (is )?busy|too many (concurrent )?requests/i;
+/** 程序调用的报错原文里像有密钥或个人信息（手机号、身份证号）时，报错和审计日志里换成这句 */
+const HIDDEN = "（报错原文里像是有密钥或个人信息，不列出来）";
 /** 名字里带这些动词的工具算「会写东西」，宁可多拦 */
 const WRITE_VERB =
   /(^|_)(create|save|update|delete|remove|archive|restart|scale|exec|apply|patch|rollback|silence|set|put|write|edit|deploy|kill|drain|cordon|evict|upsert|insert)(_|$)/;
@@ -99,6 +102,8 @@ interface ServerState {
   conn: McpConnection;
   /** 开给模型的工具（服务端的原始定义） */
   enabled: RemoteTool[];
+  /** 服务端的全部工具，程序自己调用（callDirect）时用 */
+  catalog: Map<string, RemoteTool>;
   /** 服务端下发的排查剧本（MCP prompts，只留不用填参数的） */
   playbooks: RemotePrompt[];
   /** 剧本清单连续拉失败了几次（工具照常能用，按这个退避重试） */
@@ -151,6 +156,7 @@ export class McpHub {
       config,
       conn: new McpConnection(config, this.logger),
       enabled: [],
+      catalog: new Map(),
       playbooks: [],
       playbookFailures: 0,
       synced: false,
@@ -194,6 +200,51 @@ export class McpHub {
   thinksAfter(toolName: string): boolean {
     const name = this.serverOf(toolName);
     return name !== undefined && this.servers.some((server) => server.config.name === name && server.config.thinking);
+  }
+
+  /** 程序能不能直接调这个工具（见 directAllowed）。没连上时为 false */
+  hasTool(serverName: string, tool: string): boolean {
+    const server = this.find(serverName);
+    return server !== undefined && server.catalog.has(tool) && directAllowed(server.config, tool);
+  }
+
+  /** 连上过、拿到了工具清单（之后刷新失败也算，沿用上次的清单） */
+  connected(serverName: string): boolean {
+    return this.find(serverName)?.synced ?? false;
+  }
+
+  /**
+   * 程序自己调服务端的工具，不经过模型：回答前检索 aiops 经验库、有人在确认卡片上点了保存后同步到 aiops 经验库。
+   * 写工具不受「只开只读工具」的限制（写操作的确认由调用方负责），读的工具要在配置里开了（directAllowed）。
+   * 不占模型的调用次数，照样记审计日志。返回结果原文，工具报错时抛错
+   */
+  async callDirect(
+    serverName: string,
+    tool: string,
+    args: Record<string, unknown>,
+    task: McpTaskContext,
+    signal: AbortSignal = AbortSignal.timeout(DEFAULT_MCP_TIMEOUT_MS),
+  ): Promise<string> {
+    const server = this.find(serverName);
+    if (!server?.synced) {
+      throw new Error(`${serverName} 现在连不上`);
+    }
+    if (!server.catalog.has(tool)) {
+      throw new Error(`${serverName} 没有 ${tool} 这个工具`);
+    }
+    if (!directAllowed(server.config, tool)) {
+      throw new Error(`${serverName} 的 ${tool} 没开（要开就加进 MCP_${serverName.toUpperCase()}_TOOLS）`);
+    }
+    const timeout = server.config.timeoutsMs[tool] ?? DEFAULT_MCP_TIMEOUT_MS;
+    // 程序要解析结果：有 structuredContent 时用它的 JSON（文字部分可能是给人看的说明），没有时用文字
+    const { result, raw, audit } = await this.request(server, tool, args, task, signal, timeout, true);
+    const data = result.structuredContent ? JSON.stringify(result.structuredContent) : raw;
+    audit(`结果=${data.length}字`);
+    return data;
+  }
+
+  private find(name: string): ServerState | undefined {
+    return this.servers.find((server) => server.config.name === name);
   }
 
   /**
@@ -289,6 +340,8 @@ export class McpHub {
       server.prompt = await this.readPrompt(server.config);
       const picked = pickTools(server.config, synced.tools);
       server.enabled = picked.enabled;
+      // 程序直接调用的清单也不收只能按 MCP 任务（tasks）方式调用的：这里不支持，普通调用调不成
+      server.catalog = new Map(synced.tools.filter((tool) => tool.execution?.taskSupport !== "required").map((tool) => [tool.name, tool]));
       // 剧本清单这次没拉到：沿用上次的（仍要和这次的工具不重名），按连不上的节奏重试，不等 10 分钟后的刷新
       server.playbooks = pickPlaybooks(server.config.name, synced.promptsError ? server.playbooks : synced.prompts, picked.enabled);
       const next = synced.promptsError ? this.retryMs[Math.min(server.playbookFailures++, this.retryMs.length - 1)] : this.refreshMs;
@@ -532,11 +585,32 @@ export class McpHub {
     limit: number,
   ): Promise<string> {
     const { name } = server.config;
+    const { result, raw, audit } = await this.request(server, tool, args, task, signal, timeout);
+    const note = RESULT_NOTES[name]?.[tool]?.(args, raw);
+    const text = note ? `${note}\n${formatToolResult(result, limit - note.length - 1)}` : formatToolResult(result, limit);
+    audit(`结果=${raw.length}字${text.length !== raw.length ? `→${text.length}字` : ""}${note ? " 加了机器人注" : ""}`);
+    return text;
+  }
+
+  /**
+   * 调一次工具：服务繁忙时退避重试，失败和出错记审计日志并抛错；成功时返回结果，审计日志由调用方补上结果大小。
+   * direct 是程序自己调的：报错会列在群里的卡片上，原文里像有密钥的不带（审计日志里也不记）
+   */
+  private async request(
+    server: ServerState,
+    tool: string,
+    args: Record<string, unknown>,
+    task: McpTaskContext,
+    signal: AbortSignal,
+    timeout: number,
+    direct = false,
+  ): Promise<{ result: CallToolResult; raw: string; audit: (outcome: string) => void }> {
+    const { name } = server.config;
     const startedAt = this.now();
     let retries = 0;
     const audit = (outcome: string, failed = false) => {
       const line =
-        `MCP 调用 ${name}.${tool} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
+        `MCP 调用 ${name}.${tool}${direct ? "（程序调用）" : ""} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
         `参数=${clip(JSON.stringify(args), 300)} ${outcome} 用时=${this.now() - startedAt}ms${retries > 0 ? ` 繁忙重试=${retries}` : ""}`;
       if (failed) {
         this.logger.warn(line);
@@ -556,32 +630,36 @@ export class McpHub {
         await delay(this.busyRetryMs[retries++], undefined, { signal });
       }
     } catch (err) {
-      if (signal.aborted) {
+      if (signal.aborted && !isTimeoutAbort(signal)) {
         audit("已停止");
         throw err;
       }
       // HTTP 层或网络的错误（服务端重启、会话失效、令牌改了）马上重连；工具自己的报错和超时不用
-      if (!(err instanceof McpError)) {
+      if (!(err instanceof McpError) && !signal.aborted) {
         this.resyncSoon(server);
       }
-      const message = describeCallError(err, server.config, tool, timeout);
+      const described = describeCallError(err, server.config, tool, timeout);
+      const message = direct && findSensitive(described) !== undefined ? `调用 ${name} 的 ${tool} 失败${HIDDEN}` : described;
       audit(`失败：${message}`, true);
       throw new Error(message);
     }
 
     const raw = resultText(result);
     if (result.isError) {
+      const shown = (chars: number) => (direct && findSensitive(raw) !== undefined ? HIDDEN : clip(raw, chars));
       const message = BUSY.test(raw)
-        ? `${name} 服务繁忙（并发满了），重试 ${retries} 次还是不行：${clip(raw, 300)}。可以稍后再试，或者先按已有的证据回答`
-        : `${name} 返回错误：${clip(raw, 2000)}`;
-      audit(`出错 结果=${raw.length}字：${clip(raw, 200)}`, true);
+        ? `${name} 服务繁忙（并发满了），重试 ${retries} 次还是不行：${shown(300)}。可以稍后再试，或者先按已有的证据回答`
+        : `${name} 返回错误：${shown(2000)}`;
+      audit(`出错 结果=${raw.length}字：${shown(200)}`, true);
       throw new Error(message);
     }
-    const note = RESULT_NOTES[name]?.[tool]?.(args, raw);
-    const text = note ? `${note}\n${formatToolResult(result, limit - note.length - 1)}` : formatToolResult(result, limit);
-    audit(`结果=${raw.length}字${text.length !== raw.length ? `→${text.length}字` : ""}${note ? " 加了机器人注" : ""}`);
-    return text;
+    return { result, raw, audit: (outcome) => audit(outcome) };
   }
+}
+
+/** 程序调用时用 AbortSignal.timeout 限时，超时的中止不算用户点了停止 */
+function isTimeoutAbort(signal: AbortSignal): boolean {
+  return signal.reason instanceof DOMException && signal.reason.name === "TimeoutError";
 }
 
 interface SyncResult {
@@ -817,6 +895,15 @@ function pickTools(config: McpServerConfig, tools: readonly RemoteTool[]): Picke
 function mayWrite(tool: RemoteTool, config: McpServerConfig, wildcard: boolean): boolean {
   const readOnly = tool.annotations?.readOnlyHint;
   return isWriteTool(tool.name, config.writeTools) || readOnly === false || (wildcard && readOnly !== true);
+}
+
+/**
+ * 程序能直接调的工具：读东西的要在配置里开了（MCP_<名字>_TOOLS，* 是全部）。管理员没开的工具，程序也不拿它读东西给群里看
+ * （比如回答前检索 aiops 经验库要开 search_knowledge）。写工具（按名字认，服务端的标注不能把读的说成写的绕过清单）本来就不开给模型，
+ * 由调用方在确认卡片上有人确认后调，不看这个清单
+ */
+function directAllowed(config: McpServerConfig, tool: string): boolean {
+  return config.tools === "*" || config.tools.includes(tool) || isWriteTool(tool, config.writeTools);
 }
 
 /** 交给模型的工具名：服务名_工具名，只留 OpenAI 函数名允许的字符 */

@@ -10,12 +10,16 @@ import { createDocsApi, FeishuDocs } from "./docs.js";
 import { createFeishuApi } from "./feishu.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
-import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "./llm.js";
+import { KnowledgeBase } from "./knowledge.js";
+import { AiopsLessons } from "./knowledge-aiops.js";
+import { BitableKnowledgeBackend, createBitableApi } from "./knowledge-bitable.js";
+import { createOpenAICompatibleEmbedder, createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "./llm.js";
 import { McpHub } from "./mcp.js";
 import { MemoryStore } from "./memory.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { TaskRegistry } from "./tasks.js";
 import { CODE_TOOL_NAMES, createCodeTools } from "./tools/code.js";
+import { KnowledgeDesk } from "./tools/knowledge.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
 import { createWebSearchTool } from "./tools/web-search.js";
@@ -61,6 +65,33 @@ const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefin
 // MCP 服务在后台连接，连上之前（或连不上时）的提问没有它的工具，不耽误机器人启动
 const mcp = config.mcp.length > 0 ? new McpHub(config.mcp) : undefined;
 void mcp?.start();
+// 团队经验库存在飞书多维表格里：回答前先查，起草后发确认卡片，写权限名单里的人点了才写；排查经验同步一份到 aiops 经验库
+const knowledgeTable = config.knowledge
+  ? new BitableKnowledgeBackend({
+      api: createBitableApi(channel.rawClient),
+      stateFile: config.knowledge.stateFile,
+      ...(config.knowledge.bitable ? { target: config.knowledge.bitable } : {}),
+      share: {
+        chatIds: [...config.feishu.allowedChatIds],
+        editors: [...(config.feishu.writeAllowedUsers ?? [])],
+      },
+    })
+  : undefined;
+const knowledge = config.knowledge
+  ? new KnowledgeDesk({
+      base: new KnowledgeBase(
+        knowledgeTable!,
+        config.knowledge.embeddingModel
+          ? { embedder: createOpenAICompatibleEmbedder({ baseURL: config.llm.baseURL, apiKey: config.llm.apiKey, model: config.knowledge.embeddingModel }) }
+          : {},
+      ),
+      ...(mcp?.names.includes("aiops") ? { aiops: new AiopsLessons(mcp, "aiops") } : {}),
+      send: (to, input, opts) => channel.send(to, input, opts),
+      updateCard: (messageId, card) => channel.updateCard(messageId, card),
+      ...(config.feishu.writeAllowedUsers ? { approvers: config.feishu.writeAllowedUsers } : {}),
+      allowedChatIds: config.feishu.allowedChatIds,
+    })
+  : undefined;
 // 提问里的截图先交给看图模型转成文字
 const images = config.vision
   ? new ImageReader({
@@ -82,6 +113,7 @@ const handleMessage = createMessageHandler({
   ...(workspaces ? { codeRepos: workspaces.repos } : {}),
   ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
   ...(mcp ? { mcp } : {}),
+  ...(knowledge ? { knowledge } : {}),
   ...(images ? { images } : {}),
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
@@ -117,7 +149,7 @@ channel.on("message", async (msg: NormalizedMessage) => {
   catchUp.watch(msg);
   await handleMessage(msg);
 });
-channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds }));
+channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, ...(knowledge ? { knowledge } : {}) }));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
 
 try {
@@ -164,6 +196,21 @@ if (workspaces) {
 if (mcp) {
   console.log(`MCP 服务：${mcp.names.join(", ")}，在后台连接，连上后日志里有一行「MCP <名字>：已连上」`);
 }
+if (config.knowledge) {
+  // 机器人建的表按现在的白名单群和写权限名单调整共享（移出名单的撤掉权限），在后台做
+  void knowledgeTable?.syncSharing().catch((err: unknown) => console.warn("经验库：调整多维表格的共享失败", err));
+  console.log(
+    `团队经验库：存在飞书多维表格里（${config.knowledge.bitable?.url ?? "第一次保存经验时机器人自己建表"}），每个提问回答前先查一次` +
+      `（${config.knowledge.embeddingModel ? `关键词加向量模型 ${config.knowledge.embeddingModel}` : "只按关键词"}）；` +
+      "群里说「沉淀成经验」时机器人起草、发确认卡片，" +
+      (config.feishu.writeAllowedUsers
+        ? "写权限名单里的人点「保存」才写入"
+        : "但没配写权限名单（WRITE_ALLOWED_USERS），现在只能查、不能存：经验库所有群共用，要先限定谁能确认") +
+      (mcp?.names.includes("aiops") ? "；排查经验同步一份到 aiops 经验库" : ""),
+  );
+} else {
+  console.log("团队经验库：已关闭（KNOWLEDGE=off）");
+}
 if (backup) {
   backup.start();
   console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
@@ -180,6 +227,8 @@ const shutdown = async () => {
   await backup?.stop();
   tasks.stopAll();
   await tasks.idle(5000);
+  // 已经点了确认、正在写经验库的，写完再退出（最多等 10 秒）
+  await Promise.race([knowledge?.idle(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   await mcp?.stop();
   await channel.disconnect();
   process.exit(0);

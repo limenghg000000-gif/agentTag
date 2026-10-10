@@ -1,0 +1,674 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { after, test } from "node:test";
+import type { Client } from "@larksuiteoapi/node-sdk";
+import { FeishuApiError } from "../src/feishu.js";
+import { KnowledgeBase, KnowledgeError, normalizeDraft } from "../src/knowledge.js";
+import {
+  type BitableApi,
+  type BitableField,
+  BitableKnowledgeBackend,
+  type BitableMember,
+  createBitableApi,
+  type BitableRecord,
+  parseBitableUrl,
+} from "../src/knowledge-bitable.js";
+
+const quiet = { info() {}, warn() {}, error() {} };
+const dir = await mkdtemp(path.join(tmpdir(), "agenttag-knowledge-"));
+after(() => rm(dir, { recursive: true, force: true }));
+
+function fakeBitable() {
+  const calls: string[] = [];
+  const tables = new Map<string, { fields: BitableField[]; records: BitableRecord[] }>();
+  const shared: [BitableMember, string][] = [];
+  const tokens: (string | undefined)[] = [];
+  const restricted: string[] = [];
+  let next = 0;
+  const api: BitableApi & { fail?: Error; failShare?: (member: BitableMember) => boolean; failRestrict?: boolean } = {
+    async createApp(name) {
+      calls.push(`createApp ${name}`);
+      tables.set("tbl_default", { fields: [], records: [] });
+      return { appToken: "app1", url: "https://example.feishu.cn/base/app1", defaultTableId: "tbl_default" };
+    },
+    async createTable(_app, name, fields) {
+      calls.push(`createTable ${name}`);
+      tables.set("tbl1", { fields: [...fields], records: [] });
+      return "tbl1";
+    },
+    async deleteTable(_app, tableId) {
+      calls.push(`deleteTable ${tableId}`);
+      tables.delete(tableId);
+    },
+    async listRecords(_app, tableId) {
+      if (api.fail) {
+        throw api.fail;
+      }
+      return structuredClone(tables.get(tableId)?.records ?? []);
+    },
+    async listFields(_app, tableId) {
+      return (tables.get(tableId)?.fields ?? []).map((f) => f.field_name);
+    },
+    async createField(_app, tableId, field) {
+      calls.push(`createField ${field.field_name}`);
+      tables.get(tableId)!.fields.push(field);
+    },
+    async createRecord(_app, tableId, fields, clientToken) {
+      tokens.push(clientToken);
+      const recordId = `rec${++next}`;
+      tables.get(tableId)!.records.push({ recordId, fields: { ...fields, 保存时间: 1_760_000_000_000 } });
+      return recordId;
+    },
+    async updateRecord(_app, tableId, recordId, fields) {
+      Object.assign(tables.get(tableId)!.records.find((r) => r.recordId === recordId)!.fields, fields);
+    },
+    async addCollaborator(_app, member, perm) {
+      if (api.failShare?.(member)) {
+        throw new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[docs:permission.member:create]");
+      }
+      shared.push([member, perm]);
+    },
+    async updateCollaborator(_app, member, perm) {
+      calls.push(`update ${member.id} ${perm}`);
+    },
+    async removeCollaborator(_app, member) {
+      calls.push(`remove ${member.id}`);
+    },
+    async restrictSharing(app) {
+      if (api.failRestrict) {
+        throw new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[docs:permission.setting:write_only]");
+      }
+      restricted.push(`${app}，此前已共享 ${shared.length} 个`);
+    },
+    async getUrl() {
+      return undefined;
+    },
+  };
+  return { api, calls, tables, shared, tokens, restricted };
+}
+
+const dau = normalizeDraft({ category: "metric", title: "日活的口径", question: "日活怎么统计", conclusion: "当天打开过 App 的去重用户数", keywords: "日活,DAU" });
+
+test("第一次保存时建多维表格：只留经验库这张表，先设成只有机器人能管协作者，再共享给白名单群（只读）和写权限名单里的人（可编辑），记进数据目录；重启后接着用", async () => {
+  const stateFile = path.join(dir, "first", "bitable.json");
+  const { api, calls, tables, shared, restricted } = fakeBitable();
+  const backend = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_admin"] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+
+  assert.deepEqual(await base.search("日活"), [], "还没建表时检索不调接口");
+  assert.equal(await backend.location(), undefined);
+  assert.equal(calls.length, 0);
+
+  const entry = await base.save(dau, { proposedBy: "张三", confirmedBy: "ML", source: "飞书群 oc_1" });
+  assert.equal(entry.id, "K1");
+  assert.deepEqual(calls, ["createApp AgentTag 经验库", "createTable 经验库", "deleteTable tbl_default"]);
+  assert.deepEqual(shared, [
+    [{ type: "openchat", id: "oc_1" }, "view"],
+    [{ type: "openid", id: "ou_admin" }, "edit"],
+  ]);
+  assert.deepEqual(restricted, ["app1，此前已共享 0 个"], "共享之前先设好");
+  const table = tables.get("tbl1")!;
+  const fields: Record<string, unknown> = table.records[0].fields;
+  assert.deepEqual(table.fields.map((f) => f.field_name).slice(0, 4), ["标题", "编号", "类别", "状态"]);
+  assert.deepEqual({ ...fields }, {
+    标题: "日活的口径",
+    编号: "K1",
+    类别: "数据口径",
+    状态: "有效",
+    问题或场景: "日活怎么统计",
+    结论: "当天打开过 App 的去重用户数",
+    关键词: "日活,DAU",
+    发起人: "张三",
+    确认人: "ML",
+    来源: "飞书群 oc_1",
+    保存时间: 1_760_000_000_000,
+  });
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), {
+    appToken: "app1",
+    tableId: "tbl1",
+    url: "https://example.feishu.cn/base/app1?table=tbl1",
+    shared: ["openchat:oc_1:view", "openid:ou_admin:edit"],
+    restricted: true,
+  });
+
+  // 重启：读数据目录里记的表，不再建
+  const again = new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: [], editors: [] }, logger: quiet }), { logger: quiet });
+  const [hit] = await again.search("DAU 怎么算");
+  assert.equal(hit.entry.id, "K1");
+  assert.equal(hit.entry.createdAt, new Date(1_760_000_000_000).toISOString());
+  await again.linkAiops(hit.entry, 31);
+  await again.archive("K1");
+  assert.equal(fields["aiops 经验编号"], "31");
+  assert.equal(fields["状态"], "已归档");
+  assert.equal(calls.filter((c) => c.startsWith("createApp")).length, 1);
+});
+
+test("没配写权限名单时群也只给只读；用 KNOWLEDGE_BITABLE 指定的表时不自己建", async () => {
+  const { api, calls, shared } = fakeBitable();
+  const backend = new BitableKnowledgeBackend({
+    api,
+    stateFile: path.join(dir, "edit", "bitable.json"),
+    share: { chatIds: ["oc_1"], editors: [] },
+    logger: quiet,
+  });
+  await new KnowledgeBase(backend, { logger: quiet }).save(dau);
+  assert.deepEqual(shared, [[{ type: "openchat", id: "oc_1" }, "view"]]);
+
+  const target = fakeBitable();
+  target.tables.set("tblX", { fields: [], records: [] });
+  const fixed = new BitableKnowledgeBackend({
+    api: target.api,
+    stateFile: path.join(dir, "fixed", "bitable.json"),
+    target: { appToken: "appX", tableId: "tblX", url: "https://example.feishu.cn/base/appX?table=tblX" },
+    share: { chatIds: ["oc_1"], editors: [] },
+    logger: quiet,
+  });
+  await new KnowledgeBase(fixed, { logger: quiet }).save(dau);
+  assert.ok(!target.calls.some((c) => c.startsWith("createApp")), "指定了表就不自己建");
+  assert.equal(await fixed.location(), "https://example.feishu.cn/base/appX?table=tblX");
+  assert.equal(calls.length, 3);
+});
+
+test("共享失败的下次保存时再试，后来加进白名单的群也补上；共享失败不影响保存", async () => {
+  const stateFile = path.join(dir, "share", "bitable.json");
+  const { api, shared } = fakeBitable();
+  api.failShare = (member) => member.type === "openchat";
+  const first = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_admin"] }, logger: quiet });
+  assert.equal((await new KnowledgeBase(first, { logger: quiet }).save(dau)).id, "K1");
+  assert.deepEqual(shared, [[{ type: "openid", id: "ou_admin" }, "edit"]]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:edit"]);
+
+  // 开通权限、重启，白名单里又加了一个群：下次保存时补上没共享成的，已经共享过的不再调
+  api.failShare = undefined;
+  const again = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: ["ou_admin"] }, logger: quiet });
+  assert.equal((await new KnowledgeBase(again, { logger: quiet }).save(dau)).id, "K2");
+  assert.deepEqual(shared.slice(1), [
+    [{ type: "openchat", id: "oc_1" }, "view"],
+    [{ type: "openchat", id: "oc_2" }, "view"],
+  ]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openid:ou_admin:edit", "openchat:oc_1:view", "openchat:oc_2:view"]);
+  await new KnowledgeBase(again, { logger: quiet }).save(dau);
+  assert.equal(shared.length, 3, "都共享过了就不再调");
+});
+
+test("共享跟着名单走：启动时把移出白名单的群、移出写权限名单的人的权限撤掉，权限变了的改掉；用 KNOWLEDGE_BITABLE 指定的表时不动", async () => {
+  const stateFile = path.join(dir, "revoke", "bitable.json");
+  const { api, calls } = fakeBitable();
+  const first = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: ["ou_admin", "ou_old"] }, logger: quiet });
+  await new KnowledgeBase(first, { logger: quiet }).save(dau);
+
+  // 重启：oc_2 和 ou_old 移出了名单，写权限名单清空；数据目录里记的 oc_1 是可编辑（比如以前的版本给的），改回只读
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  state.shared = state.shared.map((key: string) => (key === "openchat:oc_1:view" ? "openchat:oc_1:edit" : key));
+  await writeFile(stateFile, JSON.stringify(state));
+  const restarted = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet });
+  await restarted.syncSharing();
+  assert.deepEqual(calls.slice(3), ["update oc_1 view", "remove oc_2", "remove ou_admin", "remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+  await restarted.syncSharing();
+  assert.equal(calls.length, 7, "名单没变就不再调");
+
+  const target = fakeBitable();
+  const notes: string[] = [];
+  const fixed = new BitableKnowledgeBackend({
+    api: target.api,
+    stateFile: path.join(dir, "fixed-sync", "bitable.json"),
+    target: { appToken: "appX", tableId: "tblX" },
+    share: { chatIds: ["oc_1"], editors: [] },
+    logger: { ...quiet, info: (message: string) => notes.push(message) },
+  });
+  await fixed.syncSharing();
+  assert.equal(target.calls.length, 0);
+  assert.match(notes.join("\n"), /用的是 KNOWLEDGE_BITABLE 指定的表，机器人不管它的共享。白名单群和写权限名单变了，请在飞书里自己调整这张表的协作者/);
+});
+
+test("撤权限失败（没开 docs:permission.member:delete）时警告写明缺的权限，记录留着，下次启动再撤", async () => {
+  const stateFile = path.join(dir, "revoke-fail", "bitable.json");
+  const { api, calls } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  const remove = api.removeCollaborator.bind(api);
+  api.removeCollaborator = async () => {
+    throw new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[docs:permission.member:delete]");
+  };
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }).syncSharing();
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /撤掉 ou_old .*要用应用权限 docs:permission\.member:delete/);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view", "openid:ou_old:edit"]);
+
+  api.removeCollaborator = remove;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(calls.slice(-1), ["remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+});
+
+test("设置谁能管协作者失败（没开 docs:permission.setting:write_only）时先不共享给任何人，警告写明缺的权限；开了以后下次启动设好再共享", async () => {
+  const stateFile = path.join(dir, "restrict-fail", "bitable.json");
+  const { api, shared, restricted } = fakeBitable();
+  api.failRestrict = true;
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }), { logger: quiet }).save(dau);
+  assert.equal(shared.length, 0, "没限制好之前不共享");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /只有机器人能加、移除协作者.*要用应用权限 docs:permission\.setting:write_only/);
+  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).restricted, undefined);
+
+  api.failRestrict = false;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(restricted, ["app1，此前已共享 0 个"]);
+  assert.equal(shared.length, 1);
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(state.restricted, true);
+  assert.deepEqual(state.shared, ["openchat:oc_1:view"]);
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.equal(restricted.length, 1, "设好了就不再调");
+});
+
+test("加协作者前先记进数据目录：加上了但结果没传回来时记成不确定，移出名单后照样撤；还在名单里的下次再加一次确认", async () => {
+  const stateFile = path.join(dir, "journal", "bitable.json");
+  const { api, calls, shared } = fakeBitable();
+  const add = api.addCollaborator.bind(api);
+  const recorded: string[][] = [];
+  // 飞书加上了，但结果没传回来
+  api.addCollaborator = async (app, member, perm) => {
+    recorded.push(JSON.parse(await readFile(stateFile, "utf8")).shared);
+    await add(app, member, perm);
+    throw new Error("socket hang up");
+  };
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: [] }, logger: quiet }), { logger: quiet }).save(dau);
+  assert.deepEqual(recorded, [["openchat:oc_1:view"], ["openchat:oc_1:view", "openchat:oc_2:view"]], "调接口之前已经记下了");
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).pending, ["openchat:oc_1", "openchat:oc_2"]);
+
+  // 重启：oc_2 移出了名单，oc_1 还在
+  api.addCollaborator = add;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(calls.slice(-1), ["remove oc_2"]);
+  assert.equal(shared.filter(([member]) => member.id === "oc_1").length, 2, "结果不明的再加一次");
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.deepEqual(state.shared, ["openchat:oc_1:view"]);
+  assert.equal(state.pending, undefined);
+});
+
+test("撤权限前也先记成不确定：撤掉了但结果没传回来、以后再撤说找不到时，加回名单后重新加上", async () => {
+  const stateFile = path.join(dir, "journal-remove", "bitable.json");
+  const { api, calls, shared } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  const remove = api.removeCollaborator.bind(api);
+  const recorded: unknown[] = [];
+  // 飞书撤掉了，但结果没传回来
+  api.removeCollaborator = async (app, member) => {
+    recorded.push(JSON.parse(await readFile(stateFile, "utf8")).pending);
+    await remove(app, member);
+    throw new Error("socket hang up");
+  };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(recorded, [["openid:ou_old"]], "调接口之前已经记下了");
+
+  // 以后再撤，飞书说没有这个协作者
+  api.removeCollaborator = async () => {
+    throw new FeishuApiError(1, "飞书说没有这个协作者");
+  };
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+
+  // ou_old 又加回写权限名单：重新加上，不当成还有权限
+  api.removeCollaborator = remove;
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }).syncSharing();
+  assert.equal(shared.filter(([member]) => member.id === "ou_old").length, 2);
+  assert.equal(calls.filter((call) => call.startsWith("update ou_old")).length, 0);
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.deepEqual(state.shared, ["openchat:oc_1:view", "openid:ou_old:edit"]);
+  assert.equal(state.pending, undefined);
+});
+
+test("撤权限、加协作者前没能记进数据目录时先不动，同一次启动再调整也不动；下次记得下了再撤", async () => {
+  const stateFile = path.join(dir, "journal-remove-fail", "bitable.json");
+  const { api, calls, shared } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  // 数据目录写不进去：临时文件的位置被一个目录占了
+  await mkdir(`${stateFile}.tmp`);
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  const blocked = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: [] }, logger });
+  await blocked.syncSharing();
+  // 同一次启动里再调整一次（比如有人保存经验）：没写进去的记录不能留在内存里当成已经记下了
+  await blocked.syncSharing();
+  assert.equal(calls.filter((call) => call.startsWith("remove")).length, 0, "没记下来就不撤");
+  assert.equal(shared.filter(([member]) => member.id === "oc_2").length, 0, "没记下来就不加");
+  assert.match(warnings.join("\n"), /撤 ou_old 的权限之前没能记进数据目录，这次先不撤/);
+  assert.match(warnings.join("\n"), /没能先把 oc_2 记进数据目录，这次先不共享给它/);
+
+  await rm(`${stateFile}.tmp`, { recursive: true });
+  await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
+  assert.deepEqual(calls.filter((call) => call.startsWith("remove")), ["remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+});
+
+test("保存时把草稿编号带给飞书（client_token）并写进表格；点保存重试时同一个草稿编号不再写一行", async () => {
+  const { api, tables, tokens } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "token", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const requestId = "0f8e2a3c-7a51-4b8e-9d0c-1f2e3d4c5b6a";
+  // 第一次：飞书写进去了，但结果没传回来
+  const create = api.createRecord.bind(api);
+  api.createRecord = async (...args) => {
+    await create(...args);
+    throw new FeishuApiError(0, "socket hang up");
+  };
+  await assert.rejects(base.save(dau, { requestId }), /socket hang up/);
+  api.createRecord = create;
+  const retried = await base.save(dau, { requestId });
+  assert.equal(retried.id, "K1");
+  assert.equal(tables.get("tblX")!.records.length, 1);
+  assert.deepEqual(tokens, [requestId]);
+  assert.equal(tables.get("tblX")!.records[0].fields["草稿编号"], requestId);
+  assert.equal((await backend.list())[0].requestId, requestId);
+});
+
+test("存好以后有人在表格里清空了标题或结论：再试一次照样认出存过，返回表格里这一行，不按卡片上的草稿另算；新存的不占它的编号", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "blanked", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const requestId = "5b1d7c2e-3f4a-4c6b-8d9e-0a1b2c3d4e5f";
+  assert.equal((await base.save(dau, { requestId })).id, "K1");
+  const fields = tables.get("tblX")!.records[0].fields;
+  fields["标题"] = "";
+  const retried = await base.save(dau, { requestId });
+  assert.equal(retried.id, "K1");
+  assert.equal(retried.title, "", "返回的是表格里现在的样子");
+  assert.equal(retried.incomplete, "标题是空的");
+  assert.equal(tables.get("tblX")!.records.length, 1);
+  assert.deepEqual(await base.search("日活"), []);
+  assert.equal((await base.save({ ...dau, title: "周活的口径" })).id, "K2");
+});
+
+test("发过的最大编号记在数据目录里：表格里删了编号最大的行、重启以后也不再发这个编号；记的文件坏了不存", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const stateFile = path.join(dir, "issued", "bitable.json");
+  const options = { api, stateFile, target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet };
+  const base = new KnowledgeBase(new BitableKnowledgeBackend(options), { logger: quiet });
+  await base.save(dau);
+  await base.save({ ...dau, title: "周活的口径" });
+  assert.deepEqual(JSON.parse(await readFile(path.join(dir, "issued", "issued.json"), "utf8")), { highest: 2 });
+  tables.get("tblX")!.records.pop();
+
+  const restarted = new KnowledgeBase(new BitableKnowledgeBackend(options), { logger: quiet });
+  assert.equal((await restarted.save({ ...dau, title: "月活的口径" })).id, "K3");
+
+  await writeFile(path.join(dir, "issued", "issued.json"), "{");
+  await assert.rejects(restarted.save({ ...dau, title: "年活的口径" }), /发过的最大经验编号.*格式不对/);
+  assert.equal(tables.get("tblX")!.records.length, 2);
+});
+
+test("取代旧经验的那条在表格里记下取代的编号，读回来也有", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", { fields: [], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "replaces", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(dau, { requestId: "req-0" });
+  await base.save({ ...dau, title: "日活的口径（改过）" }, { replaces: "k1" });
+  assert.equal(tables.get("tblX")!.records[1].fields["取代的经验"], "K1");
+  assert.equal(tables.get("tblX")!.records[1].fields["取代的经验的草稿编号"], "req-0", "旧的那一行之后改了编号也认得出");
+  assert.equal(tables.get("tblX")!.records[0].fields["取代的经验"], undefined);
+  assert.deepEqual(
+    (await backend.list()).map((entry) => [entry.replaces, entry.replacesRequestId]),
+    [
+      [undefined, undefined],
+      ["K1", "req-0"],
+    ],
+  );
+});
+
+test("读表格一页一页读到底，超过 2 万行也不截断；飞书说还有下一页却没给新位置、页数多得不正常时报错，不拿一半当全部", async () => {
+  const paged = (page: (token: string | undefined, n: number) => { items: unknown[]; has_more: boolean; page_token?: string }) => {
+    let n = 0;
+    const list = async ({ params }: { params: { page_token?: string } }) => ({ code: 0, data: page(params.page_token, ++n) });
+    return createBitableApi({ bitable: { v1: { appTableRecord: { list }, appTableField: { list } } } } as unknown as Client);
+  };
+  const rows = (n: number) => Array.from({ length: 500 }, (_, i) => ({ record_id: `rec${n}_${i}`, fields: {} }));
+  const all = await paged((token, n) => ({ items: rows(n), has_more: n < 41, page_token: `p${n}` })).listRecords("app1", "tbl1");
+  assert.equal(all.length, 41 * 500);
+  assert.equal(all.at(-1)!.recordId, "rec41_499");
+
+  await assert.rejects(
+    paged((_token, n) => ({ items: rows(n), has_more: true, page_token: "same" })).listRecords("app1", "tbl1"),
+    (err: Error) => err instanceof KnowledgeError && /还有下一页，却没给新的翻页位置/.test(err.message),
+  );
+  await assert.rejects(paged((_token, n) => ({ items: rows(n), has_more: true })).listRecords("app1", "tbl1"), /还有下一页，却没给新的翻页位置/);
+  await assert.rejects(
+    paged((_token, n) => ({ items: [], has_more: true, page_token: `p${n}` })).listRecords("app1", "tbl1"),
+    /经验库表格的记录读了 200 页还没读完/,
+  );
+  const fields = await paged((_token, n) => ({ items: [{ field_name: `列${n}` }], has_more: n < 12, page_token: `f${n}` })).listFields("app1", "tbl1");
+  assert.equal(fields.length, 12);
+});
+
+test("KNOWLEDGE_BITABLE 指定的表缺列时，第一次写之前补上；已有的列不动，同一次启动只查一次", async () => {
+  const { api, calls, tables } = fakeBitable();
+  tables.set("tblX", { fields: [{ field_name: "标题", type: 1 }, { field_name: "结论", type: 1 }], records: [] });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "schema", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(dau);
+  const created = calls.filter((c) => c.startsWith("createField"));
+  assert.ok(created.includes("createField 草稿编号") && created.includes("createField 编号") && created.includes("createField 保存时间"));
+  assert.ok(created.includes("createField 取代的经验") && created.includes("createField 取代的经验的草稿编号"));
+  assert.ok(!created.includes("createField 标题") && !created.includes("createField 结论"));
+  assert.deepEqual(new Set(tables.get("tblX")!.fields.map((f) => f.field_name)).size, tables.get("tblX")!.fields.length);
+  await base.save(dau);
+  assert.equal(calls.filter((c) => c.startsWith("createField")).length, created.length);
+});
+
+test("表格里有人手动加的行：文本列是分段数组也能读，没编号的用行号，空行跳过，没有标题或结论的读出来但不拿来检索；类别认不出算其他", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: [{ type: "text", text: "退款" }, { type: "text", text: "多久到账" }], 结论: "3 个工作日", 类别: "常见问题" } },
+      { recordId: "recB", fields: { 标题: "写到一半" } },
+      { recordId: "recC", fields: { 标题: "已归档的", 结论: "旧的", 状态: "已归档", 编号: "K5" } },
+      { recordId: "recD", fields: {} },
+    ],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "manual", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const entries = await backend.list();
+  assert.deepEqual(
+    entries.map((e) => [e.id, e.title, e.category, e.status]),
+    [
+      ["recA", "退款多久到账", "other", "active"],
+      ["recB", "写到一半", "other", "active"],
+      ["K5", "已归档的", "other", "archived"],
+    ],
+  );
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  assert.deepEqual(
+    (await base.search("写到一半")).map((hit) => hit.entry.id),
+    [],
+  );
+  assert.equal((await base.get("recB"))?.incomplete, "结论是空的");
+  // 编号接着表里最大的 K 编号往后排
+  assert.equal((await base.save(dau)).id, "K6");
+});
+
+test("表格里 aiops 经验编号写得不对（不是整个正整数）时当成没填，免得归档 aiops 里别的经验", async () => {
+  const { api, tables } = fakeBitable();
+  const row = (id: string, aiops: string) => ({ recordId: `rec${id}`, fields: { 标题: id, 结论: "结论", 编号: id, "aiops 经验编号": aiops } });
+  tables.set("tblX", {
+    fields: [],
+    records: [row("K1", "31-old"), row("K2", "31,32"), row("K3", "0"), row("K4", "-1"), row("K5", "32"), row("K6", " 33 ")],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "aiops-id", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  assert.deepEqual(
+    (await backend.list()).map((e) => [e.id, e.aiopsId]),
+    [
+      ["K1", undefined],
+      ["K2", undefined],
+      ["K3", undefined],
+      ["K4", undefined],
+      ["K5", 32],
+      ["K6", 33],
+    ],
+  );
+});
+
+test("表格里有两行编号相同（有人复制了行）时不去改它们，免得改错行", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: "K1" } },
+      { recordId: "recB", fields: { 标题: "日活的口径（副本）", 结论: "去重用户数", 编号: "K1" } },
+      { recordId: "recC", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K2" } },
+    ],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "dup", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await assert.rejects(base.archive("K1"), /不止一行的编号是 K1/);
+  assert.equal(tables.get("tblX")!.records[0].fields["状态"], undefined);
+  await base.archive("K2");
+  assert.equal(tables.get("tblX")!.records[2].fields["状态"], "已归档");
+});
+
+test("编号重复的警告里，像是密钥的编号（有人把密钥贴进编号那一列、又复制了这一行）不写出来", async () => {
+  const { api, tables } = fakeBitable();
+  // GitLab 令牌认小写的前缀：统一写法（大写）以后就认不出了，要按表格里的原样查
+  const leaked = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: leaked } },
+      { recordId: "recB", fields: { 标题: "日活的口径（副本）", 结论: "去重用户数", 编号: leaked.toLowerCase() } },
+      { recordId: "recC", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K2" } },
+      { recordId: "recD", fields: { 标题: "留存的口径（副本）", 结论: "次日还打开", 编号: "K2" } },
+    ],
+  });
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "leaked-id", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger });
+  await backend.list();
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /不止一行用了同一个编号：（像是密钥的编号，不写出来） K2。/);
+  assert.ok(!/AbCdEf/i.test(warnings[0]));
+});
+
+test("表格里的编号写成「#K3」「K 3」：按 K3 认，改得到那一行；写法不同、编号一样的两行（K 5 和 k5）算重复，不去改", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: "#K3" } },
+      { recordId: "recB", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K 5" } },
+      { recordId: "recC", fields: { 标题: "留存的口径（副本）", 结论: "次日还打开", 编号: "k5" } },
+    ],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "normalized", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.archive("K3");
+  assert.equal(tables.get("tblX")!.records[0].fields["状态"], "已归档");
+  await assert.rejects(base.archive("K5"), /不止一行的编号是 K 5/);
+  assert.equal(tables.get("tblX")!.records[1].fields["状态"], undefined);
+});
+
+test("飞书接口的错误翻译成能转告的话：缺权限时说要开 bitable:app", async () => {
+  const { api } = fakeBitable();
+  api.fail = new FeishuApiError(99991672, "飞书接口返回错误 99991672：应用未开通权限：[bitable:app]");
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "err", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  await assert.rejects(backend.list(), (err: Error) => err instanceof KnowledgeError && /多维表格权限（bitable:app）/.test(err.message));
+  api.fail = new FeishuApiError(1254302, "飞书接口返回错误 1254302：no permission", 403);
+  await assert.rejects(backend.list(), /添加文档应用/);
+});
+
+test("KNOWLEDGE_BITABLE 要填打开数据表时浏览器里的链接", () => {
+  assert.deepEqual(parseBitableUrl("https://example.feishu.cn/base/AbCd123?table=tblXyZ&view=vew1"), {
+    appToken: "AbCd123",
+    tableId: "tblXyZ",
+    url: "https://example.feishu.cn/base/AbCd123?table=tblXyZ",
+  });
+  assert.throws(() => parseBitableUrl("AbCd123"), /要填多维表格的链接/);
+  assert.throws(() => parseBitableUrl("https://example.feishu.cn/base/AbCd123"), /\?table=tbl/);
+  assert.throws(() => parseBitableUrl("https://example.feishu.cn/wiki/AbCd123?table=tblX"), /\/base\/<app_token>/);
+});
+
+test("两次读表格同时进行：先开始的读后回来时不覆盖新写的行，记 aiops 编号照样找得到", async () => {
+  const { api, tables } = fakeBitable();
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "overlap", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  tables.set("tblX", { fields: [], records: [] });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  await base.save(dau);
+
+  // 回答前检索超时、还在后台读的那次：拿到的是保存新经验之前的表格
+  const list = api.listRecords.bind(api);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  api.listRecords = async (app, table) => {
+    const snapshot = await list(app, table);
+    api.listRecords = list;
+    await gate;
+    return snapshot;
+  };
+  const stale = backend.list();
+  await new Promise((resolve) => setImmediate(resolve));
+  const fresh = new KnowledgeBase(backend, { logger: quiet });
+  const entry = await fresh.save({ ...dau, title: "月活的口径", keywords: "月活,MAU" });
+  assert.equal(entry.id, "K2");
+  release();
+  assert.equal((await stale).length, 1);
+  await fresh.linkAiops(entry, 31);
+  assert.equal(tables.get("tblX")!.records[1].fields["aiops 经验编号"], "31");
+});
+
+test("归档、记 aiops 编号按核对时读到的那一行改：这期间编号改给了别的行、另一次读表格先读完，也不改错行", async () => {
+  const { api, tables } = fakeBitable();
+  tables.set("tblX", {
+    fields: [],
+    records: [
+      { recordId: "recA", fields: { 标题: "日活的口径", 结论: "去重用户数", 编号: "K1" } },
+      { recordId: "recB", fields: { 标题: "留存的口径", 结论: "次日还打开", 编号: "K2" } },
+    ],
+  });
+  const backend = new BitableKnowledgeBackend({ api, stateFile: path.join(dir, "bound-row", "bitable.json"), target: { appToken: "appX", tableId: "tblX" }, share: { chatIds: [], editors: [] }, logger: quiet });
+  const base = new KnowledgeBase(backend, { logger: quiet });
+  const seen = (await base.get("K1", { fresh: true }))!;
+
+  // 归档时读的那次表格回来得晚；这期间有人把 K1 改成 K9、K2 改成 K1，回答前检索又读了一次，先读完
+  const list = api.listRecords.bind(api);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  api.listRecords = async (app, table) => {
+    const snapshot = await list(app, table);
+    api.listRecords = list;
+    await gate;
+    return snapshot;
+  };
+  const archiving = base.archive("K1", { seen });
+  await new Promise((resolve) => setImmediate(resolve));
+  const [a, b] = tables.get("tblX")!.records;
+  a.fields["编号"] = "K9";
+  b.fields["编号"] = "K1";
+  await backend.list();
+  release();
+  await archiving;
+  assert.equal(a.fields["状态"], "已归档");
+  assert.equal(b.fields["状态"], undefined);
+
+  await base.linkAiops(seen, 31);
+  assert.equal(a.fields["aiops 经验编号"], "31");
+  assert.equal(b.fields["aiops 经验编号"], undefined);
+});
+
+test("读数据目录里记的表格出错时不记住，下次再读", async () => {
+  const stateFile = path.join(dir, "flaky", "bitable.json");
+  // 先让它读不了：路径是个目录
+  await mkdir(stateFile, { recursive: true });
+  const { api } = fakeBitable();
+  const backend = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: [], editors: [] }, logger: quiet });
+  await assert.rejects(backend.location());
+  await rm(stateFile, { recursive: true });
+  await writeFile(stateFile, JSON.stringify({ appToken: "app1", tableId: "tbl1", url: "https://example.feishu.cn/base/app1?table=tbl1", shared: [] }));
+  assert.equal(await backend.location(), "https://example.feishu.cn/base/app1?table=tbl1");
+});

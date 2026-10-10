@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CallToolResult, Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "../src/config.js";
+import { AiopsLessons } from "../src/knowledge-aiops.js";
 import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
 import { MCP_RESULT_LIMIT } from "../src/mcp-result.js";
 import { type FakeMcp, freePort, startFakeMcp } from "./helpers/fake-mcp.js";
@@ -158,6 +159,106 @@ test("服务端返回 isError 时把错误原文交给模型，审计日志记�
   await assert.rejects(toolOf(hub, "aiops_query_logs").run({ logql: "{app=" }, { signal }), /aiops 返回错误：LogQL 语法错误：缺少 }/);
   assert.equal(log.find(/MCP 调用 aiops\.query_logs/)?.level, "warn");
   assert.match(log.find(/MCP 调用 aiops\.query_logs/)!.text, /出错/);
+});
+
+test("程序自己调用（经验库检索和同步）：没开给模型的工具也能调，审计日志注明是程序调用；工具报错、没有这个工具时抛错", async () => {
+  const server = await fake({ call: (name) => (name === "archive_lesson" ? text("经验 #9 不存在", true) : text(JSON.stringify({ saved: true, id: 31 }))) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+
+  assert.ok(hub.hasTool("aiops", "save_lesson"));
+  assert.ok(!hub.hasTool("aiops", "no_such_tool"));
+  assert.ok(!hub.hasTool("other", "save_lesson"));
+  assert.ok(!hub.tools(task).some((tool) => tool.spec.name === "aiops_save_lesson"), "写工具不给模型");
+
+  assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+  assert.deepEqual(server.calls.at(-1), { name: "save_lesson", args: { title: "t" } });
+  assert.match(log.find(/MCP 调用 aiops\.save_lesson/)!.text, /（程序调用） chat=oc_1 sender=ou_1 .*结果=\d+字/);
+
+  await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /aiops 返回错误：经验 #9 不存在/);
+  await assert.rejects(hub.callDirect("aiops", "no_such_tool", {}, task), /aiops 没有 no_such_tool 这个工具/);
+  await assert.rejects(hub.callDirect("other", "save_lesson", {}, task), /other 现在连不上/);
+});
+
+test("程序自己调用：读的工具要在配置里开了才调（管理员没开 search_knowledge 时回答前不查 aiops 经验库、也不答应同步），写工具不看这个清单；配成 * 的都能调", async () => {
+  const lessonTools = [...TOOLS, remoteTool("search_knowledge", "检索经验"), remoteTool("get_knowledge", "经验详情")];
+  const server = await fake({ tools: lessonTools, call: () => text(JSON.stringify({ hits: [] })) });
+  const quiet = recorder().logger;
+  const hub = await hubFor([config(server.url)], { logger: quiet });
+  assert.ok(!hub.hasTool("aiops", "get_targets_health"), "服务端有、配置里没开的读工具");
+  await assert.rejects(hub.callDirect("aiops", "get_targets_health", {}, task), /aiops 的 get_targets_health 没开（要开就加进 MCP_AIOPS_TOOLS）/);
+  assert.ok(hub.hasTool("aiops", "query_logs"));
+  assert.ok(hub.hasTool("aiops", "save_lesson") && hub.hasTool("aiops", "archive_lesson"), "写工具由确认卡片把关，不用开给模型");
+
+  const lessons = new AiopsLessons(hub, "aiops", quiet);
+  assert.equal(lessons.searchable, false);
+  assert.deepEqual(await lessons.search("gateway-api 报 code=8", task), []);
+  assert.equal(lessons.lacksWriteTools, true, "再试同步时要用的检索、取详情没开，不答应同步");
+  assert.deepEqual(lessons.missingWriteTools, ["search_knowledge", "get_knowledge"]);
+  assert.equal(server.calls.length, 0);
+
+  const opened = await hubFor([config(server.url, { tools: ["query_logs", "search_knowledge", "get_knowledge"] })], { logger: quiet });
+  assert.equal(new AiopsLessons(opened, "aiops", quiet).writable, true);
+  const all = await hubFor([config(server.url, { tools: "*" })], { logger: quiet });
+  assert.ok(all.hasTool("aiops", "get_targets_health") && all.hasTool("aiops", "search_knowledge"));
+  assert.deepEqual(await new AiopsLessons(all, "aiops", quiet).search("gateway-api 报 code=8", task), []);
+  assert.deepEqual(server.calls.map((call) => call.name), ["search_knowledge"]);
+});
+
+test("程序自己调用：有 structuredContent 时按它的 JSON 返回，文字部分是给人看的说明也一样；没有文字时也是", async () => {
+  const server = await fake({ call: () => ({ content: [], structuredContent: { saved: true, id: 31 } }) });
+  const hub = await hubFor([config(server.url)], { logger: recorder().logger });
+  assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+
+  const both = await fake({ call: () => ({ content: [{ type: "text", text: "已存为经验 #31" }], structuredContent: { saved: true, id: 31 } }) });
+  const hub2 = await hubFor([config(both.url)], { logger: recorder().logger });
+  assert.equal(await hub2.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+});
+
+test("报错只放在 structuredContent 里、没有文字时：照样认出服务繁忙去重试，报错和审计日志里带上它", async () => {
+  let busy = 1;
+  const server = await fake({
+    call: (name) =>
+      name === "archive_lesson"
+        ? { content: [], structuredContent: { error: "经验 #9 不存在" }, isError: true }
+        : busy-- > 0
+          ? { content: [], structuredContent: { error: "服务繁忙，请稍后重试" }, isError: true }
+          : { content: [], structuredContent: { saved: true, id: 31 } },
+  });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+  assert.equal(await hub.callDirect("aiops", "save_lesson", { title: "t" }, task), JSON.stringify({ saved: true, id: 31 }));
+  assert.equal(server.calls.filter((call) => call.name === "save_lesson").length, 2);
+  assert.match(log.find(/MCP 调用 aiops\.save_lesson/)!.text, /繁忙重试=1$/);
+
+  await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /aiops 返回错误：\{"error":"经验 #9 不存在"\}/);
+  assert.match(log.find(/MCP 调用 aiops\.archive_lesson/)!.text, /出错 结果=\d+字：\{"error":"经验 #9 不存在"\}/);
+});
+
+test("程序自己调用：报错原文里像有密钥时，报错（会列在卡片上）和审计日志里都不带原文；模型调用的报错照常给原文", async () => {
+  const leaked = `连接失败：mysql://aiops:${["Correct", "Horse", "Battery9"].join("")}@db:3306/aiops`;
+  const server = await fake({ call: () => text(leaked, true) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+
+  const err = await hub.callDirect("aiops", "archive_lesson", { id: 9 }, task).then(
+    () => assert.fail("应该报错"),
+    (error: Error) => error,
+  );
+  assert.equal(err.message, "aiops 返回错误：（报错原文里像是有密钥或个人信息，不列出来）");
+  const audit = log.find(/MCP 调用 aiops\.archive_lesson/)!.text;
+  assert.match(audit, /出错 结果=\d+字：（报错原文里像是有密钥或个人信息，不列出来）/);
+  assert.ok(!audit.includes("CorrectHorse"));
+
+  await assert.rejects(toolOf(hub, "aiops_query_logs").run({ logql: "{app=\"x\"}" }, { signal }), (error: Error) => error.message.includes(leaked));
+});
+
+test("程序自己调用：报错原文里有手机号、身份证号时也不带原文", async () => {
+  const server = await fake({ call: () => text("经验 #9 的创建人 13800138000 没有权限", true) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+  await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /^Error: aiops 返回错误：（报错原文里像是有密钥或个人信息，不列出来）$/);
+  assert.ok(!log.find(/MCP 调用 aiops\.archive_lesson/)!.text.includes("13800138000"));
 });
 
 test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
@@ -344,6 +445,7 @@ test("连不上不影响启动，提示词里说明连不上；之后自动重�
   const hub = await hubFor([config(`http://127.0.0.1:${port}/mcp`)], { logger: log.logger, retryMs: [50] });
 
   assert.deepEqual(hub.tools(task), []);
+  assert.ok(!hub.connected("aiops"), "还没连上");
   assert.match(hub.prompt([]) ?? "", /aiops 现在连不上（程序在自动重连），这次没有 aiops_ 开头的工具/);
   assert.equal(log.find(/MCP aiops 连不上/)?.level, "warn");
   assert.match(log.find(/MCP aiops 连不上/)!.text, /0\.05 秒后重试；机器人照常运行，这期间没有 aiops 的工具/);
@@ -353,6 +455,8 @@ test("连不上不影响启动，提示词里说明连不上；之后自动重�
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.equal(hub.tools(task).length, 3);
+  assert.ok(hub.connected("aiops"));
+  assert.ok(!hub.connected("other"));
   assert.ok(log.find(/MCP aiops：已连上/));
   assert.ok(server.initializes >= 1);
 });
@@ -375,6 +479,9 @@ test("服务端要求按 MCP 任务方式调用的工具不开；工具清单分
     ["aiops_query_logs"],
   );
   assert.equal(log.find(/build_report 只能按 MCP 任务（tasks）方式调用/)?.level, "warn");
+  // 程序直接调用也不认它：经验库不会以为能同步，卡片上不答应
+  assert.ok(!hub.hasTool("aiops", "build_report"));
+  await assert.rejects(hub.callDirect("aiops", "build_report", {}, task), /aiops 没有 build_report 这个工具/);
 
   let pages = 0;
   const looping = await fake({
