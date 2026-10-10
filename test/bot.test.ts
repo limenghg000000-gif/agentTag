@@ -1445,28 +1445,40 @@ test("排查过以后把问题推到服务之外的结论，打回一次让模�
     "结论：并非服务端问题（把握：中）",
     "这不是我们的 bug，是淘宝平台限制",
     "服务本身没有问题",
-    "属于淘宝平台的限制，让用户换个链接再试",
+    "属于淘宝平台的限制",
+    "淘宝拒绝了这个链接，不过建议用户重新分享",
+    "淘宝无法识别，建议用户换个链接再试",
     "属于用户侧问题",
     "这个无需修复",
+    // 同一句里有举例的分句，说结论的分句照样算
+    "示例链接被淘宝拒绝，不是服务故障",
   ];
   for (const answer of deflecting) {
     assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
-    // 调过代码工具也算在排查
+    // 调过代码工具也算在排查，调用失败的也算
     assert.equal(review("code_search")(answer), DEFLECTED_ANSWER, answer);
-    // 没排查过（没调工具、只调了群记忆、只读了剧本这类说明）的不管，那是别的检查的事
+    // 没排查过（没调工具、只调了群记忆）的不管，那是别的检查的事
     assert.equal(review()(answer), undefined, answer);
     assert.equal(review("memory_search")(answer), undefined, answer);
   }
   const fine = [
-    // 看状态、说某条线索不是根因、说该我们修的，都不是把问题推出去
+    // 看状态、没说到服务、说某条线索不是根因
     "gateway-api 现在没有异常，最近 1 小时错误率 0.1%",
+    "这次 Pod 重启不是故障，是正常的滚动发布",
     "URL 解析失败那条 warn 不是故障原因，是同款推荐支路的连带报错",
-    "这条报错不是问题所在，真正的原因在主流程",
+    "这条报错不是服务问题所在，真正的原因在主流程",
+    "不是系统故障导致的",
+    // 排除外部原因、说是我们自己的问题
+    "这不是淘宝平台限制，是我们解析 pages-fast 的 bug，要修代码",
+    "不是用户侧的问题，是转链服务没处理这种链接",
+    "不是代码问题，是配置里的超时设成了 1s，改配置就行",
     "问题在转链服务没处理 pages-fast 这种落地页，要修代码",
+    // 否定、假设、修好以后让用户重试
     "修好以后不需要用户重新分享",
-    "除非服务故障，这个接口不会返回 code=8",
     "不建议让用户重新分享，应该在解析阶段识别",
-    // 举例的句子
+    "除非服务故障，这个接口不会返回 code=8",
+    "已修复并部署，通知用户重试即可",
+    // 举例的分句
     "比如回答「不是服务故障」之前，要先搜代码",
   ];
   for (const answer of fine) {
@@ -1505,6 +1517,26 @@ test("2026-10-10 转链排查那种回答：只看日志就说不是服务故障
   assert.equal(requests.length, 3);
   assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${DEFLECTED_ANSWER}` });
   assert.deepEqual(markdowns(sent), [second]);
+});
+
+test("没有代码工具时不查推出去的结论：要模型去搜代码，它也搜不了", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => JSON.stringify({ logs: [{ msg: "sub_code=26 链接不符合规范" }] }),
+  };
+  const answer = "淘宝返回 sub_code 26，不是服务故障";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: answer, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("用户反馈转链失败，排查一下"));
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [answer]);
 });
 
 test("代码和线上数据两项检查都没过时，重做时一起告诉模型", async () => {

@@ -277,7 +277,7 @@ async function runTask(
       ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
-      ...(deps.mcp?.names.length || hasCodeTools ? [reviewDeflectedAnswer(deps.mcp?.names ?? [], succeeded)] : []),
+      ...(hasCodeTools ? [reviewDeflectedAnswer(deps.mcp?.names ?? [], attempted)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
     // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
@@ -1054,44 +1054,65 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
   };
 }
 
-/** 「不是故障原因」「不是问题所在」说的是某条线索不是根因，不是把问题推出去 */
-const NOT_CAUSE = String.raw`(?!\s*(?:的|原因|根因|根源|源头|点|所在))`;
+/** 「不是服务故障的原因」「不是服务问题所在」「不是系统故障导致的」说的是某条线索不是根因，不是把问题推出去 */
+const NOT_CAUSE = String.raw`(?!\s*(?:的|原因|根因|根源|源头|点|所在|导致|引起|造成))`;
+/** 否定的前面：「不是淘宝平台限制」「不属于用户侧问题」说的是排除了外部原因 */
+const NOT_BEFORE = String.raw`(?<!(?:不|非|并非|并不)(?:是|属于|在)?)`;
+/** 我们这边的主语。「代码」「接口」不算：「不是代码问题，是配置里的超时设成了 1s」说的还是服务自己的问题 */
+const OUR_SIDE = String.raw`(?:我们|我方)?的?(?:服务端?|系统|后端|我们|我方)`;
 
 /**
- * 把问题推到服务之外的结论：「不是服务故障」「服务本身没有问题」「建议用户重新分享」「属于淘宝平台限制」「无需修复」。
- * 「服务没有异常」这类看状态的说法不算，要说到不是故障、本身没问题、让用户自己处理
+ * 把问题推到服务之外的结论：「不是服务故障」「服务本身没有问题」「属于淘宝平台限制」「用户侧问题」「无需修复」。
+ * 要说到是谁的问题：「服务没有异常」这类看状态的、「这次重启不是故障，是正常发版」这类没说到服务的都不算
  */
 const DEFLECTING = new RegExp(
   [
-    String.raw`(?:不是|并非|并不是|不属于|(?<![除是])非)(?:我们|我方)?的?(?:服务端?|系统|后端|代码|程序|接口)?(?:本身)?的?\s*(?:故障|bug|缺陷)${NOT_CAUSE}`,
-    String.raw`(?:不是|并非|并不是|不属于)(?:我们|我方)?的?(?:服务端?|系统|后端|代码|程序|接口)(?:本身)?的?问题${NOT_CAUSE}`,
-    String.raw`(?:(?:服务端?|系统|后端|代码|程序|接口)本身|(?:我们|我方)(?:这边|这里|侧)?)(?:没有|没|无|不存在|并无)\s*(?:问题|故障|bug)`,
-    String.raw`(?<![不无别勿][^，,。；;！!？?\n]{0,3})(?:建议|请|让|需要|可以|引导|提示|告诉|通知)用户[^。；;！!？?\n]{0,20}?(?:重新|再次|重试|再试|换个|换一个|换成|改用|手动)`,
-    String.raw`用户(?:侧|端|自己|自身)的?(?:问题|原因|操作)`,
-    String.raw`(?:属于|是)(?:淘宝|天猫|京东|拼多多|抖音|微信|支付宝|第三方|上游|对方|外部)(?:平台)?(?:侧|方|端|那边)?的?(?:限制|问题|原因|规则|策略|风控)`,
-    String.raw`(?:无需|无须|不用|不需要|没必要)(?:我们|开发)?(?:修复|改动代码|修改代码|改代码)`,
+    String.raw`(?:不是|并非|并不是|不属于|(?<![除是])非)${OUR_SIDE}(?:本身)?的?\s*(?:故障|问题|bug|缺陷)${NOT_CAUSE}`,
+    String.raw`(?:(?:服务端?|系统|后端)本身|(?:我们|我方)(?:这边|这里|侧))(?:没有|没|无|不存在|并无)\s*(?:问题|故障|bug)`,
+    String.raw`${NOT_BEFORE}用户(?:侧|端|自己|自身)的?(?:问题|原因|操作)`,
+    String.raw`${NOT_BEFORE}(?:属于|是)(?:淘宝|天猫|京东|拼多多|抖音|微信|支付宝|第三方|上游|对方|外部)(?:平台)?(?:侧|方|端|那边)?的?(?:限制|问题|原因|规则|策略|风控)`,
+    String.raw`(?:无需|无须|不用|不需要|没必要)(?:我们|开发)?(?:修复|修改?)`,
   ].join("|"),
   "i",
 );
+/**
+ * 让用户自己重来：「建议用户在商品详情页重新分享」「让用户换个链接再试」。「不建议让用户重新分享」「修好以后不需要用户重新分享」不算；
+ * 同一句里说了已经修了、部署了（「已修复并部署，通知用户重试即可」）也不算
+ */
+const USER_REDO = new RegExp(
+  String.raw`(?<!(?:不|不要|不用|不必|无需|无须|没必要)(?:建议|要|用|必|需)?)(?:建议|请|让|需要|可以|引导|提示|告诉|通知)用户[^。；;！!？?\n]{0,20}?(?:重新|再次|重试|再试|换个|换一个|换成|改用|手动)`,
+);
+const FIXED = /修复|修好|已修|改好|部署|上线|发版|hotfix/i;
+
+/** 回答里有没有把问题推出去的结论。举例的分句（「比如回答『不是服务故障』之前…」）不算 */
+function deflects(answer: string): boolean {
+  return answer.split(/(?<=[。；;！!？?\n])/).some((sentence) => {
+    const stated = sentence
+      .split(/(?<=[，,])/)
+      .filter((clause) => !EXAMPLE.test(clause))
+      .join("");
+    return DEFLECTING.test(stated) || (USER_REDO.test(stated) && !FIXED.test(sentence));
+  });
+}
 
 export const DEFLECTED_ANSWER =
   "（系统检查）你的回答把问题归到了服务之外（比如「不是服务故障」「建议用户重新操作」「属于平台限制」）。这类结论会让大家不再往下查，下之前要拿代码核对清楚：\n" +
   "1. 拿失败请求的特征（链接的域名和关键参数、报错原文、错误码）搜代码，从入口沿主流程看这种输入在哪一步被处理或拒绝，不要只看报错附近的几行；\n" +
   "2. 日志是当时线上那一版打的，代码可能已经改过：能查提交历史、线上版本就查，查不了就在结论里写明看的是哪个分支的代码；\n" +
   "3. 结论分开写：当时为什么失败（带日志时间）、现在的代码处不处理、线上部署了没有。\n" +
-  "核对完还是服务之外的问题，就照常这么写，并写明核对了哪些代码；读不到相关代码就直说没法确认是不是服务的问题。不要提这段检查。";
+  "核对完还是服务之外的问题，就照常这么写，并写明核对了哪些代码（只写这次用代码工具查到的文件和行号）；读不到相关代码就直说没法确认是不是服务的问题。不要提这段检查。";
 
 /**
- * 排查过（成功调过线上工具或代码工具）以后，回答把问题推到服务之外时，打回一次，让模型先拿代码核对。
+ * 排查过（调过线上工具或代码工具，成没成功都算）以后，回答把问题推到服务之外时，打回一次，让模型先拿代码核对。
  * 2026-10-10 转链排查：模型只看日志就定了「淘宝拒绝、不是服务故障，让用户重新分享」，被打回补查代码时 5 次搜索都在同款推荐那条支路上，
  * 没拿链接里的 pages-fast、topIds 搜一下，漏掉了当天已经合进 master 的修复。这类结论会让用户和开发都不再往下查。
- * 核对完还是这个结论就照常发（重做只有一次）；举例的句子不算
+ * 只在有代码工具时装（要模型去搜代码）；核对完还是这个结论就照常发（重做只有一次）
  */
-export function reviewDeflectedAnswer(servers: readonly string[], succeeded: ReadonlySet<string>) {
+export function reviewDeflectedAnswer(servers: readonly string[], attempted: ReadonlySet<string>) {
   const prefixes = servers.map((name) => `${name}_`);
   return (answer: string): string | undefined => {
-    const investigated = [...succeeded].some((name) => isCodeTool(name) || prefixes.some((prefix) => name.startsWith(prefix)));
-    return investigated && DEFLECTING.test(withoutExamples(answer)) ? DEFLECTED_ANSWER : undefined;
+    const investigated = [...attempted].some((name) => isCodeTool(name) || prefixes.some((prefix) => name.startsWith(prefix)));
+    return investigated && deflects(answer) ? DEFLECTED_ANSWER : undefined;
   };
 }
 
