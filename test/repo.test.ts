@@ -833,4 +833,9 @@ test("读代码只要了一小段：扩到所在的整个函数，同一个函�
   assert.match(out.text, /\n11\| \tif id := common\.ParseTbHalfDetailItemId/);
   // 没给止行（从某行往后读）：照旧
   assert.match(numberedLines(new ToolOutputBuilder("golang/appservice"), "services/goods/tb.go", go.join("\n"), 7, undefined).text, /下面是第 7 到 19 行）/);
+  // 函数不到 250 行但一次给不完（行很长）：不扩，照要的给，不能从函数头开始给到一半就截断、要的几行反而没给
+  const wide = ["func Wide() {", ...Array.from({ length: 100 }, (_, i) => `\tx${i} := "${"y".repeat(300)}"`), "}"];
+  assert.deepEqual(enclosingFunction(wide, 90, 92, "a.go"), { start: 1, end: 102, name: "Wide" });
+  const narrow = numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", wide.join("\n"), 90, 92);
+  assert.match(narrow.text, /^a\.go（共 102 行，下面是第 90 到 92 行，要看后面用 start_line=93）\n90\| \tx88 /);
 });

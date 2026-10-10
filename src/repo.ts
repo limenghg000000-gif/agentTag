@@ -1297,20 +1297,12 @@ export function numberedLines(
   // 只要了一小段：扩到所在的整个函数，同一个函数里后面的分支也看得到
   const asked = { from, to };
   const fn = end ? enclosingFunction(lines, from, to, file) : undefined;
-  if (fn && (fn.start < from || fn.end > to)) {
+  // 整个函数一次给不完（超过 MAX_READ_CHARS 字）就不扩：不然从函数头开始给，没到要的那几行就截断了
+  if (fn && (fn.start < from || fn.end > to) && lastShown(lines, fn.start, fn.end) === fn.end) {
     from = fn.start;
     to = fn.end;
   }
-  let size = 0;
-  let last = from - 1;
-  for (let i = from; i <= to; i++) {
-    const length = `${i}| ${lines[i - 1]}`.length;
-    if (size + length > MAX_READ_CHARS && i > from) {
-      break;
-    }
-    size += length + 1;
-    last = i;
-  }
+  const last = lastShown(lines, from, to);
   out.parts(
     [shownPath(file), { path: file }],
     "（",
@@ -1324,6 +1316,21 @@ export function numberedLines(
     out.parts([`${i}|`, { path: file, lines: [i, i] }], ` ${lines[i - 1]}`);
   }
   return out.build();
+}
+
+/** 从 from 往下给到 to，不超过 MAX_READ_CHARS 字时给到哪一行（至少给一行） */
+function lastShown(lines: readonly string[], from: number, to: number): number {
+  let size = 0;
+  let last = from - 1;
+  for (let i = from; i <= to; i++) {
+    const length = `${i}| ${lines[i - 1]}`.length;
+    if (size + length > MAX_READ_CHARS && i > from) {
+      break;
+    }
+    size += length + 1;
+    last = i;
+  }
+  return last;
 }
 
 /** 只要了一小段时，所在的函数最多这么多行就整段给出；更长的照要的给 */
