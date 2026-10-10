@@ -16,6 +16,7 @@ import {
   KnowledgeError,
   type KnowledgeHit,
   MAX_TITLE_CHARS,
+  maskPersonal,
   MissingEntryError,
   normalizeDraft,
   normalizeId,
@@ -229,7 +230,8 @@ export class KnowledgeDesk {
    * 回答前检索：团队经验库和 aiops 经验库一起查，够相近的写进提示词。已经同步到 aiops 的排查经验只列团队经验库那一条。
    * 每个库最多等 lookupMs（飞书接口不认中止信号，到时间就不等了），向量没算完时团队经验库只按关键词。
    * 一边没查成时用另一边的，查了的都没查成时返回 undefined。用户停止任务时抛出中止错误。
-   * 提问（连同话题里前几次的提问）里像是有密钥时不拿去查 aiops：查询会发到 aiops、记进 MCP 审计日志
+   * 提问（连同话题里前几次的提问）里像是有密钥时不拿去查 aiops：查询会发到 aiops、记进 MCP 审计日志。
+   * 手机号、身份证号格式确定，换成 *** 再查 aiops（用户反馈的问题常带着号码，整条不查就漏了 aiops 里的经验）
    */
   async lookup(query: string, task: McpTaskContext, signal?: AbortSignal): Promise<KnowledgeLookup | undefined> {
     const { base, aiops } = this.options;
@@ -244,7 +246,7 @@ export class KnowledgeDesk {
       const queryAiops = aiops?.searchable === true && !secret;
       const [team, lessons] = await Promise.allSettled([
         raceAbort(base.search(query, { limit: LOOKUP_HITS, semanticDeadline: semantic.signal, ...(signal ? { signal } : {}) }), deadline),
-        queryAiops ? raceAbort(aiops.search(query, task, deadline), deadline) : Promise.resolve([]),
+        queryAiops ? raceAbort(aiops.search(maskPersonal(query), task, deadline), deadline) : Promise.resolve([]),
       ]);
       signal?.throwIfAborted();
       const missed: string[] = [];

@@ -8,6 +8,7 @@ import {
   KnowledgeBase,
   type KnowledgeEntry,
   KnowledgeError,
+  maskPersonal,
   MissingEntryError,
   normalizeDraft,
   renderHitsForPrompt,
@@ -3595,4 +3596,18 @@ test("草稿、归档原因、发起人名字里的 <at id=all></at>、<font> �
   const archive = cardText((sent.at(-1)!.input as { card: any }).card);
   assert.match(archive, /归档原因：&lt;at id=all&gt;&lt;\/at&gt;口径改了/);
   assert.doesNotMatch(archive, /<at /);
+});
+
+test("回答前检索：提问里的手机号、身份证号换成 *** 再查 aiops，不发过去、不进审计日志；团队经验库、aiops 照样查", async () => {
+  const id = idCard("11010519491231002");
+  const { base, desk, calls } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  const found = await desk.lookup(`gateway-api 报 code=8，用户 13800138000、+86 139-0013-9000 下单失败，身份证 ${id}`, task);
+  assert.deepEqual(found?.ids, ["K1", "aiops#31", "aiops#40"]);
+  assert.equal(found?.aiopsSkipped, undefined);
+  const sent = calls.filter((call) => call.tool === "search_knowledge").map((call) => String(call.args.text));
+  assert.deepEqual(sent, ["gateway-api 报 code=8，用户 ***、*** 下单失败，身份证 ***"]);
+  // 打了码的、校验位不对的、长数字里的一段照原样
+  const wrong = id.slice(0, 17) + (id[17] === "1" ? "2" : "1");
+  assert.equal(maskPersonal(`用户 138****8000，号码 ${wrong}，订单 2026101013800138000`), `用户 138****8000，号码 ${wrong}，订单 2026101013800138000`);
 });

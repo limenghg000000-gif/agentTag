@@ -1431,6 +1431,13 @@ export function findPersonal(text: string): string | undefined {
   return [...text.matchAll(ID_CARD)].some(([id]) => validIdCard(id)) ? "身份证号" : undefined;
 }
 
+const MOBILE_ALL = new RegExp(MOBILE.source, "g");
+
+/** 手机号、身份证号（校验位对的）换成 ***，别的照旧：提问要发到别处（aiops 检索、审计日志）时用，号码对查相似经验没用 */
+export function maskPersonal(text: string): string {
+  return text.replace(MOBILE_ALL, "***").replace(ID_CARD, (id) => (validIdCard(id) ? "***" : id));
+}
+
 /** 像是密钥或个人信息（手机号、身份证号）的是哪一种；没有时返回 undefined。表格、aiops 这些别处能改的内容要给群里看、给模型看之前用它查 */
 export function findSensitive(text: string): string | undefined {
   return findSecret(text) ?? findPersonal(text);
