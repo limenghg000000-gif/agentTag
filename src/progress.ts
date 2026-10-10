@@ -45,13 +45,15 @@ const THOUGHT_NOTE = "💭 是模型的思考草稿，里面的猜测没有核�
  */
 export function renderProgressCard(state: ProgressState, taskId: string, now = Date.now()): object {
   const total = state.thoughts?.length ?? 0;
+  const fits = (card: object) => Buffer.byteLength(JSON.stringify(card)) <= MAX_CARD_BYTES;
   // 卡片太大时从最早的一段思考开始，只留标题、去掉正文，直到放得下
   let omitted = 0;
   let card = buildProgressCard(state, taskId, now, omitted);
-  while (omitted < total && Buffer.byteLength(JSON.stringify(card)) > MAX_CARD_BYTES) {
+  while (omitted < total && !fits(card)) {
     card = buildProgressCard(state, taskId, now, ++omitted);
   }
-  return card;
+  // 正文全去掉还放不下（步骤太多、步骤名很长）：不显示思考，和以前一样只列最近的步骤
+  return total > 0 && !fits(card) ? buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0) : card;
 }
 
 /** omitted：最早的几段思考只显示标题、不显示正文 */

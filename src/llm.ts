@@ -173,7 +173,8 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
         case "length":
           return withUsage({ text, finish: "length" });
         case "content_filter":
-          return withUsage({ text, finish: "filtered" });
+          // 回答被审核拦下时思考也不带出去
+          return usage ? { text, finish: "filtered", usage } : { text, finish: "filtered" };
         default:
           return withUsage({ text, finish: "stop" });
       }

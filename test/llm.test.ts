@@ -118,6 +118,14 @@ test("带回模型返回的思考内容（reasoning_content）；没有或只有
   assert.deepEqual(await ask(), { text: "结论：链接不规范", finish: "stop", reasoning: "先按链接 ID 搜 req_id，再查全链路。" });
   assert.deepEqual(await ask(), { text: "结论：链接不规范", finish: "stop" });
   assert.deepEqual(await ask(), { text: "结论：链接不规范", finish: "stop" });
+
+  // 回答被审核拦下时思考也不带出去
+  const filtered = withThought("被拦下的思考");
+  filtered.body.choices[0].finish_reason = "content_filter";
+  responses.push(filtered);
+  const result = await ask();
+  assert.equal(result.finish, "filtered");
+  assert.equal(result.reasoning, undefined);
 });
 
 test("带回模型服务返回的用量，包括思考用掉的 token", async () => {

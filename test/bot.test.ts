@@ -1140,6 +1140,24 @@ test("回答照抄了剧本里的核对记录（提交号）：打回时点名�
   assert.deepEqual(markdowns(sent), ["淘宝返回「淘口令生成：链接不符合规范」"]);
 });
 
+test("回答被模型服务的内容审核拦下时，卡片上前面几轮的思考也去掉", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }], reasoning: "先查资料 A" },
+    { text: "", finish: "filtered" },
+  ];
+  const { sent, updates, handle } = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool] });
+
+  await handle(message("查一下"));
+
+  assert.match(markdowns(sent)[0], /内容审核拦下/);
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|先查资料 A/);
+});
+
 test("回答因为没查证被拦下时，卡片上的思考也去掉", async () => {
   const queryLogs: Tool = {
     spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },

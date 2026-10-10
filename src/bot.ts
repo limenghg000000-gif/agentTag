@@ -346,8 +346,8 @@ async function runTask(
         blockedCode = true;
       }
     }
-    // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着
-    if (answer === BLOCKED_OPS_ANSWER || blockedCode) {
+    // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
+    if (answer === BLOCKED_OPS_ANSWER || blockedCode || result.finish === "filtered") {
       state.thoughts = undefined;
     }
     state.phase = "done";

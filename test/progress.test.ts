@@ -120,6 +120,15 @@ test("卡片超过大小上限时，从最早的一段思考开始去掉正文�
   assert.ok(contents.some((c) => c.startsWith("**💭 第 8 轮，1 秒**\n第8段思")));
 });
 
+test("思考正文全去掉还放不下时（步骤太多）不显示思考，和以前一样只列最近的步骤", () => {
+  const steps = Array.from({ length: 200 }, (_, i) => ({ id: `${i}`, label: `aiops · 查日志 ${"x".repeat(150)} ${i}`, status: "ok" as const }));
+  const card = renderProgressCard(state({ phase: "done", endedAt: 1000, steps, thoughts: [{ round: 1, ms: 1000, text: "想", at: 0 }] }), "t") as any;
+
+  assert.ok(Buffer.byteLength(text(card)) <= MAX_CARD_BYTES);
+  assert.doesNotMatch(text(card), /💭/);
+  assert.match(card.body.elements[0].elements[0].content, /^…前面还有 188 步/);
+});
+
 test("formatDuration", () => {
   assert.equal(formatDuration(400), "0 秒");
   assert.equal(formatDuration(59_400), "59 秒");
