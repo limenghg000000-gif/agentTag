@@ -322,7 +322,7 @@ async function runTask(
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
-      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || inQuestion(text, line)).filter(
+      const unseen = unseenCodeCitations(result.text, (text, line, branch) => seen(text, line, branch) || inQuestion(text, line)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -449,6 +449,12 @@ const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs
 const CODE_PATHS = new RegExp(`(?<![\\w./-])((?:[\\w.-]+\\/)+[\\w.-]+\\.${CODE_EXT})(?![\\w/-]|\\.\\w)`, "g");
 /** 反引号里带空格的路径（`src/my files/app.ts:12`）：CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations） */
 const SPACED_CODE_PATHS = new RegExp(`(?<=\`)((?:[\\w.-]+(?: [\\w.-]+)*\\/)+[\\w.-]+(?: [\\w.-]+)*\\.${CODE_EXT})(?=[\`:#])`, "g");
+/**
+ * 回答里明说是分支的路径（分支名可以长得像路径）：前面写着「分支」「branch」「切到」，或者后面跟着「分支」「branch」「@ 提交号」，
+ * 如「`feature/foo.ts` 分支」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」
+ */
+const BRANCH_BEFORE = /(?:分支|\bbranch|切到|切换到)\s*[:：]?\s*[`'"“「*]*$/i;
+const BRANCH_AFTER = /^[`'"”」*]*\s*(?:分支|branch\b|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
 /** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
 const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
 /** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
@@ -483,8 +489,8 @@ export interface CodeCitation {
   located: boolean;
 }
 
-/** 认不认得回答里的路径、提交号；line 是路径后面写的行号 */
-export type CitationCheck = (text: string, line?: number) => boolean;
+/** 认不认得回答里的路径、提交号；line 是路径后面写的行号，branch 是回答里明说了这是个分支（见 BRANCH_BEFORE） */
+export type CitationCheck = (text: string, line?: number, branch?: boolean) => boolean;
 
 /**
  * 回答里引用、但 seen 认不出来的代码位置（文件路径、行号和提交号）。
@@ -496,9 +502,11 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
     const at = LINE_AFTER_PATH.exec(answer.slice(end));
     return at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
   };
+  const branchAt = (start: number, end: number) =>
+    BRANCH_BEFORE.test(answer.slice(Math.max(0, start - 12), start)) || BRANCH_AFTER.test(answer.slice(end));
   const cites = new Map<string, CodeCitation>();
-  const check = (path: string, line: number | undefined) => {
-    if (!seen(path, line)) {
+  const check = (path: string, line: number | undefined, start: number) => {
+    if (!seen(path, line, branchAt(start, start + path.length))) {
       const text = line === undefined ? path : `${path}:${line}`;
       cites.set(text, { text, located: line !== undefined });
     }
@@ -512,12 +520,12 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
     const line = lineAfter(match.index + path.length);
     if (path.includes(" ") && (line !== undefined || seen(path, line))) {
       spans.push([match.index, match.index + path.length]);
-      check(path, line);
+      check(path, line, match.index);
     }
   }
   for (const match of answer.matchAll(CODE_PATHS)) {
     if (!spans.some(([from, to]) => match.index >= from && match.index < to)) {
-      check(match[1], lineAfter(match.index + match[1].length));
+      check(match[1], lineAfter(match.index + match[1].length), match.index);
     }
   }
   for (const match of answer.matchAll(COMMIT_REFS)) {
@@ -550,7 +558,7 @@ export interface ToolEvidence {
 export function codeEvidence(repos: readonly string[], results: readonly ToolEvidence[]): CitationCheck {
   // 任务进行中结果还会变多，按条数缓存
   let cache: { size: number; facts: CodeFacts } | undefined;
-  return (cite, line) => {
+  return (cite, line, branch) => {
     if (cache?.size !== results.length) {
       cache = { size: results.length, facts: codeFacts(results) };
     }
@@ -570,12 +578,13 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
         const sha = path.toLowerCase();
         found = facts.commits.some((seen) => inRepo(seen) && seen.sha.startsWith(sha));
       } else {
+        // 分支名可以长得像路径（feature/foo.ts）：回答里明说是分支的，查到过这个分支也算；别的只按文件认，分支不能给文件作证。
+        // 「分支」也可能说的是代码里的分支（src/a.ts 分支覆盖率），所以明说是分支的，查到过这个文件照样算
         found =
           (facts.files.get(path) ?? []).some(
             (seen) => inRepo(seen) && (line === undefined || (seen.lines !== undefined && line >= seen.lines[0] && line <= seen.lines[1])),
           ) ||
-          // 分支名可以长得像路径（feature/foo.ts），列出来、切过去的分支照样认，只是没有行
-          (line === undefined && facts.branches.some((seen) => inRepo(seen) && seen.name === path));
+          (branch === true && line === undefined && facts.branches.some((seen) => inRepo(seen) && seen.name === path));
       }
       return found || facts.text.some((output) => (line === undefined ? mentions(output, path) : hasLine(output, path, line)));
     });

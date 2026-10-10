@@ -1235,13 +1235,33 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
   assert.equal(own("ai/aiops-mcp/src/foo.ts"), true);
   const logged = codeEvidence(["ai/aiops-mcp"], [{ tool: "aiops_query_logs", output: "caller=ai/aiops-mcp/src/foo.ts:3" }]);
   assert.equal(logged("ai/aiops-mcp/src/foo.ts", 3), true);
-  // 分支名可以长得像路径：列出来的分支照样认，在哪个仓库列的就是哪个仓库的；分支没有行号
-  const branched = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_branches", [{ branch: "feature/foo.ts" }], "ai/aiops-mcp")]);
-  assert.equal(branched("feature/foo.ts"), true);
-  assert.equal(branched("ai/aiops-mcp/feature/foo.ts"), true);
-  assert.equal(branched("ai/agent-tag/feature/foo.ts"), false);
-  assert.equal(branched("feature/foo.ts", 3), false);
-  assert.equal(codeEvidence([], [{ tool: "aiops_query_logs", facts: [{ branch: "feature/foo.ts", repo: "ai/aiops-mcp", at: 0 }] }])("feature/foo.ts"), false);
+  // 分支名可以长得像路径：回答里明说是分支的，列出来的分支照样认，在哪个仓库列的就是哪个仓库的；分支没有行号，也不能给同名的文件作证
+  const branched = codeEvidence(
+    ["ai/aiops-mcp", "ai/agent-tag"],
+    [found("code_branches", [{ branch: "feature/foo.ts" }], "ai/aiops-mcp"), found("code_list_files", [{ path: "src/a.ts" }], "ai/aiops-mcp")],
+  );
+  assert.equal(branched("feature/foo.ts", undefined, true), true);
+  assert.equal(branched("ai/aiops-mcp/feature/foo.ts", undefined, true), true);
+  assert.equal(branched("ai/agent-tag/feature/foo.ts", undefined, true), false);
+  assert.equal(branched("feature/foo.ts"), false);
+  assert.equal(branched("feature/foo.ts", 3, true), false);
+  assert.equal(branched("src/a.ts", undefined, true), true);
+  assert.equal(
+    codeEvidence([], [{ tool: "aiops_query_logs", facts: [{ branch: "feature/foo.ts", repo: "ai/aiops-mcp", at: 0 }] }])("feature/foo.ts", undefined, true),
+    false,
+  );
+  // 回答里写明是分支（前面写「分支」「branch」「切到」，后面跟「分支」「branch」「@ 提交号」）才按分支认；同名当文件讲的照样拦
+  for (const answer of [
+    "在 `feature/foo.ts` 分支上",
+    "已切到 feature/foo.ts",
+    "branch: `feature/foo.ts`",
+    "看的是 **feature/foo.ts** 分支",
+    "feature/foo.ts @ 3f2a1c9 上没有改动",
+  ]) {
+    assert.deepEqual(unseenCodeCitations(answer, (text, line, branch) => branched(text, line, branch) || text === "3f2a1c9"), [], answer);
+  }
+  assert.deepEqual(unseenCodeCitations("`feature/foo.ts` 关掉了鉴权", branched), [{ text: "feature/foo.ts", located: false }]);
+  assert.deepEqual(unseenCodeCitations("切到 `feature/foo.ts:3`", branched), [{ text: "feature/foo.ts:3", located: true }]);
   // 文件是真的，行号是编的
   assert.equal(review("在 internal/k8s/tools.go:99", searched), unseenCodeAnswer(["internal/k8s/tools.go:99"], ["ai/aiops-mcp", "ai/agent-tag"]));
   // 2026-10-09：调了一次代码工具，回答里的仓库提交和文件都是编的
