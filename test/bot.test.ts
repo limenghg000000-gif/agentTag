@@ -24,6 +24,7 @@ import {
 import type { ImageRef, ThreadContext } from "../src/history.js";
 import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
+import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION } from "../src/progress.js";
 import { TaskRegistry } from "../src/tasks.js";
@@ -962,6 +963,60 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   const beforeAnchor = await ask(["报错在 `src/index.ts` 里"], "aiops_get_anchor");
   assert.equal(beforeAnchor.requests.length, 2);
   assert.deepEqual(beforeAnchor.replies, ["报错在 `src/index.ts` 里"]);
+});
+
+test("aiops 结果里转义过的报错堆栈（\\n\\t/build/...）照样算查到：2026-10-10 转链排查的回答就是因为认不出被拦下的", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  // Go 的报错堆栈：日志行里的换行、缩进是 JSON 转义（\n\t），整理 aiops 结果时又 JSON.stringify 一次，路径前面紧挨着 \t 的 t
+  const stack =
+    "get similar goods by channel fail\nyuebai-api-app/services/goods.(*TaoBao).similarGoods\n\t/build/services/goods/tb.go:8220 +0x5c4\n" +
+    "yuebai-api-app/controller/convert.ConvertLink\n\t/build/controller/convert/convert_link.go:98 +0x1b4";
+  const once = compactText(JSON.stringify({ logs: [{ msg: stack }] }));
+  // 日志行本身是 JSON 字符串、aiops 原样返回时转义两层
+  const twice = compactText(JSON.stringify({ logs: [{ line: JSON.stringify({ level: "error", content: stack }) }] }));
+  assert.match(once, /\\n\\t\/build\/services\/goods\/tb\.go:8220/);
+  assert.match(twice, /\\\\n\\\\t\/build\/services\/goods\/tb\.go:8220/);
+  const ask = async (output: string, answers: string[]) => {
+    const queryLogs: Tool = {
+      spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+      describe: () => "aiops · 查日志",
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["ai/aiops-mcp"],
+      mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+    });
+    await handle(message("用户反馈转链失败，排查一下"));
+    return { requests, replies: markdowns(sent) };
+  };
+
+  const answer = "同款推荐失败，报在 `services/goods/tb.go:8220`，是从 `controller/convert/convert_link.go:98` 调进来的";
+  for (const output of [once, twice]) {
+    const cited = await ask(output, [answer]);
+    assert.equal(cited.requests.length, 2);
+    assert.deepEqual(cited.replies, [answer]);
+  }
+  // 还原转义只是认出分界：行号对不上、堆栈里没有的文件照样打回
+  for (const output of [once, twice]) {
+    const wrong = await ask(output, ["报在 `services/goods/tb.go:8221`，`services/goods/jd.go` 也有", "报在 `services/goods/tb.go:8220`"]);
+    assert.equal(wrong.requests.length, 3);
+    assert.deepEqual(wrong.requests[2].messages.at(-1), {
+      role: "user",
+      content: unverifiedCodeAnswer(["services/goods/tb.go:8221", "services/goods/jd.go"]),
+    });
+    assert.deepEqual(wrong.replies, ["报在 `services/goods/tb.go:8220`"]);
+  }
 });
 
 test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {

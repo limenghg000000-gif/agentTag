@@ -808,7 +808,7 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     // 代码工具的结果文字一概不认，只认它记下的代码位置
     if (!isCodeTool(tool)) {
       if (output !== undefined) {
-        facts.text.push(output);
+        facts.text.push(...unescapedForms(output));
       }
       continue;
     }
@@ -824,6 +824,29 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     }
   }
   return facts;
+}
+
+const JSON_ESCAPE = /\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g;
+const JSON_ESCAPED: Record<string, string> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+
+/**
+ * aiops 结果里的报错堆栈常常是转义过的：日志行里的换行、缩进写成 \n\t，整理结果时又 JSON.stringify 一次，
+ * 路径前面紧挨着的是 \t 里的 t（\n\t/build/services/goods/tb.go:8220），就认不出是绝对路径；日志行本身是 JSON 字符串时还会转义两层（\\n\\t）。
+ * 2026-10-10 转链排查时回答引用的堆栈位置就是因为这个被当成没查证、整段拦下。
+ * 按 JSON 的转义还原一层、两层，和原文一起拿来找：还原只是把转义符变回空白、引号这些分界，不会多出原文里没有的路径
+ */
+function unescapedForms(output: string): string[] {
+  const forms = [output];
+  for (let i = 0; i < 2 && forms[i].includes("\\"); i++) {
+    const next = forms[i].replace(JSON_ESCAPE, (_, hex: string | undefined, char: string) =>
+      hex !== undefined ? String.fromCharCode(parseInt(hex, 16)) : (JSON_ESCAPED[char] ?? char),
+    );
+    if (next === forms[i]) {
+      break;
+    }
+    forms.push(next);
+  }
+  return forms;
 }
 
 /** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
