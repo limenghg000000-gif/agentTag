@@ -284,8 +284,12 @@ export class AiopsLessons {
     const lesson = await this.get(id, task);
     const teamId = teamIds[0];
     if (!teamIds.some((candidate) => syncedFrom(lesson.diagnosis_path, candidate))) {
+      const source = sourceId(lesson.diagnosis_path);
+      // 出处是别的编号：可能是 aiops 编号填错了，也可能是这一行同步以后在表格里改过编号（出处还是同步时的编号，分不出是哪种）
       throw new KnowledgeError(
-        `它不是从 ${teamId} 同步过去的（排查过程末尾没有注明「来自飞书团队经验库 ${teamId}」），可能有人在表格里改了 ${teamId} 的 aiops 编号。请在表格里改正后再点「再试一次」`,
+        source
+          ? `它的出处是 ${source}，不是 ${teamId}（排查过程末尾注明的是「来自飞书团队经验库 ${source}」）。可能有人在表格里改了 ${teamId} 的 aiops 编号，请改正后再点「再试一次」；如果是同步以后在表格里把 ${source} 的编号改成了 ${teamId}，请点「不用了」，再让机器人起草归档 aiops 经验 #${id}`
+          : `它不是从 ${teamId} 同步过去的（排查过程末尾没有注明「来自飞书团队经验库 ${teamId}」），可能有人在表格里改了 ${teamId} 的 aiops 编号。请在表格里改正后再点「再试一次」`,
       );
     }
     if (lesson.status !== "active") {
@@ -398,10 +402,15 @@ function teamSourceNote(teamId: string): string {
  * 只是在中间引用了别的经验出处的（排查过程里贴了另一条经验）不算
  */
 export function syncedFrom(diagnosisPath: string | undefined, teamId: string): boolean {
-  const last = diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
+  const id = sourceId(diagnosisPath);
   // 编号按团队经验库里的规则比（表格里把 K1 改成 k1、#K1、K 1 还是同一条）
-  const id = /^（来自飞书团队经验库 ([^）]+)）$/.exec(last)?.[1];
   return id !== undefined && normalizeId(id) === normalizeId(teamId);
+}
+
+/** 排查过程最后一行注明的出处里的团队经验编号；最后一行不是出处时返回 undefined */
+function sourceId(diagnosisPath: string | undefined): string | undefined {
+  const last = diagnosisPath?.trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
+  return /^（来自飞书团队经验库 ([^）]+)）$/.exec(last)?.[1];
 }
 
 /**

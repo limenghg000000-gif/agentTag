@@ -2256,7 +2256,7 @@ test("归档、取代时表格里的 aiops 编号被改成了别的经验（不�
   await replace.desk.handleCardAction(replace.click(replace.lastCard(), "save"));
   await replace.desk.idle();
   assert.equal(replace.calls.filter((call) => call.tool === "archive_lesson").length, 0);
-  assert.match(cardText(replace.lastCard()), /aiops 经验库里同步的经验 #32 没能归档：它不是从 K1 同步过去的/);
+  assert.match(cardText(replace.lastCard()), /aiops 经验库里同步的经验 #32 没能归档：它的出处是 K2，不是 K1.*可能有人在表格里改了 K1 的 aiops 编号/);
 });
 
 test("取代旧经验：存好新的以后、归档旧的之前有人在表格里改了旧的（同步 aiops 的时候）：不归档改过的，aiops 里旧的那条也不动，结果里说明", async () => {
@@ -3254,7 +3254,7 @@ test("归档、取代卡片发出后有人把那一行的编号改成了密钥�
     await archiving.desk.handleCardAction(archiving.click((archiving.sent[0].input as { card: any }).card, "archive"));
     await archiving.desk.idle();
     assert.equal(archiving.backend.entries[0].status, "active");
-    assert.match(cardText(archiving.lastCard()), /经验 （编号里像是有密钥） 在卡片发出后在表格里改过/);
+    assert.match(cardText(archiving.lastCard()), /经验 （编号里像是有密钥或个人信息） 在卡片发出后在表格里改过/);
     assert.ok(!JSON.stringify([archiving.sent, archiving.updates]).includes("CorrectHorse"), JSON.stringify(meta));
   }
 
@@ -3265,7 +3265,7 @@ test("归档、取代卡片发出后有人把那一行的编号改成了密钥�
   await replacing.desk.handleCardAction(replacing.click((replacing.sent[0].input as { card: any }).card, "save"));
   await replacing.desk.idle();
   assert.equal(replacing.backend.entries.length, 1);
-  assert.match(cardText(replacing.lastCard()), /经验 （编号里像是有密钥） 在卡片发出后在表格里改过/);
+  assert.match(cardText(replacing.lastCard()), /经验 （编号里像是有密钥或个人信息） 在卡片发出后在表格里改过/);
   assert.ok(!JSON.stringify([replacing.sent, replacing.updates]).includes("CorrectHorse"));
 });
 
@@ -3332,7 +3332,7 @@ test("有人在表格里把某一项改得比起草时的上限还长：这一�
   );
   assert.ok(warnings.some((line) => /表格里 K2 的结论超过了 2000 字，请在表格里改好/.test(line)), warnings.join("\n"));
   assert.ok(warnings.some((line) => /表格里 K3 的标题超过了 80 字，请在表格里改好/.test(line)), warnings.join("\n"));
-  assert.ok(warnings.some((line) => /表格里 （编号里像是有密钥） 的编号里像是有密码或令牌/.test(line)), warnings.join("\n"));
+  assert.ok(warnings.some((line) => /表格里 （编号里像是有密钥或个人信息） 的编号里像是有密码或令牌/.test(line)), warnings.join("\n"));
   assert.ok(!warnings.some((line) => line.includes("CorrectHorse")));
 
   const desk = deskSetup();
@@ -3610,4 +3610,48 @@ test("回答前检索：提问里的手机号、身份证号换成 *** 再查 ai
   // 打了码的、校验位不对的、长数字里的一段照原样
   const wrong = id.slice(0, 17) + (id[17] === "1" ? "2" : "1");
   assert.equal(maskPersonal(`用户 138****8000，号码 ${wrong}，订单 2026101013800138000`), `用户 138****8000，号码 ${wrong}，订单 2026101013800138000`);
+});
+
+test("编号里写了手机号的行：日志、报错里编号换成占位；名字是手机号、身份证号的发起人、确认人只记 open_id", async () => {
+  const { base, backend } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  backend.entries[0].id = "13800138000";
+  const warnings: string[] = [];
+  const fresh = new KnowledgeBase(backend, { logger: { ...quiet, warn: (line: string) => warnings.push(line) } });
+  const [entry] = await fresh.entries(true);
+  assert.equal(entry.id, "（编号里像是有密钥或个人信息）");
+  assert.ok(warnings.some((line) => /编号里像是有手机号/.test(line)) && !warnings.some((line) => line.includes("13800138000")), warnings.join("\n"));
+
+  const id = idCard("11010519491231002");
+  const { backend: saved, desk, sent, calls, click, lastCard } = deskSetup();
+  const propose = desk.tools({ chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "13800138000", messageId: "om_1" }).find((t) => t.spec.name === "knowledge_propose")!;
+  await propose.run(code8, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  assert.match(cardText(card), /发起人：ou_1/);
+  await desk.handleCardAction(click(card, "save", "ou_admin", id));
+  await desk.idle();
+  assert.equal(saved.entries[0].proposedBy, "ou_1");
+  assert.equal(saved.entries[0].confirmedBy, "ou_admin");
+  assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:ou_admin");
+  assert.ok(![JSON.stringify(sent), cardText(lastCard())].some((text) => text.includes("13800138000") || text.includes(id)));
+});
+
+test("同步以后在表格里改了编号的经验：归档时 aiops 那条认不出来，卡片说出处是原来的编号、怎么另外归档，按 aiops 编号起草的归档卡片能归档它", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops({ id: "K1" }, 31);
+  backend.entries[0].id = "K9";
+  await base.entries(true);
+  await tool("knowledge_propose_archive").run({ id: "K9" }, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson").length, 0);
+  assert.match(cardText(lastCard()), /经验 #31 没能归档：它的出处是 K1，不是 K9.*如果是同步以后在表格里把 K1 的编号改成了 K9，请点「不用了」，再让机器人起草归档 aiops 经验 #31/);
+  await desk.handleCardAction(click(lastCard(), "cancel"));
+  await desk.idle();
+  await tool("knowledge_propose_archive").run({ aiops_id: 31 }, { signal });
+  await desk.handleCardAction(click((sent.at(-1)!.input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
 });

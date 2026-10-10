@@ -245,12 +245,20 @@ test("程序自己调用：报错原文里像有密钥时，报错（会列在�
     () => assert.fail("应该报错"),
     (error: Error) => error,
   );
-  assert.equal(err.message, "aiops 返回错误：（报错原文里像是有密钥，不列出来）");
+  assert.equal(err.message, "aiops 返回错误：（报错原文里像是有密钥或个人信息，不列出来）");
   const audit = log.find(/MCP 调用 aiops\.archive_lesson/)!.text;
-  assert.match(audit, /出错 结果=\d+字：（报错原文里像是有密钥，不列出来）/);
+  assert.match(audit, /出错 结果=\d+字：（报错原文里像是有密钥或个人信息，不列出来）/);
   assert.ok(!audit.includes("CorrectHorse"));
 
   await assert.rejects(toolOf(hub, "aiops_query_logs").run({ logql: "{app=\"x\"}" }, { signal }), (error: Error) => error.message.includes(leaked));
+});
+
+test("程序自己调用：报错原文里有手机号、身份证号时也不带原文", async () => {
+  const server = await fake({ call: () => text("经验 #9 的创建人 13800138000 没有权限", true) });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+  await assert.rejects(hub.callDirect("aiops", "archive_lesson", { id: 9 }, task), /^Error: aiops 返回错误：（报错原文里像是有密钥或个人信息，不列出来）$/);
+  assert.ok(!log.find(/MCP 调用 aiops\.archive_lesson/)!.text.includes("13800138000"));
 });
 
 test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {

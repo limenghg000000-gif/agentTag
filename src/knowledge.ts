@@ -19,8 +19,8 @@ export type KnowledgeCategory = keyof typeof KNOWLEDGE_CATEGORIES;
 
 /** 标题的字数上限 */
 export const MAX_TITLE_CHARS = 80;
-/** 表格里编号那一列写进了像密钥的东西时，读出来的编号换成这个 */
-const HIDDEN_ID = "（编号里像是有密钥）";
+/** 表格里编号那一列写进了像密钥、手机号、身份证号的东西时，读出来的编号换成这个 */
+const HIDDEN_ID = "（编号里像是有密钥或个人信息）";
 /** 正文每个字段的字数上限 */
 export const MAX_FIELD_CHARS = 2000;
 /** 写进系统提示词时每条经验最多多少字 */
@@ -274,9 +274,9 @@ export class KnowledgeBase {
     if (!warning) {
       return entry;
     }
-    // 编号里就写着密钥的：编号换成 HIDDEN_ID，日志、卡片、报错里写到这一行时都不会写出来。
+    // 编号里就写着密钥或个人信息的：编号换成 HIDDEN_ID，日志、卡片、报错里写到这一行时都不会写出来。
     // 这一行不检索、不同步、不归档，用不着原来的编号；编号也不是 K 加数字，不影响发新编号
-    const id = findSecret(entry.id) ? HIDDEN_ID : entry.id;
+    const id = findSensitive(entry.id) ? HIDDEN_ID : entry.id;
     if (!this.warned.has(`${entry.id}\n${warning}`)) {
       this.warned.add(`${entry.id}\n${warning}`);
       this.logger.warn(`经验库：表格里 ${id} 的${warning}。这一行先不拿来检索、也不给模型看`);
@@ -1655,7 +1655,7 @@ function cardTarget(entries: readonly KnowledgeEntry[], id: string, seen: Knowle
   }
   const same = entries.filter((entry) => !entry.requestId && sameContent(entry, seen));
   if (same.length > 1) {
-    const ids = same.map((row) => row.id).filter((rowId) => !containsSecret(rowId));
+    const ids = same.map((row) => row.id).filter((rowId) => !findSensitive(rowId));
     throw new KnowledgeError(
       `表格里找不到经验 ${id}，内容和它一样的有 ${same.length} 行${ids.length > 0 ? `（经验 ${ids.join("、")}）` : ""}，分不清是哪一行。请把其中一行的编号改回 ${id} 后再点一次卡片上的按钮`,
     );
@@ -1683,7 +1683,7 @@ function byRequestId(entries: readonly KnowledgeEntry[], requestId: string): Kno
   const rows = entries.filter((entry) => entry.requestId === requestId);
   if (rows.length > 1) {
     // 编号里写进了密钥的不列出来，卡片上群里人人都看得到
-    const ids = rows.map((row) => row.id).filter((rowId) => !containsSecret(rowId));
+    const ids = rows.map((row) => row.id).filter((rowId) => !findSensitive(rowId));
     throw new KnowledgeError(
       `表格里有 ${rows.length} 行的「草稿编号」一样${ids.length > 0 ? `（经验 ${ids.join("、")}）` : ""}，多半是复制出来的行，分不清哪一行是卡片上的那条。请把复制出来的那几行的草稿编号清空后再点一次卡片上的按钮`,
     );

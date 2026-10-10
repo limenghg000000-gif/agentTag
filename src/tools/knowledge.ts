@@ -1466,9 +1466,9 @@ function optionalInteger(value: unknown, name: string): number | undefined {
   return n;
 }
 
-/** 飞书里的名字会写进表格、日志，同步到 aiops：像是有密钥的（有人把令牌改成了名字）不用，只留 open_id */
+/** 飞书里的名字会写进表格、日志，同步到 aiops：像是有密钥或手机号、身份证号的（有人把令牌、号码改成了名字）不用，只留 open_id */
 function person(openId: string, name: string | undefined): Person {
-  return { openId, ...(name && !containsSecret(name) ? { name } : {}) };
+  return { openId, ...(name && !findSensitive(name) ? { name } : {}) };
 }
 
 function preview(value: unknown): string {

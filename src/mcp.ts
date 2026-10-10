@@ -12,7 +12,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
-import { containsSecret } from "./knowledge.js";
+import { findSensitive } from "./knowledge.js";
 import { RESULT_NOTES } from "./mcp-notes.js";
 import { COMMON_SUFFIX, compactText, formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
 import type { Tool } from "./tools/tool.js";
@@ -49,8 +49,8 @@ export const MAX_PLAYBOOKS_PER_TASK = 3;
 const MAX_PLAYBOOK_DESCRIPTION_CHARS = 300;
 
 const BUSY = /服务繁忙|server (is )?busy|too many (concurrent )?requests/i;
-/** 程序调用的报错原文里像有密钥时，报错和审计日志里换成这句 */
-const HIDDEN = "（报错原文里像是有密钥，不列出来）";
+/** 程序调用的报错原文里像有密钥或个人信息（手机号、身份证号）时，报错和审计日志里换成这句 */
+const HIDDEN = "（报错原文里像是有密钥或个人信息，不列出来）";
 /** 名字里带这些动词的工具算「会写东西」，宁可多拦 */
 const WRITE_VERB =
   /(^|_)(create|save|update|delete|remove|archive|restart|scale|exec|apply|patch|rollback|silence|set|put|write|edit|deploy|kill|drain|cordon|evict|upsert|insert)(_|$)/;
@@ -639,14 +639,14 @@ export class McpHub {
         this.resyncSoon(server);
       }
       const described = describeCallError(err, server.config, tool, timeout);
-      const message = direct && containsSecret(described) ? `调用 ${name} 的 ${tool} 失败${HIDDEN}` : described;
+      const message = direct && findSensitive(described) !== undefined ? `调用 ${name} 的 ${tool} 失败${HIDDEN}` : described;
       audit(`失败：${message}`, true);
       throw new Error(message);
     }
 
     const raw = resultText(result);
     if (result.isError) {
-      const shown = (chars: number) => (direct && containsSecret(raw) ? HIDDEN : clip(raw, chars));
+      const shown = (chars: number) => (direct && findSensitive(raw) !== undefined ? HIDDEN : clip(raw, chars));
       const message = BUSY.test(raw)
         ? `${name} 服务繁忙（并发满了），重试 ${retries} 次还是不行：${shown(300)}。可以稍后再试，或者先按已有的证据回答`
         : `${name} 返回错误：${shown(2000)}`;

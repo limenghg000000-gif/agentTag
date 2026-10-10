@@ -5,7 +5,7 @@ import { call } from "./docs.js";
 import { FeishuApiError } from "./feishu.js";
 import type { Logger } from "./history.js";
 import {
-  containsSecret,
+  findSensitive,
   KNOWLEDGE_CATEGORIES,
   type KnowledgeBackend,
   type KnowledgeCategory,
@@ -343,7 +343,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
           ambiguous.add(key);
         }
         seen.add(key);
-        if (containsSecret(entry.id)) {
+        if (findSensitive(entry.id)) {
           leaked.add(key);
         }
         // 改这一行时按读到它的这次的行 id 改：之后再读一次表格，这个编号可能已经是别的行了
