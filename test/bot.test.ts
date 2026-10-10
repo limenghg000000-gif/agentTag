@@ -1405,6 +1405,31 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   assert.equal(commit("3f2a1c9"), true);
   assert.equal(commit("3f2a1c9d8e7b"), true);
   assert.equal(commit("3f2a1c9d8e7bdeadbeef"), false);
+  // 提交号前面同一句话里写着仓库名的，只认这个仓库里查到的提交；离提交号最近的那个仓库名算数
+  const scoped = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_search", [{ commit: "3f2a1c9" }], "ai/aiops-mcp")]);
+  for (const answer of [
+    "ai/agent-tag master @ 3f2a1c9",
+    "AI/Agent-Tag 的 master 分支 @ 3f2a1c9",
+    "ai/agent-tag/internal 在 master @ 3f2a1c9 上",
+    "在 ai/agent-tag 里查到，提交 3f2a1c9",
+    "ai/aiops-mcp 查完了。ai/agent-tag 在 master @ 3f2a1c9",
+    "ai/aiops-mcp 里查到了，ai/agent-tag 在 master @ 3f2a1c9",
+  ]) {
+    assert.deepEqual(unseenCodeCitations(answer, scoped), [{ text: "3f2a1c9", located: true }], answer);
+  }
+  for (const answer of [
+    "ai/aiops-mcp master @ 3f2a1c9",
+    "master @ 3f2a1c9",
+    "ai/agent-tag 和 ai/aiops-mcp 都看了，aiops 在 master @ 3f2a1c9",
+    "ai/agent-tag 查完了。master @ 3f2a1c9",
+    "ai/agent-tagger @ 3f2a1c9",
+  ]) {
+    assert.deepEqual(unseenCodeCitations(answer, scoped), [], answer);
+  }
+  // 文件名里真有反斜杠的按原样认；写成 Windows 的反斜杠的，当成 / 也认
+  const slashes = codeEvidence([], [found("code_list_files", [{ path: "src/foo\\bar.ts" }, { path: "internal/k8s/client.go" }])]);
+  assert.deepEqual(unseenCodeCitations("见 `src/foo\\bar.ts` 和 internal/k8s\\client.go", slashes), []);
+  assert.deepEqual(unseenCodeCitations("见 src/foo/bar.ts", slashes), [{ text: "src/foo/bar.ts", located: false }]);
 });
 
 test("代码引用：反引号里带空格的路径按整段认，命令里的路径一个个认", () => {
@@ -1432,6 +1457,19 @@ test("代码引用：反引号里带空格的路径按整段认，命令里的�
     assert.deepEqual(unseenCodeCitations(`在 \`${cite}\``, suffix), [{ text: "src/my files/app.ts:2", located: true }], cite);
   }
   assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts`:2", suffix), [{ text: "src/my files/app.ts:2", located: true }]);
+  // 加粗、引号里的一样按整段认
+  for (const answer of [
+    "在 **src/my files/app.ts**:2",
+    "在 **src/my files/app.ts:2**",
+    '在 "src/my files/app.ts":2',
+    "在 “src/my files/app.ts”:2",
+    "在「src/my files/app.ts」第 2 行",
+    "在『src/my files/app.ts』:2",
+  ]) {
+    assert.deepEqual(unseenCodeCitations(answer, suffix), [{ text: "src/my files/app.ts:2", located: true }], answer);
+  }
+  // 加粗的中文句子里的路径照常一个个认：汉字不算路径
+  assert.deepEqual(unseenCodeCitations("**改了 src/a.ts 和 src/c.ts**", seen), []);
   // 换行不算：代码块的语言名和下一行的路径（```ts 换行 files/app.ts:2）不是一个路径
   assert.deepEqual(unseenCodeCitations("```ts\nfiles/app.ts:2\n```", suffix), []);
   // 整段里带 @、+、! 的一样按整段认
@@ -1628,7 +1666,13 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.match(String(asked.requests[2].messages.at(-1)?.content), /读失败、没搜到的路径也不算/);
   assert.deepEqual(asked.replies, [missing]);
   // 群成员写的是「仓库名/路径」，回答里写的是仓库里的路径，也算照着复述
-  for (const question of ["ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的", "AI/AIOPS-MCP/src/legacy/user.ts 第 10 行是干嘛的"]) {
+  for (const question of [
+    "ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
+    "AI/AIOPS-MCP/src/legacy/user.ts 第 10 行是干嘛的",
+    // 前面带 ./ 或 / 的也是仓库开头，和回答里的写法一样整理
+    "./ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
+    "/ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
+  ]) {
     const prefixed = await ask([missing, missing], { question, tool: "code_read_file" });
     assert.equal(prefixed.requests.length, 3, question);
     assert.deepEqual(prefixed.replies, [missing], question);
