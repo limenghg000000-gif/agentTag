@@ -472,7 +472,8 @@ test("分支：列出分支、在最近活跃的分支上一起搜、读别的�
   assert.match((await ws.readFile("internal", 1, undefined, "aiops")).text, /internal\/tools\/k8s.go/);
   assert.match((await ws.listFiles({ glob: "**/*.go", branch: "aiops" })).text, /^共 1 个文件（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go$/);
   assert.match((await ws.listFiles({ dir: "internal/tools", branch: "aiops" })).text, /internal\/tools\/k8s.go$/);
-  await assert.rejects(ws.readFile("nope.go", 1, undefined, "aiops"), /aiops 分支上没有这个文件：nope.go/);
+  // 分支在、文件不在：报错里只记下分支
+  await rejectsWith(ws.readFile("nope.go", 1, undefined, "aiops"), /aiops 分支上没有这个文件：nope.go/, [{ repo: "ai/aiops-mcp", branch: "aiops" }]);
   await assert.rejects(ws.readFile("x", 1, undefined, "nope"), /没有 nope 这个分支，用 code_branches 看看有哪些分支/);
   await assert.rejects(ws.search("x", { branches: ["../etc"] }), /分支名不对/);
   await assert.rejects(ws.search("x", { branches: ["-x"] }), /分支名不对/);
@@ -494,8 +495,10 @@ test("切换分支：之后读、搜、开合并请求都基于它，下个任�
   const again = await all.open("om_b2", "ai/aiops-mcp");
   assert.equal(again.baseBranch, "aiops");
   (await again.editFile("internal/tools/k8s.go", "func RegisterK8sTools() {}", "func RegisterK8sTools() {\n\t// TODO\n}")).text;
-  await assert.rejects(again.switchBranch("main"), /已经基于 aiops 分支改了代码，不能再切分支/);
-  assert.equal((await again.switchBranch("aiops")).text, "已经在 aiops 分支上了。");
+  await rejectsWith(again.switchBranch("main"), /已经基于 aiops 分支改了代码，不能再切分支/, [{ repo: "ai/aiops-mcp", branch: "aiops" }]);
+  const stay = await again.switchBranch("aiops");
+  assert.equal(stay.text, "已经在 aiops 分支上了。");
+  assert.deepEqual(stay.facts.map(named), ["branch:aiops"]);
 
   // 远端分支后来又有新提交：比较改动时不会把它混进来
   await runGit(["checkout", "-q", "aiops"], { cwd: branchSeed });

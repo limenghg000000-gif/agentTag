@@ -1498,6 +1498,11 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     assert.equal(prefixed.requests.length, 3, question);
     assert.deepEqual(prefixed.replies, [missing], question);
   }
+  // 仓库名要在路径开头才去掉：vendor/ai/aiops-mcp/src/legacy/user.ts 不是这个仓库里的 src/legacy/user.ts
+  for (const question of ["vendor/ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的", "node_modules/@ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的"]) {
+    const vendored = await ask([missing, missing], { question, tool: "code_read_file" });
+    assert.deepEqual(vendored.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], question);
+  }
   // 照着复述要连行号一起：问的是第 10 行（或者没写行号），回答写的是第 99 行，不算复述
   const otherLine = "`src/legacy/user.ts:99` 初始化配置";
   for (const question of ["src/legacy/user.ts 第 10 行是干嘛的", "src/legacy/user.ts 是干嘛的"]) {

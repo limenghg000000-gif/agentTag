@@ -313,8 +313,12 @@ async function runTask(
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
-      // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述
-      const unprefixed = repos.reduce((text, repo) => text.replace(new RegExp(`${escapeRegExp(repo)}/`, "gi"), " "), userText);
+      // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
+      // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
+      const unprefixed = repos.reduce(
+        (text, repo) => text.replace(new RegExp(`(?<![\\w./@+!~-])${escapeRegExp(repo)}/`, "gi"), " "),
+        userText,
+      );
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));

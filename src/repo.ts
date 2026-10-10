@@ -497,11 +497,12 @@ export class Workspace {
       const name = branchName(branch);
       if (this.state.branch || (await this.hasChanges(signal))) {
         if (name === this.baseBranch) {
-          return this.output().line(`已经在 ${name} 分支上了。`).build();
+          return this.output().line(`已经在 ${name} 分支上了。`, { branch: name }).build();
         }
         throw new RepoError(
           `这个话题里已经基于 ${this.baseBranch} 分支改了代码${this.pullRequest ? `，开了${this.host.requestName} ${this.pullRequest.url}` : ""}，不能再切分支。` +
             "只是看别的分支的代码，给读、搜工具传 branch 就行；要基于别的分支改代码，请群成员新开一个话题",
+          this.onBranch(this.baseBranch),
         );
       }
       await this.fetchBranches([name], signal);
@@ -584,7 +585,7 @@ export class Workspace {
     const spec = `${ref.ref}:${rel}`;
     const type = (await this.git(["cat-file", "-t", spec], signal).catch(() => "")).trim();
     if (!type) {
-      throw new RepoError(`${ref.name} 分支上没有这个文件：${file}。可以先用 code_list_files 或 code_search 找找`);
+      throw new RepoError(`${ref.name} 分支上没有这个文件：${file}。可以先用 code_list_files 或 code_search 找找`, this.onBranch(ref.name));
     }
     if (type === "tree") {
       return this.listFiles({ dir: rel, branch: ref.name }, signal);
@@ -934,6 +935,11 @@ export class Workspace {
   /** 报错里查到的：这个文件在（rel 是整理过的路径） */
   private exists(rel: string): CodeFact[] {
     return [{ path: rel, repo: this.repo, at: 0 }];
+  }
+
+  /** 报错里查到的：这个分支在 */
+  private onBranch(name: string): CodeFact[] {
+    return [{ branch: name, repo: this.repo, at: 0 }];
   }
 
   private async hasChanges(signal?: AbortSignal): Promise<boolean> {
