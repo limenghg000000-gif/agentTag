@@ -6,8 +6,7 @@ import {
   containsSecret,
   draftOf,
   fieldLines,
-  findPersonal,
-  findSecret,
+  findSensitive,
   formatKnowledge,
   KNOWLEDGE_CATEGORIES,
   type KnowledgeBase,
@@ -31,10 +30,11 @@ import {
   type AiopsSaveResult,
   type AiopsSent,
   clip,
-  lessonHasSecret,
+  lessonSensitive,
   renderAiopsHitsForPrompt,
   syncedFrom,
 } from "../knowledge-aiops.js";
+import { escapeCardMarkdown } from "../markdown.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { Tool } from "./tool.js";
 
@@ -428,7 +428,7 @@ export class KnowledgeDesk {
         }
         const reason = typeof args.reason === "string" && args.reason.trim() ? args.reason.trim() : undefined;
         // 原因会列在卡片上给群里看：和草稿一样，先查整段（截断前）里有没有密钥、个人信息
-        const sensitive = reason && (findSecret(reason) ?? findPersonal(reason));
+        const sensitive = reason && findSensitive(reason);
         if (sensitive) {
           throw new KnowledgeError(`归档原因（reason）里像是有${sensitive}。原因会列在卡片上给群里看：去掉后再起草，回答里也不要复述它`);
         }
@@ -578,7 +578,11 @@ export class KnowledgeDesk {
     this.proposals.delete(proposal.id);
     await this.render(proposal);
     await this.options
-      .send(proposal.chatId, { markdown: proposal.result.join("\n") }, { replyTo: proposal.cardMessageId ?? proposal.sourceMessageId, replyInThread: true })
+      .send(
+        proposal.chatId,
+        { markdown: proposal.result.map(escapeCardMarkdown).join("\n") },
+        { replyTo: proposal.cardMessageId ?? proposal.sourceMessageId, replyInThread: true },
+      )
       .catch((err: unknown) => this.logger.warn("经验库：结果没能发到话题里", err));
   }
 
@@ -1126,8 +1130,11 @@ export class KnowledgeDesk {
       throw new KnowledgeError(`aiops 经验 #${id} 已经归档了`);
     }
     // 卡片上会列出它的内容，群里人人都看得到
-    if (lessonHasSecret(lesson)) {
-      throw new KnowledgeError(`aiops 经验 #${id} 里像是写进了密钥，不能列在卡片上给群里看。请 aiops 的管理员在 aiops 里删掉密钥或者直接归档它，回答里不要猜它的内容`);
+    const sensitive = lessonSensitive(lesson);
+    if (sensitive) {
+      throw new KnowledgeError(
+        `aiops 经验 #${id} 里像是写进了${sensitive}，不能列在卡片上给群里看。请 aiops 的管理员在 aiops 里删掉这部分内容或者直接归档它，回答里不要猜它的内容`,
+      );
     }
     return lesson;
   }
@@ -1296,7 +1303,10 @@ const HEADERS: Record<ProposalState, { save: string; archive: string; template: 
   stale: { save: "已作废", archive: "已作废", template: "grey" },
 };
 
-/** 确认卡片（飞书卡片 JSON 2.0）：草稿全文、说明和按钮；处理完以后去掉按钮，写上结果 */
+/**
+ * 确认卡片（飞书卡片 JSON 2.0）：草稿全文、说明和按钮；处理完以后去掉按钮，写上结果。
+ * 草稿、表格、aiops、归档原因、发起人名字都是别处来的，写进 markdown 前转义尖括号（escapeCardMarkdown），卡片自己的格式不转
+ */
 export function renderProposalCard(proposal: Proposal): object {
   const header = HEADERS[proposal.state];
   const notes: string[] = [];
@@ -1361,23 +1371,26 @@ export function renderProposalCard(proposal: Proposal): object {
     notes.push(proposal.note);
   }
   const elements: object[] = [
-    { tag: "markdown", content: body.map(([name, value]) => `**${name}**：${value}`).join("\n") },
-    { tag: "markdown", content: notes.map((line) => `<font color='grey'>${line}</font>`).join("\n") },
+    { tag: "markdown", content: fieldsMarkdown(body) },
+    { tag: "markdown", content: notes.map((line) => `<font color='grey'>${escapeCardMarkdown(line)}</font>`).join("\n") },
   ];
   if (proposal.result) {
-    elements.push({ tag: "markdown", content: proposal.result.join("\n") });
+    elements.push({ tag: "markdown", content: proposal.result.map(escapeCardMarkdown).join("\n") });
   }
   if (proposal.unfinished) {
-    elements.push({ tag: "markdown", content: ["**没做成的**：", ...proposal.unfinished.map((line) => `- ${line}`)].join("\n") });
+    elements.push({
+      tag: "markdown",
+      content: ["**没做成的**：", ...proposal.unfinished.map((line) => `- ${escapeCardMarkdown(line)}`)].join("\n"),
+    });
   }
   const reconfirm = proposal.kind === "save" && proposal.state === "partial" ? proposal.reconfirm : undefined;
   if (reconfirm && proposal.kind === "save") {
-    const lines = [["类别", KNOWLEDGE_CATEGORIES[reconfirm.category]], ["标题", reconfirm.title], ...fieldLines(reconfirm)];
+    const lines: [string, string][] = [["类别", KNOWLEDGE_CATEGORIES[reconfirm.category]], ["标题", reconfirm.title], ...fieldLines(reconfirm)];
     elements.push({
       tag: "markdown",
       content: [
         `**表格里现在的内容**（和确认的不一样；点「再试一次」就按下面的${[proposal.syncAiops ? "同步到 aiops" : "", proposal.replaces ? "取代旧经验" : ""].filter(Boolean).join("、")}，不同意的话在表格里改回来或者点「不用了」）：`,
-        ...lines.map(([name, value]) => `**${name}**：${value}`),
+        fieldsMarkdown(lines),
       ].join("\n"),
     });
   }
@@ -1402,6 +1415,11 @@ export function renderProposalCard(proposal: Proposal): object {
     header: { title: { tag: "plain_text", content: title }, template: header.template },
     body: { elements },
   };
+}
+
+/** 卡片上一项一行：「**名字**：内容」，内容转义 */
+function fieldsMarkdown(fields: [string, string][]): string {
+  return fields.map(([name, value]) => `**${name}**：${escapeCardMarkdown(value)}`).join("\n");
 }
 
 /** 做了一半的卡片不再试了：没做成的写进结果，卡片收起按钮 */

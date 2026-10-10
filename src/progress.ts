@@ -1,3 +1,5 @@
+import { escapeCardMarkdown } from "./markdown.js";
+
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
 
@@ -92,18 +94,13 @@ function stepLines(steps: ProgressStep[]): string[] {
   const icon = { running: "▶️", ok: "✔️", error: "❌" };
   return [
     ...(hidden > 0 ? [`…前面还有 ${hidden} 步`] : []),
-    ...steps.slice(hidden).map((step) => `${icon[step.status]} ${escapeMarkdown(step.label)}`),
+    ...steps.slice(hidden).map((step) => `${icon[step.status]} ${escapeCardMarkdown(step.label)}`),
   ];
 }
 
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
-}
-
-/** 步骤说明里的尖括号会被卡片当成标签（如 <at>、<font>），转成实体 */
-function escapeMarkdown(text: string): string {
-  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export type PatchCard = (card: object) => Promise<void>;

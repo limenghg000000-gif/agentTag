@@ -94,7 +94,7 @@ export interface KnowledgeEntry extends KnowledgeDraft {
   replacesRequestId?: string;
   createdAt: string;
   updatedAt?: string;
-  /** 有人直接在表格里写进了像密钥的东西（哪一项里像是有什么）：不拿来检索，也不给模型看 */
+  /** 有人直接在表格里写进了像密钥、手机号、身份证号的东西（哪一项里像是有什么）：不拿来检索，也不给模型看 */
   unsafe?: string;
   /**
    * 表格里这一行缺了标题或结论（写到一半、有人清空了），或者哪一项比起草时的字数上限还长（有人在表格里加长了）：
@@ -248,7 +248,7 @@ export class KnowledgeBase {
 
   /**
    * 读整张表，超过 readTimeoutMs 就不等了、报错（还在读的那次回来了也不用）。
-   * 表格能直接改：缺了标题或结论、改得超长的行（incomplete）、有人写进了密钥的行（unsafe）记下来，编号、去重照常算它们，检索、给模型看时跳过
+   * 表格能直接改：缺了标题或结论、改得超长的行（incomplete）、有人写进了密钥或个人信息的行（unsafe）记下来，编号、去重照常算它们，检索、给模型看时跳过
    */
   private read(): Promise<KnowledgeEntry[]> {
     const timeout = timeoutSignal(this.readTimeoutMs);
@@ -269,7 +269,7 @@ export class KnowledgeBase {
       .filter(([, text, limit]) => text !== undefined && text.trim().length > limit)
       .map(([name, , limit]) => `${name}超过了 ${limit} 字`);
     const incomplete = [missing.length > 0 ? `${missing.join("、")}是空的` : "", ...tooLong].filter(Boolean).join("，") || undefined;
-    const unsafe = entrySecret(entry);
+    const unsafe = entrySensitive(entry);
     const warning = [incomplete && `${incomplete}，请在表格里改好`, unsafe && `${unsafe}，请在表格里删掉`].filter(Boolean).join("；");
     if (!warning) {
       return entry;
@@ -1431,6 +1431,11 @@ export function findPersonal(text: string): string | undefined {
   return [...text.matchAll(ID_CARD)].some(([id]) => validIdCard(id)) ? "身份证号" : undefined;
 }
 
+/** 像是密钥或个人信息（手机号、身份证号）的是哪一种；没有时返回 undefined。表格、aiops 这些别处能改的内容要给群里看、给模型看之前用它查 */
+export function findSensitive(text: string): string | undefined {
+  return findSecret(text) ?? findPersonal(text);
+}
+
 /** 转义的换行、回车、制表符；引号、反斜杠、斜杠去掉反斜杠就是它自己 */
 const ESCAPED: Record<string, string> = { n: "\n", r: "\r", t: "\t" };
 
@@ -1497,8 +1502,11 @@ export function findSecret(text: string): string | undefined {
   return unescaped === text ? undefined : findSecret(unescaped);
 }
 
-/** 表格里这一行哪一项里像是有密钥；没有时返回 undefined。编号、确认人这些也会写进检索结果，有编辑权限的人也能改，一起查 */
-function entrySecret(entry: KnowledgeEntry): string | undefined {
+/**
+ * 表格里这一行哪一项里像是有密钥或个人信息（起草时不让存的那些）；没有时返回 undefined。
+ * 编号、确认人这些也会写进检索结果，有编辑权限的人也能改，一起查
+ */
+function entrySensitive(entry: KnowledgeEntry): string | undefined {
   const fields: [string, string | undefined][] = [
     ["编号", entry.id],
     ["标题", entry.title],
@@ -1516,9 +1524,9 @@ function entrySecret(entry: KnowledgeEntry): string | undefined {
     ["取代的经验", entry.replaces],
   ];
   for (const [name, text] of fields) {
-    const secret = text ? findSecret(text) : undefined;
-    if (secret) {
-      return `${name}里像是有${secret}`;
+    const sensitive = text ? findSensitive(text) : undefined;
+    if (sensitive) {
+      return `${name}里像是有${sensitive}`;
     }
   }
   return undefined;
@@ -1676,7 +1684,7 @@ function byRequestId(entries: readonly KnowledgeEntry[], requestId: string): Kno
   return rows[0];
 }
 
-/** 这一行能拿来检索、给模型看、起草卡片：没缺标题或结论，没被写进密钥，编号也没和别的行重复 */
+/** 这一行能拿来检索、给模型看、起草卡片：没缺标题或结论，没被写进密钥或个人信息，编号也没和别的行重复 */
 export function usable(entry: KnowledgeEntry): boolean {
   return !entry.unsafe && !entry.incomplete && !entry.conflict;
 }

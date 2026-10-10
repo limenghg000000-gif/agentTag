@@ -1,5 +1,5 @@
 import type { Logger } from "./history.js";
-import { containsSecret, type KnowledgeDraft, KnowledgeError, MAX_TITLE_CHARS, normalizeId, StaleProposalError } from "./knowledge.js";
+import { findSensitive, type KnowledgeDraft, KnowledgeError, MAX_TITLE_CHARS, normalizeId, StaleProposalError } from "./knowledge.js";
 import type { McpTaskContext } from "./mcp.js";
 
 /** 回答前检索时，提问最多取多少字 */
@@ -109,7 +109,7 @@ export class AiopsLessons {
 
   /**
    * 按提问原文检索，返回够相近的（aiops 最多给 5 条，只看有效的）。aiops 里的经验别处（告警自动排查、Open WebUI）也能存，
-   * 不经过团队经验库的密钥检查：像是写进了密钥的不返回，不给模型看，群里也就看不到
+   * 不经过团队经验库起草时的检查：像是写进了密钥或个人信息（手机号、身份证号）的不返回，不给模型看，群里也就看不到
    */
   async search(text: string, task: McpTaskContext, signal?: AbortSignal): Promise<AiopsLessonHit[]> {
     const query = text.trim().slice(0, QUERY_CHARS);
@@ -120,8 +120,9 @@ export class AiopsLessons {
       if (hit.score < MIN_PROMPT_SCORE) {
         return false;
       }
-      if (lessonHasSecret(hit)) {
-        this.logger.warn(`aiops 经验 #${hit.id} 里像是写进了密钥，这次不给模型看。请 aiops 的管理员删掉密钥`);
+      const sensitive = lessonSensitive(hit);
+      if (sensitive) {
+        this.logger.warn(`aiops 经验 #${hit.id} 里像是写进了${sensitive}，这次不给模型看。请 aiops 的管理员删掉这部分内容`);
         return false;
       }
       return true;
@@ -192,14 +193,14 @@ export class AiopsLessons {
     const duplicate = data?.duplicate_of as Record<string, unknown> | undefined;
     const duplicateId = lessonId(duplicate?.id);
     if (data?.saved === false && duplicate && duplicateId !== undefined) {
-      // 那一条可能是别的地方（Open WebUI）存的、写进了密钥：标题、原因要列在卡片上给群里看，像有密钥的不要。
+      // 那一条可能是别的地方（Open WebUI）存的、写进了密钥或个人信息：标题、原因要列在卡片上给群里看，像有这些的不要。
       // 也可能很长：只留开头（先查密钥再截，截断处不会把密钥切成认不出的两半），卡片太大飞书不收，就一直停在「正在存进经验库…」
       const title = String(duplicate.title ?? "");
-      const leaked = containsSecret(title);
+      const leaked = findSensitive(title);
       if (leaked) {
-        this.logger.warn(`aiops 经验 #${duplicateId} 的标题里像是写进了密钥，卡片上不列它的标题。请 aiops 的管理员删掉密钥`);
+        this.logger.warn(`aiops 经验 #${duplicateId} 的标题里像是写进了${leaked}，卡片上不列它的标题。请 aiops 的管理员删掉这部分内容`);
       }
-      const why = typeof duplicate.why === "string" && !containsSecret(duplicate.why) ? duplicate.why : undefined;
+      const why = typeof duplicate.why === "string" && !findSensitive(duplicate.why) ? duplicate.why : undefined;
       return {
         saved: false,
         duplicate: { id: duplicateId, title: leaked ? "" : clip(title, MAX_TITLE_CHARS), ...(why !== undefined ? { why: clip(why, DUPLICATE_WHY_CHARS) } : {}) },
@@ -355,13 +356,20 @@ function lessonContent(draft: KnowledgeDraft, teamId: string): Partial<Record<Le
   };
 }
 
-/** aiops 里这条经验的标题、现象、根因、处理办法、排查过程这些里像不像有密钥 */
-export function lessonHasSecret(lesson: AiopsLessonHit | AiopsLesson): boolean {
+/**
+ * aiops 里这条经验的标题、现象、根因、处理办法、排查过程这些里像是有密钥还是个人信息（手机号、身份证号）；都没有时返回 undefined。
+ * 别处存的经验没经过起草时的检查，给模型看、列在卡片上之前和团队经验库的草稿一样查
+ */
+export function lessonSensitive(lesson: AiopsLessonHit | AiopsLesson): string | undefined {
   // 检索结果里没有服务名、关键词
   const { title, symptom, root_cause, solution, diagnosis_path, service, keywords, error_codes, alertname }: Partial<AiopsLesson> = lesson;
-  return [title, symptom, root_cause, solution, diagnosis_path, service, keywords, error_codes, alertname].some(
-    (value) => value !== undefined && containsSecret(value),
-  );
+  for (const value of [title, symptom, root_cause, solution, diagnosis_path, service, keywords, error_codes, alertname]) {
+    const sensitive = value === undefined ? undefined : findSensitive(value);
+    if (sensitive) {
+      return sensitive;
+    }
+  }
+  return undefined;
 }
 
 /** 别处来的一段文字放进卡片：换行和连续空白并成一个空格，超过 chars 字的截掉 */
@@ -370,9 +378,9 @@ export function clip(text: string, chars: number): string {
   return flat.length > chars ? `${flat.slice(0, chars)}…` : flat;
 }
 
-/** 报错里带上 aiops 返回的原文（前 chars 个字符）：报错会列在卡片上给群里看，原文里像有密钥的不带 */
+/** 报错里带上 aiops 返回的原文（前 chars 个字符）：报错会列在卡片上给群里看，原文里像有密钥或个人信息的不带 */
 function excerpt(raw: string, chars: number): string {
-  return containsSecret(raw) ? "（返回的内容里像是有密钥，不列出来）" : raw.slice(0, chars);
+  return findSensitive(raw) ? "（返回的内容里像是有密钥或个人信息，不列出来）" : raw.slice(0, chars);
 }
 
 /** aiops 的经验编号：正的安全整数，别的（小数、负数、超出范围被四舍五入过的）不认 */

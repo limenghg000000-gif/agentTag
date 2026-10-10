@@ -2491,7 +2491,7 @@ test("aiops 返回的内容里像有密钥的不列出来：疑似重复的那�
   const lessons = new AiopsLessons(mcp, "aiops", quiet);
   const draft = normalizeDraft(code8);
   assert.deepEqual(await lessons.save({ ...draft, title: "重复的" }, { confirmedBy: "ML", teamId: "K1" }, task), { saved: false, duplicate: { id: 12, title: "" } });
-  const hidden = (err: Error) => err instanceof KnowledgeError && /返回的内容里像是有密钥，不列出来/.test(err.message) && !err.message.includes(leaked);
+  const hidden = (err: Error) => err instanceof KnowledgeError && /返回的内容里像是有密钥或个人信息，不列出来/.test(err.message) && !err.message.includes(leaked);
   await assert.rejects(lessons.save(draft, { confirmedBy: "ML", teamId: "K1" }, task), hidden);
   await assert.rejects(lessons.get(12, task), hidden);
   await assert.rejects(lessons.search("code=8", task), hidden);
@@ -3453,7 +3453,7 @@ test("aiops 里别处存的经验写进了密钥：回答前检索不给模型�
   assert.deepEqual(found?.ids, ["aiops#41"]);
   assert.doesNotMatch(found!.text, /correcthorse|#40/);
   handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", keywords: token });
-  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal }), /aiops 经验 #40 里像是写进了密钥，不能列在卡片上/);
+  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal }), /aiops 经验 #40 里像是写进了密码或令牌，不能列在卡片上/);
   assert.equal(sent.length, 0);
 });
 
@@ -3477,12 +3477,14 @@ test("按编号找到的行带着别的草稿编号时不算：原来那行删�
   assert.equal((await base.saved("req-1", "K1"))?.title, "月活的口径");
 });
 
+/** 前 17 位补上校验位，拼成一个格式对的身份证号（测试里现拼，不写死） */
+function idCard(first17: string): string {
+  const weights = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
+  const sum = weights.reduce((total, weight, i) => total + weight * Number(first17[i]), 0);
+  return first17 + "10X98765432"[sum % 11];
+}
+
 test("草稿和归档原因里的手机号、身份证号不让发卡片；打了码的、更长的数字里的一段、校验位不对的不算", async () => {
-  const idCard = (first17: string) => {
-    const weights = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
-    const sum = weights.reduce((total, weight, i) => total + weight * Number(first17[i]), 0);
-    return first17 + "10X98765432"[sum % 11];
-  };
   const id = idCard("11010519491231002");
   for (const text of ["用户 13800138000 反馈下单失败", "联系 +86 138-0013-8000", "手机 138 0013 8000", `身份证 ${id}`, `身份证 ${id.toLowerCase()}`]) {
     assert.throws(() => normalizeDraft({ ...dau, conclusion: text }), /里像是有(手机号|身份证号)。经验库所有群都能看到，不能存个人信息/, text);
@@ -3515,4 +3517,82 @@ test("名字里像是有密钥的发起人、确认人：卡片、表格和 aiop
   assert.equal(backend.entries[0].confirmedBy, "ou_admin");
   assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:ou_admin");
   assert.ok(![JSON.stringify(sent), cardText(lastCard())].some((text) => text.includes(leaked)));
+});
+
+test("有人在表格里写进了手机号、身份证号：这一行和写进密钥的一样，不拿来检索、不给模型看，也不能起草归档卡片", async () => {
+  const { base, backend } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（App 端）", keywords: "日活,App" }));
+  backend.entries[1].handling = "先打给用户 13800138000 确认";
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（小程序）", keywords: "日活,小程序" }));
+  backend.entries[2].basis = `用户身份证 ${idCard("11010519491231002")} 反馈的`;
+  // 打了码的照常用
+  await base.save(normalizeDraft({ ...dau, title: "日活的口径（H5）", keywords: "日活,H5" }));
+  backend.entries[3].handling = "先打给用户 138****8000 确认";
+  const fresh = new KnowledgeBase(backend, { logger: quiet });
+  assert.deepEqual(
+    (await fresh.search("日活")).map((hit) => hit.entry.id),
+    ["K1", "K4"],
+  );
+  const desk = deskSetup();
+  desk.backend.entries = structuredClone(backend.entries);
+  assert.doesNotMatch(await desk.tool("knowledge_search").run({ query: "日活" }, { signal }), /K2|K3|13800138000|11010519491231002/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K2" }, { signal }), /经验 K2 在表格里被改过，怎么处理里像是有手机号/);
+  await assert.rejects(desk.tool("knowledge_get").run({ id: "K3" }, { signal }), /经验 K3 在表格里被改过，依据或排查过程里像是有身份证号/);
+  await assert.rejects(desk.tool("knowledge_propose_archive").run({ id: "K2" }, { signal }), /怎么处理里像是有手机号/);
+  assert.equal(desk.sent.length, 0);
+});
+
+test("aiops 里别处存的经验写进了手机号、身份证号：回答前检索不给模型看，也不能起草归档卡片列出来；重复经验的标题也不列", async () => {
+  const id = idCard("11010519491231002");
+  const { desk, sent, tool, handlers, click, lastCard } = deskSetup({
+    searchLessons: () =>
+      JSON.stringify({
+        hits: [
+          { id: 40, title: "Open WebUI 存的", score: 9, symptom: "用户 13800138000 下单失败" },
+          { id: 42, title: "告警排查存的", score: 9, root_cause: `身份证 ${id} 校验不过` },
+          { id: 41, title: "user-rpc 降载", score: 8, root_cause: "单 Pod 被打满" },
+        ],
+      }),
+    saveLesson: () => JSON.stringify({ saved: false, duplicate_of: { id: 43, title: "用户 13800138000 的 code=8", why: "很像" } }),
+  });
+  const found = await desk.lookup("gateway-api 报 code=8", task);
+  assert.deepEqual(found?.ids, ["aiops#41"]);
+  assert.doesNotMatch(found!.text, /13800138000|11010519491231002|#40|#42/);
+  handlers.get_knowledge = (args) => JSON.stringify({ id: args.id, title: "Open WebUI 存的", status: "active", solution: `联系身份证 ${id} 的用户` });
+  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal }), /aiops 经验 #40 里像是写进了身份证号，不能列在卡片上/);
+  assert.equal(sent.length, 0);
+
+  // 存的时候 aiops 说已有一条很像的：那一条的标题里有手机号，卡片和话题里只列编号
+  await tool("knowledge_propose").run(code8, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /#43/);
+  assert.ok(![JSON.stringify(sent), cardText(lastCard())].some((text) => text.includes("13800138000")));
+});
+
+test("草稿、归档原因、发起人名字里的 <at id=all></at>、<font> 这些在卡片和话题里原样显示：转义成实体，不会 @所有人", async () => {
+  const at = "<at id=all></at>";
+  const { desk, sent, click, lastCard } = deskSetup();
+  const tools = desk.tools({ chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: `张三${at}`, messageId: "om_1" });
+  const tool = (name: string) => tools.find((t) => t.spec.name === name)!;
+  await tool("knowledge_propose").run({ ...dau, title: `${at}日活的口径`, handling: "<font color='red'>按新口径</font>重算" }, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  const text = cardText(card);
+  assert.doesNotMatch(text, /<at |<font color='red'>/);
+  assert.match(text, /\*\*标题\*\*：&lt;at id=all&gt;&lt;\/at&gt;日活的口径/);
+  assert.match(text, /&lt;font color='red'&gt;按新口径&lt;\/font&gt;重算/);
+  assert.match(text, /<font color='grey'>发起人：张三&lt;at id=all&gt;&lt;\/at&gt;<\/font>/, "卡片自己的格式不转");
+
+  await desk.handleCardAction(click(card, "save"));
+  await desk.idle();
+  assert.doesNotMatch(cardText(lastCard()), /<at /);
+  const reply = (sent.at(-1)!.input as { markdown: string }).markdown;
+  assert.match(reply, /经验 K1「&lt;at id=all&gt;&lt;\/at&gt;日活的口径/);
+  assert.doesNotMatch(reply, /<at /);
+
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: `${at}口径改了` }, { signal });
+  const archive = cardText((sent.at(-1)!.input as { card: any }).card);
+  assert.match(archive, /归档原因：&lt;at id=all&gt;&lt;\/at&gt;口径改了/);
+  assert.doesNotMatch(archive, /<at /);
 });
