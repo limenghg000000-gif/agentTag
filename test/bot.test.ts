@@ -1605,6 +1605,14 @@ test("没查到的代码位置：带行号的路径和提交号算「说查过�
   );
   // 全是数字的（requestId）、没有数字的英文单词不算提交号
   assert.deepEqual(unseenCodeCitations("requestId @ 179152518627422277，版本 deadbeef", none), []);
+  // 提交号前后可以有加粗、斜体、删除线、引号
+  assert.deepEqual(unseenCodeCitations("commit **3f2a1c9**，**提交**：1a2b3c4d，提交 _5e6f7a8_，@ ~~9b8c7d6~~，版本「4e5f6a7」", none), [
+    { text: "3f2a1c9", located: true },
+    { text: "1a2b3c4d", located: true },
+    { text: "5e6f7a8", located: true },
+    { text: "9b8c7d6", located: true },
+    { text: "4e5f6a7", located: true },
+  ]);
   // 中文紧挨着的、加粗的、写在等号后面的路径照样认；网址里的、.ts.map 这类不是代码文件的不认
   assert.deepEqual(unseenCodeCitations("问题在internal/logic/userlogic.go:35，见**rpc/x.go:3**，caller=src/a.ts", none), [
     { text: "internal/logic/userlogic.go:35", located: true },
@@ -1657,6 +1665,18 @@ test("没查到的代码位置：带行号的路径和提交号算「说查过�
   ]);
   const routes = codeEvidence([], [found("code_read_file", [{ path: "app/(auth)/login/page.tsx", lines: [3, 3] }])]);
   assert.deepEqual(unseenCodeCitations("见 `app/(auth)/login/page.tsx:3`", routes), []);
+  // Markdown 的下划线、删除线包着的路径：两头一样的一对符号不算路径的一部分
+  assert.deepEqual(unseenCodeCitations("见 _src/missing.ts_:10、__src/bold.ts__、~~src/old.ts~~:3 和 _src/my files/app.ts_", none), [
+    { text: "src/missing.ts:10", located: true },
+    { text: "src/bold.ts", located: false },
+    { text: "src/old.ts:3", located: true },
+    { text: "src/my files/app.ts", located: false },
+  ]);
+  const wrapped = codeEvidence([], [found("code_read_file", [{ path: "src/missing.ts", lines: [10, 10] }, { path: "__tests__/a.test.ts" }, { path: "cmd/main.go" }])]);
+  assert.deepEqual(unseenCodeCitations("见 _src/missing.ts_:10，__tests__/a.test.ts 也看了", wrapped), []);
+  // 前面紧挨着路径字符的、两头不成对的不是包着的符号；包着的命令里的路径一个个认
+  assert.deepEqual(unseenCodeCitations("见 x_src/fake.ts_:10、_src/fake.ts__ 和 __src/fake.ts_", none), []);
+  assert.deepEqual(unseenCodeCitations("跑 _go run cmd/main.go_ 和 _go run cmd/fake.go_", wrapped), [{ text: "cmd/fake.go", located: false }]);
   // 紧挨着汉字、全角标点、符号、emoji 的照样认出来；句末的省略号、问号是标点
   assert.deepEqual(unseenCodeCitations("见v1/src/foo.ts:9，（v1/src/foo.ts:9）→v1/src/foo.ts:9 👉v1/src/foo.ts:9 •v1/src/foo.ts:9", tail), []);
   assert.deepEqual(unseenCodeCitations("见v1/src/bar.ts:9 👉v1/src/baz.ts 是 v1/src/qux.ts? 还有 v1/src/end.ts...", tail), [

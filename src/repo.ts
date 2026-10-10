@@ -1086,9 +1086,12 @@ function splitNul(out: string): string[] {
   return out.split("\0").filter(Boolean);
 }
 
-/** 给模型看的文件名：带换行、引号这类字符的，和 git 一样加引号转义 */
+/**
+ * 给模型看的文件名：带换行、引号这类字符的，和 git 一样加引号转义。反斜杠照原样写：转义成 \\ 以后模型照着写出来的就和记下的文件名对不上了，
+ * 反斜杠在回答里认路径时也不是分界
+ */
 function shownPath(file: string): string {
-  return /[\u0000-\u001f"\\]/.test(file) ? JSON.stringify(file) : file;
+  return /[\u0000-\u001f"]/.test(file) ? JSON.stringify(file) : file;
 }
 
 /** 有几行，和读文件时一样数：结尾的换行不算多一行 */

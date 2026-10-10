@@ -191,6 +191,11 @@ test("改文件记下改动后新内容所在的行，删掉的行不记；新�
   const listed = await ws.listFiles({ glob: "src/q*" });
   assert.match(listed.text, /\n"src\/q\\"x\.ts"$/);
   assert.deepEqual(listed.facts.flatMap((fact) => ("path" in fact ? [fact.path] : [])), ['src/q"x.ts']);
+  // 带反斜杠的照原样写，模型照着写出来的就是记下的文件名
+  await writeFile(path.join(ws.dir, "src", "w\\x.ts"), "x\n");
+  const slashed = await ws.listFiles({ glob: "src/w*" });
+  assert.match(slashed.text, /\nsrc\/w\\x\.ts$/);
+  assert.deepEqual(slashed.facts.flatMap((fact) => ("path" in fact ? [fact.path] : [])), ["src/w\\x.ts"]);
   // 二进制文件的改动：只记文件，不写行数
   await writeFile(path.join(ws.dir, "img.bin"), Buffer.from([0, 1, 2]));
   const diff = await ws.diff();

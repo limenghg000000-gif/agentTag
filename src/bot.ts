@@ -489,6 +489,15 @@ const SPACED_CODE_PATHS = new RegExp(
   "g",
 );
 /**
+ * Markdown 的下划线、删除线包着的路径（_src/a.ts_:12、__src/a.ts__、~~src/a.ts~~，中间也可以带空格）：_ 和 ~ 也是路径字符，
+ * CODE_PATHS 会把两头的符号算进路径里、认不出来。前面是分界、两头是一样的一对符号时，中间按一整段路径认（见 unseenCodeCitations）
+ */
+const WRAPPED_CODE_PATHS = new RegExp(
+  `(?<=(?:^|[${PATH_DELIM}])([_~]{1,2}))(?![_~])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})` +
+    `(?=\\1(?:$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}])))`,
+  "g",
+);
+/**
  * 回答里明说是 Git 分支的路径（分支名可以长得像路径）：前面写着「切到」「切换到」「checkout」「on/to branch」「分支：」「branch:」，
  * 或者后面跟着「分支」「branch」再接「上」「@」、标点或者到头了，或者后面跟着「@ 提交号」，
  * 如「`feature/foo.ts` 分支上」「on the `feature/foo.ts` branch.」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」。
@@ -501,9 +510,9 @@ const BRANCH_AFTER =
  * 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行；
  * 中间可以隔着 Markdown 的收尾符号：`src/foo.ts`:99、**src/foo.ts**:99、「src/foo.ts」第 99 行
  */
-const LINE_AFTER_PATH = /^[`*_'"”」』]*(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
-/** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
-const COMMIT_REFS = /(?:@|\bcommit\b|提交|版本)\s*[:：]?\s*[`'"]?((?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40})(?![0-9a-z])/gi;
+const LINE_AFTER_PATH = /^[`*_~'"”」』]*(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
+/** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」「commit **3f2a1c9**」，7～40 位十六进制，字母和数字都有；前后可以有引号和 Markdown 的符号 */
+const COMMIT_REFS = /(?:@|\bcommit\b|提交|版本)[`'"“「『*_~]*\s*[:：]?\s*[`'"“「『*_~]*((?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40})(?![0-9a-z])/gi;
 /** 一句话到这儿完了：换行、句号、叹号、问号、分号（英文的句号、叹号、问号后面要跟着空白或者到头了，v1.2 里的点不算） */
 const SENTENCE_END = /[\n。！？；;]|[.!?](?=\s|$)/g;
 /** 一句话里的一小句到这儿完了：逗号、顿号 */
@@ -591,6 +600,20 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
     if (/\s/.test(path) && (line !== undefined || seen(path, line) || !looksLikeCommand(path))) {
       spans.push([match.index, match.index + path.length]);
       check(path, line, match.index);
+    }
+  }
+  // 下划线、删除线包着的：中间是一个路径的按整段认；中间带空格的和上面一样，读起来是命令的、没写行号也没查到过的，里面的路径一个个认
+  for (const match of answer.matchAll(WRAPPED_CODE_PATHS)) {
+    const path = match[2];
+    const line = lineAfter(match.index + path.length);
+    spans.push([match.index, match.index + path.length]);
+    if (!/\s/.test(path) || line !== undefined || seen(path, line) || !looksLikeCommand(path)) {
+      check(path, line, match.index);
+    } else {
+      for (const piece of path.matchAll(CODE_PATHS)) {
+        const at = match.index + piece.index;
+        check(piece[1], lineAfter(at + piece[1].length), at);
+      }
     }
   }
   for (const match of answer.matchAll(CODE_PATHS)) {
