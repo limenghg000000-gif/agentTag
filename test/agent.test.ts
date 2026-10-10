@@ -291,10 +291,10 @@ test("调过 thinkAfter 认的工具以后，后面每一轮都打开思考；�
   );
 });
 
-test("steerReasoning 返回一段话时，加在这一轮工具结果后面；没有思考内容、给出回答的那轮不看", async () => {
+test("steerReasoning 返回一段话时，接在这一轮最后一个工具结果后面，不另起用户消息；没有思考内容、给出回答的那轮不看", async () => {
   const { model, requests } = scriptedModel([
-    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "check the logs" },
-    { text: "", finish: "tool_calls", toolCalls: [call("c2", "echo", { text: "b" })] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" }), call("c2", "echo", { text: "b" })], reasoning: "check the logs" },
+    { text: "", finish: "tool_calls", toolCalls: [call("c3", "echo", { text: "c" })] },
     { text: "好了", finish: "stop", reasoning: "done" },
   ]);
   const seen: string[] = [];
@@ -312,9 +312,25 @@ test("steerReasoning 返回一段话时，加在这一轮工具结果后面；�
   });
 
   assert.deepEqual(seen, ["check the logs"]);
-  assert.deepEqual(requests[1].messages.slice(-2), [
+  assert.deepEqual(requests[1].messages.slice(1), [
+    { role: "assistant", content: "", toolCalls: [call("c1", "echo", { text: "a" }), call("c2", "echo", { text: "b" })] },
     { role: "tool", toolCallId: "c1", content: "回声：a" },
-    { role: "user", content: "用中文想" },
+    { role: "tool", toolCallId: "c2", content: "回声：b\n\n用中文想" },
   ]);
-  assert.equal(requests[2].messages.at(-1)!.role, "tool");
+  assert.deepEqual(requests[2].messages.at(-1), { role: "tool", toolCallId: "c3", content: "回声：c" });
+});
+
+test("最后一轮工具前提醒过时，收尾提醒前面仍然只有工具结果，不会连着两条用户消息", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "check the logs" },
+    { text: "只能先这样答", finish: "stop" },
+  ]);
+
+  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, maxToolRounds: 1, steerReasoning: () => "用中文想" });
+
+  assert.deepEqual(
+    requests[1].messages.slice(-2).map((m) => m.role),
+    ["tool", "user"],
+  );
+  assert.match(requests[1].messages.at(-1)!.content, /工具调用次数已经用完/);
 });

@@ -41,8 +41,9 @@ export interface AgentRequest {
    */
   review?: (answer: string, usedTools: ReadonlySet<string>) => string | undefined;
   /**
-   * 一轮调了工具以后看这一轮的思考：返回一段话时，在工具结果后面加一条用户消息再问下一轮。
-   * 比如思考被英文的日志、代码带成了英文，提醒模型接着用中文想（思考会显示在进度卡片上）
+   * 一轮调了工具以后看这一轮的思考：返回一段话时，接在这一轮最后一个工具结果后面再问下一轮。
+   * 比如思考被英文的日志、代码带成了英文，提醒模型接着用中文想（思考会显示在进度卡片上）。
+   * 不另起一条用户消息：工具循环中间插进来的用户消息，模型可能当成新问题去回，轮数用完时还会和收尾提醒连成两条用户消息
    */
   steerReasoning?: (reasoning: string) => string | undefined;
 }
@@ -122,13 +123,11 @@ export async function runAgent({
       investigating ||= thinkAfter?.(call.name) ?? false;
     }
     signal.throwIfAborted();
-    result.toolCalls.forEach((call, i) => {
-      conversation.push({ role: "tool", toolCallId: call.id, content: outputs[i] });
-    });
     const steer = result.reasoning ? steerReasoning?.(result.reasoning) : undefined;
-    if (steer) {
-      conversation.push({ role: "user", content: steer });
-    }
+    const lastCall = result.toolCalls.length - 1;
+    result.toolCalls.forEach((call, i) => {
+      conversation.push({ role: "tool", toolCallId: call.id, content: steer && i === lastCall ? `${outputs[i]}\n\n${steer}` : outputs[i] });
+    });
   }
 }
 

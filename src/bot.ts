@@ -284,11 +284,18 @@ async function runTask(
       ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
-    // 不是用英文问的（群里一般说中文）、思考却被英文的日志、代码带成了英文：提醒模型接着用中文想，最多提醒几次
+    // 卡片上显示思考、不是用英文问的（群里一般说中文），思考却被英文的日志、代码带成了英文：提醒模型接着用中文想，最多提醒几次
     let nudged = 0;
     const steerReasoning =
-      deps.showThinking !== false && !writtenInEnglish(question)
-        ? (reasoning: string) => (writtenInEnglish(reasoning) && nudged++ < MAX_THINKING_NUDGES ? THINK_IN_CHINESE : undefined)
+      deps.showThinking !== false && card && !askedInEnglish(question)
+        ? (reasoning: string) => {
+            if (nudged >= MAX_THINKING_NUDGES || !writtenInEnglish(reasoning)) {
+              return undefined;
+            }
+            nudged++;
+            logger.info(`思考是英文，提醒模型接着用中文想（第 ${nudged} 次） message=${msg.messageId}`);
+            return THINK_IN_CHINESE;
+          }
         : undefined;
     // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
     let lastRound = 0;
@@ -1224,21 +1231,36 @@ function deflects(answer: string): boolean {
 /** 一次任务里最多提醒几次「接着用中文想」 */
 const MAX_THINKING_NUDGES = 3;
 /**
- * 思考被英文带跑时加在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
+ * 思考被英文带跑时接在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
  * 进度卡片上整段英文，群里看着费劲。系统提示词里也写了，但模型想用什么语言跟着最近读到的内容走，离得近的提醒更管用
  */
-export const THINK_IN_CHINESE = "（系统提醒，不用回复这句）接下来的思考请用中文写：思考会显示在进度卡片上给群里的人看。代码、日志、报错原文、函数名、命令照原样引用，不用翻译。";
+export const THINK_IN_CHINESE = "（系统提醒，不是工具返回的内容）接下来的思考请用中文写：思考会显示在进度卡片上给群里的人看。代码、日志、报错原文、函数名、命令照原样引用，不用翻译。";
+
+/** 网址只算到第一个非 ASCII 字符：中文里网址后面常常直接跟着汉字、全角标点，没有空格 */
+const URL_TEXT = /https?:\/\/[\x21-\x7e]+/g;
+/** 引号、反引号、书名号里引用的原文：英文思考里引用的中文报错、商品名，中文思考里引用的英文日志 */
+const QUOTED_TEXT = /`[^`]*`|「[^」]*」|“[^”]*”|【[^】]*】|"[^"\n]*"/g;
+/** 英文行文才有的虚词。日志、报错、路径、函数名里几乎没有，拿它们认英文，中文思考里夹着英文原文不会误判 */
+const ENGLISH_PROSE = /\b(?:the|I|I'm|I'll|let|let's|me|we|we're|need|should|now|so|okay|wait|maybe|but|which|it's|there|then|seems|looks)\b/gi;
 
 /**
- * 这段文字是不是英文写的：去掉网址和引号、反引号里引用的原文以后，汉字数不到英文单词数的三分之一。
- * 中文里夹着函数名、日志原文、报错很常见，一个汉字顶不上一个英文单词，所以拿汉字和单词比，而且宽一些；
- * 英文思考里引用的中文报错一般在引号里，不算
+ * 思考是不是用英文写的：去掉网址和引用的原文以后，英文虚词至少 3 个，而且汉字数不到虚词数的 8 倍。
+ * 中文思考里引用的英文日志、路径、函数名不带这些虚词；英文思考里没加引号提到的商品名、中文报错也压不过虚词
  */
 export function writtenInEnglish(text: string): boolean {
-  const plain = text.replace(/https?:\/\/\S+/g, " ").replace(/`[^`]*`|「[^」]*」|“[^”]*”|"[^"\n]*"/g, " ");
+  const plain = text.replace(URL_TEXT, " ").replace(QUOTED_TEXT, " ");
   const han = plain.match(/\p{Script=Han}/gu)?.length ?? 0;
-  const words = plain.match(/[A-Za-z]+/g)?.length ?? 0;
-  return words >= 3 && han * 3 < words;
+  const prose = plain.match(ENGLISH_PROSE)?.length ?? 0;
+  return prose >= 3 && han < prose * 8;
+}
+
+/**
+ * 提问是不是用英文写的：去掉网址和 @ 的名字以后一个汉字都没有，至少两个英文单词。
+ * 群里一般说中文，拿不准时（只 @ 了一下、只写了一个词）按中文算
+ */
+export function askedInEnglish(question: string): boolean {
+  const plain = question.replace(URL_TEXT, " ").replace(/@\S+/g, " ");
+  return !/\p{Script=Han}/u.test(plain) && (plain.match(/[A-Za-z]+/g)?.length ?? 0) >= 2;
 }
 
 export const DEFLECTED_ANSWER =
