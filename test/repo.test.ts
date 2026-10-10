@@ -247,9 +247,16 @@ test("推上去了但开 PR 失败时，再调一次直接补开，不用新改�
   const ws = await workspaces(host).open("om_4", "acme/demo");
   (await ws.editFile("README.md", "# demo", "# demo 2")).text;
   await assert.rejects(ws.openPullRequest("改标题", ""), /开 PR 失败/);
+  // 推上去的提交还不在任何 PR 里：diff 和补开的 PR 都列出全部改动，记下改动了的文件
+  const pending = await ws.diff();
+  assert.match(pending.text, /^改动了 1 个文件（\+1 -1）：\nREADME\.md（\+1 -1）/);
+  assert.deepEqual(pending.facts.map(named), ["README.md"]);
   const pr = await ws.openPullRequest("改标题", "");
   assert.equal(pr.created, true);
   assert.equal(prs.length, 1);
+  assert.deepEqual(pr.changes, [{ path: "README.md", added: 1, deleted: 1 }]);
+  // PR 开好以后，和推上去的比
+  assert.match((await ws.diff()).text, /和已经推到合并请求的内容相比没有新的改动/);
 });
 
 test("没有改动、也没开过 PR 的工作目录，下次打开时更新到远端最新", async () => {

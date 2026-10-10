@@ -1401,6 +1401,10 @@ test("代码引用：反引号里带空格的路径按整段认，命令里的�
   for (const path of ["src/my  files/app.ts", "src/my\tfiles/app.ts", "src/my\u3000files/app.ts", "src/my \u00a0files/app.ts"]) {
     assert.deepEqual(unseenCodeCitations(`在 \`${path}:2\``, suffix), [{ text: `${path}:2`, located: true }], JSON.stringify(path));
   }
+  // 行号写成全角冒号、#L、「第 N 行」的一样按整段认
+  for (const cite of ["src/my files/app.ts：2", "src/my files/app.ts#L2", "src/my files/app.ts 第 2 行", "src/my files/app.ts 的第 2 行"]) {
+    assert.deepEqual(unseenCodeCitations(`在 \`${cite}\``, suffix), [{ text: "src/my files/app.ts:2", located: true }], cite);
+  }
   // 换行不算：代码块的语言名和下一行的路径（```ts 换行 files/app.ts:2）不是一个路径
   assert.deepEqual(unseenCodeCitations("```ts\nfiles/app.ts:2\n```", suffix), []);
   // 整段里带 @、+、! 的一样按整段认

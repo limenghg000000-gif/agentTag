@@ -850,8 +850,8 @@ export class Workspace {
 
   private async stagedDiff(): Promise<ToolOutput> {
     await this.git(["add", "-A"]);
-    // 和上次推上去的（没推过就是检出时的分支）比，没推的提交和没提交的改动都算
-    const base = this.state.pushedSha ?? this.state.baseSha ?? `origin/${this.baseBranch}`;
+    // 和上次推上去的（没推过就是检出时的分支，见 compareBase）比，没推的提交和没提交的改动都算
+    const base = this.compareBase() ?? `origin/${this.baseBranch}`;
     const files = await this.changedFiles(["--cached", base]);
     const out = this.output();
     if (files.length === 0) {
@@ -899,7 +899,7 @@ export class Workspace {
     }
     const branch = this.state.branch;
     const head = (await this.git(["rev-parse", "HEAD"], signal)).trim();
-    const base = this.state.pushedSha ?? this.state.baseSha ?? (await this.git(["rev-parse", `origin/${this.baseBranch}`], signal)).trim();
+    const base = this.compareBase() ?? (await this.git(["rev-parse", `origin/${this.baseBranch}`], signal)).trim();
     const changes = await this.changedFiles([base, "HEAD"], signal);
     if (!branch || (head === base && this.pullRequest)) {
       throw new RepoError(
@@ -932,6 +932,14 @@ export class Workspace {
     const result = this.queue.then(run);
     this.queue = result.catch(() => {});
     return result;
+  }
+
+  /**
+   * 算改动从哪儿比起：开过 PR 的，和上次推上去的比；还没开成 PR 的，和检出时的分支比。
+   * 推上去了但开 PR 失败时，推上去的提交还不在任何 PR 里，补开时要列出全部改动
+   */
+  private compareBase(): string | undefined {
+    return (this.pullRequest ? this.state.pushedSha : undefined) ?? this.state.baseSha;
   }
 
   /** 这个仓库的工具结果 */

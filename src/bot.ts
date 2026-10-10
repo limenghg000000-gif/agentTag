@@ -455,10 +455,11 @@ const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs
 const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})((?:[\\w.@+!-]+\\/)+[\\w.@+!-]+\\.${CODE_EXT})(?![\\w/@+~-]|[.!]\\w)`, "g");
 /**
  * 反引号里带空格的路径（`src/my files/app.ts:12`、`pkg@v1/my files/app.ts:2`）：CODE_PATHS 只认得出空格后面那段，
- * 这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，词之间可以是连着几个空格、制表符、全角空格
+ * 这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，词之间可以是连着几个空格、制表符、全角空格；
+ * 后面是反引号，或者 LINE_AFTER_PATH 认的行号写法（:12、：12、#L12、 第 12 行）
  */
 const SPACED_CODE_PATHS = new RegExp(
-  `(?<=\`)((?:[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\/)+[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\.${CODE_EXT})(?=[\`:#])`,
+  `(?<=\`)((?:[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\/)+[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\.${CODE_EXT})(?=[\`:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
   "g",
 );
 /**
