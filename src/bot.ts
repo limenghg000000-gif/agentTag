@@ -315,9 +315,10 @@ async function runTask(
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
-      // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉
-      const unprefixed =
-        repos.length === 0 ? userText : userText.replace(new RegExp(`(?<!${PATH_CHAR})(?:${repos.map(escapeRegExp).join("|")})/`, "gi"), " ");
+      // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
+      // 仓库名互相包含时去掉最长的那个（长的排前面），和 codeEvidence 一样
+      const longestFirst = [...repos].sort((a, b) => b.length - a.length).map(escapeRegExp);
+      const unprefixed = repos.length === 0 ? userText : userText.replace(new RegExp(`(?<!${PATH_CHAR})(?:${longestFirst.join("|")})/`, "gi"), " ");
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
@@ -454,9 +455,12 @@ const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs
 const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})((?:[\\w.@+!-]+\\/)+[\\w.@+!-]+\\.${CODE_EXT})(?![\\w/@+~-]|[.!]\\w)`, "g");
 /**
  * 反引号里带空格的路径（`src/my files/app.ts:12`、`pkg@v1/my files/app.ts:2`）：CODE_PATHS 只认得出空格后面那段，
- * 这种先按整段认（见 unseenCodeCitations），目录和文件名里能有的字符和 CODE_PATHS 一样
+ * 这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，词之间可以是连着几个空格、制表符、全角空格
  */
-const SPACED_CODE_PATHS = new RegExp(`(?<=\`)((?:[\\w.@+!-]+(?: [\\w.@+!-]+)*\\/)+[\\w.@+!-]+(?: [\\w.@+!-]+)*\\.${CODE_EXT})(?=[\`:#])`, "g");
+const SPACED_CODE_PATHS = new RegExp(
+  `(?<=\`)((?:[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\/)+[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\.${CODE_EXT})(?=[\`:#])`,
+  "g",
+);
 /**
  * 回答里明说是 Git 分支的路径（分支名可以长得像路径）：前面写着「切到」「切换到」「checkout」「on/to branch」「分支：」「branch:」，
  * 或者后面跟着「分支」「branch」再接「上」「@」、标点或者到头了，或者后面跟着「@ 提交号」，
@@ -529,7 +533,7 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
   for (const match of answer.matchAll(SPACED_CODE_PATHS)) {
     const path = match[1];
     const line = lineAfter(match.index + path.length);
-    if (path.includes(" ") && (line !== undefined || seen(path, line))) {
+    if (/\s/.test(path) && (line !== undefined || seen(path, line))) {
       spans.push([match.index, match.index + path.length]);
       check(path, line, match.index);
     }
@@ -575,11 +579,12 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
     }
     const facts = cache.facts;
     const text = repoPath(cite);
-    const prefixed = repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => repo.toLowerCase());
-    // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算
+    // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算。
+    // 仓库名互相包含时（team/backend、team/backend/api）只按最长的那个算：team/backend/api/src/x.ts 说的是 team/backend/api 里的
+    const prefix = longestRepoPrefix(text, repos);
     const forms: Array<{ path: string; repos?: string[] }> = [
-      { path: text, repos: prefixed.length > 0 ? prefixed : undefined },
-      ...prefixed.map((repo) => ({ path: text.slice(repo.length + 1), repos: [repo] })),
+      { path: text, repos: prefix === undefined ? undefined : [prefix] },
+      ...(prefix === undefined ? [] : [{ path: text.slice(prefix.length + 1), repos: [prefix] }]),
     ];
     return forms.some(({ path, repos: scope }) => {
       const inRepo = (found: { repo: string }) => scope === undefined || scope.includes(found.repo);
@@ -600,6 +605,14 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
       return found || facts.text.some((output) => (line === undefined ? mentions(output, path) : hasLine(output, path, line)));
     });
   };
+}
+
+/** path 开头写着的配置的仓库名（小写）；几个都对得上时取最长的 */
+function longestRepoPrefix(path: string, repos: readonly string[]): string | undefined {
+  return repos
+    .map((repo) => repo.toLowerCase())
+    .filter((repo) => path.toLowerCase().startsWith(`${repo}/`))
+    .reduce<string | undefined>((longest, repo) => (longest === undefined || repo.length > longest.length ? repo : longest), undefined);
 }
 
 /** 这次查到的：代码工具记下的文件（和查到的行）、提交号、分支，按仓库分；别的工具的原文 */

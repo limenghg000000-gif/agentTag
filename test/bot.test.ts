@@ -1233,6 +1233,20 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
   assert.equal(nested("ai/agent-tag/ai/aiops-mcp/src/foo.ts"), true);
   const own = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_list_files", [{ path: "src/foo.ts" }], "ai/aiops-mcp")]);
   assert.equal(own("ai/aiops-mcp/src/foo.ts"), true);
+  // 仓库名互相包含时只按最长的那个算：team/backend 里的 api/src/x.ts 不能给 team/backend/api/src/x.ts 作证
+  for (const repos of [
+    ["team/backend", "team/backend/api"],
+    ["team/backend/api", "team/backend"],
+  ]) {
+    const outer = codeEvidence(repos, [found("code_read_file", [{ path: "api/src/x.ts", lines: [3, 3] }], "team/backend")]);
+    assert.equal(outer("team/backend/api/src/x.ts", 3), false, repos.join());
+    assert.equal(outer("team/backend/api/src/x.ts"), false, repos.join());
+    assert.equal(outer("team/backend/API/src/x.ts", 3), false, repos.join());
+    assert.equal(outer("Team/Backend/api/src/x.ts", 3), false, repos.join());
+    const inner = codeEvidence(repos, [found("code_read_file", [{ path: "src/x.ts", lines: [3, 3] }], "team/backend/api")]);
+    assert.equal(inner("team/backend/api/src/x.ts", 3), true, repos.join());
+    assert.equal(inner("team/backend/src/x.ts", 3), false, repos.join());
+  }
   const logged = codeEvidence(["ai/aiops-mcp"], [{ tool: "aiops_query_logs", output: "caller=ai/aiops-mcp/src/foo.ts:3" }]);
   assert.equal(logged("ai/aiops-mcp/src/foo.ts", 3), true);
   // 分支名可以长得像路径：回答里明说是分支的，列出来的分支照样认，在哪个仓库列的就是哪个仓库的；分支没有行号，也不能给同名的文件作证
@@ -1383,6 +1397,12 @@ test("代码引用：反引号里带空格的路径按整段认，命令里的�
   const suffix = codeEvidence([], [found("code_read_file", [{ path: "files/app.ts" }, { path: "files/app.ts", lines: [2, 2] }])]);
   assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:2`", suffix), [{ text: "src/my files/app.ts:2", located: true }]);
   assert.deepEqual(unseenCodeCitations("在 `files/app.ts:2`", suffix), []);
+  // 词之间连着几个空格、制表符、全角空格的一样按整段认
+  for (const path of ["src/my  files/app.ts", "src/my\tfiles/app.ts", "src/my\u3000files/app.ts", "src/my \u00a0files/app.ts"]) {
+    assert.deepEqual(unseenCodeCitations(`在 \`${path}:2\``, suffix), [{ text: `${path}:2`, located: true }], JSON.stringify(path));
+  }
+  // 换行不算：代码块的语言名和下一行的路径（```ts 换行 files/app.ts:2）不是一个路径
+  assert.deepEqual(unseenCodeCitations("```ts\nfiles/app.ts:2\n```", suffix), []);
   // 整段里带 @、+、! 的一样按整段认
   for (const path of ["pkg@v1/my files/app.ts", "lib/@acme+web/my files/app.ts", "github.com/!acme/my files/app.ts"]) {
     assert.deepEqual(unseenCodeCitations(`在 \`${path}:2\``, suffix), [{ text: `${path}:2`, located: true }], path);
@@ -1511,7 +1531,12 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     "结论：code=8 是 user-rpc 定义的「用户不存在」（把握：高）。依据：ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`";
   const ask = async (
     answers: string[],
-    { question = "去 gateway-api 和 user-rpc 服务代码去排查一下", tool = "code_search", also = [] as string[] } = {},
+    {
+      question = "去 gateway-api 和 user-rpc 服务代码去排查一下",
+      tool = "code_search",
+      also = [] as string[],
+      repos = ["ai/aiops-mcp", "ai/agent-tag"],
+    } = {},
   ) => {
     const results: ChatResult[] = [
       {
@@ -1526,7 +1551,7 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     const { sent, handle } = setup({
       model,
       taskTools: () => [codeSearch, codeRead, longList, searchPath, readBig, otherTool],
-      codeRepos: ["ai/aiops-mcp", "ai/agent-tag"],
+      codeRepos: repos,
       logger: { ...quiet, warn: (line: string) => warnings.push(line) },
     });
     await handle(message(question));
@@ -1570,6 +1595,18 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   ]) {
     const vendored = await ask([missing, missing], { question, tool: "code_read_file" });
     assert.deepEqual(vendored.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], question);
+  }
+  // 仓库名互相包含时去掉最长的那个：问的是 team/backend/api 里的 src/legacy/user.ts，不是 team/backend 里的 api/src/legacy/user.ts
+  for (const repos of [
+    ["team/backend", "team/backend/api"],
+    ["team/backend/api", "team/backend"],
+  ]) {
+    const question = "team/backend/api/src/legacy/user.ts 第 10 行是干嘛的";
+    const longest = await ask([missing, missing], { question, tool: "code_read_file", repos });
+    assert.deepEqual(longest.replies, [missing], repos.join());
+    const shorter = "api/src/legacy/user.ts 第 10 行在仓库里找不到";
+    const outer = await ask([shorter, shorter], { question, tool: "code_read_file", repos });
+    assert.deepEqual(outer.replies, [blockedCodeAnswer(repos)], repos.join());
   }
   // 照着复述要连行号一起：问的是第 10 行（或者没写行号），回答写的是第 99 行，不算复述
   const otherLine = "`src/legacy/user.ts:99` 初始化配置";
