@@ -1457,6 +1457,12 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
     "ai/agent-tag 里查到了，pkg#ai/aiops-mcp 在 master @ 3f2a1c9",
     // 仓库名后面紧挨着的括号是写分支，照样只认这个仓库里的提交
     "ai/agent-tag(master) @ 3f2a1c9",
+    // 仓库名写在提交号后面的也算；提交号所在的这一小句里写着的，比整句里别处写着的优先
+    "commit 3f2a1c9 in ai/agent-tag",
+    "提交 3f2a1c9 在 ai/agent-tag 上",
+    "master @ 3f2a1c9（ai/agent-tag）",
+    "ai/aiops-mcp 里没找到，提交 3f2a1c9 在 ai/agent-tag 上",
+    "提交 3f2a1c9 改了登录逻辑，在 ai/agent-tag 里",
   ]) {
     assert.deepEqual(unseenCodeCitations(answer, scoped), [{ text: "3f2a1c9", located: true }], answer);
   }
@@ -1466,6 +1472,14 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
     "ai/agent-tag 和 ai/aiops-mcp 都看了，aiops 在 master @ 3f2a1c9",
     "ai/agent-tag 查完了。master @ 3f2a1c9",
     "ai/agent-tagger @ 3f2a1c9",
+    "commit 3f2a1c9 in ai/aiops-mcp",
+    "ai/aiops-mcp master @ 3f2a1c9，和 ai/agent-tag 不一样",
+    "ai/aiops-mcp master @ 3f2a1c9 而 ai/agent-tag 没改",
+    "提交 3f2a1c9 在 ai/aiops-mcp 上。ai/agent-tag 没改",
+    "commit 3f2a1c9 in ai/aiops-mcp and ai/agent-tag",
+    "ai/aiops-mcp 里，提交 3f2a1c9 没问题，ai/agent-tag 也看了",
+    "提交 3f2a1c9 改了登录。ai/agent-tag 没改",
+    "提交 3f2a1c9 改了登录，ai/aiops-mcp 和 ai/agent-tag 都要合",
   ]) {
     assert.deepEqual(unseenCodeCitations(answer, scoped), [], answer);
   }
@@ -1475,7 +1489,7 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   assert.deepEqual(unseenCodeCitations("见 src/foo/bar.ts", slashes), [{ text: "src/foo/bar.ts", located: false }]);
 });
 
-test("代码引用：反引号里带空格的路径按整段认，命令里的路径一个个认", () => {
+test("代码引用：反引号里带空格的路径按整段认，读起来是命令的里面的路径一个个认", () => {
   const seen = codeEvidence(
     [],
     [
@@ -1521,8 +1535,22 @@ test("代码引用：反引号里带空格的路径按整段认，命令里的�
   }
   const special = codeEvidence([], [found("code_read_file", [{ path: "pkg@v1/my files/app.ts", lines: [2, 2] }])]);
   assert.deepEqual(unseenCodeCitations("在 `pkg@v1/my files/app.ts:2`", special), []);
-  // 不带行号、分不清是路径还是命令的：里面的路径一个个认
-  for (const answer of ["跑 `go run cmd/main.go`", "`bin/server -f etc/user.yaml` 启动", "见 `src/a.ts or src/c.ts`", "`cp src/a.ts src/c.ts`", "`vendor/bin/phpunit src/a.ts`"]) {
+  // 不带行号的也按整段认：只查到 files/app.ts、dir/app.ts，不能拿来给编出来的整段作证
+  for (const answer of ["`src/my files/app.ts` 里有 bug", "**src/my files/app.ts** 里有 bug", '"src/my files/app.ts" 里有 bug', "`my dir/app.ts` 里有 bug", "`src/go dir/app.ts` 里有 bug"]) {
+    const path = /[`*"]+([^`*"]+)/.exec(answer)![1];
+    assert.deepEqual(unseenCodeCitations(answer, codeEvidence([], [found("code_read_file", [{ path: "files/app.ts" }, { path: "dir/app.ts" }])])), [{ text: path, located: false }], answer);
+  }
+  assert.deepEqual(unseenCodeCitations("`src/my files/app.ts` 里有 bug", seen), []);
+  // 读起来是命令的（开头是常见命令或者 bin/ 下的命令、带 - 开头的参数、最后一个词前面就有完整的代码文件）：里面的路径一个个认
+  for (const answer of [
+    "跑 `go run cmd/main.go`",
+    "`bin/server -f etc/user.yaml` 启动",
+    "见 `src/a.ts or src/c.ts`",
+    "`cp src/a.ts src/c.ts`",
+    "`vendor/bin/phpunit src/a.ts`",
+    "`node_modules/.bin/jest src/a.ts`",
+    "`cat my src/a.ts`",
+  ]) {
     assert.deepEqual(unseenCodeCitations(answer, seen), [], answer);
   }
   assert.deepEqual(unseenCodeCitations("见 `src/a.ts or src/zzz.ts`", seen), [{ text: "src/zzz.ts", located: false }]);
