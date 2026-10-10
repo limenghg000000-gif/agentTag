@@ -600,6 +600,35 @@ test("日志里记下每轮模型调用和每次工具调用的用时", async ()
   assert.match(text, /模型第2轮 message=om_1 用时=\d+ms 输入=1600 输出=300 → 给出回答/);
 });
 
+test("模型返回了思考内容时，进度卡片上显示最新一段，结束后和步骤一起折叠；SHOW_THINKING=off 时不显示", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const script = (): ChatResult[] => [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }], reasoning: "先查资料 A" },
+    { text: "总结", finish: "stop", reasoning: "资料够了，可以总结" },
+  ];
+
+  let results = script();
+  const shown = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool] });
+  await shown.handle(message("查一下"));
+  assert.ok(shown.updates.some((u) => /最新的思考（第 1 轮.*先查资料 A/.test(cardText(u.card))));
+  const final = shown.updates.at(-1)!.card;
+  assert.deepEqual(
+    final.body.elements[0].elements.map((e: any) => e.content.split("\n").at(-1)),
+    ["💭 是模型的思考草稿，里面的猜测没有核实，结论以回答为准", "先查资料 A", "✔️ 查资料 A", "资料够了，可以总结"],
+  );
+  assert.deepEqual(markdowns(shown.sent), ["总结"]);
+
+  results = script();
+  const hidden = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool], showThinking: false });
+  await hidden.handle(message("查一下"));
+  assert.ok(hidden.updates.length > 0);
+  assert.ok(hidden.updates.every((u) => !/💭|先查资料/.test(cardText(u.card))));
+});
+
 test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const { handle } = setup({ model });
@@ -1081,6 +1110,46 @@ test("打回重做以后还是没查证就给出线上数据：不发出去，�
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
   assert.deepEqual(context.remembered, [{ question: "[群成员] prod", answer: BLOCKED_OPS_ANSWER }]);
+});
+
+test("回答因为没查证被拦下时，卡片上的思考也去掉", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const results: ChatResult[] = [
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop", reasoning: "不用查，直接说没有报错" },
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop", reasoning: "还是不查了" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { sent, updates, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("prod"));
+
+  assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
+  assert.ok(updates.some((u) => /不用查/.test(cardText(u.card))));
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|不用查|还是不查了/);
+});
+
+test("引用了没查到的代码位置被拦下时，卡片上的思考也去掉", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }], reasoning: "搜一下 user.go" },
+    { text: "问题在 src/user.go:99", finish: "stop", reasoning: "多半是 src/user.go:99" },
+    { text: "问题在 src/user.go:99", finish: "stop", reasoning: "就是 src/user.go:99" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { sent, updates, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|user\.go/);
 });
 
 test("打回重做以后没再给线上数据、查过工具、或者是整理之前内容的请求时，照常发出", async () => {

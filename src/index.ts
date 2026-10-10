@@ -83,6 +83,7 @@ const handleMessage = createMessageHandler({
   ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
   ...(mcp ? { mcp } : {}),
   ...(images ? { images } : {}),
+  showThinking: config.showThinking,
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi),
   memory,

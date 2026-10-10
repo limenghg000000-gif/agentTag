@@ -190,6 +190,24 @@ test("每轮模型调用和每次工具调用都报告用时，带上模型用�
   }
 });
 
+test("模型返回了思考内容时，这一轮的事件带上它", async () => {
+  const { model } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "先查日志" },
+    { text: "好了", finish: "stop" },
+  ]);
+  const events: AgentEvent[] = [];
+
+  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, now: () => 0, onEvent: (e) => events.push(e) });
+
+  assert.deepEqual(
+    events.filter((e) => e.type === "model"),
+    [
+      { type: "model", round: 1, ms: 0, toolNames: ["echo"], reasoning: "先查日志" },
+      { type: "model", round: 2, ms: 0, toolNames: [] },
+    ],
+  );
+});
+
 test("回答没通过 review 时交回模型重做一次，第二次不再检查", async () => {
   const { model, requests } = scriptedModel([
     { text: "瞎编的答案", finish: "stop" },

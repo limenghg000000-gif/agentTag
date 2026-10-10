@@ -48,6 +48,8 @@ export interface ChatResult {
   toolCalls?: ToolCall[];
   /** 模型服务返回了用量时才有 */
   usage?: TokenUsage;
+  /** 模型这一轮的思考内容（百炼放在 reasoning_content 里）。开着思考、模型服务返回了才有 */
+  reasoning?: string;
 }
 
 /** 模型调用层。业务代码只依赖这个接口，换模型服务只需换实现或改环境变量。 */
@@ -156,7 +158,10 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
       const choice = completion.choices[0];
       const text = stripThinkTags(choice?.message.content ?? "");
       const usage = toUsage(completion.usage);
-      const withUsage = <T extends ChatResult>(result: T): T => (usage ? { ...result, usage } : result);
+      // reasoning_content 不是 OpenAI 的标准字段，百炼、DeepSeek 等开着思考时在这里返回思考内容
+      const thought = (choice?.message as { reasoning_content?: unknown } | undefined)?.reasoning_content;
+      const reasoning = typeof thought === "string" && thought.trim() ? thought.trim() : undefined;
+      const withUsage = <T extends ChatResult>(result: T): T => ({ ...result, ...(usage ? { usage } : {}), ...(reasoning ? { reasoning } : {}) });
       const toolCalls = (choice?.message.tool_calls ?? [])
         .filter((call) => call.type === "function")
         .map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments }));

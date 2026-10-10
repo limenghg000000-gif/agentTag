@@ -98,6 +98,8 @@ export interface BotDeps {
   now?: () => number;
   /** 同一张进度卡片两次更新的最小间隔 */
   cardIntervalMs?: number;
+  /** 进度卡片上显示模型每轮的思考（SHOW_THINKING）。不传时显示 */
+  showThinking?: boolean;
   /** 配置的代码仓库（CODE_REPOS）。用来检查回答是不是没读代码就说了仓库里的内容 */
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
@@ -307,10 +309,14 @@ async function runTask(
         if (event.type === "tool_start" || event.type === "tool_end") {
           applyEvent(state, event);
           card?.update(render());
+        } else if (event.type === "model" && event.reasoning && deps.showThinking !== false) {
+          (state.thoughts ??= []).push({ round: event.round, ms: event.ms, text: event.reasoning, at: state.steps.length });
+          card?.update(render());
         }
       },
     });
     answer = toReply(result.text, result.finish);
+    let blockedCode = false;
     if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
@@ -337,7 +343,12 @@ async function runTask(
       if (unseen.length > 0) {
         logger.warn(`回答打回重做以后还是引用了没查到的代码位置，没有发出 message=${msg.messageId}：${unseen.map((cite) => cite.text).join("、")}`);
         answer = blockedCodeAnswer(deps.codeRepos ?? []);
+        blockedCode = true;
       }
+    }
+    // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着
+    if (answer === BLOCKED_OPS_ANSWER || blockedCode) {
+      state.thoughts = undefined;
     }
     state.phase = "done";
     deps.context.remember(msg, prompt, answer);
