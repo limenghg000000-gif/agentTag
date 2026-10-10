@@ -316,7 +316,7 @@ async function runTask(
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       const unprefixed = repos.reduce(
-        (text, repo) => text.replace(new RegExp(`(?<![\\w./@+!~-])${escapeRegExp(repo)}/`, "gi"), " "),
+        (text, repo) => text.replace(new RegExp(`(?<!${PATH_CHAR})${escapeRegExp(repo)}/`, "gi"), " "),
         userText,
       );
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
@@ -620,12 +620,14 @@ function mentions(text: string, cite: string): boolean {
 }
 
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
+/** 路径里会有的字符（Go 模块的 @ 和 !、pnpm 的 +）：前面紧挨着这些的，是一个更长的路径的后半截 */
+const PATH_CHAR = "[\\w./@+!~-]";
 /**
- * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、src/a.tsx 都不是 src/a.ts）。
+ * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、src/a.tsx 都不是 src/a.ts）。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。
  * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
  */
-const PATH_START = "(?:(?<![\\w./-])|(?<=(?:^|[\\s\"'`(（=])/(?:[^\\s/\"'`()（）<>]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
+const PATH_START = "(?:(?<!" + PATH_CHAR + ")|(?<=(?:^|[\\s\"'`(（=])/(?:[^\\s/\"'`()（）<>]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
 const PATH_END = "(?![\\w/-]|\\.\\w)";
 
 function escapeRegExp(text: string): string {
