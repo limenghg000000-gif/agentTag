@@ -810,7 +810,8 @@ function deskSetup({
   searchLessons = () => JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9 }, { id: 40, title: "Open WebUI 存的", score: 8 }] }),
 }: {
   aiops?: boolean;
-  approvers?: ReadonlySet<string>;
+  /** null：没配写权限名单 */
+  approvers?: ReadonlySet<string> | null;
   saveLesson?: (args: Record<string, unknown>) => string;
   searchLessons?: (args: Record<string, unknown>) => string;
 } = {}) {
@@ -866,7 +867,7 @@ function deskSetup({
       }
       updates.push({ messageId, card });
     },
-    approvers,
+    ...(approvers ? { approvers } : {}),
     allowedChatIds: new Set(["oc_1"]),
     logger: quiet,
     now: () => now,
@@ -3674,4 +3675,17 @@ test("归档时 aiops 那条的出处不是这一条：出处只有是 K 编号�
     get_knowledge: (args) => JSON.stringify({ id: args.id, title: "t", status: "active", diagnosis_path: "看了连接数\n（来自飞书团队经验库 #k 1）" }),
   });
   await assert.rejects(new AiopsLessons(mcp, "aiops", quiet).archiveSynced(31, ["K9"], "ML", task), /它的出处是 K1，不是 K9/);
+});
+
+test("没配写权限名单：经验库只能查，不给起草和归档的工具，提示词里说存不了", async () => {
+  const { base, desk, tool, sent } = deskSetup({ approvers: null });
+  await base.save(normalizeDraft(dau));
+  const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
+  const names = desk.tools(ctx).map((t) => t.spec.name);
+  assert.deepEqual(names, ["knowledge_search", "knowledge_get"]);
+  assert.match(await tool("knowledge_search").run({ query: "日活" }, { signal }), /K1/);
+  const prompt = buildSystemPrompt({ botName: "飞书 CLI", now: new Date(0), toolNames: names, knowledge: { hits: "" } });
+  assert.match(prompt, /现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）/);
+  assert.doesNotMatch(prompt, /knowledge_propose/);
+  assert.equal(sent.length, 0);
 });

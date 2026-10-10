@@ -188,7 +188,10 @@ export interface KnowledgeDeskOptions {
   aiops?: AiopsLessons;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   updateCard: (messageId: string, card: object) => Promise<void>;
-  /** 能在卡片上点「保存」「归档」的人（open_id）。不配时群里所有人都能 */
+  /**
+   * 能在卡片上点「保存」「归档」的人（open_id）。不配时只能查、不能存和归档：经验库所有群共用，存进去的会写进别的群回答前的提示词，
+   * 谁都能存的话，一个群里有人存一条带指令的「经验」就能影响别的群的回答
+   */
   approvers?: ReadonlySet<string>;
   allowedChatIds: ReadonlySet<string>;
   logger?: Logger;
@@ -443,7 +446,8 @@ export class KnowledgeDesk {
         });
       },
     };
-    return [search, get, propose, archive];
+    // 没配写权限名单：没人能确认，起草和归档的工具不给（提示词里会说存不了）
+    return this.options.approvers ? [search, get, propose, archive] : [search, get];
   }
 
   /** 处理确认卡片上的按钮。不是经验库的卡片返回 false */
@@ -489,7 +493,7 @@ export class KnowledgeDesk {
       }
       return true;
     }
-    const approver = !this.options.approvers || this.options.approvers.has(operator.openId);
+    const approver = this.options.approvers?.has(operator.openId) === true;
     const who = operator.name ?? "有人";
     if (value.op === "cancel") {
       // 做了一半的是写权限名单里的人确认过的：剩下的不再做，也要名单里的人说了算，发起人只能取消还没确认的

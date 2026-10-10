@@ -144,6 +144,8 @@ function knowledgeSection(
     );
   }
   if (!canPropose) {
+    // 没有起草的工具：管理员没配写权限名单，经验库只能查
+    lines.push("- 现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）。有人要沉淀经验时如实说明，不要假装已经存了。");
     return lines;
   }
   lines.push(

@@ -204,7 +204,9 @@ if (config.knowledge) {
     `团队经验库：存在飞书多维表格里（${config.knowledge.bitable?.url ?? "第一次保存经验时机器人自己建表"}），每个提问回答前先查一次` +
       `（${config.knowledge.embeddingModel ? `关键词加向量模型 ${config.knowledge.embeddingModel}` : "只按关键词"}）；` +
       "群里说「沉淀成经验」时机器人起草、发确认卡片，" +
-      (config.feishu.writeAllowedUsers ? "写权限名单里的人点「保存」才写入" : "群里任何人点「保存」都能写入（要限制就配 WRITE_ALLOWED_USERS）") +
+      (config.feishu.writeAllowedUsers
+        ? "写权限名单里的人点「保存」才写入"
+        : "但没配写权限名单（WRITE_ALLOWED_USERS），现在只能查、不能存：经验库所有群共用，要先限定谁能确认") +
       (mcp?.names.includes("aiops") ? "；排查经验同步一份到 aiops 经验库" : ""),
   );
 } else {
