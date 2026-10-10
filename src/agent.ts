@@ -11,7 +11,7 @@ const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限�
 
 export type AgentEvent =
   /** 一轮模型调用结束。toolNames 为空表示这一轮给出了回答 */
-  | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[] }
+  | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[]; thinking?: boolean }
   | { type: "tool_start"; id: string; label: string }
   /** error 是交给模型的失败原因 */
   | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string }
@@ -30,6 +30,11 @@ export interface AgentRequest {
   now?: () => number;
   /** 这次任务单独打开或关掉思考；不传用模型的配置 */
   thinking?: boolean;
+  /**
+   * 调过某个工具以后，后面几轮打开思考（没传 thinking 时才看）：比如调过 aiops 的工具就是在排查线上问题，
+   * 每拿到一次结果都要想清楚下一步查什么。返回 true 的工具调过一次，这次任务后面每一轮都开着
+   */
+  thinkAfter?: (toolName: string) => boolean;
   /**
    * 模型给出最终回答时检查一遍，比如「回答里提到了仓库的文件，这次却一次代码工具都没调」。
    * 返回一段话时，这版回答不发出去，把这段话交给模型让它重做；每个任务只重做一次。usedTools 是这次任务调过的工具名
@@ -58,6 +63,7 @@ export async function runAgent({
   maxToolRounds = MAX_TOOL_ROUNDS,
   now = Date.now,
   thinking,
+  thinkAfter,
   review,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
@@ -66,6 +72,7 @@ export async function runAgent({
   const usedTools = new Set<string>();
   let toolCalls = 0;
   let reviewed = false;
+  let investigating = false;
 
   for (let round = 0; ; round++) {
     signal.throwIfAborted();
@@ -74,13 +81,15 @@ export async function runAgent({
       conversation.push({ role: "user", content: LAST_ROUND_NOTE });
     }
     const startedAt = now();
-    const result = await model.chat({ system, messages: conversation, tools: specs, signal, ...(thinking !== undefined ? { thinking } : {}) });
+    const think = thinking ?? (investigating ? true : undefined);
+    const result = await model.chat({ system, messages: conversation, tools: specs, signal, ...(think !== undefined ? { thinking: think } : {}) });
     onEvent({
       type: "model",
       round: round + 1,
       ms: now() - startedAt,
       ...(result.usage ? { usage: result.usage } : {}),
       toolNames: result.finish === "tool_calls" ? (result.toolCalls ?? []).map((call) => call.name) : [],
+      ...(think !== undefined ? { thinking: think } : {}),
     });
     if (result.finish !== "tool_calls" || !result.toolCalls?.length) {
       const redo = !lastRound && !reviewed && result.finish !== "filtered" ? review?.(result.text, usedTools) : undefined;
@@ -103,6 +112,7 @@ export async function runAgent({
     toolCalls += result.toolCalls.length;
     for (const call of result.toolCalls) {
       usedTools.add(call.name);
+      investigating ||= thinkAfter?.(call.name) ?? false;
     }
     signal.throwIfAborted();
     result.toolCalls.forEach((call, i) => {

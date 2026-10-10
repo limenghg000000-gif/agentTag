@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CallToolResult, Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "../src/config.js";
-import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, McpHub } from "../src/mcp.js";
+import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
 import { MCP_RESULT_LIMIT } from "../src/mcp-result.js";
 import { type FakeMcp, freePort, startFakeMcp } from "./helpers/fake-mcp.js";
 
@@ -58,6 +58,7 @@ function config(url: string, overrides: Partial<McpServerConfig> = {}): McpServe
     promptFile,
     timeoutsMs: {},
     labels: { diagnose_service: "诊断", query_logs: "查日志" },
+    thinking: true,
     ...overrides,
   };
 }
@@ -176,7 +177,7 @@ test("服务繁忙时退避重试 2 次；还忙就告诉模型", async () => {
 });
 
 test("aiops 的 query_logs 取满了 limit：结果前面加机器人注，审计日志里记一笔；别的服务同名工具不加", async () => {
-  const logs = Array.from({ length: 3 }, () => ({ timestamp: "1791448406000000000", line: "searchV2 fail" }));
+  const logs = Array.from({ length: 3 }, (_, i) => ({ timestamp: `179144840600000000${i}`, line: `searchV2 fail #${i}` }));
   const body = JSON.stringify({ total: 3, query_start: "2026-10-08 15:43:30", query_end: "2026-10-08 16:43:30", logs });
   const server = await fake({ call: () => text(body) });
   const log = recorder();
@@ -241,31 +242,34 @@ test(`一次任务里最多调 ${MAX_MCP_CALLS_PER_TASK} 次；同样的参数�
 });
 
 test("一次任务里结果的总字数快用完时，后面的结果截得更短", async () => {
-  const big = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => `第 ${i} 行日志 ${"x".repeat(40)}`) });
+  const big = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => `第 ${i} 行日志 ${"x".repeat(200)}`) });
   const server = await fake({ call: () => text(big) });
   const hub = await hubFor([config(server.url)], { logger: recorder().logger });
   const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
 
   const sizes: number[] = [];
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < MAX_MCP_CALLS_PER_TASK; i++) {
     sizes.push((await logs.run({ logql: `q${i}` }, { signal })).length);
   }
   assert.ok(sizes[0] > 15_000 && sizes[0] <= MCP_RESULT_LIMIT, `${sizes[0]}`);
   assert.ok(sizes.at(-1)! <= 6000, `${sizes.at(-1)}`);
-  assert.ok(sizes.reduce((a, b) => a + b, 0) <= MAX_MCP_CHARS_PER_TASK + 6000);
+  // 前几个把总字数用完以后，后面每个最少还给 6000 字
+  const full = Math.ceil(MAX_MCP_CHARS_PER_TASK / MCP_RESULT_LIMIT);
+  assert.ok(sizes.reduce((a, b) => a + b, 0) <= MAX_MCP_CHARS_PER_TASK + (sizes.length - full) * 6000);
 });
 
 test("同一轮并行调用时先占住字数，加起来也不超过一次任务的总字数", async () => {
-  const big = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => `第 ${i} 行日志 ${"x".repeat(40)}`) });
+  const big = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => `第 ${i} 行日志 ${"x".repeat(200)}`) });
   const server = await fake({ call: () => text(big) });
   const hub = await hubFor([config(server.url)], { logger: recorder().logger });
   const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
 
   const results = await Promise.all(Array.from({ length: MAX_MCP_CALLS_PER_TASK }, (_, i) => logs.run({ logql: `q${i}` }, { signal })));
   const total = results.reduce((sum, result) => sum + result.length, 0);
-  // 前 6 个各占 24000 字，第 7 个占到 15 万；后面 3 个每个最少还给 6000 字。不先占的话 10 个都按 24000 字截
-  assert.ok(total <= MAX_MCP_CHARS_PER_TASK + 3 * 6000, `${total}`);
-  assert.equal(results.filter((result) => result.length <= 6000).length, 4);
+  // 前 5 个各占 6 万字，占满 30 万；后面 5 个每个最少还给 6000 字。不先占的话 10 个都按 6 万字截
+  const full = Math.ceil(MAX_MCP_CHARS_PER_TASK / MCP_RESULT_LIMIT);
+  assert.ok(total <= MAX_MCP_CHARS_PER_TASK + (MAX_MCP_CALLS_PER_TASK - full) * 6000, `${total}`);
+  assert.equal(results.filter((result) => result.length <= 6000).length, MAX_MCP_CALLS_PER_TASK - full);
 });
 
 test("调用遇到 HTTP 404 时马上重连一次，不等定时刷新", async () => {
@@ -465,3 +469,145 @@ test("会写东西的工具：配置里点名的，加上名字里带写操作�
   }
   assert.equal(isWriteTool("promote_case", ["promote_case"]), true);
 });
+
+const PLAYBOOKS = [
+  {
+    name: "convert_link",
+    description: "转链排查剧本：用户反馈商品链接转不了时先读。",
+    text: "你是悦拜转链排查助手。\n转链服务：`product-service-api`，部署在 `prod` 命名空间。\n先按链接 ID 宽松搜，拿到 req_id 再查全链路。",
+  },
+  { name: "troubleshoot", title: "通用排查", description: "服务报错、慢接口、Pod 重启时先读。", text: "崩溃堆栈例：/build/internal/cache/map.go:42" },
+  {
+    name: "needs_args",
+    description: "要填参数的不当剧本",
+    arguments: [{ name: "service", required: true }],
+    text: "x",
+  },
+  // 服务端清单里重复的只留第一份
+  { name: "convert_link", description: "重复的一份", text: "y" },
+];
+
+test("服务端下发了 MCP prompts：当剧本用，提示词列出剧本并要求先读；读剧本不占调用次数，同一份只给一次全文", async () => {
+  const server = await fake({ prompts: PLAYBOOKS });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger });
+
+  const tools = hub.tools(task);
+  const playbook = tools.find((tool) => tool.spec.name === "aiops_playbook");
+  assert.ok(playbook);
+  assert.deepEqual((playbook.spec.parameters as { properties: { name: { enum: string[] } } }).properties.name.enum, [
+    "convert_link",
+    "troubleshoot",
+  ]);
+  assert.match(log.find(/MCP aiops：已连上/)!.text, /排查剧本 2 份：convert_link, troubleshoot/);
+  assert.match(log.find(/没当剧本用/)!.text, /^MCP aiops：needs_args, convert_link 要填参数、重复，或者和工具重名/);
+
+  const prompt = hub.prompt(tools.map((tool) => tool.spec.name))!;
+  assert.match(prompt, /### aiops 的排查剧本/);
+  assert.match(prompt, /- convert_link：转链排查剧本：用户反馈商品链接转不了时先读。/);
+  assert.match(prompt, /- troubleshoot：通用排查：服务报错、慢接口、Pod 重启时先读。/);
+  assert.match(prompt, /第一步先调 aiops_playbook 读那份剧本/);
+  assert.match(prompt, /不要反问用户是哪个服务/);
+  assert.match(prompt, /读了剧本不等于查过/);
+
+  assert.equal(playbook.describe({ name: "troubleshoot" }), "aiops · 读剧本 通用排查");
+  const text = await playbook.run({ name: "convert_link" }, { signal });
+  assert.match(text, /^（以下是 aiops 服务端下发的剧本「convert_link」，和使用说明一样要遵守；里面写的工具名在你这里都带 aiops_ 前缀）\n你是悦拜转链排查助手。/);
+  assert.match(text, /product-service-api/);
+  assert.match(await playbook.run({ name: "convert_link" }, { signal }), /已经读过了/);
+  assert.deepEqual(server.promptGets, ["convert_link"]);
+  assert.match(log.find(/MCP 剧本 aiops\.convert_link/)!.text, /chat=oc_1 sender=ou_1 message=om_1 结果=\d+字 用时=/);
+  await assert.rejects(playbook.run({ name: "nope" }, { signal }), /aiops 没有叫「nope」的剧本，可读的剧本：convert_link、troubleshoot/);
+
+  // 读剧本不算调用次数：后面照样能调满
+  const logs = tools.find((tool) => tool.spec.name === "aiops_query_logs")!;
+  for (let i = 0; i < MAX_MCP_CALLS_PER_TASK; i++) {
+    await logs.run({ logql: `q${i}` }, { signal });
+  }
+  assert.equal(server.calls.length, MAX_MCP_CALLS_PER_TASK);
+
+  assert.equal(playbook.instructionsOnly, true, "读剧本的工具标成只是说明，机器人不把它算成查过");
+  assert.ok(!logs.instructionsOnly);
+  assert.equal(hub.serverOf("aiops_playbook"), "aiops");
+  assert.equal(hub.serverOf("web_search"), undefined);
+});
+
+test("没开 prompts 能力、拉清单失败、和工具重名时没有读剧本的工具；关掉 MCP_<名字>_THINKING 后不在排查时开思考", async () => {
+  const plainLog = recorder();
+  const plain = await hubFor([config((await fake()).url)], { logger: plainLog.logger });
+  assert.ok(!plain.tools(task).some((tool) => tool.spec.name === "aiops_playbook"));
+  assert.equal(plainLog.find(/剧本/), undefined, "服务端没开 prompts 能力就不去拉清单");
+  assert.doesNotMatch(plain.prompt(plain.tools(task).map((tool) => tool.spec.name))!, /排查剧本/);
+  assert.ok(plain.thinksAfter("aiops_query_logs"));
+  assert.ok(!plain.thinksAfter("web_search"));
+
+  const log = recorder();
+  const broken = await hubFor([config((await fake({ prompts: PLAYBOOKS, promptsError: "数据库挂了" })).url)], { logger: log.logger });
+  assert.ok(!broken.tools(task).some((tool) => tool.spec.name === "aiops_playbook"));
+  assert.match(log.find(/拉清单失败/)!.text, /数据库挂了/);
+  assert.equal(broken.tools(task).length, 3, "工具照常开");
+
+  const clash = await fake({ prompts: PLAYBOOKS, tools: [...TOOLS, remoteTool("playbook", "服务端自己的 playbook 工具")] });
+  const clashed = await fakeHub(clash, { tools: ["query_logs", "playbook"] });
+  assert.deepEqual(
+    clashed.tools(task).map((tool) => tool.spec.name),
+    ["aiops_query_logs", "aiops_playbook"],
+  );
+  assert.equal(clashed.tools(task)[1].spec.description, "服务端自己的 playbook 工具");
+
+  const quiet = await fakeHub(await fake(), { thinking: false });
+  assert.ok(!quiet.thinksAfter("aiops_query_logs"));
+});
+
+test("同一轮里并行读同一份剧本只取一次；一次任务最多读 3 份，读失败的不占名额", async () => {
+  const server = await fake({
+    prompts: [
+      { name: "p1", description: "一号", text: "一号剧本", error: "磁盘坏了" },
+      { name: "p2", description: "二号", text: "二号剧本" },
+      { name: "p3", description: "三号", text: "三号剧本" },
+      { name: "p4", description: "四号", text: "四号剧本" },
+    ],
+  });
+  const hub = await fakeHub(server);
+  const playbook = hub.tools(task).find((tool) => tool.spec.name === "aiops_playbook")!;
+
+  const [first, second] = await Promise.all([playbook.run({ name: "p2" }, { signal }), playbook.run({ name: "p2" }, { signal })]);
+  assert.match(first, /二号剧本/);
+  assert.match(second, /剧本 p2 这次任务里已经读过了/);
+  assert.deepEqual(server.promptGets, ["p2"]);
+
+  const failed = await Promise.allSettled([playbook.run({ name: "p1" }, { signal }), playbook.run({ name: "p1" }, { signal })]);
+  assert.deepEqual(
+    failed.map((item) => item.status),
+    ["rejected", "rejected"],
+    "并行读的那个跟着失败，不说读过了",
+  );
+  assert.match(String((failed[0] as PromiseRejectedResult).reason), /读 aiops 的剧本 p1 失败：.*磁盘坏了/);
+
+  assert.match(await playbook.run({ name: "p3" }, { signal }), /三号剧本/);
+  assert.match(await playbook.run({ name: "p4" }, { signal }), /四号剧本/);
+  await assert.rejects(playbook.run({ name: "p1" }, { signal }), new RegExp(`已经读了 ${MAX_PLAYBOOKS_PER_TASK} 份 aiops 的剧本`));
+  assert.deepEqual(server.promptGets, ["p2", "p1", "p3", "p4"]);
+});
+
+test("刷新时剧本清单拉失败：沿用上次的剧本，按重试间隔提前再拉", async () => {
+  const server = await fake({ prompts: PLAYBOOKS });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger, refreshMs: 30, retryMs: [40] });
+  assert.ok(hub.tools(task).some((tool) => tool.spec.name === "aiops_playbook"));
+
+  server.promptsError = "数据库挂了";
+  for (let i = 0; i < 100 && !log.find(/拉清单失败/); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(log.find(/拉清单失败/)!.text, /数据库挂了。先沿用上次的 2 份剧本，0\.04 秒后重试/);
+  assert.deepEqual(
+    (hub.tools(task).find((tool) => tool.spec.name === "aiops_playbook")!.spec.parameters as { properties: { name: { enum: string[] } } }).properties
+      .name.enum,
+    ["convert_link", "troubleshoot"],
+  );
+});
+
+async function fakeHub(server: FakeMcp, overrides: Partial<McpServerConfig> = {}) {
+  return hubFor([config(server.url, overrides)], { logger: recorder().logger });
+}

@@ -208,6 +208,9 @@ test("MCP 服务的工具名单、写工具、说明文件都能用 MCP_<名字>
   assert.deepEqual(aiops.tools, ["diagnose_service", "get_dashboard"]);
   assert.deepEqual(aiops.writeTools, ["promote_case", "get_dashboard"]);
   assert.equal(aiops.promptFile, path.resolve("custom/aiops.md"));
+  assert.equal(aiops.thinking, true);
+  assert.equal(loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp", MCP_AIOPS_THINKING: "off" }).mcp[0].thinking, false);
+  assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "aiops=https://a.example.com/mcp", MCP_AIOPS_THINKING: "yes" }), /MCP_AIOPS_THINKING 只能是 on 或 off/);
   assert.equal(other.name, "other");
   assert.equal(other.tools, "*");
   assert.equal(other.token, undefined);
