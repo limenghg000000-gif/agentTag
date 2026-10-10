@@ -444,22 +444,32 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 }
 
 const CODE_TOOL_PREFIX = "code_";
-/** 路径里会有的字符（Go 模块的 @ 和 !、pnpm 的 +）：前面紧挨着这些的，是一个更长的路径的后半截 */
-const PATH_CHAR = "[\\w./@+!~-]";
+/**
+ * 路径和前后文字的分界：空白、引号、括号、Markdown 的 * 和 |、, ; = : #、中文标点、汉字和假名、全角字符、各种符号和 emoji。
+ * 别的字符都算路径的一部分（字母数字和 . _ - / @ + ! ~ $ % \ 等，Go 模块的 @ 和 !、pnpm 的 +）：
+ * 不一个个列路径里能有什么字符，没想到的字符也算在路径里，紧挨着它的是一个更长的路径的一截（pkg$v1/src/foo.ts 不是 v1/src/foo.ts）
+ */
+const PATH_DELIM = "\\s\"'`()\\[\\]<>{}*|,;=:#\\u2010-\\u2027\\u2190-\\u2bff\\u3000-\\u30ff\\u3400-\\u9fff\\uff00-\\uffef\\ud800-\\udfff";
+/** 路径里的一个字符：前面紧挨着这样的字符的，是一个更长的路径的后半截 */
+const PATH_CHAR = `[^${PATH_DELIM}]`;
+/** 目录名、文件名里的一个字符 */
+const NAME_CHAR = `[^${PATH_DELIM}/]`;
+/** 路径到这儿完了：后面是分界字符或者到头了；中间可以隔着句号、叹号、问号这些标点（src/a.ts。src/a.ts!） */
+const PATH_END = `(?=$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}]))`;
 /**
  * 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go。
- * 目录和文件名里可以有 @、+、!（pkg@v1/src/foo.ts 按整段认，不拿后半截 v1/src/foo.ts 充数）；
- * 前后紧挨着路径字符的不认（src/foo.ts@backup 不是代码文件，~/.config/x.yaml 是家目录下的文件），后面的句号、叹号是标点
+ * 按整段路径认（pkg@v1/src/foo.ts、pkg$v1/src/foo.ts 不拿后半截 v1/src/foo.ts 充数）；
+ * 后面紧挨着路径字符的不是代码文件（src/foo.ts@backup、a.ts.map），~ 开头的是家目录下的文件（~/.config/x.yaml）
  */
 const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
-const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})((?:[\\w.@+!-]+\\/)+[\\w.@+!-]+\\.${CODE_EXT})(?![\\w/@+~-]|[.!]\\w)`, "g");
+const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})(?!~)((?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
 /**
  * 反引号里带空格的路径（`src/my files/app.ts:12`、`pkg@v1/my files/app.ts:2`）：CODE_PATHS 只认得出空格后面那段，
  * 这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，词之间可以是连着几个空格、制表符、全角空格；
  * 后面是反引号，或者 LINE_AFTER_PATH 认的行号写法（:12、：12、#L12、 第 12 行）
  */
 const SPACED_CODE_PATHS = new RegExp(
-  `(?<=\`)((?:[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\/)+[\\w.@+!-]+(?:[^\\S\\r\\n]+[\\w.@+!-]+)*\\.${CODE_EXT})(?=[\`:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
+  `(?<=\`)((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})(?=[\`:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
   "g",
 );
 /**
@@ -658,13 +668,12 @@ function mentions(text: string, cite: string): boolean {
 
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
 /**
- * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、src/a.tsx 都不是 src/a.ts）。
+ * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、src/a.tsx 都不是 src/a.ts），
+ * 前后的分界和回答里认路径（CODE_PATHS）一样。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。
  * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
  */
 const PATH_START = "(?:(?<!" + PATH_CHAR + ")|(?<=(?:^|[\\s\"'`(（=])/(?:[^\\s/\"'`()（）<>]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
-/** 路径后面不能紧挨着路径字符（src/a.ts@v2 不是 src/a.ts），句号、叹号是标点；和回答里认路径（CODE_PATHS）一样 */
-const PATH_END = "(?![\\w/@+~-]|[.!]\\w)";
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -700,12 +709,11 @@ function seenByModel(output: string, limit: number): string {
     return output;
   }
   const kept = output.slice(0, limit);
-  const next = output[limit];
-  if (next === ":" || !/[\w./-]/.test(next)) {
+  if (!new RegExp(PATH_CHAR).test(output[limit])) {
     return kept;
   }
-  const token = /[\w./:-]+$/.exec(kept)?.[0] ?? "";
-  return token.includes(":") ? kept.replace(/:[\w./-]*$/, "") : kept.slice(0, kept.length - token.length);
+  const token = new RegExp(`(?:${PATH_CHAR}|:)+$`).exec(kept)?.[0] ?? "";
+  return token.includes(":") ? kept.replace(new RegExp(`:${PATH_CHAR}*$`), "") : kept.slice(0, kept.length - token.length);
 }
 
 /** 回答里写的路径和 src/repo.ts 读写文件时一样整理（见 Workspace.relative）：去掉前后的空格和开头的 ./、/，合并多余的 / 和 ./ */

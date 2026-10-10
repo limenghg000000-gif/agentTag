@@ -861,6 +861,14 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
     maxOutputChars: stack.indexOf("x:5"),
     run: async () => stack,
   };
+  // 截在 $ 前面：$ 也是路径字符，模型看到的 src/index.ts 是一个更长的路径的前半截
+  const bundle = "Error: boom\n    at render (src/index.ts$chunk.js:5:3)";
+  const cutBundle: Tool = {
+    spec: { name: "aiops_get_bundle", description: "查打包后的堆栈", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查打包后的堆栈",
+    maxOutputChars: bundle.indexOf("$chunk"),
+    run: async () => bundle,
+  };
   const ask = async (answers: string[], tool = "aiops_get_pod_logs") => {
     const results: ChatResult[] = [
       { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: tool, arguments: "{}" }] },
@@ -871,7 +879,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
       model,
       taskTools: () => [codeSearch],
       codeRepos: ["ai/aiops-mcp"],
-      mcp: { names: ["aiops"], tools: () => [podLogs, longLogs, cutTrace, cutStack], prompt: () => undefined },
+      mcp: { names: ["aiops"], tools: () => [podLogs, longLogs, cutTrace, cutStack, cutBundle], prompt: () => undefined },
     });
     await handle(message("order-api 的 Pod 为什么重启"));
     return { requests, replies: markdowns(sent) };
@@ -900,6 +908,9 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   const halfPath = await ask(["报错在 `src/index.ts` 里", "报错在 render 里"], "aiops_get_stack");
   assert.equal(halfPath.requests.length, 3);
   assert.deepEqual(halfPath.replies, ["报错在 render 里"]);
+  const beforeDollar = await ask(["报错在 `src/index.ts` 里", "报错在 render 里"], "aiops_get_bundle");
+  assert.equal(beforeDollar.requests.length, 3);
+  assert.deepEqual(beforeDollar.replies, ["报错在 render 里"]);
 });
 
 test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
@@ -1351,6 +1362,7 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
       { tool: "aiops_query_logs", output: "caller=vendor/svc@v1.2.3/internal/repo/order.go:9" },
       { tool: "aiops_query_logs", output: "at vendor/pkg@src/glued.ts:10 and vendor/pkg+lib/glued.go:3 and mod/!x!lib/glued.py:4" },
       { tool: "aiops_query_logs", output: "loaded src/tail.ts@v2 and src/tail.go+x, then failed in src/end.ts!" },
+      { tool: "aiops_query_logs", output: "at pkg$src/dollar.ts:10 and vendor\\lib/back.go:3 and x%2Flib/pct.py:4 and src/last.ts$ and src/q.ts?" },
     ],
   );
   // 结果里只有 src/index.tsx、pkg/mysrc/util.ts、src/app.ts.map、pkg/src/nested.ts，不能认 src/index.ts、src/util.ts、src/app.ts、src/nested.ts
@@ -1382,6 +1394,12 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   assert.equal(seen("src/tail.ts"), false);
   assert.equal(seen("src/tail.go"), false);
   assert.equal(seen("src/end.ts"), true);
+  // 别的字符（$、\、%）也一样：不在分界字符里的都算路径的一部分；句末的问号是标点
+  assert.equal(seen("src/dollar.ts", 10), false);
+  assert.equal(seen("lib/back.go", 3), false);
+  assert.equal(seen("lib/pct.py", 4), false);
+  assert.equal(seen("src/last.ts"), false);
+  assert.equal(seen("src/q.ts"), true);
   // 提交号可以只写前几位，不能在查到的后面再编几位
   const commit = codeEvidence([], [found("code_search", [{ commit: "3f2a1c9d8e7b" }])]);
   assert.equal(commit("3f2a1c9"), true);
@@ -1493,6 +1511,22 @@ test("没查到的代码位置：带行号的路径和提交号算「说查过�
   ]);
   assert.deepEqual(unseenCodeCitations("`src/foo.ts@backup`，编辑 ~/.config/x.yaml 或 ~deploy/conf/app.yaml", none), []);
   assert.deepEqual(unseenCodeCitations("注意 src/a.ts!", none), [{ text: "src/a.ts", located: false }]);
+  // 不一个个列路径字符：$、\、% 这些也算在路径里，整段认
+  const tail = codeEvidence([], [found("code_read_file", [{ path: "v1/src/foo.ts", lines: [9, 9] }])]);
+  assert.deepEqual(unseenCodeCitations("读了 `pkg$v1/src/foo.ts:9`、pkg\\v1/src/foo.ts:9 和 pkg%v1/src/foo.ts:9", tail), [
+    { text: "pkg$v1/src/foo.ts:9", located: true },
+    { text: "pkg\\v1/src/foo.ts:9", located: true },
+    { text: "pkg%v1/src/foo.ts:9", located: true },
+  ]);
+  assert.deepEqual(unseenCodeCitations("见 v1/src/foo.ts:9", tail), []);
+  // 紧挨着汉字、全角标点、符号、emoji 的照样认出来；句末的省略号、问号是标点
+  assert.deepEqual(unseenCodeCitations("见v1/src/foo.ts:9，（v1/src/foo.ts:9）→v1/src/foo.ts:9 👉v1/src/foo.ts:9 •v1/src/foo.ts:9", tail), []);
+  assert.deepEqual(unseenCodeCitations("见v1/src/bar.ts:9 👉v1/src/baz.ts 是 v1/src/qux.ts? 还有 v1/src/end.ts...", tail), [
+    { text: "v1/src/bar.ts:9", located: true },
+    { text: "v1/src/baz.ts", located: false },
+    { text: "v1/src/qux.ts", located: false },
+    { text: "v1/src/end.ts", located: false },
+  ]);
 });
 
 test("调过代码工具还编出仓库里没有的文件：打回重做，重做后还编就不发出", async () => {
@@ -1605,6 +1639,9 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     "node_modules/@ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
     // 只去掉开头的一个仓库名：去掉 ai/aiops-mcp/ 以后露出来的 ai/agent-tag/ 不再去掉
     "ai/aiops-mcp/ai/agent-tag/src/legacy/user.ts 第 10 行是干嘛的",
+    // 前面紧挨着的不管是什么路径字符（\、$），仓库名都不在路径开头
+    "vendor\\ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
+    "pkg$ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
   ]) {
     const vendored = await ask([missing, missing], { question, tool: "code_read_file" });
     assert.deepEqual(vendored.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], question);
