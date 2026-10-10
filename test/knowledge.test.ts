@@ -3464,3 +3464,43 @@ test("按编号找到的行带着别的草稿编号时不算：原来那行删�
   delete backend.entries[0].requestId;
   assert.equal((await base.saved("req-1", "K1"))?.title, "月活的口径");
 });
+
+test("草稿和归档原因里的手机号、身份证号不让发卡片；打了码的、更长的数字里的一段、校验位不对的不算", async () => {
+  const idCard = (first17: string) => {
+    const weights = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
+    const sum = weights.reduce((total, weight, i) => total + weight * Number(first17[i]), 0);
+    return first17 + "10X98765432"[sum % 11];
+  };
+  const id = idCard("11010519491231002");
+  for (const text of ["用户 13800138000 反馈下单失败", "联系 +86 138-0013-8000", "手机 138 0013 8000", `身份证 ${id}`, `身份证 ${id.toLowerCase()}`]) {
+    assert.throws(() => normalizeDraft({ ...dau, conclusion: text }), /里像是有(手机号|身份证号)。经验库所有群都能看到，不能存个人信息/, text);
+  }
+  const wrong = id.slice(0, 17) + (id[17] === "1" ? "2" : "1");
+  for (const text of ["用户 138****8000 反馈下单失败", "订单号 2026101013800138000", "trace 9f13800138000ab", "时间戳 1760000000000", `号码 ${wrong}`, "错误码 13800"]) {
+    assert.doesNotThrow(() => normalizeDraft({ ...dau, conclusion: text }), text);
+  }
+
+  const { base, sent, tool } = deskSetup();
+  await base.save(normalizeDraft(dau));
+  const password = ["Correct", "Horse", "Battery", "Staple9"].join("");
+  await assert.rejects(tool("knowledge_propose_archive").run({ id: "K1", reason: `旧口径，password=${password}` }, { signal }), /归档原因（reason）里像是有/);
+  await assert.rejects(tool("knowledge_propose_archive").run({ id: "K1", reason: `${"过时了。".repeat(100)}用户 13800138000 说的` }, { signal }), /归档原因（reason）里像是有手机号/);
+  assert.equal(sent.length, 0, "原因里有密钥、个人信息的不发卡片");
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: "口径改了" }, { signal });
+  assert.equal(sent.length, 1);
+});
+
+test("名字里像是有密钥的发起人、确认人：卡片、表格和 aiops 里只记 open_id", async () => {
+  const leaked = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
+  const { backend, desk, sent, calls, click, lastCard } = deskSetup();
+  const propose = desk.tools({ chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: leaked, messageId: "om_1" }).find((t) => t.spec.name === "knowledge_propose")!;
+  await propose.run(code8, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  assert.match(cardText(card), /发起人：ou_1/);
+  await desk.handleCardAction(click(card, "save", "ou_admin", leaked));
+  await desk.idle();
+  assert.equal(backend.entries[0].proposedBy, "ou_1");
+  assert.equal(backend.entries[0].confirmedBy, "ou_admin");
+  assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:ou_admin");
+  assert.ok(![JSON.stringify(sent), cardText(lastCard())].some((text) => text.includes(leaked)));
+});

@@ -652,7 +652,7 @@ function isMasked(value: string): boolean {
 
 /**
  * 经验库所有群都能看，排查经验还会同步给 aiops 的告警自动排查，所以明显的密钥、密码不让存。
- * 只拦格式很确定的，免得误伤；手机号这类个人信息靠提示词
+ * 只拦格式很确定的，免得误伤；个人信息也只拦格式确定的手机号、身份证号（见 findPersonal），用户姓名这类靠提示词
  */
 /** PEM 私钥（RSA、EC、OPENSSH、PKCS#8，加密的也算）和 OpenPGP 私钥（PGP PRIVATE KEY BLOCK）的开头；公钥、证书不算 */
 const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
@@ -1335,11 +1335,33 @@ export function containsSecret(text: string): boolean {
   return findSecret(text) !== undefined;
 }
 
+/**
+ * 中国大陆手机号：1 开头 11 位，可以带 +86，中间可以用空格或横线隔开。前后紧挨着字母或数字的不算
+ * （订单号、trace id、时间戳里的一段）；打了码的（138****8000）不算
+ */
+const MOBILE = /(?<![\dA-Za-z])(?:\+?86[- ]?)?1[3-9]\d(?:[- ]?\d{4}){2}(?![\dA-Za-z])/;
+/** 18 位身份证号：地区码、出生日期、顺序码、校验位，校验位对得上才算 */
+const ID_CARD = /(?<![\dA-Za-z])[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\dA-Za-z])/g;
+const ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
+
+function validIdCard(id: string): boolean {
+  const sum = ID_WEIGHTS.reduce((total, weight, i) => total + weight * Number(id[i]), 0);
+  return "10X98765432"[sum % 11] === id[17].toUpperCase();
+}
+
+/** 草稿里像是个人信息（手机号、身份证号）的是哪一种；没有时返回 undefined。经验库所有群都能看，用户反馈的问题只写现象 */
+export function findPersonal(text: string): string | undefined {
+  if (MOBILE.test(text)) {
+    return "手机号";
+  }
+  return [...text.matchAll(ID_CARD)].some(([id]) => validIdCard(id)) ? "身份证号" : undefined;
+}
+
 /** 转义的换行、回车、制表符；引号、反斜杠、斜杠去掉反斜杠就是它自己 */
 const ESCAPED: Record<string, string> = { n: "\n", r: "\r", t: "\t" };
 
 /** 草稿里像是密钥的是哪一种；没有时返回 undefined */
-function findSecret(text: string): string | undefined {
+export function findSecret(text: string): string | undefined {
   const known =
     SECRET_PATTERNS.find(([pattern]) => pattern.test(text)) ??
     LABELED_SECRETS.find(([pattern]) => [...text.matchAll(pattern)].some((match) => !isMasked(match.slice(1).find((value) => value !== undefined) ?? "")));
@@ -1470,6 +1492,12 @@ export function normalizeDraft(draft: Record<string, unknown>): KnowledgeDraft {
     if (secret) {
       throw new KnowledgeError(
         `${name}（${key}）里像是有${secret}。经验库所有群都能看到，不能存密钥和密码：去掉或者换成 *** 再起草，回答里也不要复述它`,
+      );
+    }
+    const personal = findPersonal(text);
+    if (personal) {
+      throw new KnowledgeError(
+        `${name}（${key}）里像是有${personal}。经验库所有群都能看到，不能存个人信息：去掉或者打码（如 138****8000）再起草，回答里也不要复述它`,
       );
     }
     return shaped;

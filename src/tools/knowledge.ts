@@ -6,6 +6,8 @@ import {
   containsSecret,
   draftOf,
   fieldLines,
+  findPersonal,
+  findSecret,
   formatKnowledge,
   KNOWLEDGE_CATEGORIES,
   type KnowledgeBase,
@@ -424,13 +426,18 @@ export class KnowledgeDesk {
         if ((id === undefined) === (aiopsId === undefined)) {
           throw new KnowledgeError("id 和 aiops_id 填一个：团队经验库的填 id（如 K3），aiops 经验库的填 aiops_id");
         }
-        const reason = typeof args.reason === "string" && args.reason.trim() ? args.reason.trim().slice(0, 300) : undefined;
+        const reason = typeof args.reason === "string" && args.reason.trim() ? args.reason.trim() : undefined;
+        // 原因会列在卡片上给群里看：和草稿一样，先查整段（截断前）里有没有密钥、个人信息
+        const sensitive = reason && (findSecret(reason) ?? findPersonal(reason));
+        if (sensitive) {
+          throw new KnowledgeError(`归档原因（reason）里像是有${sensitive}。原因会列在卡片上给群里看：去掉后再起草，回答里也不要复述它`);
+        }
         return this.open(ctx, signal, async () => {
           const target =
             id !== undefined
               ? { type: "team" as const, entry: await raceAbort(this.activeEntry(id), signal) }
               : { type: "aiops" as const, lesson: await this.activeLesson(aiopsId!, ctx, signal) };
-          return { kind: "archive", target, ...(reason ? { reason } : {}) };
+          return { kind: "archive", target, ...(reason ? { reason: reason.slice(0, 300) } : {}) };
         });
       },
     };
@@ -446,7 +453,7 @@ export class KnowledgeDesk {
     if (!this.options.allowedChatIds.has(evt.chatId)) {
       return true;
     }
-    const operator: Person = { openId: evt.operator.openId, ...(evt.operator.name ? { name: evt.operator.name } : {}) };
+    const operator = person(evt.operator.openId, evt.operator.name);
     const proposal = this.proposals.get(value.proposal);
     if (!proposal || proposal.chatId !== evt.chatId) {
       this.logger.info(`经验库卡片 已失效 proposal=${value.proposal} operator=${operator.openId}`);
@@ -1187,7 +1194,7 @@ export class KnowledgeDesk {
       id: randomUUID().slice(0, 8),
       chatId: ctx.chatId,
       threadKey: ctx.threadKey,
-      proposer: { openId: ctx.senderId, ...(ctx.askerName ? { name: ctx.askerName } : {}) },
+      proposer: person(ctx.senderId, ctx.askerName),
       sourceMessageId: ctx.messageId,
       createdAt: this.now(),
       state: "pending",
@@ -1437,6 +1444,11 @@ function optionalInteger(value: unknown, name: string): number | undefined {
     throw new KnowledgeError(`${name} 要填正整数`);
   }
   return n;
+}
+
+/** 飞书里的名字会写进表格、日志，同步到 aiops：像是有密钥的（有人把令牌改成了名字）不用，只留 open_id */
+function person(openId: string, name: string | undefined): Person {
+  return { openId, ...(name && !containsSecret(name) ? { name } : {}) };
 }
 
 function preview(value: unknown): string {
