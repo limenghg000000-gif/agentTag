@@ -12,7 +12,9 @@ import {
   codeEvidence,
   createCardActionHandler,
   createMessageHandler,
+  DEFLECTED_ANSWER,
   reviewCodeAnswer,
+  reviewDeflectedAnswer,
   reviewOpsAnswer,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
@@ -1434,6 +1436,75 @@ test("aiops 连不上、这次没有它的工具时，照搬话题里之前的�
 
   assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
   assert.deepEqual(markdowns(sent), ["aiops 现在连不上，暂时查不了，请稍后再试"]);
+});
+
+test("排查过以后把问题推到服务之外的结论，打回一次让模型先拿代码核对", () => {
+  const review = (...names: string[]) => reviewDeflectedAnswer(["aiops"], new Set(names));
+  const deflecting = [
+    "淘宝拒绝了这个链接，不是服务故障，建议用户在商品详情页重新分享",
+    "结论：并非服务端问题（把握：中）",
+    "这不是我们的 bug，是淘宝平台限制",
+    "服务本身没有问题",
+    "属于淘宝平台的限制，让用户换个链接再试",
+    "属于用户侧问题",
+    "这个无需修复",
+  ];
+  for (const answer of deflecting) {
+    assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
+    // 调过代码工具也算在排查
+    assert.equal(review("code_search")(answer), DEFLECTED_ANSWER, answer);
+    // 没排查过（没调工具、只调了群记忆、只读了剧本这类说明）的不管，那是别的检查的事
+    assert.equal(review()(answer), undefined, answer);
+    assert.equal(review("memory_search")(answer), undefined, answer);
+  }
+  const fine = [
+    // 看状态、说某条线索不是根因、说该我们修的，都不是把问题推出去
+    "gateway-api 现在没有异常，最近 1 小时错误率 0.1%",
+    "URL 解析失败那条 warn 不是故障原因，是同款推荐支路的连带报错",
+    "这条报错不是问题所在，真正的原因在主流程",
+    "问题在转链服务没处理 pages-fast 这种落地页，要修代码",
+    "修好以后不需要用户重新分享",
+    "除非服务故障，这个接口不会返回 code=8",
+    "不建议让用户重新分享，应该在解析阶段识别",
+    // 举例的句子
+    "比如回答「不是服务故障」之前，要先搜代码",
+  ];
+  for (const answer of fine) {
+    assert.equal(review("aiops_query_logs")(answer), undefined, answer);
+  }
+});
+
+test("2026-10-10 转链排查那种回答：只看日志就说不是服务故障，和「没调代码工具」一起打回，重做后照常发", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => JSON.stringify({ logs: [{ msg: "TaoBao CreatePassWord code params sub_code=26 链接不符合规范" }] }),
+  };
+  const first = "淘宝返回 sub_code 26，链接不符合规范。这不是服务故障，建议用户在商品详情页重新分享。";
+  const second = "当时失败是淘宝拒绝了 pages-fast 半屏详情页链接；现在 master 的 tb.go 已经从 topIds 取商品 id，要看线上是否部署了这一版。";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: first, finish: "stop" },
+    { text: second, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["golang/appservice"],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("用户反馈 appservice 转链失败，排查一下"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${DEFLECTED_ANSWER}` });
+  assert.deepEqual(markdowns(sent), [second]);
 });
 
 test("代码和线上数据两项检查都没过时，重做时一起告诉模型", async () => {
