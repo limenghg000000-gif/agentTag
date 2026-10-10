@@ -319,7 +319,7 @@ async function runTask(
       // 仓库名互相包含时去掉最长的那个（长的排前面），和 codeEvidence 一样；前面的 ./、/ 一起去掉（./ai/aiops-mcp/src/foo.ts），和 repoPath 一样
       const longestFirst = [...repos].sort((a, b) => b.length - a.length).map(escapeRegExp);
       const unprefixed =
-        repos.length === 0 ? userText : userText.replace(new RegExp(`(?<!${PATH_CHAR})(?:\\.?\\/+)?(?:${longestFirst.join("|")})/`, "gi"), " ");
+        repos.length === 0 ? userText : userText.replace(new RegExp(`${NOT_GLUED}(?:\\.?\\/+)?(?:${longestFirst.join("|")})/`, "gi"), " ");
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
@@ -446,24 +446,39 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 
 const CODE_TOOL_PREFIX = "code_";
 /**
- * 路径和前后文字的分界：空白、引号、括号、Markdown 的 * 和 |、, ; = : #、中文标点、汉字和假名、全角字符、各种符号和 emoji。
+ * 路径和前后文字的分界：空白、引号、括号、Markdown 的 * 和 |、, ; = : #、中文标点、汉字和假名、全角字符、各种符号和 emoji
+ * （# ; , ' 和括号夹在路径字符中间时除外，见 SOFT_DELIM）。
  * 别的字符都算路径的一部分（字母数字和 . _ - / @ + ! ~ $ % \ 等，Go 模块的 @ 和 !、pnpm 的 +）：
  * 不一个个列路径里能有什么字符，没想到的字符也算在路径里，紧挨着它的是一个更长的路径的一截（pkg$v1/src/foo.ts 不是 v1/src/foo.ts）
  */
 const PATH_DELIM = "\\s\"'`()\\[\\]<>{}*|,;=:#\\u2010-\\u2027\\u2190-\\u2bff\\u3000-\\u30ff\\u3400-\\u9fff\\uff00-\\uffef\\ud800-\\udfff";
 /** 路径里的一个字符：前面紧挨着这样的字符的，是一个更长的路径的后半截 */
 const PATH_CHAR = `[^${PATH_DELIM}]`;
+/**
+ * 分界字符里，Git 文件名里也常有的 # ; , ' 和括号：一个或连着几个，两边都紧挨着路径字符时是路径的一部分
+ * （pkg#v1/src/foo.ts、Next.js 的 app/(auth)/login/page.tsx、app/[[...slug]]/page.tsx），不然是分界（(src/a.ts)、src/a.ts#L3、'src/a.ts'）。
+ * = 和 : 一直是分界：日志里的 caller=src/a.ts:3、"file":"src/a.ts" 要能认出 src/a.ts
+ */
+const SOFT_DELIM = "#;,'()\\[\\]{}";
+/** 两边都紧挨着路径字符（中间可以隔着别的 SOFT_DELIM 字符）、算路径一部分的 SOFT_DELIM 字符 */
+const GLUED = `(?<=${PATH_CHAR}[${SOFT_DELIM}]*)[${SOFT_DELIM}](?=[${SOFT_DELIM}]*${PATH_CHAR})`;
+/** 路径从这儿开始：前面没有紧挨着路径字符，也没有紧挨着跟在路径字符后面的 SOFT_DELIM 字符（pkg#v1/src/foo.ts、pkg##v1/src/foo.ts 里的 v1/src/foo.ts 不是开头） */
+const NOT_GLUED = `(?<!${PATH_CHAR}[${SOFT_DELIM}]*)`;
 /** 目录名、文件名里的一个字符 */
-const NAME_CHAR = `[^${PATH_DELIM}/]`;
-/** 路径到这儿完了：后面是分界字符或者到头了；中间可以隔着句号、叹号、问号这些标点（src/a.ts。src/a.ts!） */
-const PATH_END = `(?=$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}]))`;
+const NAME_CHAR = `(?:[^${PATH_DELIM}/]|${GLUED})`;
+/**
+ * 路径到这儿完了：后面是分界字符或者到头了；中间可以隔着句号、叹号、问号这些标点（src/a.ts。src/a.ts!）。
+ * 后面紧挨着的 SOFT_DELIM 字符接着的是更深的路径时（src/a.ts#v2/b.ts、src/a.ts,src/b.ts）没完，是一个更长的路径的前半截；
+ * 只是行号、参数的照样算完了（src/a.ts#L3、PHP 堆栈的 /app/src/a.php(12)）
+ */
+const PATH_END = `(?=$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}]))(?![${SOFT_DELIM}]+(?=${PATH_CHAR})(?:${NAME_CHAR})*\\/)`;
 /**
  * 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go。
- * 按整段路径认（pkg@v1/src/foo.ts、pkg$v1/src/foo.ts 不拿后半截 v1/src/foo.ts 充数）；
+ * 按整段路径认（pkg@v1/src/foo.ts、pkg$v1/src/foo.ts、pkg#v1/src/foo.ts 不拿后半截 v1/src/foo.ts 充数）；
  * 后面紧挨着路径字符的不是代码文件（src/foo.ts@backup、a.ts.map），~ 开头的是家目录下的文件（~/.config/x.yaml）
  */
 const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
-const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})(?!~)((?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
+const CODE_PATHS = new RegExp(`${NOT_GLUED}(?!~)((?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
 /**
  * 反引号、加粗、引号里带空格的路径（`src/my files/app.ts:12`、**src/my files/app.ts**:12、"src/my files/app.ts":12）：
  * CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，
@@ -641,11 +656,14 @@ function matchesFacts(facts: CodeFacts, forms: Array<{ path: string; repos?: str
   });
 }
 
-/** text 里离结尾最近的配置的仓库名（小写）：前面不能紧挨着路径字符，后面可以接 /路径；同一处对得上几个时取最长的 */
+/**
+ * text 里离结尾最近的配置的仓库名（小写）：前面不能紧挨着路径字符（pkg#ai/aiops-mcp 不是这个仓库），后面可以接 /路径；同一处对得上几个时取最长的。
+ * 后面紧挨着的括号、# 这些照样算写的是这个仓库（ai/agent-tag(master) @ 3f2a1c9），只认这个仓库里的提交
+ */
 function nearestRepo(text: string, repos: readonly string[]): string | undefined {
   let best: { repo: string; end: number } | undefined;
   for (const repo of repos.map((name) => name.toLowerCase())) {
-    for (const match of text.matchAll(new RegExp(`(?<!${PATH_CHAR})${escapeRegExp(repo)}(?!${NAME_CHAR})`, "gi"))) {
+    for (const match of text.matchAll(new RegExp(`${NOT_GLUED}${escapeRegExp(repo)}(?![^${PATH_DELIM}/])`, "gi"))) {
       const end = match.index + match[0].length;
       if (best === undefined || end > best.end || (end === best.end && repo.length > best.repo.length)) {
         best = { repo, end };
@@ -702,24 +720,31 @@ function mentions(text: string, cite: string): boolean {
 
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
 /**
- * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、src/a.tsx 都不是 src/a.ts），
+ * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、pkg#src/a.ts、src/a.tsx 都不是 src/a.ts），
  * 前后的分界和回答里认路径（CODE_PATHS）一样。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。
+ * 绝对路径前面的引号、括号要是分界（(/app/src/a.ts:12)），夹在路径字符中间的（x(/app/src/a.ts）是一个更长的路径的一截，不是绝对路径。
  * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
  */
-const PATH_START = "(?:(?<!" + PATH_CHAR + ")|(?<=(?:^|[\\s\"'`(（=])/(?:[^\\s/\"'`()（）<>]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
+const PATH_START = `(?:${NOT_GLUED}|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])/(?:[^\\s/"'\`()（）<>]+/)*)|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])\\./))`;
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 按 path 在 text 里找、前后的分界和 containsPath 一样的正则；先认 path 本身，再看前后（长长一串 SOFT_DELIM 字符时不用每处都往前看一遍） */
+function pathPattern(path: string, after: string, flags?: string): RegExp {
+  const literal = escapeRegExp(path);
+  return new RegExp(`(?=${literal})${PATH_START}${literal}${after}`, flags);
+}
+
 function containsPath(text: string, path: string): boolean {
-  return new RegExp(`${PATH_START}${escapeRegExp(path)}${PATH_END}`).test(text);
+  return pathPattern(path, PATH_END).test(text);
 }
 
 /** text 里有没有写 path 的第 line 行，写法和回答里认行号的一样（path:35、path#L35、path 第 35 行） */
 function mentionsLine(text: string, path: string, line: number): boolean {
-  for (const match of text.matchAll(new RegExp(`${PATH_START}${escapeRegExp(path)}${PATH_END}`, "g"))) {
+  for (const match of text.matchAll(pathPattern(path, PATH_END, "g"))) {
     const at = LINE_AFTER_PATH.exec(text.slice(match.index + match[0].length));
     if (at && Number(at[1] ?? at[2] ?? at[3]) === line) {
       return true;
@@ -730,24 +755,34 @@ function mentionsLine(text: string, path: string, line: number): boolean {
 
 /** 这段没有固定格式的结果里有没有 path 的第 line 行：path:35，或者 Python 堆栈的 "path", line 35 */
 function hasLine(output: string, path: string, line: number): boolean {
-  return new RegExp(`${PATH_START}${escapeRegExp(path)}(?::|", line )${line}(?!\\d)`).test(output);
+  return pathPattern(path, `(?::|", line )${line}(?!\\d)`).test(output);
 }
 
 /**
  * 别的工具（aiops）结果里模型看到的部分：和 runAgent 交给模型时一样截短。被截掉的不算查到，截断处被切开的也去掉：
- * 切在行号里（src/foo.ts:12 后面其实还有个 3）只去掉行号，路径是完整的；切在路径里（src/foo.t）整个去掉；
- * 正好切在路径后面的冒号前（src/foo.ts 后面是 :123）路径是完整的，都留着
+ * 切在行号里（src/foo.ts:12 后面其实还有个 3）只去掉行号，路径是完整的；切在路径里（src/foo.t、src/a.ts 后面其实是 #v2/b.ts）整个去掉；
+ * 正好切在路径结尾（src/foo.ts 后面是 :123、#L3）路径是完整的，都留着
  */
 function seenByModel(output: string, limit: number): string {
   if (output.length <= limit) {
     return output;
   }
   const kept = output.slice(0, limit);
-  if (!new RegExp(PATH_CHAR).test(output[limit])) {
+  // 截断处后面在原文里是路径的结尾（见 PATH_END）：没有切开路径
+  const end = new RegExp(PATH_END, "y");
+  end.lastIndex = limit;
+  if (end.test(output)) {
     return kept;
   }
-  const token = new RegExp(`(?:${PATH_CHAR}|:)+$`).exec(kept)?.[0] ?? "";
-  return token.includes(":") ? kept.replace(new RegExp(`:${PATH_CHAR}*$`), "") : kept.slice(0, kept.length - token.length);
+  // 往前找到被切开的这一段：路径字符、冒号、SOFT_DELIM 字符。这一段开头的 SOFT_DELIM 字符前面不是路径字符，是分界，一起去掉也不影响认路径
+  const part = new RegExp(`${PATH_CHAR}|[:${SOFT_DELIM}]`);
+  let start = limit;
+  while (start > 0 && part.test(output[start - 1])) {
+    start--;
+  }
+  // 冒号是分界，最后一个冒号前面的路径是完整的
+  const colon = kept.lastIndexOf(":");
+  return colon >= start ? kept.slice(0, colon) : kept.slice(0, start);
 }
 
 /** 回答里写的路径和 src/repo.ts 读写文件时一样整理（见 Workspace.relative）：去掉前后的空格和开头的 ./、/，合并多余的 / 和 ./（反斜杠见 codeEvidence） */
