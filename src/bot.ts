@@ -224,6 +224,8 @@ async function runTask(
     const attempted = new Set<string>();
     const evidence: ToolEvidence[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
+    // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
+    const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
@@ -251,7 +253,7 @@ async function runTask(
           evidence.push(
             code
               ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
-              : { tool: tool.spec.name, output: seenByModel(output, limit) },
+              : { tool: tool.spec.name, output: seenByModel(output, limit), ...(mcpNames.has(tool.spec.name) ? { links: true } : {}) },
           );
           return output;
         },
@@ -273,8 +275,10 @@ async function runTask(
     const toolNames = taskTools.map((tool) => tool.spec.name);
     const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
+    // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
+    const readCode = () => evidence.some(linksCode);
     const reviews = [
-      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen)] : []),
+      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
       ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
@@ -336,7 +340,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
+      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${result.text}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -688,6 +692,8 @@ export interface ToolEvidence {
   tool: string;
   output?: string;
   facts?: readonly CodeFact[];
+  /** output 里的代码永久链接（见 codeLinks）算查到的代码：MCP 服务的结果是，网页、搜索结果不是 */
+  links?: boolean;
 }
 
 /**
@@ -814,11 +820,18 @@ interface CodeFacts {
 
 function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
   const facts: CodeFacts = { files: new Map(), commits: [], branches: [], text: [] };
-  for (const { tool, output, facts: found } of results) {
+  for (const { tool, output, facts: found, links } of results) {
     // 代码工具的结果文字一概不认，只认它记下的代码位置
     if (!isCodeTool(tool)) {
       if (output !== undefined) {
-        facts.text.push(...unescapedForms(output));
+        const forms = unescapedForms(output);
+        facts.text.push(...forms);
+        for (const link of links ? new Map(forms.flatMap(codeLinks).map((link) => [JSON.stringify(link), link])).values() : []) {
+          facts.files.set(link.path, [...(facts.files.get(link.path) ?? []), { repo: link.repo, lines: link.lines }]);
+          if (COMMIT_ID.test(link.ref)) {
+            facts.commits.push({ repo: link.repo, sha: link.ref.toLowerCase() });
+          }
+        }
       }
       continue;
     }
@@ -857,6 +870,54 @@ function unescapedForms(output: string): string[] {
     forms.push(next);
   }
   return forms;
+}
+
+/**
+ * 代码平台上文件的永久链接：GitLab 的 https://主机/组/项目/-/blob/<提交或分支>/<路径>#L12-20，GitHub 的 https://github.com/owner/repo/blob/<提交>/<路径>#L12-L20。
+ * aiops 的代码工具（get_repo_file、search_code）按线上版本读到代码时都附这样的链接，写明了读的是哪个仓库、哪个提交、哪个文件的哪几行；
+ * 结果里的行号写在代码前面（「2468| ...」），回答里的「tb.go:2468」在原文里找不到，只能按链接认。
+ * 认链接不认字段名：aiops 的代码工具还在开发，字段可能改，链接是代码平台自己的格式。
+ * 结果太长被截短时，链接可能断在中间（…#L2440-24…（省略 2 字））：后面紧跟着省略号、字母数字的不认，断在行号里的只认文件
+ */
+const CODE_LINK =
+  /https?:\/\/[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/(?:-\/)?blob\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/g;
+
+interface CodeLink {
+  /** 仓库（小写） */
+  repo: string;
+  /** 链接里的提交号或分支 */
+  ref: string;
+  path: string;
+  /** 链接标了行（#L12、#L12-20）时，起止行 */
+  lines?: [number, number];
+}
+
+function codeLinks(text: string): CodeLink[] {
+  const links: CodeLink[] = [];
+  for (const match of text.matchAll(CODE_LINK)) {
+    const [, repo, ref, file, from, to] = match;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(file);
+    } catch {
+      continue;
+    }
+    const start = from === undefined ? undefined : Number(from);
+    // 止行比起行小的不是正常的范围，只认起行
+    const end = to === undefined || start === undefined || Number(to) < start ? start : Number(to);
+    links.push({
+      repo: repo.toLowerCase(),
+      ref,
+      path: repoPath(decoded),
+      ...(start !== undefined && end !== undefined ? { lines: [start, end] as [number, number] } : {}),
+    });
+  }
+  return links;
+}
+
+/** 这次结果里有 MCP 服务读代码给的永久链接：算读过代码 */
+function linksCode(item: ToolEvidence): boolean {
+  return item.links === true && item.output !== undefined && unescapedForms(item.output).some((form) => codeLinks(form).length > 0);
 }
 
 /** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
@@ -955,12 +1016,13 @@ function mentionsRepo(text: string, repos: readonly string[]): boolean {
  * - 一次代码工具都没调，问题或回答却提到了配置的仓库、或者回答里写了没查证的文件路径：让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
  * - 调过代码工具，回答里还是写了工具结果里没有的文件、行号、提交号：让它只按查到的重写。只看「调没调过」不够，调一次什么都没查到照样能编。
  * seen 认的不算没查证：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，代码工具读到的也在里面；
- * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码
+ * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码。
+ * readCode：通过 aiops 这类 MCP 服务读过代码（结果里有代码永久链接），和调过代码工具一样只核对引用
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false) {
+export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false, readCode: () => boolean = () => false) {
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     const unseen = unseenCodeCitations(answer, seen);
-    if ([...usedTools].some(isCodeTool)) {
+    if ([...usedTools].some(isCodeTool) || readCode()) {
       return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
     }
     return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;

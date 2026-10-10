@@ -2342,3 +2342,104 @@ test("没读代码、也没问仓库时，重做后还写着举例的路径照�
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), ["比如写在 k8s/deployment.yaml 里，用 envFrom 引用 ConfigMap"]);
 });
+
+test("aiops 按线上版本读的代码：结果里的永久链接写明了仓库、提交、文件和行，引用对得上就算查证过", () => {
+  // aiops get_repo_file 的返回：行号写在代码前面（2468| ...），回答里的 tb.go:2468 在原文里找不到，只能按链接认
+  const repoFile = JSON.stringify({
+    project: "golang/appservice",
+    commit_id: "da67e31c495ec498e41bb42e6296a9d688995d6a",
+    path: "services/goods/tb.go",
+    start_line: 2440,
+    end_line: 2480,
+    permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c495ec498e41bb42e6296a9d688995d6a/services/goods/tb.go#L2440-2480",
+    content: '2466| //淘宝分享落地的半屏详情页\n2468| if halfDetailGoodsId := common.ParseTbHalfDetailItemId(str); halfDetailGoodsId != "" {',
+  });
+  const seen = codeEvidence(["golang/appservice"], [{ tool: "aiops_get_repo_file", output: compactText(repoFile), links: true }]);
+  assert.equal(seen("services/goods/tb.go", 2468), true);
+  assert.equal(seen("golang/appservice/services/goods/tb.go", 2468), true);
+  assert.equal(seen("da67e31c4"), true);
+  // 链接没标的行、别的文件照样不算
+  assert.equal(seen("services/goods/tb.go", 2500), false);
+  assert.equal(seen("services/goods/jd.go"), false);
+  // 网页、搜索结果里的链接是别人的仓库，不算
+  assert.equal(codeEvidence([], [{ tool: "fetch_url", output: repoFile }])("services/goods/tb.go", 2468), false);
+  // 结果太长、链接被截在行号里：只认文件，不认行
+  const cut = codeEvidence([], [
+    { tool: "aiops_get_repo_file", output: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go#L2440-24…（省略 2 字）", links: true },
+  ]);
+  assert.equal(cut("services/goods/tb.go"), true);
+  assert.equal(cut("services/goods/tb.go", 100), false);
+  assert.equal(cut("services/goods/tb.go", 2440), false);
+
+  // GitHub 的写法（#L10-L20）、路径里转义过的字、结果又被 JSON 转义了一层
+  const hits = JSON.stringify({
+    line: JSON.stringify({
+      hits: [
+        { path: "src/a.ts", permalink: "https://github.com/o/r/blob/0123abcd/src/a.ts#L10-L20" },
+        { path: "src/中.ts", permalink: "https://github.com/o/r/blob/main/src/%E4%B8%AD.ts#L3" },
+      ],
+    }),
+  });
+  const github = codeEvidence([], [{ tool: "aiops_search_code", output: hits, links: true }]);
+  assert.equal(github("src/a.ts", 15), true);
+  assert.equal(github("src/a.ts", 21), false);
+  assert.equal(github("src/中.ts", 3), true);
+  assert.equal(github("0123abcd"), true);
+
+  // 通过 aiops 读过代码，和调过代码工具一样只核对引用；没读过的照旧要先读代码
+  const review = reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen, () => true);
+  assert.equal(review("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])), undefined);
+  assert.equal(
+    review("在 `services/goods/tb.go:2500`", new Set(["aiops_get_repo_file"])),
+    unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]),
+  );
+  assert.equal(
+    reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen)("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])),
+    UNVERIFIED_CODE_ANSWER,
+  );
+});
+
+test("用 aiops 按线上版本读了代码、回答提到仓库和行号：不再打回让模型用代码工具重读一遍", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const output = compactText(
+    JSON.stringify({
+      project: "golang/appservice",
+      path: "services/goods/tb.go",
+      permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c495ec498e41bb42e6296a9d688995d6a/services/goods/tb.go#L2460-2475",
+      content: "2468| if halfDetailGoodsId := common.ParseTbHalfDetailItemId(str); halfDetailGoodsId != \"\" {",
+    }),
+  );
+  const ask = async (answers: string[]) => {
+    const repoFile: Tool = {
+      spec: { name: "aiops_get_repo_file", description: "读代码", parameters: { type: "object", properties: {} } },
+      describe: () => "aiops · 读代码",
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_get_repo_file", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["golang/appservice"],
+      mcp: { names: ["aiops"], tools: () => [repoFile], prompt: () => undefined },
+    });
+    await handle(message("golang/appservice 现在能处理 c.tb.cn 的半屏详情页吗"));
+    return { requests, replies: markdowns(sent) };
+  };
+  const answer = "能处理：golang/appservice 线上版本的 `services/goods/tb.go:2468` 从 topIds 取商品 ID（da67e31c）";
+  const ok = await ask([answer]);
+  assert.equal(ok.requests.length, 2);
+  assert.deepEqual(ok.replies, [answer]);
+  // 链接没覆盖的行照样打回
+  const wrong = await ask(["在 `services/goods/tb.go:2500`", answer]);
+  assert.equal(wrong.requests.length, 3);
+  assert.deepEqual(wrong.requests[2].messages.at(-1), { role: "user", content: unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]) });
+  assert.deepEqual(wrong.replies, [answer]);
+});
