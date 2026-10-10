@@ -26,9 +26,25 @@ import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, Ll
 import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION } from "../src/progress.js";
 import { TaskRegistry } from "../src/tasks.js";
-import type { Tool } from "../src/tools/tool.js";
+import { type CodeLocation, type Tool, type ToolContext, ToolError, ToolOutputBuilder } from "../src/tools/tool.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
+
+/** 假的代码工具结果：一行行文字和这一行里查到的代码位置，像 src/repo.ts 那样把代码位置交给 onFacts、文字交给模型 */
+function codeResult(ctx: ToolContext, rows: Array<[string, ...CodeLocation[]]>, repo = "ai/aiops-mcp"): string {
+  const out = new ToolOutputBuilder(repo);
+  for (const [text, ...locations] of rows) {
+    out.line(text, ...locations);
+  }
+  const { text, facts } = out.build();
+  ctx.onFacts?.(facts);
+  return text;
+}
+
+/** 代码工具记下的代码位置，当作一次工具调用查到的 */
+function found(tool: string, locations: CodeLocation[], repo = "ai/aiops-mcp") {
+  return { tool, facts: locations.map((location) => ({ ...location, repo, at: 0 })) };
+}
 
 function message(content: string, extra: Partial<NormalizedMessage> = {}): NormalizedMessage {
   return {
@@ -782,7 +798,11 @@ test("有代码工具时，没读代码就说仓库内容的回答被打回去�
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
     describe: () => "搜代码",
-    run: async () => "共 1 处（aiops 分支 @ 9d8e7f6）：\ninternal/k8s/tools.go:12: func GetPods()",
+    run: async (_args, ctx) =>
+      codeResult(ctx, [
+        ["共 1 处（aiops 分支 @ 9d8e7f6）：", { commit: "9d8e7f6" }],
+        ["internal/k8s/tools.go:12: func GetPods()", { path: "internal/k8s/tools.go", lines: [12, 12] }],
+      ]),
   };
   const results: ChatResult[] = [
     { text: "在 ai/aiops-mcp 里，K8s tool 注册在 `src/index.ts:30-36`", finish: "stop" },
@@ -1194,13 +1214,19 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
 });
 
 test("代码回答检查：调过代码工具也要核对，回答里的文件、行号和提交号得在工具结果里出现过", () => {
-  const seen = codeEvidence(["ai/aiops-mcp"], [{ tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9）：\ninternal/k8s/tools.go:12: func GetPods()" }]);
+  const seen = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_search", [{ commit: "3f2a1c9" }, { path: "internal/k8s/tools.go", lines: [12, 12] }])]);
   const review = reviewCodeAnswer("k8s 工具在哪定义", ["ai/aiops-mcp", "ai/agent-tag"], seen);
   const searched = new Set(["code_search"]);
   assert.equal(review("定义在 `internal/k8s/tools.go:12`（master 分支 @ 3f2a1c9）", searched), undefined);
   // 写成「仓库名/路径」「./路径」也认
   assert.equal(review("在 ai/aiops-mcp/internal/k8s/tools.go 第 12 行", searched), undefined);
   assert.equal(review("在 ./internal/k8s/tools.go:12", searched), undefined);
+  // 写明了仓库的，要是在这个仓库里查到的
+  assert.equal(review("在 AI/AIOPS-MCP/internal/k8s/tools.go:12", searched), undefined);
+  assert.equal(
+    review("在 ai/agent-tag/internal/k8s/tools.go:12", searched),
+    unseenCodeAnswer(["ai/agent-tag/internal/k8s/tools.go:12"], ["ai/aiops-mcp", "ai/agent-tag"]),
+  );
   // 文件是真的，行号是编的
   assert.equal(review("在 internal/k8s/tools.go:99", searched), unseenCodeAnswer(["internal/k8s/tools.go:99"], ["ai/aiops-mcp", "ai/agent-tag"]));
   // 2026-10-09：调了一次代码工具，回答里的仓库提交和文件都是编的
@@ -1215,11 +1241,10 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
 });
 
 test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行", () => {
-  const read = "src/app.ts（master 分支 @ 3f2a1c9，共 80 行，下面是第 1 到 40 行）\n1| import x\n35| export function start() {}";
   const seen = codeEvidence(
     [],
     [
-      { tool: "code_read_file", output: read },
+      found("code_read_file", [{ path: "src/app.ts" }, { path: "src/app.ts", lines: [1, 1] }, { path: "src/app.ts", lines: [35, 35] }]),
       { tool: "aiops_query_logs", output: 'Traceback\n  File "app/jobs/sync.py", line 88, in run' },
       { tool: "aiops_query_logs", output: "panic\n\tinternal/logic/order.go:88 +0x1d" },
     ],
@@ -1234,14 +1259,14 @@ test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号�
   assert.equal(seen("src/other.ts"), false);
 });
 
-test("代码引用的路径要整段对上，改文件的结果里写的行也认", () => {
+test("代码引用的路径要整段对上，改文件记下的行也认", () => {
   const seen = codeEvidence(
     [],
     [
-      { tool: "code_list_files", output: "共 3 个文件（master 分支 @ 3f2a1c9）：\nsrc/index.tsx\npkg/mysrc/util.ts\nsrc/app.ts.map" },
-      { tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9）：\npkg/src/nested.ts:12: export const x = 1" },
-      { tool: "code_edit_file", output: "已修改 src/foo.ts 第 10 行起的内容。" },
-      { tool: "code_edit_file", output: "已新建 src/util/new.ts（12 行）。" },
+      found("code_list_files", [{ commit: "3f2a1c9" }, { path: "src/index.tsx" }, { path: "pkg/mysrc/util.ts" }, { path: "src/app.ts.map" }]),
+      found("code_search", [{ path: "pkg/src/nested.ts", lines: [12, 12] }]),
+      found("code_edit_file", [{ path: "src/foo.ts", lines: [10, 10] }]),
+      found("code_edit_file", [{ path: "src/util/new.ts", lines: [1, 12] }]),
       { tool: "aiops_query_logs", output: "goroutine 1 [running]:\n/app/internal/logic/order.go:88 +0x1d" },
       { tool: "aiops_query_logs", output: "Error: boom\n    at start (/app/src/server.ts:12:5)" },
       { tool: "aiops_query_logs", output: "caller=./internal/svc/ctx.go:21" },
@@ -1264,78 +1289,55 @@ test("代码引用的路径要整段对上，改文件的结果里写的行也�
   assert.equal(seen("src/util/new.ts", 13), false);
   assert.equal(seen("internal/svc/ctx.go", 21), true);
   // 提交号可以只写前几位，不能在查到的后面再编几位
-  const commit = codeEvidence([], [{ tool: "code_search", output: "共 1 处（master 分支 @ 3f2a1c9d8e7b）：\na/b.go:1: x" }]);
+  const commit = codeEvidence([], [found("code_search", [{ commit: "3f2a1c9d8e7b" }])]);
   assert.equal(commit("3f2a1c9"), true);
   assert.equal(commit("3f2a1c9d8e7b"), true);
   assert.equal(commit("3f2a1c9d8e7bdeadbeef"), false);
 });
 
-test("代码引用：带空格的路径、diff 和开 PR 结果里的改动统计", () => {
+test("代码引用：反引号里带空格的路径按整段认，命令里的路径一个个认", () => {
   const seen = codeEvidence(
     [],
     [
-      { tool: "code_list_files", output: "共 1 个文件（master 分支 @ 3f2a1c9）：\nsrc/my files/app.ts" },
-      { tool: "code_read_file", output: "src/my files/app.ts（共 2 行，下面是第 1 到 2 行）\n1| a\n2| b" },
-      // 模型传的路径前后带空格：工具读的是整理过的 src/foo.ts，结果里写的是原样
-      { tool: "code_read_file", output: " src/foo.ts （共 1 行，下面是第 1 到 1 行）\n1| a" },
-      // 统计整体 trim 过：只改了一个文件时，唯一的一行前面没有空格
-      { tool: "code_open_pr", output: "已开合并请求 !11：https://lab.example.com/x/-/merge_requests/11\n\n改动统计：\nsrc/one.ts | 1 +\n 1 file changed, 1 insertion(+)" },
-      {
-        tool: "code_open_pr",
-        output:
-          "已开合并请求 !12：https://lab.example.com/x/-/merge_requests/12\n\n改动统计：\nsrc/a.ts | 3 ++-\n assets/logo.png | Bin 0 -> 1234 bytes\n" +
-          " .../deep/name.ts | 1 +\n 3 files changed, 3 insertions(+), 1 deletion(-)",
-      },
-      // 统计在空行以前；diff 里的上下文行也以空格开头，长得像统计的不算
-      {
-        tool: "code_diff",
-        output:
-          "src/c.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/src/c.ts b/src/c.ts\n@@ -1,3 +1,3 @@\n fake/path.ts | 9 +\n-x\n+y\n" +
-          "diff --git a/src/my dir/d.ts b/src/my dir/d.ts",
-      },
+      found("code_read_file", [{ path: "src/my files/app.ts" }, { path: "src/my files/app.ts", lines: [2, 2] }]),
+      found("code_diff", [{ path: "src/a.ts" }, { path: "src/c.ts" }, { path: "cmd/main.go" }, { path: "etc/user.yaml" }]),
     ],
   );
-  // 反引号里带空格的路径按整段认；空格后面那段（files/app.ts）是另一个路径，不认
+  // 整段查到过的按整段认；同一个整段写了没查到的行号，整段报出来，不只报空格后面那段
   assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:2`", seen), []);
-  assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:3`", seen), [{ text: "files/app.ts:3", located: true }]);
+  assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:3`", seen), [{ text: "src/my files/app.ts:3", located: true }]);
   assert.deepEqual(unseenCodeCitations("在 files/app.ts 和 `files/app.ts`", seen), [{ text: "files/app.ts", located: false }]);
-  // 反引号里是几个路径，整段不是一个路径时照常一个个认
-  assert.deepEqual(unseenCodeCitations("见 `src/a.ts or src/c.ts`", seen), []);
+  // 只查到 files/app.ts：前面编了一段带空格的目录，不能拿空格后面那段充数
+  const suffix = codeEvidence([], [found("code_read_file", [{ path: "files/app.ts" }, { path: "files/app.ts", lines: [2, 2] }])]);
+  assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:2`", suffix), [{ text: "src/my files/app.ts:2", located: true }]);
+  assert.deepEqual(unseenCodeCitations("在 `files/app.ts:2`", suffix), []);
+  // 不带行号、分不清是路径还是命令的：里面的路径一个个认
+  for (const answer of ["跑 `go run cmd/main.go`", "`bin/server -f etc/user.yaml` 启动", "见 `src/a.ts or src/c.ts`", "`cp src/a.ts src/c.ts`", "`vendor/bin/phpunit src/a.ts`"]) {
+    assert.deepEqual(unseenCodeCitations(answer, seen), [], answer);
+  }
   assert.deepEqual(unseenCodeCitations("见 `src/a.ts or src/zzz.ts`", seen), [{ text: "src/zzz.ts", located: false }]);
-  assert.equal(seen("src/my files/app.ts", 2), true);
-  assert.equal(seen("files/app.ts"), false);
-  assert.equal(seen("src/foo.ts", 1), true);
-  assert.equal(seen("src/one.ts"), true);
-  assert.equal(seen("src/a.ts"), true);
-  assert.equal(seen("src/a.ts", 1), false);
-  assert.equal(seen("assets/logo.png"), true);
-  assert.equal(seen("deep/name.ts"), false);
-  assert.equal(seen("src/c.ts"), true);
-  assert.equal(seen("fake/path.ts"), false);
-  assert.equal(seen("src/my dir/d.ts"), true);
+  assert.deepEqual(unseenCodeCitations("跑 `go run cmd/fake.go`", seen), [{ text: "cmd/fake.go", located: false }]);
 });
 
-test("代码工具的结果只认工具自己写的部分，读到、搜到的代码正文里写的路径、行号、提交号不算", () => {
+test("代码工具的结果只认它记下的代码位置，结果文字里写的路径、行号、提交号不算", () => {
   const seen = codeEvidence(
     [],
     [
-      // 搜到的是测试文件里的字符串：认 test/bot.test.ts 第 97 行，不认字符串里写的 src/foo.ts 第 10 行、userlogic.go:35、2c6a7d9
+      // 搜到的是测试文件里的字符串：记下的是 test/bot.test.ts 第 97 行，字符串里写的 src/foo.ts 第 10 行、userlogic.go:35、2c6a7d9 不算
       {
         tool: "code_search",
         output:
           "共 2 处（master 分支 @ 3f2a1c9）：\ntest/bot.test.ts:97:  assert.equal(x, \"已修改 src/foo.ts 第 10 行起的内容。\");\n" +
           "test/bot.test.ts:1169:  const made = \"ai/agent-tag master @ 2c6a7d9，`yuebai-user/rpc/internal/logic/common/userlogic.go:35`\";",
+        facts: found("code_search", [
+          { commit: "3f2a1c9" },
+          { path: "test/bot.test.ts", lines: [97, 97] },
+          { path: "test/bot.test.ts", lines: [1169, 1169] },
+        ]).facts,
       },
-      { tool: "code_read_file", output: "./src/bar.ts（共 3 行，下面是第 1 到 3 行）\n1| // 见 src/other.ts:2\n2| export {};\n3| " },
-      // 没搜到时照抄的搜索内容里写什么都不算，结尾的提交号算
+      // 没记下代码位置的代码工具结果，文字里写什么都不算
       { tool: "code_search", output: "没有搜到「x」：src/fake.ts:10」（aiops 分支 @ 9d8e7f6）。" },
-      // 搜多个分支：每组开头的分支和提交号算，搜到的那行正文里写的不算
-      {
-        tool: "code_search",
-        output: "在 2 个分支上共搜到 2 处：\n【master 分支 @ 1a2b3c4，1 处】\nsrc/a.ts:3: // 【dev 分支 @ 2c6a7d9，1 处】\n【dev 分支 @ 5e6f7a8，1 处】\nsrc/b.ts:4: y",
-      },
-      // 读文件时路径写成 src/./baz.ts，和读文件时一样整理成 src/baz.ts
-      { tool: "code_read_file", output: "src/./baz.ts（共 1 行，下面是第 1 到 1 行）\n1| export {};" },
+      found("code_read_file", [{ path: "src/baz.ts" }, { path: "src/baz.ts", lines: [1, 1] }]),
     ],
   );
   assert.equal(seen("test/bot.test.ts", 97), true);
@@ -1344,18 +1346,12 @@ test("代码工具的结果只认工具自己写的部分，读到、搜到的�
   assert.equal(seen("yuebai-user/rpc/internal/logic/common/userlogic.go", 35), false);
   assert.equal(seen("2c6a7d9"), false);
   assert.equal(seen("3f2a1c9"), true);
-  // 读文件时写成 ./src/bar.ts 的照样认；正文里写的 src/other.ts:2 不算
-  assert.equal(seen("src/bar.ts"), true);
-  assert.equal(seen("src/bar.ts", 2), true);
-  assert.equal(seen("src/other.ts", 2), false);
   assert.equal(seen("src/fake.ts", 10), false);
-  assert.equal(seen("9d8e7f6"), true);
-  assert.equal(seen("1a2b3c4"), true);
-  assert.equal(seen("5e6f7a8"), true);
-  assert.equal(seen("src/a.ts", 3), true);
-  assert.equal(seen("src/b.ts", 4), true);
+  assert.equal(seen("9d8e7f6"), false);
+  // 回答里写成 ./src/baz.ts、src/./baz.ts 的和读文件时一样整理
   assert.equal(seen("src/baz.ts", 1), true);
   assert.equal(seen("./src/baz.ts", 1), true);
+  assert.equal(seen("src/./baz.ts", 1), true);
 });
 
 test("没查到的代码位置：带行号的路径和提交号算「说查过」，举例的路径不算", () => {
@@ -1371,13 +1367,20 @@ test("没查到的代码位置：带行号的路径和提交号算「说查过�
   );
   // 全是数字的（requestId）、没有数字的英文单词不算提交号
   assert.deepEqual(unseenCodeCitations("requestId @ 179152518627422277，版本 deadbeef", none), []);
+  // 中文紧挨着的、加粗的、写在等号后面的路径照样认；网址里的、.ts.map 这类不是代码文件的不认
+  assert.deepEqual(unseenCodeCitations("问题在internal/logic/userlogic.go:35，见**rpc/x.go:3**，caller=src/a.ts", none), [
+    { text: "internal/logic/userlogic.go:35", located: true },
+    { text: "rpc/x.go:3", located: true },
+    { text: "src/a.ts", located: false },
+  ]);
+  assert.deepEqual(unseenCodeCitations("https://lab.example.com/ai/agent-tag/-/blob/master/src/bot.ts#L12 和 dist/a.ts.map", none), []);
 });
 
 test("调过代码工具还编出仓库里没有的文件：打回重做，重做后还编就不发出", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
     describe: () => "搜代码",
-    run: async () => "没有搜到「getUserCenterFromRemote」（master 分支 @ 1a2b3c4）。",
+    run: async (_args, ctx) => codeResult(ctx, [["没有搜到「getUserCenterFromRemote」（master 分支 @ 1a2b3c4）。", { commit: "1a2b3c4" }]]),
   };
   const codeRead: Tool = {
     spec: { name: "code_read_file", description: "读代码", parameters: { type: "object", properties: {} } },
@@ -1390,13 +1393,19 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     spec: { name: "code_list_files", description: "列文件", parameters: { type: "object", properties: {} } },
     describe: () => "列文件",
     maxOutputChars: 50,
-    run: async () => `共 2 个文件（master 分支 @ 1a2b3c4）：\nsrc/index.ts\n${"x".repeat(60)}\nsrc/hidden/tail.ts`,
+    run: async (_args, ctx) =>
+      codeResult(ctx, [
+        ["共 2 个文件（master 分支 @ 1a2b3c4）：", { commit: "1a2b3c4" }],
+        ["src/index.ts", { path: "src/index.ts" }],
+        ["x".repeat(60)],
+        ["src/hidden/tail.ts", { path: "src/hidden/tail.ts" }],
+      ]),
   };
   const readBig: Tool = {
     spec: { name: "code_read_big", description: "读大文件", parameters: { type: "object", properties: {} } },
     describe: () => "读大文件",
     run: async () => {
-      throw new Error("src/generated.ts 有 2048 KB，太大了不读，用 code_search 搜需要的部分");
+      throw new ToolError("src/generated.ts 有 2048 KB，太大了不读，用 code_search 搜需要的部分", [{ repo: "ai/aiops-mcp", path: "src/generated.ts", at: 0 }]);
     },
   };
   const searchPath: Tool = {
@@ -1404,12 +1413,12 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     describe: () => "按路径搜",
     run: async () => "没有搜到「src/legacy/user.ts」（master 分支 @ 1a2b3c4）。",
   };
-  // 不是代码工具：报错写成「路径 是目录」也不算查到这个文件
+  // 不是代码工具：报错里带着代码位置也不算查到这个文件
   const otherTool: Tool = {
     spec: { name: "aiops_get_file", description: "别的工具", parameters: { type: "object", properties: {} } },
     describe: () => "别的工具",
     run: async () => {
-      throw new Error("src/legacy/user.ts 是目录");
+      throw new ToolError("src/legacy/user.ts 是目录", [{ repo: "ai/aiops-mcp", path: "src/legacy/user.ts", at: 0 }]);
     },
   };
   const made =
@@ -1485,7 +1494,7 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.deepEqual(tooBig.replies, ["src/generated.ts 太大，读不了"]);
   const bigLine = await ask(["src/generated.ts:10 初始化配置", "src/generated.ts:10 初始化配置"], { tool: "code_read_big" });
   assert.deepEqual(bigLine.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
-  // 同样的报错出自别的工具（比如 MCP），不算查到文件
+  // 出自别的工具（比如 MCP）的，不算查到文件
   const notCode = await ask(["src/legacy/user.ts 是个目录", "src/legacy/user.ts 是个目录"], { also: ["aiops_get_file"] });
   assert.equal(notCode.requests.length, 3);
   assert.deepEqual(notCode.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])]);
@@ -1506,14 +1515,20 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
   assert.deepEqual(clipped.replies, ["入口在 src/index.ts"]);
 });
 
-test("代码工具的结果被截断时，切开的最后一行整行不算（文件名里可以有空格）", async () => {
+test("代码工具的结果被截断时，截断处以后的代码位置不算，切开的那一行也不算（文件名里可以有空格）", async () => {
   const output = "共 2 个文件（master 分支 @ 1a2b3c4）：\nsrc/index.ts\nsrc/foo.ts backup\nsrc/b.ts";
   const ask = async (limit: number, answers: string[]) => {
     const listFiles: Tool = {
       spec: { name: "code_list_files", description: "列文件", parameters: { type: "object", properties: {} } },
       describe: () => "列文件",
       maxOutputChars: limit,
-      run: async () => output,
+      run: async (_args, ctx) =>
+        codeResult(ctx, [
+          ["共 2 个文件（master 分支 @ 1a2b3c4）：", { commit: "1a2b3c4" }],
+          ["src/index.ts", { path: "src/index.ts" }],
+          ["src/foo.ts backup", { path: "src/foo.ts backup" }],
+          ["src/b.ts", { path: "src/b.ts" }],
+        ]),
     };
     const results: ChatResult[] = [
       { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_list_files", arguments: "{}" }] },

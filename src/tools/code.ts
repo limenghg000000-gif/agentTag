@@ -1,5 +1,5 @@
-import { type CodeWorkspaces, RECENT_BRANCHES, type Workspace } from "../repo.js";
-import type { Tool, ToolContext } from "./tool.js";
+import { addChanges, type CodeWorkspaces, RECENT_BRANCHES, type Workspace } from "../repo.js";
+import { type Tool, type ToolContext, type ToolOutput, ToolOutputBuilder } from "./tool.js";
 
 export const CODE_TOOL_NAMES = [
   "code_branches",
@@ -73,7 +73,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     async run(args, ctx) {
       const ws = await workspace(args, ctx);
       const target = optional(args.switch_to);
-      return target ? ws.switchBranch(target, ctx.signal) : ws.listBranches(optional(args.filter), ctx.signal);
+      return target ? report(ctx, await ws.switchBranch(target, ctx.signal)) : ws.listBranches(optional(args.filter), ctx.signal);
     },
   };
 
@@ -94,10 +94,8 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
     describe: (args) => `列出代码文件 ${optional(args.glob) ?? optional(args.dir) ?? ""}${onBranch(args.branch)}`.trim(),
     async run(args, ctx) {
-      return (await workspace(args, ctx)).listFiles(
-        { dir: optional(args.dir), glob: optional(args.glob), branch: optional(args.branch) },
-        ctx.signal,
-      );
+      const ws = await workspace(args, ctx);
+      return report(ctx, await ws.listFiles({ dir: optional(args.dir), glob: optional(args.glob), branch: optional(args.branch) }, ctx.signal));
     },
   };
 
@@ -122,7 +120,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
       const file = requireString(args, "path");
       const start = typeof args.start_line === "number" ? args.start_line : 1;
       const end = typeof args.end_line === "number" ? args.end_line : undefined;
-      return (await workspace(args, ctx)).readFile(file, start, end, optional(args.branch), ctx.signal);
+      return report(ctx, await (await workspace(args, ctx)).readFile(file, start, end, optional(args.branch), ctx.signal));
     },
   };
 
@@ -158,16 +156,9 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
     async run(args, ctx) {
       const pattern = requireString(args, "pattern");
-      return (await workspace(args, ctx)).search(
-        pattern,
-        {
-          literal: args.literal === true,
-          ignoreCase: args.ignore_case === true,
-          glob: optional(args.glob),
-          branches: list(args.branches),
-        },
-        ctx.signal,
-      );
+      const ws = await workspace(args, ctx);
+      const options = { literal: args.literal === true, ignoreCase: args.ignore_case === true, glob: optional(args.glob), branches: list(args.branches) };
+      return report(ctx, await ws.search(pattern, options, ctx.signal));
     },
   };
 
@@ -198,7 +189,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         throw new Error("缺少 new_text 参数");
       }
       const oldText = typeof args.old_text === "string" && args.old_text !== "" ? args.old_text : undefined;
-      return (await workspace(args, ctx)).editFile(file, oldText, args.new_text);
+      return report(ctx, await (await workspace(args, ctx)).editFile(file, oldText, args.new_text));
     },
   };
 
@@ -210,7 +201,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
     describe: () => "查看代码改动",
     async run(args, ctx) {
-      return (await workspace(args, ctx)).diff();
+      return report(ctx, await (await workspace(args, ctx)).diff());
     },
   };
 
@@ -242,18 +233,22 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         .join("\n\n---\n");
       const ws = await workspace(args, ctx);
       const pr = await ws.openPullRequest(title, body, ctx.signal);
-      return [
+      const out = new ToolOutputBuilder(ws.repo).line(
         pr.created
           ? `已开${requestName} ${refOf(pr.number)}：${pr.url}`
           : `已把新改动推到这个话题之前开的${requestName} ${refOf(pr.number)}：${pr.url}`,
-        "",
-        "改动统计：",
-        pr.stat,
-      ].join("\n");
+      );
+      return report(ctx, addChanges(out.line(""), pr.changes).build());
     },
   };
 
   return [branches, listFiles, read, search, edit, diff, openPr];
+}
+
+/** 把结果里查到的代码位置交给机器人的回答检查，文字交给模型 */
+function report(ctx: ToolContext, output: ToolOutput): string {
+  ctx.onFacts?.(output.facts);
+  return output.text;
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {
