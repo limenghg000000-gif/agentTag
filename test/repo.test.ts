@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { type CodeHost, CodeWorkspaces, createGitHubHost, createGitLabHost, RepoError, runGit } from "../src/repo.js";
+import { type CodeHost, type CommitQuery, type CommitSearch, CodeWorkspaces, createGitHubHost, createGitLabHost, RepoError, runGit } from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
 import type { CodeFact, CodeLocation } from "../src/tools/tool.js";
 
@@ -596,4 +596,167 @@ test("代码工具：code_branches 列出和切换分支，code_search 的 branc
   assert.match(await tools.code_search.run({ pattern: "k8s", ignore_case: true, branches: "aiops, old" }, { signal }), /在 2 个分支上共搜到 2 处/);
   assert.match(await tools.code_branches.run({ switch_to: "aiops" }, { signal }), /已切到 aiops 分支/);
   assert.match(await tools.code_list_files.run({ glob: "**/*.go" }, { signal }), /（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go/);
+});
+
+test("GitLab 查提交历史：只按说明里的词时用搜索接口，带文件或日期时列出提交再按说明筛，都按时间从新到旧", async () => {
+  const urls: string[] = [];
+  const commits = [
+    {
+      id: "1bfb19b1a0000000000000000000000000000000",
+      title: "修复淘宝c.tb.cn不能转链的问题",
+      author_name: "赵作武",
+      committed_date: "2026-09-01T10:00:00.000+08:00",
+    },
+    {
+      id: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+      title: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题",
+      message: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题\n\n直接从 topIds 参数取商品id",
+      author_name: "赵作武",
+      committed_date: "2026-10-10T02:03:01.000-07:00",
+      web_url: "https://lab.corp/golang/appservice/-/commit/4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+    },
+    { id: "fd243a73d0000000000000000000000000000000", title: "Merge branch 'feature/x' into 'master'", author_name: "赵作武", committed_date: "2026-10-09T03:09:24.000+00:00" },
+  ];
+  const fakeFetch = (async (url: string) => {
+    urls.push(url);
+    return new Response(JSON.stringify(commits), { status: 200 });
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://lab.corp", "glpat-x", fakeFetch);
+  // 空格隔开的几个词都要有，不分大小写；说明正文里的词也算
+  const searched = await host.searchCommits!("golang/appservice", { ref: "master", query: "C.TB.CN topids", limit: 10 });
+  assert.deepEqual(searched, {
+    commits: [
+      {
+        sha: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+        title: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题",
+        message: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题\n\n直接从 topIds 参数取商品id",
+        date: "2026-10-10T02:03:01.000-07:00",
+        author: "赵作武",
+        url: "https://lab.corp/golang/appservice/-/commit/4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+      },
+    ],
+  });
+  assert.equal(urls[0], "https://lab.corp/api/v4/projects/golang%2Fappservice/search?scope=commits&search=C.TB.CN+topids&ref=master&per_page=100");
+  const byFile = await host.searchCommits!("golang/appservice", {
+    ref: "master",
+    query: "c.tb.cn",
+    path: "services/goods/tb.go",
+    since: "2026-08-31T16:00:00.000Z",
+    limit: 1,
+  });
+  assert.deepEqual(
+    byFile.commits.map((c) => c.sha.slice(0, 9)),
+    ["4a677c0a4"],
+  );
+  assert.equal(byFile.scanned, 3);
+  assert.equal(
+    urls[1],
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&path=services%2Fgoods%2Ftb.go&since=2026-08-31T16%3A00%3A00.000Z&per_page=100",
+  );
+  // 不按词筛：只要 limit 个
+  const recent = await host.searchCommits!("golang/appservice", { ref: "master", limit: 2 });
+  assert.deepEqual(
+    recent.commits.map((c) => c.sha.slice(0, 9)),
+    ["4a677c0a4", "fd243a73d"],
+  );
+  assert.equal(recent.scanned, undefined);
+  assert.equal(urls[2], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=2");
+  // 提交搜索被关了：退回列出最近的提交再筛
+  const fallbackUrls: string[] = [];
+  const noSearch = createGitLabHost("https://lab.corp", "glpat-x", (async (url: string) => {
+    fallbackUrls.push(url);
+    return url.includes("/search?") ? new Response("{}", { status: 400 }) : new Response(JSON.stringify(commits), { status: 200 });
+  }) as unknown as typeof fetch);
+  const fellBack = await noSearch.searchCommits!("golang/appservice", { ref: "master", query: "半屏", limit: 10 });
+  assert.deepEqual(
+    fellBack.commits.map((c) => c.sha.slice(0, 9)),
+    ["4a677c0a4"],
+  );
+  assert.equal(fellBack.scanned, 3);
+  assert.equal(fallbackUrls[1], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=100");
+  const missing = createGitLabHost("https://lab.corp", "glpat-x", (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch);
+  await assert.rejects(missing.searchCommits!("golang/appservice", { ref: "nope", limit: 10 }), /GitLab 查提交历史失败（HTTP 404）：找不到项目或分支/);
+});
+
+test("GitHub 查提交历史：列出这个分支的提交再按说明筛", async () => {
+  const urls: string[] = [];
+  const fakeFetch = (async (url: string) => {
+    urls.push(url);
+    return new Response(
+      JSON.stringify([
+        {
+          sha: "aaaaaaaa11111111111111111111111111111111",
+          html_url: "https://github.com/o/r/commit/aaaaaaaa",
+          commit: { message: "fix: retry on 429\n\ndetails", author: { name: "张三", date: "2026-10-01T00:00:00Z" } },
+        },
+        { sha: "bbbbbbbb22222222222222222222222222222222", commit: { message: "docs", author: { name: "李四", date: "2026-10-02T00:00:00Z" } } },
+      ]),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  const host = createGitHubHost("ghp_x", fakeFetch);
+  assert.deepEqual(await host.searchCommits!("o/r", { ref: "main", query: "429", path: "src", limit: 10 }), {
+    commits: [
+      {
+        sha: "aaaaaaaa11111111111111111111111111111111",
+        title: "fix: retry on 429",
+        message: "fix: retry on 429\n\ndetails",
+        date: "2026-10-01T00:00:00Z",
+        author: "张三",
+        url: "https://github.com/o/r/commit/aaaaaaaa",
+      },
+    ],
+    scanned: 2,
+  });
+  assert.equal(urls[0], "https://api.github.com/repos/o/r/commits?sha=main&path=src&per_page=100");
+});
+
+test("代码工具 code_log：查当前分支的提交历史，列出的提交号记作查到的；翻满了写明更早的没看", async () => {
+  const { all } = branchWorkspaces();
+  const queries: CommitQuery[] = [];
+  let result: CommitSearch = {
+    commits: [
+      {
+        sha: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+        title: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题",
+        date: "2026-10-10T09:03:01Z",
+        author: "赵作武",
+        url: "https://lab.corp/golang/appservice/-/commit/4a677c0a4",
+      },
+    ],
+  };
+  all.host.searchCommits = async (_repo, query) => {
+    queries.push(query);
+    return result;
+  };
+  const tools = Object.fromEntries(createCodeTools({ workspaces: all, threadKey: "om_log", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  assert.equal(tools.code_log.describe({ query: "c.tb.cn", path: "services/goods/tb.go" }), "查提交：c.tb.cn services/goods/tb.go");
+  assert.equal(tools.code_log.describe({ branch: "aiops" }), "查提交：最近的提交（aiops 分支）");
+  const facts: CodeFact[] = [];
+  const text = await tools.code_log.run(
+    { query: "c.tb.cn", path: "./services/goods/tb.go", since: "2026-10-01" },
+    { signal, onFacts: (found) => facts.push(...found) },
+  );
+  assert.equal(
+    text,
+    "ai/aiops-mcp 的 main 分支上说明里有「c.tb.cn」、改过 services/goods/tb.go、2026-10-01 以后的提交，最近的 1 个，从新到旧：\n" +
+      "- 4a677c0a 2026-10-10 赵作武「修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题」 https://lab.corp/golang/appservice/-/commit/4a677c0a4",
+  );
+  // 只写日期的按北京时间当天 0 点
+  assert.deepEqual(queries[0], { ref: "main", query: "c.tb.cn", path: "services/goods/tb.go", since: "2026-09-30T16:00:00.000Z", limit: 10 });
+  assert.deepEqual(located(text, facts), [{ commit: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37", repo: "ai/aiops-mcp", line: "- 4a677c0a" }]);
+  // 先列再筛、又翻满了：不能当成「没改过」
+  result = { commits: [], scanned: 100 };
+  assert.equal(
+    await tools.code_log.run({ query: "topIds", branch: "aiops", limit: 99 }, { signal }),
+    "ai/aiops-mcp 的 aiops 分支上说明里有「topIds」的提交一个都没找到（只翻了最近 100 个提交，更早的没看，可以加 since 或换个词再查）。",
+  );
+  assert.deepEqual(queries[1], { ref: "aiops", query: "topIds", path: undefined, since: undefined, limit: 30 });
+  await assert.rejects(tools.code_log.run({ since: "上周" }, { signal }), /since 要写成 2026-10-01 这样的日期/);
+  await assert.rejects(tools.code_log.run({ path: "../etc/passwd" }, { signal }), /路径要在仓库里面/);
+  // 平台没有查提交的接口时直说
+  const plain = Object.fromEntries(
+    createCodeTools({ workspaces: branchWorkspaces().all, threadKey: "om_log2", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]),
+  );
+  await assert.rejects(plain.code_log.run({}, { signal }), /Fake 还不支持查提交历史/);
 });

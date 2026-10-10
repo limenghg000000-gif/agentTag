@@ -17,6 +17,10 @@ const MAX_LIST_BRANCHES = 50;
 export const RECENT_BRANCHES = 8;
 const MAX_SEARCH_BRANCHES = 10;
 const MAX_DIFF_CHARS = 15000;
+/** 查提交历史时默认列几个、最多列几个；按说明里的词筛时，带了文件或日期的最多翻最近这么多个提交 */
+export const DEFAULT_LOG_COMMITS = 10;
+export const MAX_LOG_COMMITS = 30;
+const LOG_SCAN_COMMITS = 100;
 const GIT_TIMEOUT_MS = 120_000;
 /** 话题里的工作目录多久没用就删掉 */
 export const WORKSPACE_KEEP_MS = 3 * 24 * 60 * 60_000;
@@ -38,6 +42,51 @@ export interface CodeHost {
   checkAccess?(repo: string): Promise<string>;
   /** 用平台接口列出分支和各自最近一次提交，不用拉代码。没有实现时用 git 把所有分支拉下来再列 */
   listBranches?(repo: string, signal?: AbortSignal): Promise<BranchInfo[]>;
+  /** 用平台接口查一个分支的提交历史（工作目录是浅克隆，没有历史），按提交时间从新到旧。没有实现时 code_log 不能用 */
+  searchCommits?(repo: string, query: CommitQuery, signal?: AbortSignal): Promise<CommitSearch>;
+}
+
+/** 查提交历史的条件 */
+export interface CommitQuery {
+  /** 分支 */
+  ref: string;
+  /** 提交说明里要有的词，空格隔开的几个词都要有，不分大小写 */
+  query?: string;
+  /** 只看改过这个文件或目录的提交（相对仓库根目录） */
+  path?: string;
+  /** 只看这个时间以后的提交（ISO 格式） */
+  since?: string;
+  limit: number;
+}
+
+export interface CommitInfo {
+  sha: string;
+  title: string;
+  /** 完整的提交说明，按词筛时用 */
+  message?: string;
+  /** 提交时间（ISO 格式） */
+  date?: string;
+  author?: string;
+  url?: string;
+}
+
+export interface CommitSearch {
+  commits: CommitInfo[];
+  /** 先列提交再按说明里的词筛时，一共翻了几个提交（翻满 LOG_SCAN_COMMITS 说明更早的没看）；平台直接按说明搜的不填 */
+  scanned?: number;
+}
+
+/** 按说明里的词筛（空格隔开的几个词都要有，不分大小写），从新到旧取前 limit 个 */
+function pickCommits(commits: CommitInfo[], query: CommitQuery): CommitInfo[] {
+  const words = (query.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  return commits
+    .filter((c) => words.every((word) => `${c.title}\n${c.message ?? ""}`.toLowerCase().includes(word)))
+    .sort((a, b) => (Date.parse(b.date ?? "") || 0) - (Date.parse(a.date ?? "") || 0))
+    .slice(0, query.limit);
+}
+
+function firstLine(text: string | undefined): string {
+  return (text ?? "").split("\n")[0].trim();
 }
 
 /** 一个分支和它最近一次提交 */
@@ -154,6 +203,55 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         title: b.commit?.title,
       }));
     },
+    async searchCommits(repo, query, signal) {
+      const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
+      const get = (url: string) =>
+        fetchImpl(url, {
+          headers: { "private-token": token },
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+        });
+      // 只按说明里的词找：用搜索接口，搜这个分支上全部提交的说明；带了文件或日期时列出这个分支上符合的提交，再按说明筛
+      let bySearch = query.query !== undefined && query.path === undefined && query.since === undefined;
+      const list = () =>
+        get(
+          `${project}/repository/commits?${new URLSearchParams({
+            ref_name: query.ref,
+            ...(query.path ? { path: query.path } : {}),
+            ...(query.since ? { since: query.since } : {}),
+            per_page: String(query.query ? LOG_SCAN_COMMITS : query.limit),
+          })}`,
+        );
+      let res = bySearch
+        ? await get(`${project}/search?${new URLSearchParams({ scope: "commits", search: query.query ?? "", ref: query.ref, per_page: String(LOG_SCAN_COMMITS) })}`)
+        : await list();
+      // 自建 GitLab 可能关了提交搜索（400、403）：退回列出最近的提交再按说明筛
+      if (bySearch && (res.status === 400 || res.status === 403)) {
+        bySearch = false;
+        res = await list();
+      }
+      if (!res.ok) {
+        const hint = res.status === 404 ? "：找不到项目或分支" : res.status === 401 || res.status === 403 ? "：令牌没有读这个项目的权限" : "";
+        throw new RepoError(`GitLab 查提交历史失败（HTTP ${res.status}）${hint}`);
+      }
+      const body = (await res.json()) as {
+        id: string;
+        title?: string;
+        message?: string;
+        author_name?: string;
+        committed_date?: string;
+        created_at?: string;
+        web_url?: string;
+      }[];
+      const commits = body.map((c) => ({
+        sha: c.id,
+        title: c.title ?? firstLine(c.message),
+        message: c.message,
+        date: c.committed_date ?? c.created_at,
+        author: c.author_name,
+        url: c.web_url,
+      }));
+      return { commits: pickCommits(commits, query), ...(bySearch || !query.query ? {} : { scanned: body.length }) };
+    },
   };
 }
 
@@ -223,6 +321,37 @@ export function createGitHubHost(token: string, fetchImpl: typeof fetch = fetch)
         throw new RepoError("能看到仓库，但没有写权限，推不了分支");
       }
       return `能访问${body.default_branch ? `，默认分支 ${body.default_branch}` : ""}`;
+    },
+    async searchCommits(repo, query, signal) {
+      // GitHub 的提交搜索只搜默认分支：一律列出这个分支上的提交，再按说明筛
+      const params = new URLSearchParams({
+        sha: query.ref,
+        ...(query.path ? { path: query.path } : {}),
+        ...(query.since ? { since: query.since } : {}),
+        per_page: String(query.query ? LOG_SCAN_COMMITS : query.limit),
+      });
+      const res = await fetchImpl(`https://api.github.com/repos/${repo}/commits?${params}`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "AgentTag",
+        },
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        throw new RepoError(`GitHub 查提交历史失败（HTTP ${res.status}）${res.status === 404 || res.status === 422 ? "：找不到仓库或分支" : ""}`);
+      }
+      const body = (await res.json()) as { sha: string; html_url?: string; commit?: { message?: string; author?: { name?: string; date?: string } } }[];
+      const commits = body.map((c) => ({
+        sha: c.sha,
+        title: firstLine(c.commit?.message),
+        message: c.commit?.message,
+        date: c.commit?.author?.date,
+        author: c.commit?.author?.name,
+        url: c.html_url,
+      }));
+      return { commits: pickCommits(commits, query), ...(query.query ? { scanned: body.length } : {}) };
     },
   };
 }
@@ -484,6 +613,40 @@ export class Workspace {
       const tags = [b.isDefault ? "默认分支" : "", b.name === this.baseBranch ? "当前在看" : ""].filter(Boolean);
       const commit = [b.date?.slice(0, 10), b.author].filter(Boolean).join(" ") + (b.title ? `「${oneLine(b.title)}」` : "");
       out.parts("- ", [b.name, { branch: b.name }], `${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`);
+    }
+    return out.build();
+  }
+
+  /**
+   * 查一个分支的提交历史，从新到旧：按说明里的词、改过的文件或目录、起始日期筛。工作目录是浅克隆，用平台接口查。
+   * branch 不填是这个话题当前看的分支。列出的提交号记作查到的，回答里引用时要对得上
+   */
+  async log(
+    options: { query?: string; path?: string; branch?: string; since?: string; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<ToolOutput> {
+    if (!this.host.searchCommits) {
+      throw new RepoError(`${this.host.name} 还不支持查提交历史`);
+    }
+    const ref = options.branch?.trim() || this.baseBranch;
+    const query = options.query?.trim() || undefined;
+    const rel = options.path?.trim() ? this.relative(options.path) : undefined;
+    const file = rel === "." ? undefined : rel;
+    const since = options.since?.trim() ? isoDate(options.since) : undefined;
+    const limit = Math.min(MAX_LOG_COMMITS, Math.max(1, Math.trunc(options.limit ?? DEFAULT_LOG_COMMITS)));
+    const { commits, scanned } = await this.host.searchCommits(this.repo, { ref, query, path: file, since, limit }, signal);
+    const conditions = [query ? `说明里有「${query}」` : "", file ? `改过 ${file}` : "", since ? `${options.since?.trim()} 以后` : ""].filter(Boolean);
+    const what = `${this.repo} 的 ${ref} 分支上${conditions.length > 0 ? `${conditions.join("、")}的` : ""}提交`;
+    // 先列提交再筛、又翻满了：更早的提交没看，不能说「没改过」
+    const partial = scanned !== undefined && scanned >= LOG_SCAN_COMMITS ? `（只翻了最近 ${scanned} 个提交，更早的没看，可以加 since 或换个词再查）` : "";
+    const out = this.output();
+    if (commits.length === 0) {
+      return out.line(`${what}一个都没找到${partial}。`).build();
+    }
+    out.line(`${what}，最近的 ${commits.length} 个，从新到旧${partial}：`);
+    for (const c of commits) {
+      const detail = [c.date?.slice(0, 10), c.author].filter(Boolean).join(" ");
+      out.parts("- ", [c.sha.slice(0, 8), { commit: c.sha }], `${detail ? ` ${detail}` : ""}「${oneLine(c.title)}」${c.url ? ` ${c.url}` : ""}`);
     }
     return out.build();
   }
@@ -1191,4 +1354,14 @@ export function globToRegExp(glob: string): RegExp {
 function oneLine(text: string): string {
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > 60 ? `${line.slice(0, 60)}…` : line;
+}
+
+/** 模型写的日期（2026-10-01，或带时间的）换成平台接口要的 ISO 时间；只写日期的按北京时间当天 0 点 */
+function isoDate(text: string): string {
+  const value = text.trim();
+  const date = new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00+08:00` : value);
+  if (Number.isNaN(date.getTime())) {
+    throw new RepoError(`since 要写成 2026-10-01 这样的日期：${text}`);
+  }
+  return date.toISOString();
 }
