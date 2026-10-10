@@ -290,3 +290,50 @@ test("调过 thinkAfter 认的工具以后，后面每一轮都打开思考；�
     [false, false, false, false],
   );
 });
+
+test("steerReasoning 返回一段话时，在这一轮工具结果后面加一条用户消息；没有思考内容、给出回答的那轮不看", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" }), call("c2", "echo", { text: "b" })], reasoning: "check the logs" },
+    { text: "", finish: "tool_calls", toolCalls: [call("c3", "echo", { text: "c" })] },
+    { text: "好了", finish: "stop", reasoning: "done" },
+  ]);
+  const seen: string[] = [];
+
+  await runAgent({
+    model,
+    system: "s",
+    messages: user,
+    tools: [echoTool()],
+    signal,
+    steerReasoning: (reasoning) => {
+      seen.push(reasoning);
+      return "用中文想";
+    },
+  });
+
+  assert.deepEqual(seen, ["check the logs"]);
+  assert.deepEqual(requests[1].messages.slice(-3), [
+    { role: "tool", toolCallId: "c1", content: "回声：a" },
+    { role: "tool", toolCallId: "c2", content: "回声：b" },
+    { role: "user", content: "用中文想" },
+  ]);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "tool", toolCallId: "c3", content: "回声：c" });
+});
+
+test("轮数用完时上一条已经是用户消息（思考提醒）就把收尾提醒并进去，不连着两条用户消息", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "check the logs" },
+    { text: "只能先这样答", finish: "stop" },
+  ]);
+
+  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, maxToolRounds: 1, steerReasoning: () => "用中文想" });
+
+  const last = requests[1].messages.slice(-2);
+  assert.deepEqual(
+    last.map((m) => m.role),
+    ["tool", "user"],
+  );
+  assert.match(last[1].content, /^用中文想\n\n工具调用次数已经用完/);
+  // 调用方传进来的消息没被改
+  assert.deepEqual(user, [{ role: "user", content: "帮我做事" }]);
+});
