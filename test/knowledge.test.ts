@@ -3655,3 +3655,23 @@ test("同步以后在表格里改了编号的经验：归档时 aiops 那条认�
   await desk.idle();
   assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
 });
+
+test("归档时 aiops 那条的出处不是这一条：出处只有是 K 编号时才写在卡片上，写成别的（密钥、手机号）不写", async () => {
+  const leaked = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
+  for (const source of [leaked, "13800138000", "K12345678901"]) {
+    const { mcp } = fakeMcp({
+      get_knowledge: (args) => JSON.stringify({ id: args.id, title: "t", status: "active", diagnosis_path: `看了连接数\n（来自飞书团队经验库 ${source}）` }),
+    });
+    const lessons = new AiopsLessons(mcp, "aiops", quiet);
+    const err = await lessons.archiveSynced(31, ["K9"], "ML", task).then(
+      () => assert.fail("应该报错"),
+      (error: Error) => error,
+    );
+    assert.match(err.message, /它不是从 K9 同步过去的/, source);
+    assert.ok(!err.message.includes(source), source);
+  }
+  const { mcp } = fakeMcp({
+    get_knowledge: (args) => JSON.stringify({ id: args.id, title: "t", status: "active", diagnosis_path: "看了连接数\n（来自飞书团队经验库 #k 1）" }),
+  });
+  await assert.rejects(new AiopsLessons(mcp, "aiops", quiet).archiveSynced(31, ["K9"], "ML", task), /它的出处是 K1，不是 K9/);
+});

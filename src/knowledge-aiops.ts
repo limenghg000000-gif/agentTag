@@ -284,8 +284,10 @@ export class AiopsLessons {
     const lesson = await this.get(id, task);
     const teamId = teamIds[0];
     if (!teamIds.some((candidate) => syncedFrom(lesson.diagnosis_path, candidate))) {
-      const source = sourceId(lesson.diagnosis_path);
-      // 出处是别的编号：可能是 aiops 编号填错了，也可能是这一行同步以后在表格里改过编号（出处还是同步时的编号，分不出是哪种）
+      // 出处是别的编号：可能是 aiops 编号填错了，也可能是这一行同步以后在表格里改过编号（出处还是同步时的编号，分不出是哪种）。
+      // 出处在 aiops 里能改，会列在卡片上：只有像 K12 这样的编号才写出来，写成别的（可能是密钥、号码）不写
+      const noted = normalizeId(sourceId(lesson.diagnosis_path) ?? "");
+      const source = /^K\d{1,9}$/.test(noted) ? noted : undefined;
       throw new KnowledgeError(
         source
           ? `它的出处是 ${source}，不是 ${teamId}（排查过程末尾注明的是「来自飞书团队经验库 ${source}」）。可能有人在表格里改了 ${teamId} 的 aiops 编号，请改正后再点「再试一次」；如果是同步以后在表格里把 ${source} 的编号改成了 ${teamId}，请点「不用了」，再让机器人起草归档 aiops 经验 #${id}`
