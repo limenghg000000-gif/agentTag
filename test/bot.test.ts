@@ -956,6 +956,45 @@ test("有 aiops 工具时，一个工具都没调就给出线上数据的回答�
   assert.deepEqual(markdowns(sent), ["最近 1 小时没有查到报错日志"]);
 });
 
+test("读剧本不算查过线上，剧本里举例的路径也不算证据；调过 aiops 的工具以后后面几轮打开思考", async () => {
+  const playbook: Tool = {
+    spec: { name: "aiops_playbook", description: "读剧本", parameters: { type: "object", properties: { name: { type: "string" } } } },
+    describe: () => "aiops · 读剧本 转链",
+    run: async () => "（以下是 aiops 服务端下发的剧本「convert_link」）转链服务 product-service-api 在 prod。崩溃堆栈例：/build/internal/cache/map.go:42",
+  };
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[{"line":"isv.parse-result-invalid"}]}',
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_playbook", arguments: '{"name":"convert_link"}' }] },
+    // 只读了剧本就给出线上结论：打回重做
+    { text: "结论：最近 1 小时转链失败 3 次，都是 isv.parse-result-invalid（把握：中）", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c2", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "结论：这条链接返回 isv.parse-result-invalid，商品可能已下架（把握：中）", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const mcp = {
+    names: ["aiops"],
+    tools: () => [playbook, queryLogs],
+    prompt: () => undefined,
+    isPlaybookTool: (name: string) => name === "aiops_playbook",
+    thinksAfter: (name: string) => name.startsWith("aiops_"),
+  };
+  const { sent, handle } = setup({ model, mcp });
+
+  await handle(message("用户反馈转链失败，排查一下 https://c.tb.cn/h.8AYbSqZ7SeriAVy"));
+
+  assert.equal(requests.length, 4);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedOpsAnswer(["aiops"]) });
+  assert.deepEqual(
+    requests.map((req) => req.thinking),
+    [undefined, true, true, true],
+  );
+  assert.deepEqual(markdowns(sent), ["结论：这条链接返回 isv.parse-result-invalid，商品可能已下架（把握：中）"]);
+});
+
 test("线上数据检查：提问像在问线上服务，一个工具都没成功调过就打回，不管回答怎么写；成功调过工具、或者提问和线上无关时放行", () => {
   const flagged = unverifiedOpsAnswer(["aiops"]);
   // 复测时没调工具编出来的定位候选：没有时间、Pod 名、条数，只看回答认不出来

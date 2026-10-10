@@ -111,6 +111,10 @@ export interface BotDeps {
     tools(task: TaskToolContext): readonly Tool[];
     /** 这些工具的使用说明，写进系统提示词。toolNames 是这次任务的全部工具名 */
     prompt(toolNames: readonly string[]): string | undefined;
+    /** 读剧本的工具（如 aiops_playbook）：只是读说明，不算查过线上，读到的内容也不算证据 */
+    isPlaybookTool?(name: string): boolean;
+    /** 调过这个工具以后，这次任务后面几轮打开思考 */
+    thinksAfter?(name: string): boolean;
   };
 }
 
@@ -224,6 +228,10 @@ async function runTask(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
+          // 剧本是服务端下发的说明，不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
+          if (deps.mcp?.isPlaybookTool?.(tool.spec.name)) {
+            return tool.run(args, ctx);
+          }
           attempted.add(tool.spec.name);
           const code = isCodeTool(tool.spec.name);
           let facts: CodeFact[] = [];
@@ -270,9 +278,11 @@ async function runTask(
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
     ];
+    const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
+      ...(thinksAfter ? { thinkAfter: thinksAfter } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
@@ -432,7 +442,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
       ? ` 输入=${event.usage.input} 输出=${event.usage.output}${event.usage.reasoning ? ` 其中思考=${event.usage.reasoning}` : ""}`
       : "";
     const next = event.toolNames.length > 0 ? `调用 ${event.toolNames.join(", ")}` : "给出回答";
-    logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${usage} → ${next}`);
+    const think = event.thinking ? " 思考=开" : "";
+    logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${think}${usage} → ${next}`);
   } else if (event.type === "retry") {
     logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);
   } else if (event.type === "tool_end") {

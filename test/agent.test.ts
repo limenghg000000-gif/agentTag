@@ -242,3 +242,33 @@ test("review 拿到这次调过的工具名，通过时直接返回", async () =
   assert.equal(result.text, "答案");
   assert.deepEqual(used, ["echo"]);
 });
+
+test("调过 thinkAfter 认的工具以后，后面每一轮都打开思考；之前的轮次和别的工具不动；显式传了 thinking 时照它", async () => {
+  const script = (): ChatResult[] => [
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c2", "aiops_query_logs", { text: "b" })] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c3", "echo", { text: "c" })] },
+    { text: "查完了", finish: "stop" },
+  ];
+  const tools = [echoTool(), echoTool("aiops_query_logs")];
+  const thinkAfter = (name: string) => name.startsWith("aiops_");
+  const events: AgentEvent[] = [];
+
+  const { model, requests } = scriptedModel(script());
+  await runAgent({ model, system: "s", messages: user, tools, signal, thinkAfter, onEvent: (e) => events.push(e) });
+  assert.deepEqual(
+    requests.map((req) => req.thinking),
+    [undefined, undefined, true, true],
+  );
+  assert.deepEqual(
+    events.flatMap((e) => (e.type === "model" ? [e.thinking] : [])),
+    [undefined, undefined, true, true],
+  );
+
+  const forced = scriptedModel(script());
+  await runAgent({ model: forced.model, system: "s", messages: user, tools, signal, thinkAfter, thinking: false });
+  assert.deepEqual(
+    forced.requests.map((req) => req.thinking),
+    [false, false, false, false],
+  );
+});
