@@ -610,9 +610,10 @@ function mentions(text: string, cite: string): boolean {
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
 /**
  * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、src/a.tsx 都不是 src/a.ts）。
- * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算
+ * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。
+ * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
  */
-const PATH_START = "(?:(?<![\\w./-])|(?<=(?:^|[\\s\"'`(（=])/(?:[\\w.-]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
+const PATH_START = "(?:(?<![\\w./-])|(?<=(?:^|[\\s\"'`(（=])/(?:[^\\s/\"'`()（）<>]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
 const PATH_END = "(?![\\w/-]|\\.\\w)";
 
 function escapeRegExp(text: string): string {

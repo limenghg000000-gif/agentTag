@@ -1270,6 +1270,9 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
       { tool: "aiops_query_logs", output: "goroutine 1 [running]:\n/app/internal/logic/order.go:88 +0x1d" },
       { tool: "aiops_query_logs", output: "Error: boom\n    at start (/app/src/server.ts:12:5)" },
       { tool: "aiops_query_logs", output: "caller=./internal/svc/ctx.go:21" },
+      { tool: "aiops_query_logs", output: "panic: boom\n/go/pkg/mod/github.com/!acme/svc@v1.2.3/internal/repo/user.go:42 +0x1d" },
+      { tool: "aiops_query_logs", output: "Error: boom\n    at f (/app/node_modules/.pnpm/@acme+web@1.0.0/node_modules/@acme/web/lib/handler.js:7:3)" },
+      { tool: "aiops_query_logs", output: "caller=vendor/svc@v1.2.3/internal/repo/order.go:9" },
     ],
   );
   // 结果里只有 src/index.tsx、pkg/mysrc/util.ts、src/app.ts.map、pkg/src/nested.ts，不能认 src/index.ts、src/util.ts、src/app.ts、src/nested.ts
@@ -1288,6 +1291,11 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   assert.equal(seen("src/util/new.ts", 12), true);
   assert.equal(seen("src/util/new.ts", 13), false);
   assert.equal(seen("internal/svc/ctx.go", 21), true);
+  // 绝对路径前面的目录名里有 @、+、! 的（Go 模块缓存、pnpm）照样认；不是绝对路径的，前面多一段照样不认
+  assert.equal(seen("internal/repo/user.go", 42), true);
+  assert.equal(seen("lib/handler.js", 7), true);
+  assert.equal(seen("internal/repo/order.go"), false);
+  assert.equal(seen("internal/repo/order.go", 9), false);
   // 提交号可以只写前几位，不能在查到的后面再编几位
   const commit = codeEvidence([], [found("code_search", [{ commit: "3f2a1c9d8e7b" }])]);
   assert.equal(commit("3f2a1c9"), true);
