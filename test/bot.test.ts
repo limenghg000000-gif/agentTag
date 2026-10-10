@@ -16,12 +16,14 @@ import {
   reviewCodeAnswer,
   reviewDeflectedAnswer,
   reviewOpsAnswer,
+  THINK_IN_CHINESE,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
   unseenCodeAnswer,
   unverifiedCodeAnswer,
   unseenCodeCitations,
   unverifiedOpsAnswer,
+  writtenInEnglish,
 } from "../src/bot.js";
 import type { ImageRef, ThreadContext } from "../src/history.js";
 import { UNREAD_IMAGE } from "../src/images.js";
@@ -631,6 +633,59 @@ test("模型返回了思考内容时，进度卡片上显示最新一段，结�
   await hidden.handle(message("查一下"));
   assert.ok(hidden.updates.length > 0);
   assert.ok(hidden.updates.every((u) => !/💭|先查资料/.test(cardText(u.card))));
+});
+
+test("中文提问、思考被英文带跑时，在工具结果后面提醒接着用中文想，一次任务最多提醒 3 次", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料",
+    run: async () => "ERROR parse failed: invalid control character in URL",
+  };
+  const rounds = (reasoning: string, n: number): ChatResult[] => [
+    ...Array.from({ length: n }, (_, i): ChatResult => ({
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: `c${i}`, name: "lookup", arguments: "{}" }],
+      reasoning,
+    })),
+    { text: "查完了", finish: "stop" },
+  ];
+  const nudges = (requests: ChatRequest[]) => requests.map((req) => req.messages.at(-1)?.content === THINK_IN_CHINESE);
+
+  let results = rounds("The log shows a parse error, let me read GetGoodIdAndOriginUrl next.", 5);
+  const english = fakeModel(() => results.shift()!);
+  await setup({ model: english.model, tools: [tool] }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(english.requests), [false, true, true, true, false, false]);
+
+  results = rounds("日志里是 parse error，下一步读 GetGoodIdAndOriginUrl 看 c.tb.cn 怎么处理", 2);
+  const chinese = fakeModel(() => results.shift()!);
+  await setup({ model: chinese.model, tools: [tool] }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(chinese.requests), [false, false, false]);
+
+  results = rounds("The log shows a parse error.", 2);
+  const asked = fakeModel(() => results.shift()!);
+  await setup({ model: asked.model, tools: [tool] }).handle(message("why did the link conversion fail?"));
+  assert.deepEqual(nudges(asked.requests), [false, false, false]);
+
+  results = rounds("The log shows a parse error.", 2);
+  const hidden = fakeModel(() => results.shift()!);
+  await setup({ model: hidden.model, tools: [tool], showThinking: false }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(hidden.requests), [false, false, false]);
+});
+
+test("writtenInEnglish：拿汉字数和英文单词数比，网址和引号里的原文不算", () => {
+  assert.equal(writtenInEnglish("The log shows `URL 解析失败`, so read the caller next."), true);
+  assert.equal(writtenInEnglish("The log shows 「URL 解析失败」, so read the caller next."), true);
+  assert.equal(writtenInEnglish("The user asked why 转链 failed; the logs show a parse error in the share text."), true);
+  assert.equal(writtenInEnglish("日志里是 invalid control character in URL，下一步读 GetGoodIdAndOriginUrl"), false);
+  assert.equal(
+    writtenInEnglish("报错是 ERROR parse failed: invalid control character in URL at position 12，说明分享文本整段被当成了链接"),
+    false,
+  );
+  assert.equal(writtenInEnglish("报错原文：\n```\nERROR convert_link.go:98 parse share text failed: invalid control character in URL\n```\n同款推荐兜底把整段分享文本当链接解析"), false);
+  assert.equal(writtenInEnglish("看下 https://lab.yuebai.site/golang/appservice/-/blob/master/app/tb.go#L2431 这段"), false);
+  assert.equal(writtenInEnglish("先查一下日志"), false);
+  assert.equal(writtenInEnglish("12:00 → 500"), false);
 });
 
 test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {

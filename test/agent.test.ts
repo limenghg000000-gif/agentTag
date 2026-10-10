@@ -290,3 +290,31 @@ test("调过 thinkAfter 认的工具以后，后面每一轮都打开思考；�
     [false, false, false, false],
   );
 });
+
+test("steerReasoning 返回一段话时，加在这一轮工具结果后面；没有思考内容、给出回答的那轮不看", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "check the logs" },
+    { text: "", finish: "tool_calls", toolCalls: [call("c2", "echo", { text: "b" })] },
+    { text: "好了", finish: "stop", reasoning: "done" },
+  ]);
+  const seen: string[] = [];
+
+  await runAgent({
+    model,
+    system: "s",
+    messages: user,
+    tools: [echoTool()],
+    signal,
+    steerReasoning: (reasoning) => {
+      seen.push(reasoning);
+      return "用中文想";
+    },
+  });
+
+  assert.deepEqual(seen, ["check the logs"]);
+  assert.deepEqual(requests[1].messages.slice(-2), [
+    { role: "tool", toolCallId: "c1", content: "回声：a" },
+    { role: "user", content: "用中文想" },
+  ]);
+  assert.equal(requests[2].messages.at(-1)!.role, "tool");
+});

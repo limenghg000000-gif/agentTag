@@ -40,6 +40,11 @@ export interface AgentRequest {
    * 返回一段话时，这版回答不发出去，把这段话交给模型让它重做；每个任务只重做一次。usedTools 是这次任务调过的工具名
    */
   review?: (answer: string, usedTools: ReadonlySet<string>) => string | undefined;
+  /**
+   * 一轮调了工具以后看这一轮的思考：返回一段话时，在工具结果后面加一条用户消息再问下一轮。
+   * 比如思考被英文的日志、代码带成了英文，提醒模型接着用中文想（思考会显示在进度卡片上）
+   */
+  steerReasoning?: (reasoning: string) => string | undefined;
 }
 
 export interface AgentResult {
@@ -65,6 +70,7 @@ export async function runAgent({
   thinking,
   thinkAfter,
   review,
+  steerReasoning,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
   const specs = tools.map((tool) => tool.spec);
@@ -119,6 +125,10 @@ export async function runAgent({
     result.toolCalls.forEach((call, i) => {
       conversation.push({ role: "tool", toolCallId: call.id, content: outputs[i] });
     });
+    const steer = result.reasoning ? steerReasoning?.(result.reasoning) : undefined;
+    if (steer) {
+      conversation.push({ role: "user", content: steer });
+    }
   }
 }
 
