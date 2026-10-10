@@ -826,8 +826,10 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
       if (output !== undefined) {
         const forms = unescapedForms(output);
         facts.text.push(...forms);
-        const marked = links ? markedLines(forms) : new Set<number>();
-        for (const link of links ? new Map(forms.flatMap(codeLinks).map((link) => [JSON.stringify(link), link])).values() : []) {
+        const found = links ? [...new Map(forms.flatMap(codeLinks).map((link) => [JSON.stringify(link), link])).values()] : [];
+        // 只有标了一段行的链接才要看「行号|」
+        const marked = found.some((link) => link.lines && link.lines[0] !== link.lines[1]) ? markedLines(forms) : undefined;
+        for (const link of found) {
           const shown = shownLines(link.lines, marked).map((lines) => ({ repo: link.repo, lines }));
           facts.files.set(link.path, [...(facts.files.get(link.path) ?? []), { repo: link.repo }, ...shown]);
           if (COMMIT_ID.test(link.ref)) {
@@ -884,7 +886,7 @@ function unescapedForms(output: string): string[] {
  * 路径里不收中文标点和 , ; { }：链接后面紧跟着「，见上」时不能把标点算进路径
  */
 const CODE_LINK =
-  /https?:\/\/(?:github\.com\/([^\s/"'`<>()（）…\\#?]+\/[^\s/"'`<>()（）…\\#?]+)\/blob|[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/-\/blob)\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?，。；：、！？「」『』【】,;{}]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/g;
+  /https?:\/\/(?:github\.com\/([^\s/"'`<>()（）…\\#?]+\/[^\s/"'`<>()（）…\\#?]+)\/blob|[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/-\/blob)\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?，。；：、！？「」『』【】,;{}]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/gi;
 
 interface CodeLink {
   /** 仓库（小写） */
@@ -934,13 +936,15 @@ function markedLines(forms: readonly string[]): Set<number> {
 
 /**
  * 链接标的行里，哪些算查到了：只标一行的（搜代码命中的那一行）算；标了一段的（读文件），只算结果里真有「行号|」的那几行，连着的并成一段。
- * 结果太长时长字段会被截短（见 compactText），链接还在、后面的代码已经没了：那些行模型没看到
+ * 结果太长时长字段会被截短（见 compactText），链接还在、后面的代码已经没了：那些行模型没看到。
+ * 结果里一个「行号|」都没有时（aiops 改了代码的写法），没法按行核对，照链接标的整段算，不因为格式变了就把引用全打回。
+ * 「行号|」不分是哪个文件的：一次结果里有几段代码时，别的文件的行号也会算上，这一点放宽
  */
-function shownLines(lines: [number, number] | undefined, marked: ReadonlySet<number>): Array<[number, number]> {
+function shownLines(lines: [number, number] | undefined, marked: ReadonlySet<number> | undefined): Array<[number, number]> {
   if (lines === undefined) {
     return [];
   }
-  if (lines[0] === lines[1]) {
+  if (lines[0] === lines[1] || marked === undefined || marked.size === 0) {
     return [lines];
   }
   const runs: Array<[number, number]> = [];
@@ -1192,8 +1196,9 @@ const DEFLECTING = new RegExp(
 const USER_REDO = new RegExp(
   String.raw`(?<!(?:不|(?<![特识区个类级])别|勿|无需|无须|没必要)(?:应该?|能|可以?|该|要|用|必|需|建议)?|而不是|不要再|别再|不再|避免)(?:建议|请|让|需要|可以|引导|提示|告诉|通知)用户[^。；;！!？?\n]{0,20}?(?:重新|再次|重试|再试|换个|换一个|换成|改用)`,
 );
-// 「是否已部署」「不确定是否已修复」不是说修好了
-const FIXED = /(?<!是否|是不是|有没有|有无|不确定)已经?(?:修复|修好|改好|部署|上线|发版)|等[^，,。；;]{0,8}(?:修复|修好|改好|部署|上线|发版)/;
+const FIXED = /已经?(?:修复|修好|改好|部署|上线|发版)|等[^，,。；;]{0,8}(?:修复|修好|改好|部署|上线|发版)/;
+/** 这句话里修没修好、上没上线还没确定（「是否已部署未确认」「不确定是否已修复」「已修复，待确认上线」）：这时让用户重试还是推出去 */
+const UNSURE = /是否|是不是|有没有|有无|不确定|不能确定|无法确定|没法确定|无法确认|没法确认|未确认|待确认|还没确认|尚未确认|不清楚/;
 
 /** 回答里有没有把问题推出去的结论。问句（「系统本身没有问题吗？」）、举例的分句（「比如回答『不是服务故障』之前…」）不算 */
 function deflects(answer: string): boolean {
@@ -1205,7 +1210,7 @@ function deflects(answer: string): boolean {
       .split(/(?<=[，,])/)
       .filter((clause) => !EXAMPLE.test(clause))
       .join("");
-    return DEFLECTING.test(stated) || (USER_REDO.test(stated) && !FIXED.test(sentence));
+    return DEFLECTING.test(stated) || (USER_REDO.test(stated) && !(FIXED.test(sentence) && !UNSURE.test(sentence)));
   });
 }
 
@@ -1221,7 +1226,7 @@ export const DEFLECTED_ANSWER =
  * 2026-10-10 转链排查：模型只看日志就定了「淘宝拒绝、不是服务故障，让用户重新分享」，被打回补查代码时 5 次搜索都在同款推荐那条支路上，
  * 没拿链接里的 pages-fast、topIds 搜一下，漏掉了当天已经合进 master 的修复。这类结论会让用户和开发都不再往下查。
  * 只问代码、没查线上的（「前端不需要修改」）不管。只在有代码工具时装（要模型去搜代码）；核对完还是这个结论就照常发。
- * 重做只有一次：这一项用掉以后，重做的回答里再有没查证的引用就直接拦下，所以提示里要模型只写代码工具查到的文件和行号
+ * 重做只有一次：这一项用掉以后，重做的回答里再有没查证的引用就直接拦下，所以提示里要模型只写这次实际读到、搜到的文件和行号
  */
 export function reviewDeflectedAnswer(servers: readonly string[], attempted: ReadonlySet<string>) {
   const prefixes = servers.map((name) => `${name}_`);

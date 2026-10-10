@@ -5,9 +5,12 @@ import path from "node:path";
 import type { Logger } from "./history.js";
 import { type CodeFact, type CodeLocation, type Piece, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
 
-/** 读文件时一次最多返回的行数和字数 */
+/**
+ * 读文件时一次最多返回的行数和字数。字数要比工具结果交给模型前的上限（MAX_TOOL_OUTPUT_CHARS，1.6 万字）小，留出结果开头的说明：
+ * 原先是 2 万字，超出的部分被截掉，结果开头却写着「下面是第 1 到 400 行，要看后面用 start_line=401」，中间那段模型没看到也不知道
+ */
 export const MAX_READ_LINES = 400;
-export const MAX_READ_CHARS = 20000;
+export const MAX_READ_CHARS = 15_000;
 /** 超过这个大小的文件不读不改 */
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_MATCHES = 100;
@@ -251,6 +254,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       // 自建 GitLab 可能关了提交搜索（400、403），搜的词里有正则符号时也可能出错（5xx）：退回列出最近的提交再按说明筛
       if (bySearch && (res.status === 400 || res.status === 403 || res.status >= 500)) {
         bySearch = false;
+        await res.body?.cancel();
         res = await list();
       }
       let found = await read(res);
@@ -659,7 +663,7 @@ export class Workspace {
     }
     out.line(`${what}，最近的 ${commits.length} 个，从新到旧${partial}：`);
     for (const c of commits) {
-      const detail = [c.date?.slice(0, 10), c.author].filter(Boolean).join(" ");
+      const detail = [c.date && beijingDate(c.date), c.author].filter(Boolean).join(" ");
       out.parts("- ", [c.sha.slice(0, 8), { commit: c.sha }], `${detail ? ` ${detail}` : ""}「${oneLine(c.title)}」${c.url ? ` ${c.url}` : ""}`);
     }
     return out.build();
@@ -1312,7 +1316,7 @@ export function numberedLines(
   const asked = { from, to };
   const fn = end ? enclosingFunction(lines, from, to, file) : undefined;
   // 整个函数一次给不完就不扩：不然从函数头开始给，没到要的那几行就截断了
-  if (fn && (fn.start < from || fn.end > to) && lastShown(lines, fn.start, fn.end, MAX_FUNCTION_CHARS) === fn.end) {
+  if (fn && (fn.start < from || fn.end > to) && lastShown(lines, fn.start, fn.end) === fn.end) {
     from = fn.start;
     to = fn.end;
   }
@@ -1332,13 +1336,13 @@ export function numberedLines(
   return out.build();
 }
 
-/** 从 from 往下给到 to，不超过 budget 字时给到哪一行（至少给一行） */
-function lastShown(lines: readonly string[], from: number, to: number, budget = MAX_READ_CHARS): number {
+/** 从 from 往下给到 to，不超过 MAX_READ_CHARS 字时给到哪一行（至少给一行） */
+function lastShown(lines: readonly string[], from: number, to: number): number {
   let size = 0;
   let last = from - 1;
   for (let i = from; i <= to; i++) {
     const length = `${i}| ${lines[i - 1]}`.length;
-    if (size + length > budget && i > from) {
+    if (size + length > MAX_READ_CHARS && i > from) {
       break;
     }
     size += length + 1;
@@ -1349,11 +1353,6 @@ function lastShown(lines: readonly string[], from: number, to: number, budget = 
 
 /** 只要了一小段时，所在的函数最多这么多行就整段给出；更长的照要的给 */
 const MAX_FUNCTION_LINES = 250;
-/**
- * 扩到整个函数时，整段最多这么多字。要比工具结果交给模型前的上限（MAX_TOOL_OUTPUT_CHARS，1.6 万字）小，留出结果开头的说明：
- * 超过那个上限的部分模型看不到，扩出来的函数后半段、连同要的那几行就被截掉了
- */
-const MAX_FUNCTION_CHARS = 12_000;
 /** 往上找函数头最多找多少行 */
 const MAX_FUNCTION_LOOKBACK = 400;
 /** PHP、JS/TS 用 function 关键字的函数头 */
@@ -1377,8 +1376,8 @@ export function enclosingFunction(lines: readonly string[], from: number, to: nu
         return undefined;
       }
       const header = /^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/.exec(line);
-      // 一行写完的函数（func (x X) Len() int { return len(x) }）：在它下面的几行不在它里面
-      if (header && /\{.*\}\s*(?:\/\/.*)?$/.test(line)) {
+      // 一行写完的函数（func (x X) Len() int { return len(x) }）：在它下面的几行不在它里面。行尾注释里的大括号（// GET /items/{id}）不算
+      if (header && /\{.*\}\s*$/.test(line.replace(/\s*\/\/.*$/, ""))) {
         return undefined;
       }
       if (header) {
@@ -1470,10 +1469,16 @@ function oneLine(text: string): string {
   return line.length > 60 ? `${line.slice(0, 60)}…` : line;
 }
 
+/** 平台给的提交时间（各带各的时区，GitHub 是 UTC）写成北京时间的日期，和 since 的口径一样 */
+function beijingDate(iso: string): string {
+  const time = Date.parse(iso);
+  return Number.isNaN(time) ? iso.slice(0, 10) : new Date(time + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
 /** 模型写的日期（2026-10-01，或带时间的）换成平台接口要的 ISO 时间；没写时区的按北京时间，只写日期的是当天 0 点 */
 function isoDate(text: string): string {
   const value = text.trim();
-  const local = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(value);
+  const local = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?$/.exec(value);
   const pad = (part: string | undefined) => (part ?? "0").padStart(2, "0");
   const date = new Date(
     local ? `${local[1]}-${pad(local[2])}-${pad(local[3])}T${pad(local[4])}:${pad(local[5])}:${pad(local[6])}+08:00` : value,

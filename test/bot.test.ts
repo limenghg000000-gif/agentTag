@@ -1461,9 +1461,14 @@ test("排查过以后把问题推到服务之外的结论，打回一次让模�
     "原因在淘宝平台限制",
     // 同一句里有举例的分句，说结论的分句照样算
     "示例链接被淘宝拒绝，不是服务故障",
-    // 「是否已部署」「不确定是否已修复」不是修好了
+    // 「是否已部署」「不确定是否已修复」「已修复，待确认上线」不是修好了
     "淘宝返回链接不符合规范，线上是否已部署未确认，建议让用户重新分享。",
     "不确定是否已修复，建议让用户重新分享。",
+    "参数、域名等线上是否已部署还不确定，建议让用户重新分享。",
+    "等待确认是否已上线，建议让用户重新分享。",
+    "无法确认是否均已修复，建议让用户重新分享。",
+    "未确认已部署，建议让用户重新分享。",
+    "代码已修复，待确认上线，建议让用户重新分享。",
   ];
   for (const answer of deflecting) {
     assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
@@ -2396,6 +2401,12 @@ test("aiops 按线上版本读的代码：结果里的永久链接写明了仓�
   assert.equal(other("services/goods/tb.go"), true);
   assert.equal(other("README.md"), true);
   assert.equal(other("da67e31c4"), true);
+  // 结果里一个「行号|」都没有（aiops 改了写法）：照链接标的整段算；主机名大小写不论
+  const plain = codeEvidence([], [
+    { tool: "aiops_get_repo_file", output: JSON.stringify({ permalink: "https://GitHub.com/o/r/blob/abc1234/x.go#L10-20", content: "func a() {\n\tb()\n}" }), links: true },
+  ]);
+  assert.equal(plain("x.go", 11), true);
+  assert.equal(plain("x.go", 21), false);
 
   // GitHub 的写法（#L10-L20）、路径里转义过的字、结果又被 JSON 转义了一层
   const hits = JSON.stringify({

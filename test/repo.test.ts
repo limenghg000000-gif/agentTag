@@ -793,6 +793,13 @@ test("代码工具 code_log：查当前分支的提交历史，列出的提交�
   assert.equal(queries[3].since, "2026-09-30T16:00:00.000Z");
   await tools.code_log.run({ since: "2026-10-10T09:00:00Z" }, { signal });
   assert.equal(queries[4].since, "2026-10-10T09:00:00.000Z");
+  await tools.code_log.run({ since: "2026/10/10" }, { signal });
+  assert.equal(queries[5].since, "2026-10-09T16:00:00.000Z");
+  await tools.code_log.run({ since: "2026-10-10T09:00:00.000" }, { signal });
+  assert.equal(queries[6].since, "2026-10-10T01:00:00.000Z");
+  // 提交时间按北京时间写日期：UTC 前一天 23 点是北京当天 7 点
+  result = { commits: [{ sha: "aaaaaaaa11111111111111111111111111111111", title: "fix", date: "2026-10-09T23:00:00Z" }] };
+  assert.match(await tools.code_log.run({ since: "2026-10-10" }, { signal }), /- aaaaaaaa 2026-10-10「fix」/);
   await assert.rejects(tools.code_log.run({ since: "上周" }, { signal }), /since 要写成 2026-10-01 这样的日期/);
   await assert.rejects(tools.code_log.run({ path: "../etc/passwd" }, { signal }), /路径要在仓库里面/);
   // 平台没有查提交的接口时直说
@@ -832,6 +839,9 @@ test("读代码只要了一小段：扩到所在的整个函数，同一个函�
   // 一行写完的函数下面的几行（var 块）不在它里面
   const oneLine = ["package x", "func (x X) Len() int { return len(x) }", "", "var m = map[string]int{", '\t"a": 1,', "}"];
   assert.equal(enclosingFunction(oneLine, 5, 5, "x.go"), undefined);
+  // 行尾注释里的大括号不算一行写完
+  const routed = ["func Handle(w http.ResponseWriter, r *http.Request) { // GET /items/{id}", "\tid := r.PathValue(\"id\")", "\t_ = id", "}"];
+  assert.deepEqual(enclosingFunction(routed, 2, 2, "x.go"), { start: 1, end: 4, name: "Handle" });
   const long = ["func Long() {", ...Array.from({ length: 300 }, () => "\tx++"), "}"];
   assert.equal(enclosingFunction(long, 10, 12, "a.go"), undefined);
   // PHP：认 function 关键字，往下数大括号，字符串里的括号不算
@@ -865,8 +875,8 @@ test("读代码只要了一小段：扩到所在的整个函数，同一个函�
   assert.deepEqual(enclosingFunction(wide, 90, 92, "a.go"), { start: 1, end: 102, name: "Wide" });
   const narrow = numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", wide.join("\n"), 90, 92);
   assert.match(narrow.text, /^a\.go（共 102 行，下面是第 90 到 92 行，要看后面用 start_line=93）\n90\| \tx88 /);
-  // 不到一次能读的 2 万字、但超过工具结果交给模型的上限（1.6 万字）减去说明：也不扩，扩了后半段会被截掉
-  const mid = ["func Mid() {", ...Array.from({ length: 100 }, (_, i) => `\tx${i} := "${"y".repeat(130)}"`), "}"];
-  assert.ok(mid.join("\n").length > 14_000 && mid.join("\n").length < 20_000);
+  // 超过一次能读的 1.5 万字（工具结果交给模型前截到 1.6 万字）：也不扩，扩了后半段会被截掉
+  const mid = ["func Mid() {", ...Array.from({ length: 100 }, (_, i) => `\tx${i} := "${"y".repeat(150)}"`), "}"];
+  assert.ok(mid.join("\n").length > 15_000 && mid.join("\n").length < 20_000);
   assert.match(numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", mid.join("\n"), 90, 92).text, /下面是第 90 到 92 行，/);
 });
