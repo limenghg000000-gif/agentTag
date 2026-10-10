@@ -224,6 +224,8 @@ async function runTask(
     const attempted = new Set<string>();
     const evidence: ToolEvidence[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
+    // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
+    const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
@@ -251,7 +253,7 @@ async function runTask(
           evidence.push(
             code
               ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
-              : { tool: tool.spec.name, output: seenByModel(output, limit) },
+              : { tool: tool.spec.name, output: seenByModel(output, limit), ...(mcpNames.has(tool.spec.name) ? { links: true } : {}) },
           );
           return output;
         },
@@ -273,10 +275,13 @@ async function runTask(
     const toolNames = taskTools.map((tool) => tool.spec.name);
     const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
+    // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
+    const readCode = () => evidence.some(linksCode);
     const reviews = [
-      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen)] : []),
+      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
+      ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
     // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
@@ -335,7 +340,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
+      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${result.text}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -687,6 +692,8 @@ export interface ToolEvidence {
   tool: string;
   output?: string;
   facts?: readonly CodeFact[];
+  /** output 里的代码永久链接（见 codeLinks）算查到的代码：MCP 服务的结果是，网页、搜索结果不是 */
+  links?: boolean;
 }
 
 /**
@@ -813,11 +820,22 @@ interface CodeFacts {
 
 function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
   const facts: CodeFacts = { files: new Map(), commits: [], branches: [], text: [] };
-  for (const { tool, output, facts: found } of results) {
+  for (const { tool, output, facts: found, links } of results) {
     // 代码工具的结果文字一概不认，只认它记下的代码位置
     if (!isCodeTool(tool)) {
       if (output !== undefined) {
-        facts.text.push(...unescapedForms(output));
+        const forms = unescapedForms(output);
+        facts.text.push(...forms);
+        const found = links ? [...new Map(forms.flatMap(codeLinks).map((link) => [JSON.stringify(link), link])).values()] : [];
+        // 只有标了一段行的链接才要看「行号|」
+        const marked = found.some((link) => link.lines && link.lines[0] !== link.lines[1]) ? markedLines(forms) : undefined;
+        for (const link of found) {
+          const shown = shownLines(link.lines, marked).map((lines) => ({ repo: link.repo, lines }));
+          facts.files.set(link.path, [...(facts.files.get(link.path) ?? []), { repo: link.repo }, ...shown]);
+          if (COMMIT_ID.test(link.ref)) {
+            facts.commits.push({ repo: link.repo, sha: link.ref.toLowerCase() });
+          }
+        }
       }
       continue;
     }
@@ -856,6 +874,94 @@ function unescapedForms(output: string): string[] {
     forms.push(next);
   }
   return forms;
+}
+
+/**
+ * 代码平台上文件的永久链接：GitLab 的 https://主机/组/项目/-/blob/<提交或分支>/<路径>#L12-20，GitHub 的 https://github.com/owner/repo/blob/<提交>/<路径>#L12-L20。
+ * aiops 的代码工具（get_repo_file、search_code）按线上版本读到代码时都附这样的链接，写明了读的是哪个仓库、哪个提交、哪个文件的哪几行；
+ * 结果里的行号写在代码前面（「2468| ...」），回答里的「tb.go:2468」在原文里找不到，只能按链接认。
+ * 认链接不认字段名：aiops 的代码工具还在开发，字段可能改，链接是代码平台自己的格式。
+ * 结果太长被截短时，链接可能断在中间（…#L2440-24…（省略 2 字））：后面紧跟着省略号、字母数字的不认，断在行号里的只认文件。
+ * 只认 GitLab 的 /-/blob/ 和 github.com 的 /blob/：日志里别的网址（对象存储 https://oss…/img/blob/abc1234/a.php、用户分享的链接）路径里也可能有 blob，不是代码。
+ * 路径里不收中文标点和 , ; { }：链接后面紧跟着「，见上」时不能把标点算进路径
+ */
+const CODE_LINK =
+  /https?:\/\/(?:github\.com\/([^\s/"'`<>()（）…\\#?]+\/[^\s/"'`<>()（）…\\#?]+)\/blob|[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/-\/blob)\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?，。；：、！？「」『』【】,;{}]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/gi;
+
+interface CodeLink {
+  /** 仓库（小写） */
+  repo: string;
+  /** 链接里的提交号或分支 */
+  ref: string;
+  path: string;
+  /** 链接标了行（#L12、#L12-20）时，起止行 */
+  lines?: [number, number];
+}
+
+function codeLinks(text: string): CodeLink[] {
+  const links: CodeLink[] = [];
+  for (const match of text.matchAll(CODE_LINK)) {
+    const [, github, gitlab, ref, file, from, to] = match;
+    const repo = github ?? gitlab;
+    let decoded: string;
+    try {
+      // 链接写在句末时，后面的英文句号、冒号不是路径的一部分（中文标点本来就不收进路径）
+      decoded = decodeURIComponent(from === undefined ? file.replace(/[.:!]+$/, "") : file);
+    } catch {
+      continue;
+    }
+    const start = from === undefined ? undefined : Number(from);
+    // 止行比起行小的不是正常的范围，只认起行
+    const end = to === undefined || start === undefined || Number(to) < start ? start : Number(to);
+    links.push({
+      repo: repo.toLowerCase(),
+      ref,
+      path: repoPath(decoded),
+      ...(start !== undefined && end !== undefined ? { lines: [start, end] as [number, number] } : {}),
+    });
+  }
+  return links;
+}
+
+/** 结果里带行号的代码行（aiops 读代码、搜代码的结果写成「2468| ...」）的行号。转义过的结果（\n2468|）在还原过的那份里认 */
+function markedLines(forms: readonly string[]): Set<number> {
+  const marked = new Set<number>();
+  for (const form of forms) {
+    for (const match of form.matchAll(/(?<![\w.])(\d{1,7})\|/g)) {
+      marked.add(Number(match[1]));
+    }
+  }
+  return marked;
+}
+
+/**
+ * 链接标的行里，哪些算查到了：只标一行的（搜代码命中的那一行）算；标了一段的（读文件），只算结果里真有「行号|」的那几行，连着的并成一段。
+ * 结果太长时长字段会被截短（见 compactText），链接还在、后面的代码已经没了：那些行模型没看到。
+ * 结果里一个「行号|」都没有时（aiops 改了代码的写法），没法按行核对，照链接标的整段算，不因为格式变了就把引用全打回。
+ * 「行号|」不分是哪个文件的：一次结果里有几段代码时，别的文件的行号也会算上，这一点放宽
+ */
+function shownLines(lines: [number, number] | undefined, marked: ReadonlySet<number> | undefined): Array<[number, number]> {
+  if (lines === undefined) {
+    return [];
+  }
+  if (lines[0] === lines[1] || marked === undefined || marked.size === 0) {
+    return [lines];
+  }
+  const runs: Array<[number, number]> = [];
+  for (const line of [...marked].filter((n) => n >= lines[0] && n <= lines[1]).sort((a, b) => a - b)) {
+    const last = runs.at(-1);
+    if (last && last[1] === line - 1) {
+      last[1] = line;
+    } else {
+      runs.push([line, line]);
+    }
+  }
+  return runs;
+}
+
+/** 这次结果里有 MCP 服务读代码给的永久链接：算读过代码 */
+function linksCode(item: ToolEvidence): boolean {
+  return item.links === true && item.output !== undefined && unescapedForms(item.output).some((form) => codeLinks(form).length > 0);
 }
 
 /** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
@@ -954,12 +1060,13 @@ function mentionsRepo(text: string, repos: readonly string[]): boolean {
  * - 一次代码工具都没调，问题或回答却提到了配置的仓库、或者回答里写了没查证的文件路径：让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
  * - 调过代码工具，回答里还是写了工具结果里没有的文件、行号、提交号：让它只按查到的重写。只看「调没调过」不够，调一次什么都没查到照样能编。
  * seen 认的不算没查证：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，代码工具读到的也在里面；
- * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码
+ * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码。
+ * readCode：通过 aiops 这类 MCP 服务读过代码（结果里有代码永久链接），和调过代码工具一样只核对引用
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false) {
+export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false, readCode: () => boolean = () => false) {
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     const unseen = unseenCodeCitations(answer, seen);
-    if ([...usedTools].some(isCodeTool)) {
+    if ([...usedTools].some(isCodeTool) || readCode()) {
       return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
     }
     return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;
@@ -1050,6 +1157,82 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
       return undefined;
     }
     return OPS_QUESTION.test(question) || hasUnverified(OPS_DATA, question, answer) ? unverifiedOpsAnswer(servers) : undefined;
+  };
+}
+
+/** 「不是服务故障的原因」「不是服务问题所在」说的是某条线索不是根因，不是把问题推出去（「不是服务故障导致的」是） */
+const NOT_CAUSE = String.raw`(?!\s*(?:的|原因|根因|根源|源头|点|所在))`;
+/** 否定、拿不准的前面：「不是淘宝平台限制」「不属于用户侧问题」说的是排除了外部原因，「不排除是」「可能是」还没下结论 */
+const NOT_BEFORE = String.raw`(?<!(?:不|非|并非|并不|排除|可能|也许|或许|怀疑|是否)(?:是|属于|在)?)`;
+/** 我们这边的主语。「代码」「接口」不算：「不是代码问题，是配置里的超时设成了 1s」说的还是服务自己的问题 */
+const OUR_SIDE = String.raw`(?:我们|我方)?的?(?:服务端?|系统|后端|我们|我方)`;
+
+/** 外部：平台、第三方、上游 */
+const OUTSIDE = String.raw`(?:淘宝|天猫|京东|拼多多|抖音|微信|支付宝|第三方|上游|对方|外部)(?:平台|服务)?(?:侧|方|端|那边)?`;
+
+/**
+ * 把问题推到服务之外的结论：「不是服务故障」「服务本身没有问题」「跟我们无关」「属于淘宝平台限制」「用户侧问题」「无需修复」。
+ * 要说到是谁的问题：「服务没有异常」这类看状态的、「这次重启不是故障，是正常发版」这类没说到服务的都不算；
+ * 只提到外部原因、同一句里说是我们没处理的（「根因是淘宝风控返回的 code 我们没处理」）也不算
+ */
+const DEFLECTING = new RegExp(
+  [
+    // 「是不是服务故障」「如果不是服务故障」「是否」是在问、在假设
+    String.raw`(?:(?<![是果否])不是|并非|并不是|不属于|(?<![除是])非)${OUR_SIDE}(?:本身)?的?\s*(?:故障|问题|bug|缺陷)${NOT_CAUSE}`,
+    String.raw`(?:(?:服务端?|系统|后端)本身|(?:我们|我方)(?:这边|这里|侧))(?:没有|没|无|不存在|并无)\s*(?:问题|故障|bug)`,
+    String.raw`(?:跟|和|与)(?:我们|我方|服务端?|系统|后端)(?:这边|本身)?(?:无关|没关系|没有关系)`,
+    String.raw`(?:没有|没|无)\s*(?:问题|故障|bug)[，,]?\s*是${OUTSIDE}`,
+    String.raw`${NOT_BEFORE}用户(?:侧|端|自己|自身)的?(?:问题|原因)|用户操作(?:不当|失误|有误|错误)`,
+    String.raw`${NOT_BEFORE}属于${OUTSIDE}的?(?:限制|问题|原因|规则|策略|风控)`,
+    String.raw`${NOT_BEFORE}(?:是|在)${OUTSIDE}的?(?:限制|问题)`,
+    String.raw`(?:无需|无须|不用|不需要|没必要)(?:我们|开发)?修复`,
+  ].join("|"),
+  "i",
+);
+/**
+ * 让用户自己重来：「建议用户在商品详情页重新分享」「让用户换个链接再试」。否定的（「不建议让用户重新分享」「不应该让用户重新分享」）不算；
+ * 同一句里说了已经修了、等修好上线（「已修复并部署，通知用户重试即可」「等修复上线后通知用户重试」）也不算；「而不是让用户重新分享」「避免让用户…」是反过来说的
+ */
+const USER_REDO = new RegExp(
+  String.raw`(?<!(?:不|(?<![特识区个类级])别|勿|无需|无须|没必要)(?:应该?|能|可以?|该|要|用|必|需|建议)?|而不是|不要再|别再|不再|避免)(?:建议|请|让|需要|可以|引导|提示|告诉|通知)用户[^。；;！!？?\n]{0,20}?(?:重新|再次|重试|再试|换个|换一个|换成|改用)`,
+);
+const FIXED = /已经?(?:修复|修好|改好|部署|上线|发版)|等[^，,。；;]{0,8}(?:修复|修好|改好|部署|上线|发版)/;
+/** 这句话里修没修好、上没上线还没确定（「是否已部署未确认」「不确定是否已修复」「已修复，待确认上线」）：这时让用户重试还是推出去 */
+const UNSURE = /是否|是不是|有没有|有无|不确定|不能确定|无法确定|没法确定|无法确认|没法确认|未确认|待确认|还没确认|尚未确认|不清楚/;
+
+/** 回答里有没有把问题推出去的结论。问句（「系统本身没有问题吗？」）、举例的分句（「比如回答『不是服务故障』之前…」）不算 */
+function deflects(answer: string): boolean {
+  return answer.split(/(?<=[。；;！!？?\n])/).some((sentence) => {
+    if (/(?:[？?]|[吗呢][。！!]?)\s*$/.test(sentence)) {
+      return false;
+    }
+    const stated = sentence
+      .split(/(?<=[，,])/)
+      .filter((clause) => !EXAMPLE.test(clause))
+      .join("");
+    return DEFLECTING.test(stated) || (USER_REDO.test(stated) && !(FIXED.test(sentence) && !UNSURE.test(sentence)));
+  });
+}
+
+export const DEFLECTED_ANSWER =
+  "（系统检查）你的回答把问题归到了服务之外（比如「不是服务故障」「建议用户重新操作」「属于平台限制」）。这类结论会让大家不再往下查，下之前要拿代码核对清楚：\n" +
+  "1. 拿失败请求的特征（链接的域名和关键参数、报错原文、错误码）搜代码，从入口沿主流程看这种输入在哪一步被处理或拒绝，不要只看报错附近的几行；\n" +
+  "2. 日志是当时线上那一版打的，代码可能已经改过：用 code_log 按同样的特征查最近的提交，看是不是已经修过，能查线上版本就查，查不了就在结论里写明看的是哪个分支的代码；\n" +
+  "3. 结论分开写：当时为什么失败（带日志时间）、现在的代码处不处理、线上部署了没有。\n" +
+  "核对完还是服务之外的问题，就照常这么写，并写明核对了哪些代码（只写这次实际读到、搜到的文件和行号）；读不到相关代码就直说没法确认是不是服务的问题。不要提这段检查。";
+
+/**
+ * 排查线上问题（调过 aiops 这类 MCP 服务的工具，成没成功都算）以后，回答把问题推到服务之外时，打回一次，让模型先拿代码核对。
+ * 2026-10-10 转链排查：模型只看日志就定了「淘宝拒绝、不是服务故障，让用户重新分享」，被打回补查代码时 5 次搜索都在同款推荐那条支路上，
+ * 没拿链接里的 pages-fast、topIds 搜一下，漏掉了当天已经合进 master 的修复。这类结论会让用户和开发都不再往下查。
+ * 只问代码、没查线上的（「前端不需要修改」）不管。只在有代码工具时装（要模型去搜代码）；核对完还是这个结论就照常发。
+ * 重做只有一次：这一项用掉以后，重做的回答里再有没查证的引用就直接拦下，所以提示里要模型只写这次实际读到、搜到的文件和行号
+ */
+export function reviewDeflectedAnswer(servers: readonly string[], attempted: ReadonlySet<string>) {
+  const prefixes = servers.map((name) => `${name}_`);
+  return (answer: string): string | undefined => {
+    const investigated = [...attempted].some((name) => prefixes.some((prefix) => name.startsWith(prefix)));
+    return investigated && deflects(answer) ? DEFLECTED_ANSWER : undefined;
   };
 }
 

@@ -12,7 +12,9 @@ import {
   codeEvidence,
   createCardActionHandler,
   createMessageHandler,
+  DEFLECTED_ANSWER,
   reviewCodeAnswer,
+  reviewDeflectedAnswer,
   reviewOpsAnswer,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
@@ -1436,6 +1438,138 @@ test("aiops 连不上、这次没有它的工具时，照搬话题里之前的�
   assert.deepEqual(markdowns(sent), ["aiops 现在连不上，暂时查不了，请稍后再试"]);
 });
 
+test("排查过以后把问题推到服务之外的结论，打回一次让模型先拿代码核对", () => {
+  const review = (...names: string[]) => reviewDeflectedAnswer(["aiops"], new Set(names));
+  const deflecting = [
+    "淘宝拒绝了这个链接，不是服务故障，建议用户在商品详情页重新分享",
+    "结论：并非服务端问题（把握：中）",
+    "这不是我们的 bug，是淘宝平台限制",
+    "服务本身没有问题",
+    "属于淘宝平台的限制",
+    "淘宝拒绝了这个链接，不过建议用户重新分享",
+    "淘宝无法识别，建议用户换个链接再试",
+    "属于用户侧问题",
+    "这个无需修复",
+    "服务端没有问题，是淘宝拒绝了链接",
+    "是淘宝那边拒绝的，跟我们无关",
+    "这个问题没法修复，建议用户重新分享",
+    "线上部署的还是旧版本，建议用户重新分享",
+    "修复后仍然失败，建议用户重新分享",
+    "淘宝侧限制导致失败，不是服务故障导致",
+    "这次失败不是系统故障导致的",
+    "是上游服务的问题",
+    "原因在淘宝平台限制",
+    // 同一句里有举例的分句，说结论的分句照样算
+    "示例链接被淘宝拒绝，不是服务故障",
+    // 「是否已部署」「不确定是否已修复」「已修复，待确认上线」不是修好了
+    "淘宝返回链接不符合规范，线上是否已部署未确认，建议让用户重新分享。",
+    "不确定是否已修复，建议让用户重新分享。",
+    "参数、域名等线上是否已部署还不确定，建议让用户重新分享。",
+    "等待确认是否已上线，建议让用户重新分享。",
+    "无法确认是否均已修复，建议让用户重新分享。",
+    "未确认已部署，建议让用户重新分享。",
+    "代码已修复，待确认上线，建议让用户重新分享。",
+  ];
+  for (const answer of deflecting) {
+    assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
+    // 没查线上（没调工具、只调了群记忆、只问代码）的不管
+    assert.equal(review()(answer), undefined, answer);
+    assert.equal(review("memory_search")(answer), undefined, answer);
+    assert.equal(review("code_search")(answer), undefined, answer);
+  }
+  const fine = [
+    // 看状态、没说到服务、说某条线索不是根因
+    "gateway-api 现在没有异常，最近 1 小时错误率 0.1%",
+    "这次 Pod 重启不是故障，是正常的滚动发布",
+    "URL 解析失败那条 warn 不是故障原因，是同款推荐支路的连带报错",
+    "这条报错不是服务问题所在，真正的原因在主流程",
+    // 排除外部原因、说是我们自己的问题
+    "这不是淘宝平台限制，是我们解析 pages-fast 的 bug，要修代码",
+    "不是用户侧的问题，是转链服务没处理这种链接",
+    "不是代码问题，是配置里的超时设成了 1s，改配置就行",
+    "无需修改代码，把超时配置改成 5s 即可",
+    "前端不需要修改，只改后端 order.go 就行",
+    "用户端操作后接口没校验，这是我们的 bug",
+    "根因是淘宝风控返回的 code 我们没处理",
+    "问题在转链服务没处理 pages-fast 这种落地页，要修代码",
+    // 否定、假设、修好以后让用户重试
+    "修好以后不需要用户重新分享",
+    "不建议让用户重新分享，应该在解析阶段识别",
+    "不应该让用户重新分享，要在解析阶段处理",
+    "等修复上线后通知用户重试",
+    "应该在解析阶段兼容这种链接，而不是让用户重新分享",
+    "不要再让用户重新分享，要在代码里处理",
+    "需要通知用户手动处理已经生成的订单",
+    "可以引导用户在页面上手动刷新查看最新状态",
+    // 问句、假设、拿不准
+    "要先确认是不是服务故障，再决定怎么处理",
+    "如果不是服务故障，就要看淘宝那边",
+    "无法确定是不是我们的问题",
+    "不排除是淘宝平台限制",
+    "系统本身没有问题吗？需要再查",
+    "除非服务故障，这个接口不会返回 code=8",
+    "已修复并部署，通知用户重试即可",
+    // 举例的分句
+    "比如回答「不是服务故障」之前，要先搜代码",
+  ];
+  for (const answer of fine) {
+    assert.equal(review("aiops_query_logs")(answer), undefined, answer);
+  }
+});
+
+test("2026-10-10 转链排查那种回答：只看日志就说不是服务故障，和「没调代码工具」一起打回，重做后照常发", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => JSON.stringify({ logs: [{ msg: "TaoBao CreatePassWord code params sub_code=26 链接不符合规范" }] }),
+  };
+  const first = "淘宝返回 sub_code 26，链接不符合规范。这不是服务故障，建议用户在商品详情页重新分享。";
+  const second = "当时失败是淘宝拒绝了 pages-fast 半屏详情页链接；现在 master 的 tb.go 已经从 topIds 取商品 id，要看线上是否部署了这一版。";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: first, finish: "stop" },
+    { text: second, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["golang/appservice"],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("用户反馈 appservice 转链失败，排查一下"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${DEFLECTED_ANSWER}` });
+  assert.deepEqual(markdowns(sent), [second]);
+});
+
+test("没有代码工具时不查推出去的结论：要模型去搜代码，它也搜不了", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => JSON.stringify({ logs: [{ msg: "sub_code=26 链接不符合规范" }] }),
+  };
+  const answer = "淘宝返回 sub_code 26，不是服务故障";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: answer, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("用户反馈转链失败，排查一下"));
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [answer]);
+});
+
 test("代码和线上数据两项检查都没过时，重做时一起告诉模型", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
@@ -2215,4 +2349,163 @@ test("没读代码、也没问仓库时，重做后还写着举例的路径照�
   await handle(message("K8s 里环境变量一般怎么配"));
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), ["比如写在 k8s/deployment.yaml 里，用 envFrom 引用 ConfigMap"]);
+});
+
+test("aiops 按线上版本读的代码：结果里的永久链接写明了仓库、提交、文件和行，引用对得上就算查证过", () => {
+  // aiops get_repo_file 的返回：行号写在代码前面（2468| ...），回答里的 tb.go:2468 在原文里找不到，只能按链接认
+  const repoFile = JSON.stringify({
+    project: "golang/appservice",
+    commit_id: "da67e31c495ec498e41bb42e6296a9d688995d6a",
+    path: "services/goods/tb.go",
+    start_line: 2440,
+    end_line: 2480,
+    permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c495ec498e41bb42e6296a9d688995d6a/services/goods/tb.go#L2440-2480",
+    content: '2466| //淘宝分享落地的半屏详情页\n2468| if halfDetailGoodsId := common.ParseTbHalfDetailItemId(str); halfDetailGoodsId != "" {',
+  });
+  const seen = codeEvidence(["golang/appservice"], [{ tool: "aiops_get_repo_file", output: compactText(repoFile), links: true }]);
+  assert.equal(seen("services/goods/tb.go", 2468), true);
+  assert.equal(seen("golang/appservice/services/goods/tb.go", 2468), true);
+  assert.equal(seen("da67e31c4"), true);
+  // 链接没标的行、别的文件照样不算
+  assert.equal(seen("services/goods/tb.go", 2500), false);
+  assert.equal(seen("services/goods/jd.go"), false);
+  // 网页、搜索结果里的链接是别人的仓库，不算
+  assert.equal(codeEvidence([], [{ tool: "fetch_url", output: repoFile }])("services/goods/tb.go", 2468), false);
+  // 结果太长、链接被截在行号里：只认文件，不认行
+  const cut = codeEvidence([], [
+    { tool: "aiops_get_repo_file", output: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go#L2440-24…（省略 2 字）", links: true },
+  ]);
+  assert.equal(cut("services/goods/tb.go"), true);
+  assert.equal(cut("services/goods/tb.go", 100), false);
+  assert.equal(cut("services/goods/tb.go", 2440), false);
+  // 内容被截短、链接还在：链接标了一段的，只认结果里真有「行号|」的那几行
+  const shortened = codeEvidence([], [
+    {
+      tool: "aiops_get_repo_file",
+      output: compactText(JSON.stringify({ permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go#L2000-2600", content: "2000| func a() {\n2001| \tb()…（省略 30000 字）" })),
+      links: true,
+    },
+  ]);
+  assert.equal(shortened("services/goods/tb.go", 2001), true);
+  assert.equal(shortened("services/goods/tb.go", 2550), false);
+  assert.equal(shortened("services/goods/tb.go"), true);
+  // 日志里别的网址路径里有 blob 的不是代码；链接后面紧跟着中文标点、英文句号的，标点不算进路径
+  const other = codeEvidence([], [
+    {
+      tool: "aiops_query_logs",
+      output: "GET https://oss.example.com/img/blob/abc1234/avatar/user.php 200；修复见 https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go，见上；另见 https://lab.yuebai.site/golang/appservice/-/blob/master/README.md.",
+      links: true,
+    },
+  ]);
+  assert.equal(other("avatar/user.php"), false);
+  assert.equal(other("services/goods/tb.go"), true);
+  assert.equal(other("README.md"), true);
+  assert.equal(other("da67e31c4"), true);
+  // 结果里一个「行号|」都没有（aiops 改了写法）：照链接标的整段算；主机名大小写不论
+  const plain = codeEvidence([], [
+    { tool: "aiops_get_repo_file", output: JSON.stringify({ permalink: "https://GitHub.com/o/r/blob/abc1234/x.go#L10-20", content: "func a() {\n\tb()\n}" }), links: true },
+  ]);
+  assert.equal(plain("x.go", 11), true);
+  assert.equal(plain("x.go", 21), false);
+
+  // GitHub 的写法（#L10-L20）、路径里转义过的字、结果又被 JSON 转义了一层
+  const hits = JSON.stringify({
+    line: JSON.stringify({
+      hits: [
+        { path: "src/a.ts", permalink: "https://github.com/o/r/blob/0123abcd/src/a.ts#L10-L20", snippet: "14| a();\n15| b();" },
+        { path: "src/中.ts", permalink: "https://github.com/o/r/blob/main/src/%E4%B8%AD.ts#L3" },
+      ],
+    }),
+  });
+  const github = codeEvidence([], [{ tool: "aiops_search_code", output: hits, links: true }]);
+  assert.equal(github("src/a.ts", 15), true);
+  assert.equal(github("src/a.ts", 16), false);
+  assert.equal(github("src/a.ts", 21), false);
+  assert.equal(github("src/中.ts", 3), true);
+  assert.equal(github("0123abcd"), true);
+
+  // 通过 aiops 读过代码，和调过代码工具一样只核对引用；没读过的照旧要先读代码
+  const review = reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen, () => true);
+  assert.equal(review("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])), undefined);
+  assert.equal(
+    review("在 `services/goods/tb.go:2500`", new Set(["aiops_get_repo_file"])),
+    unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]),
+  );
+  assert.equal(
+    reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen)("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])),
+    UNVERIFIED_CODE_ANSWER,
+  );
+});
+
+test("日志里别的网址路径里有 blob 的不算读过代码：提到仓库的回答照样要先读代码", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const logs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => "2026-10-10 10:00:00 GET https://oss.example.com/img/blob/abc1234/avatar/user.php 500",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "golang/appservice 的 avatar/user.php 处理头像时出错", finish: "stop" },
+    { text: "日志里 10:00 有 500，还没读代码，确认不了是哪一行", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["golang/appservice"],
+    mcp: { names: ["aiops"], tools: () => [logs], prompt: () => undefined },
+  });
+  await handle(message("golang/appservice 的头像接口为什么报 500"));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["avatar/user.php"]) });
+});
+
+test("用 aiops 按线上版本读了代码、回答提到仓库和行号：不再打回让模型用代码工具重读一遍", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const output = compactText(
+    JSON.stringify({
+      project: "golang/appservice",
+      path: "services/goods/tb.go",
+      permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c495ec498e41bb42e6296a9d688995d6a/services/goods/tb.go#L2460-2475",
+      content: "2468| if halfDetailGoodsId := common.ParseTbHalfDetailItemId(str); halfDetailGoodsId != \"\" {",
+    }),
+  );
+  const ask = async (answers: string[]) => {
+    const repoFile: Tool = {
+      spec: { name: "aiops_get_repo_file", description: "读代码", parameters: { type: "object", properties: {} } },
+      describe: () => "aiops · 读代码",
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_get_repo_file", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["golang/appservice"],
+      mcp: { names: ["aiops"], tools: () => [repoFile], prompt: () => undefined },
+    });
+    await handle(message("golang/appservice 现在能处理 c.tb.cn 的半屏详情页吗"));
+    return { requests, replies: markdowns(sent) };
+  };
+  const answer = "能处理：golang/appservice 线上版本的 `services/goods/tb.go:2468` 从 topIds 取商品 ID（da67e31c）";
+  const ok = await ask([answer]);
+  assert.equal(ok.requests.length, 2);
+  assert.deepEqual(ok.replies, [answer]);
+  // 链接没覆盖的行照样打回
+  const wrong = await ask(["在 `services/goods/tb.go:2500`", answer]);
+  assert.equal(wrong.requests.length, 3);
+  assert.deepEqual(wrong.requests[2].messages.at(-1), { role: "user", content: unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]) });
+  assert.deepEqual(wrong.replies, [answer]);
 });

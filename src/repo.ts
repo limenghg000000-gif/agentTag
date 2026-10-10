@@ -5,9 +5,12 @@ import path from "node:path";
 import type { Logger } from "./history.js";
 import { type CodeFact, type CodeLocation, type Piece, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
 
-/** 读文件时一次最多返回的行数和字数 */
+/**
+ * 读文件时一次最多返回的行数和字数。字数要比工具结果交给模型前的上限（MAX_TOOL_OUTPUT_CHARS，1.6 万字）小，留出结果开头的说明：
+ * 原先是 2 万字，超出的部分被截掉，结果开头却写着「下面是第 1 到 400 行，要看后面用 start_line=401」，中间那段模型没看到也不知道
+ */
 export const MAX_READ_LINES = 400;
-export const MAX_READ_CHARS = 20000;
+export const MAX_READ_CHARS = 15_000;
 /** 超过这个大小的文件不读不改 */
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_MATCHES = 100;
@@ -17,6 +20,10 @@ const MAX_LIST_BRANCHES = 50;
 export const RECENT_BRANCHES = 8;
 const MAX_SEARCH_BRANCHES = 10;
 const MAX_DIFF_CHARS = 15000;
+/** 查提交历史时默认列几个、最多列几个；按说明里的词筛时，带了文件或日期的最多翻最近这么多个提交 */
+export const DEFAULT_LOG_COMMITS = 10;
+export const MAX_LOG_COMMITS = 30;
+const LOG_SCAN_COMMITS = 100;
 const GIT_TIMEOUT_MS = 120_000;
 /** 话题里的工作目录多久没用就删掉 */
 export const WORKSPACE_KEEP_MS = 3 * 24 * 60 * 60_000;
@@ -38,6 +45,51 @@ export interface CodeHost {
   checkAccess?(repo: string): Promise<string>;
   /** 用平台接口列出分支和各自最近一次提交，不用拉代码。没有实现时用 git 把所有分支拉下来再列 */
   listBranches?(repo: string, signal?: AbortSignal): Promise<BranchInfo[]>;
+  /** 用平台接口查一个分支的提交历史（工作目录是浅克隆，没有历史），按提交时间从新到旧。没有实现时 code_log 不能用 */
+  searchCommits?(repo: string, query: CommitQuery, signal?: AbortSignal): Promise<CommitSearch>;
+}
+
+/** 查提交历史的条件 */
+export interface CommitQuery {
+  /** 分支 */
+  ref: string;
+  /** 提交说明里要有的词，空格隔开的几个词都要有，不分大小写 */
+  query?: string;
+  /** 只看改过这个文件或目录的提交（相对仓库根目录） */
+  path?: string;
+  /** 只看这个时间以后的提交（ISO 格式） */
+  since?: string;
+  limit: number;
+}
+
+export interface CommitInfo {
+  sha: string;
+  title: string;
+  /** 完整的提交说明，按词筛时用 */
+  message?: string;
+  /** 提交时间（ISO 格式） */
+  date?: string;
+  author?: string;
+  url?: string;
+}
+
+export interface CommitSearch {
+  commits: CommitInfo[];
+  /** 先列提交再按说明里的词筛时，一共翻了几个提交（翻满 LOG_SCAN_COMMITS 说明更早的没看）；平台直接按说明搜的不填 */
+  scanned?: number;
+}
+
+/** 按说明里的词筛（空格隔开的几个词都要有，不分大小写），从新到旧取前 limit 个 */
+function pickCommits(commits: CommitInfo[], query: CommitQuery): CommitInfo[] {
+  const words = (query.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  return commits
+    .filter((c) => words.every((word) => `${c.title}\n${c.message ?? ""}`.toLowerCase().includes(word)))
+    .sort((a, b) => (Date.parse(b.date ?? "") || 0) - (Date.parse(a.date ?? "") || 0))
+    .slice(0, query.limit);
+}
+
+function firstLine(text: string | undefined): string {
+  return (text ?? "").split("\n")[0].trim();
 }
 
 /** 一个分支和它最近一次提交 */
@@ -154,6 +206,65 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         title: b.commit?.title,
       }));
     },
+    async searchCommits(repo, query, signal) {
+      const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
+      const get = (url: string) =>
+        fetchImpl(url, {
+          headers: { "private-token": token },
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+        });
+      // 只按说明里的词找：用搜索接口，搜这个分支上全部提交的说明；带了文件或日期时列出这个分支上符合的提交，再按说明筛
+      let bySearch = query.query !== undefined && query.path === undefined && query.since === undefined;
+      const list = () =>
+        get(
+          `${project}/repository/commits?${new URLSearchParams({
+            ref_name: query.ref,
+            ...(query.path ? { path: query.path } : {}),
+            ...(query.since ? { since: query.since } : {}),
+            per_page: String(query.query ? LOG_SCAN_COMMITS : query.limit),
+          })}`,
+        );
+      const read = async (res: Response) => {
+        if (!res.ok) {
+          const hint = res.status === 404 ? "：找不到项目或分支" : res.status === 401 || res.status === 403 ? "：令牌没有读这个项目的权限" : "";
+          throw new RepoError(`GitLab 查提交历史失败（HTTP ${res.status}）${hint}`);
+        }
+        const body = (await res.json()) as {
+          id: string;
+          title?: string;
+          message?: string;
+          author_name?: string;
+          committed_date?: string;
+          created_at?: string;
+          web_url?: string;
+        }[];
+        const commits = body.map((c) => ({
+          sha: c.id,
+          title: c.title ?? firstLine(c.message),
+          message: c.message,
+          date: c.committed_date ?? c.created_at,
+          author: c.author_name,
+          url: c.web_url,
+        }));
+        return { commits: pickCommits(commits, query), scanned: body.length };
+      };
+      let res = bySearch
+        ? await get(`${project}/search?${new URLSearchParams({ scope: "commits", search: query.query ?? "", ref: query.ref, per_page: String(LOG_SCAN_COMMITS) })}`)
+        : await list();
+      // 自建 GitLab 可能关了提交搜索（400、403），搜的词里有正则符号时也可能出错（5xx）：退回列出最近的提交再按说明筛
+      if (bySearch && (res.status === 400 || res.status === 403 || res.status >= 500)) {
+        bySearch = false;
+        await res.body?.cancel();
+        res = await list();
+      }
+      let found = await read(res);
+      // 没开高级搜索时，搜索接口把整串当成一句话找（git log --grep），几个词不挨着就搜不到：搜不到再列出最近的提交按词筛一遍
+      if (bySearch && found.commits.length === 0) {
+        bySearch = false;
+        found = await read(await list());
+      }
+      return { commits: found.commits, ...(bySearch || !query.query ? {} : { scanned: found.scanned }) };
+    },
   };
 }
 
@@ -223,6 +334,42 @@ export function createGitHubHost(token: string, fetchImpl: typeof fetch = fetch)
         throw new RepoError("能看到仓库，但没有写权限，推不了分支");
       }
       return `能访问${body.default_branch ? `，默认分支 ${body.default_branch}` : ""}`;
+    },
+    async searchCommits(repo, query, signal) {
+      // GitHub 的提交搜索只搜默认分支：一律列出这个分支上的提交，再按说明筛
+      const params = new URLSearchParams({
+        sha: query.ref,
+        ...(query.path ? { path: query.path } : {}),
+        ...(query.since ? { since: query.since } : {}),
+        per_page: String(query.query ? LOG_SCAN_COMMITS : query.limit),
+      });
+      const res = await fetchImpl(`https://api.github.com/repos/${repo}/commits?${params}`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "AgentTag",
+        },
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        throw new RepoError(`GitHub 查提交历史失败（HTTP ${res.status}）${res.status === 404 || res.status === 422 ? "：找不到仓库或分支" : ""}`);
+      }
+      const body = (await res.json()) as {
+        sha: string;
+        html_url?: string;
+        commit?: { message?: string; author?: { name?: string; date?: string }; committer?: { date?: string } };
+      }[];
+      const commits = body.map((c) => ({
+        sha: c.sha,
+        title: firstLine(c.commit?.message),
+        message: c.commit?.message,
+        // 提交进这个分支的时间（rebase、cherry-pick 过的提交，写的时间可能早得多），和 GitLab 的 committed_date 一样
+        date: c.commit?.committer?.date ?? c.commit?.author?.date,
+        author: c.commit?.author?.name,
+        url: c.html_url,
+      }));
+      return { commits: pickCommits(commits, query), ...(query.query ? { scanned: body.length } : {}) };
     },
   };
 }
@@ -484,6 +631,40 @@ export class Workspace {
       const tags = [b.isDefault ? "默认分支" : "", b.name === this.baseBranch ? "当前在看" : ""].filter(Boolean);
       const commit = [b.date?.slice(0, 10), b.author].filter(Boolean).join(" ") + (b.title ? `「${oneLine(b.title)}」` : "");
       out.parts("- ", [b.name, { branch: b.name }], `${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`);
+    }
+    return out.build();
+  }
+
+  /**
+   * 查一个分支的提交历史，从新到旧：按说明里的词、改过的文件或目录、起始日期筛。工作目录是浅克隆，用平台接口查。
+   * branch 不填是这个话题当前看的分支。列出的提交号记作查到的，回答里引用时要对得上
+   */
+  async log(
+    options: { query?: string; path?: string; branch?: string; since?: string; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<ToolOutput> {
+    if (!this.host.searchCommits) {
+      throw new RepoError(`${this.host.name} 还不支持查提交历史`);
+    }
+    const ref = options.branch?.trim() ? branchName(options.branch) : this.baseBranch;
+    const query = options.query?.trim() || undefined;
+    const rel = options.path?.trim() ? this.relative(options.path) : undefined;
+    const file = rel === "." ? undefined : rel;
+    const since = options.since?.trim() ? isoDate(options.since) : undefined;
+    const limit = Math.min(MAX_LOG_COMMITS, Math.max(1, Math.trunc(options.limit ?? DEFAULT_LOG_COMMITS)));
+    const { commits, scanned } = await this.host.searchCommits(this.repo, { ref, query, path: file, since, limit }, signal);
+    const conditions = [query ? `说明里有「${query}」` : "", file ? `改过 ${file}` : "", since ? `${options.since?.trim()} 以后` : ""].filter(Boolean);
+    const what = `${this.repo} 的 ${ref} 分支上${conditions.length > 0 ? `${conditions.join("、")}的` : ""}提交`;
+    // 先列提交再筛、又翻满了：更早的提交没看，不能说「没改过」
+    const partial = scanned !== undefined && scanned >= LOG_SCAN_COMMITS ? `（只翻了最近 ${scanned} 个提交，更早的没看，可以加 since 或换个词再查）` : "";
+    const out = this.output();
+    if (commits.length === 0) {
+      return out.line(`${what}一个都没找到${partial}。`).build();
+    }
+    out.line(`${what}，最近的 ${commits.length} 个，从新到旧${partial}：`);
+    for (const c of commits) {
+      const detail = [c.date && beijingDate(c.date), c.author].filter(Boolean).join(" ");
+      out.parts("- ", [c.sha.slice(0, 8), { commit: c.sha }], `${detail ? ` ${detail}` : ""}「${oneLine(c.title)}」${c.url ? ` ${c.url}` : ""}`);
     }
     return out.build();
   }
@@ -1114,7 +1295,7 @@ function safeName(name: string): string {
 }
 
 /** 文件内容加上行号，一次最多 MAX_READ_LINES 行、MAX_READ_CHARS 字。where 写明是哪个分支上的。记下读到的文件和每一行 */
-function numberedLines(
+export function numberedLines(
   out: ToolOutputBuilder,
   file: string,
   text: string,
@@ -1126,11 +1307,37 @@ function numberedLines(
   if (lines.at(-1) === "") {
     lines.pop();
   }
-  const from = Math.max(1, Math.floor(start));
-  const to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
+  let from = Math.max(1, Math.floor(start));
+  let to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
   if (from > lines.length) {
     return out.parts([shownPath(file), { path: file }], ` 只有 ${lines.length} 行。`).build();
   }
+  // 只要了一小段：扩到所在的整个函数，同一个函数里后面的分支也看得到
+  const asked = { from, to };
+  const fn = end ? enclosingFunction(lines, from, to, file) : undefined;
+  // 整个函数一次给不完就不扩：不然从函数头开始给，没到要的那几行就截断了
+  if (fn && (fn.start < from || fn.end > to) && lastShown(lines, fn.start, fn.end) === fn.end) {
+    from = fn.start;
+    to = fn.end;
+  }
+  const last = lastShown(lines, from, to);
+  out.parts(
+    [shownPath(file), { path: file }],
+    "（",
+    ...(where ? [[where.text, ...where.refs] as const, "，"] : []),
+    `共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行` +
+      (from !== asked.from || to !== asked.to ? `：要的是第 ${asked.from} 到 ${asked.to} 行，扩到了所在的整个函数 ${fn?.name}` : "") +
+      `${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`,
+  );
+  // 每一行的行号「12|」交给了模型，这一行就算查到了
+  for (let i = from; i <= last; i++) {
+    out.parts([`${i}|`, { path: file, lines: [i, i] }], ` ${lines[i - 1]}`);
+  }
+  return out.build();
+}
+
+/** 从 from 往下给到 to，不超过 MAX_READ_CHARS 字时给到哪一行（至少给一行） */
+function lastShown(lines: readonly string[], from: number, to: number): number {
   let size = 0;
   let last = from - 1;
   for (let i = from; i <= to; i++) {
@@ -1141,17 +1348,86 @@ function numberedLines(
     size += length + 1;
     last = i;
   }
-  out.parts(
-    [shownPath(file), { path: file }],
-    "（",
-    ...(where ? [[where.text, ...where.refs] as const, "，"] : []),
-    `共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`,
-  );
-  // 每一行的行号「12|」交给了模型，这一行就算查到了
-  for (let i = from; i <= last; i++) {
-    out.parts([`${i}|`, { path: file, lines: [i, i] }], ` ${lines[i - 1]}`);
+  return last;
+}
+
+/** 只要了一小段时，所在的函数最多这么多行就整段给出；更长的照要的给 */
+const MAX_FUNCTION_LINES = 250;
+/** 往上找函数头最多找多少行 */
+const MAX_FUNCTION_LOOKBACK = 400;
+/** PHP、JS/TS 用 function 关键字的函数头 */
+const FUNCTION_HEADER = /^\s*(?:(?:export|default|public|private|protected|static|final|abstract|async)\s+)*function\s*&?\s*([A-Za-z_$][\w$]*)\s*\(/;
+const BRACE_FILE = /\.(?:php|js|jsx|mjs|cjs|ts|tsx)$/i;
+
+/**
+ * 读的这几行（from 到 to）所在的函数，起止行（含）和函数名；不在函数里、或者函数超过 MAX_FUNCTION_LINES 行时不给。
+ * 2026-10-10 转链排查：模型只读了 tb.go 报错附近几行（2431-2436，重定向失败就 return），
+ * 修复在同一个函数往下 30 行（2468 从 topIds 取商品 ID），没看到，下了「不是服务故障」的结论。
+ * Go 按 gofmt 的写法认：顶格的 func 到下一个顶格的 }。PHP、JS/TS 认 function 关键字的函数头，往下数大括号找到结尾
+ * （字符串、注释里的大括号会数错，数出来超长的就不扩）
+ */
+export function enclosingFunction(lines: readonly string[], from: number, to: number, file: string): { start: number; end: number; name: string } | undefined {
+  const limit = Math.max(1, from - MAX_FUNCTION_LOOKBACK);
+  if (file.toLowerCase().endsWith(".go")) {
+    for (let i = from; i >= limit; i--) {
+      const line = lines[i - 1];
+      // 先碰到上一个函数的结尾：要的这几行不在函数里
+      if (i < from && /^}/.test(line)) {
+        return undefined;
+      }
+      const header = /^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/.exec(line);
+      // 一行写完的函数（func (x X) Len() int { return len(x) }）：在它下面的几行不在它里面。行尾注释里的大括号（// GET /items/{id}）不算
+      if (header && /\{.*\}\s*$/.test(line.replace(/\s*\/\/.*$/, ""))) {
+        return undefined;
+      }
+      if (header) {
+        const close = lines.findIndex((text, index) => index >= i - 1 && /^}/.test(text));
+        return close >= 0 ? fit(i, close + 1, header[1]) : undefined;
+      }
+    }
+    return undefined;
   }
-  return out.build();
+  if (!BRACE_FILE.test(file)) {
+    return undefined;
+  }
+  // 由近到远找函数头，第一个把要的这几行包在里面的就是所在的函数（方法里的闭包也是函数，取最近的那个）
+  for (let i = from; i >= limit; i--) {
+    const header = FUNCTION_HEADER.exec(lines[i - 1]);
+    if (!header) {
+      continue;
+    }
+    const close = closingBrace(lines, i);
+    if (close !== undefined && close >= to) {
+      return fit(i, close, header[1]);
+    }
+  }
+  return undefined;
+
+  function fit(start: number, end: number, name: string) {
+    return end >= to && end - start + 1 <= MAX_FUNCTION_LINES ? { start, end, name } : undefined;
+  }
+}
+
+/** 从函数头那一行往下数大括号，回到 0 的那一行；数不到（或者超过 MAX_FUNCTION_LINES 还没完）不给 */
+function closingBrace(lines: readonly string[], header: number): number | undefined {
+  let depth = 0;
+  let opened = false;
+  for (let i = header; i <= Math.min(lines.length, header + MAX_FUNCTION_LINES); i++) {
+    // 去掉行尾的 // 注释和引号里的内容，少数错一些。反斜杠只当转义符认（[^\\]），不然一长串没闭合的反斜杠会让正则回溯到卡死
+    const code = lines[i - 1].replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/g, "").replace(/\/\/.*$/, "");
+    for (const char of code) {
+      if (char === "{") {
+        depth++;
+        opened = true;
+      } else if (char === "}") {
+        depth--;
+      }
+    }
+    if (opened && depth <= 0) {
+      return i;
+    }
+  }
+  return undefined;
 }
 
 /** 分支名：去掉 origin/、refs/heads/ 前缀，只许 git 分支名里常见的字符 */
@@ -1191,4 +1467,24 @@ export function globToRegExp(glob: string): RegExp {
 function oneLine(text: string): string {
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > 60 ? `${line.slice(0, 60)}…` : line;
+}
+
+/** 平台给的提交时间（各带各的时区，GitHub 是 UTC）写成北京时间的日期，和 since 的口径一样 */
+function beijingDate(iso: string): string {
+  const time = Date.parse(iso);
+  return Number.isNaN(time) ? iso.slice(0, 10) : new Date(time + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
+/** 模型写的日期（2026-10-01，或带时间的）换成平台接口要的 ISO 时间；没写时区的按北京时间，只写日期的是当天 0 点 */
+function isoDate(text: string): string {
+  const value = text.trim();
+  const local = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?$/.exec(value);
+  const pad = (part: string | undefined) => (part ?? "0").padStart(2, "0");
+  const date = new Date(
+    local ? `${local[1]}-${pad(local[2])}-${pad(local[3])}T${pad(local[4])}:${pad(local[5])}:${pad(local[6])}+08:00` : value,
+  );
+  if (Number.isNaN(date.getTime())) {
+    throw new RepoError(`since 要写成 2026-10-01 这样的日期：${text}`);
+  }
+  return date.toISOString();
 }
