@@ -73,7 +73,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     async run(args, ctx) {
       const ws = await workspace(args, ctx);
       const target = optional(args.switch_to);
-      return target ? report(ctx, await ws.switchBranch(target, ctx.signal)) : ws.listBranches(optional(args.filter), ctx.signal);
+      return report(ctx, await (target ? ws.switchBranch(target, ctx.signal) : ws.listBranches(optional(args.filter), ctx.signal)));
     },
   };
 

@@ -315,8 +315,10 @@ async function runTask(
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述
       const unprefixed = repos.reduce((text, repo) => text.replace(new RegExp(`${escapeRegExp(repo)}/`, "gi"), " "), userText);
-      const inQuestion = (text: string) => mentions(userText, text) || mentions(unprefixed, text);
-      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || inQuestion(text)).filter(
+      // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
+      const inQuestion = (text: string, line?: number) =>
+        [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
+      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || inQuestion(text, line)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -550,38 +552,42 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
     }
     const facts = cache.facts;
     const text = repoPath(cite);
-    const forms: Array<{ path: string; repo?: string }> = [
-      { path: text },
-      ...repos
-        .filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`))
-        .map((repo) => ({ path: text.slice(repo.length + 1), repo: repo.toLowerCase() })),
+    const prefixed = repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => repo.toLowerCase());
+    // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算
+    const forms: Array<{ path: string; repos?: string[] }> = [
+      { path: text, repos: prefixed.length > 0 ? prefixed : undefined },
+      ...prefixed.map((repo) => ({ path: text.slice(repo.length + 1), repos: [repo] })),
     ];
-    return forms.some(({ path, repo }) => {
-      const inRepo = (found: { repo: string }) => repo === undefined || found.repo === repo;
+    return forms.some(({ path, repos: scope }) => {
+      const inRepo = (found: { repo: string }) => scope === undefined || scope.includes(found.repo);
       let found: boolean;
       if (COMMIT_ID.test(path)) {
         // 回答里的提交号可以是查到的提交号的前几位，不能比查到的长：多出来的几位是编的
         const sha = path.toLowerCase();
         found = facts.commits.some((seen) => inRepo(seen) && seen.sha.startsWith(sha));
       } else {
-        found = (facts.files.get(path) ?? []).some(
-          (seen) => inRepo(seen) && (line === undefined || (seen.lines !== undefined && line >= seen.lines[0] && line <= seen.lines[1])),
-        );
+        found =
+          (facts.files.get(path) ?? []).some(
+            (seen) => inRepo(seen) && (line === undefined || (seen.lines !== undefined && line >= seen.lines[0] && line <= seen.lines[1])),
+          ) ||
+          // 分支名可以长得像路径（feature/foo.ts），列出来、切过去的分支照样认，只是没有行
+          (line === undefined && facts.branches.some((seen) => inRepo(seen) && seen.name === path));
       }
       return found || facts.text.some((output) => (line === undefined ? mentions(output, path) : hasLine(output, path, line)));
     });
   };
 }
 
-/** 这次查到的：代码工具记下的文件（和查到的行）、提交号，按仓库分；别的工具的原文 */
+/** 这次查到的：代码工具记下的文件（和查到的行）、提交号、分支，按仓库分；别的工具的原文 */
 interface CodeFacts {
   files: Map<string, Array<{ repo: string; lines?: [number, number] }>>;
   commits: Array<{ repo: string; sha: string }>;
+  branches: Array<{ repo: string; name: string }>;
   text: string[];
 }
 
 function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
-  const facts: CodeFacts = { files: new Map(), commits: [], text: [] };
+  const facts: CodeFacts = { files: new Map(), commits: [], branches: [], text: [] };
   for (const { tool, output, facts: found } of results) {
     // 代码工具的结果文字一概不认，只认它记下的代码位置
     if (!isCodeTool(tool)) {
@@ -594,6 +600,8 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
       const repo = fact.repo.toLowerCase();
       if ("commit" in fact) {
         facts.commits.push({ repo, sha: fact.commit.toLowerCase() });
+      } else if ("branch" in fact) {
+        facts.branches.push({ repo, name: fact.branch });
       } else {
         facts.files.set(fact.path, [...(facts.files.get(fact.path) ?? []), { repo, lines: fact.lines }]);
       }
@@ -622,6 +630,17 @@ function escapeRegExp(text: string): string {
 
 function containsPath(text: string, path: string): boolean {
   return new RegExp(`${PATH_START}${escapeRegExp(path)}${PATH_END}`).test(text);
+}
+
+/** text 里有没有写 path 的第 line 行，写法和回答里认行号的一样（path:35、path#L35、path 第 35 行） */
+function mentionsLine(text: string, path: string, line: number): boolean {
+  for (const match of text.matchAll(new RegExp(`${PATH_START}${escapeRegExp(path)}${PATH_END}`, "g"))) {
+    const at = LINE_AFTER_PATH.exec(text.slice(match.index + match[0].length));
+    if (at && Number(at[1] ?? at[2] ?? at[3]) === line) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** 这段没有固定格式的结果里有没有 path 的第 line 行：path:35，或者 Python 堆栈的 "path", line 35 */

@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./history.js";
-import { type CodeFact, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
+import { type CodeFact, type CodeLocation, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
 
 /** 读文件时一次最多返回的行数和字数 */
 export const MAX_READ_LINES = 400;
@@ -235,6 +235,12 @@ export class RepoError extends ToolError {
   }
 }
 
+/** 结果里写的「分支 @ 提交号」，和它对应的代码位置（提交号和分支名） */
+interface Label {
+  text: string;
+  refs: CodeLocation[];
+}
+
 /** 一个改动了的文件，按 git diff --numstat 统计；二进制文件没有行数 */
 export interface ChangedFile {
   path: string;
@@ -460,24 +466,26 @@ export class Workspace {
   /**
    * 列出分支，按最近提交从新到旧，带最近一次提交的时间、作者和说明。filter 只列名字里带这个词的
    */
-  async listBranches(filter?: string, signal?: AbortSignal): Promise<string> {
+  async listBranches(filter?: string, signal?: AbortSignal): Promise<ToolOutput> {
     const all = await this.branchList(signal);
     const word = filter?.trim().toLowerCase();
     const matched = word ? all.filter((b) => b.name.toLowerCase().includes(word)) : all;
+    const out = this.output();
     if (matched.length === 0) {
-      return word ? `${this.repo} 没有名字里带「${filter}」的分支，共 ${all.length} 个分支。` : `${this.repo} 还没有分支。`;
+      return out.line(word ? `${this.repo} 没有名字里带「${filter}」的分支，共 ${all.length} 个分支。` : `${this.repo} 还没有分支。`).build();
     }
     const shown = matched.slice(0, MAX_LIST_BRANCHES);
     const more = matched.length - shown.length;
-    const lines = shown.map((b) => {
+    out.line(
+      `${this.repo} 共 ${all.length} 个分支${word ? `，名字带「${filter}」的有 ${matched.length} 个` : ""}，按最近提交从新到旧` +
+        `${more > 0 ? `，只列出前 ${MAX_LIST_BRANCHES} 个，用 filter 缩小范围` : ""}：`,
+    );
+    for (const b of shown) {
       const tags = [b.isDefault ? "默认分支" : "", b.name === this.baseBranch ? "当前在看" : ""].filter(Boolean);
       const commit = [b.date?.slice(0, 10), b.author].filter(Boolean).join(" ") + (b.title ? `「${oneLine(b.title)}」` : "");
-      return `- ${b.name}${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`;
-    });
-    const head =
-      `${this.repo} 共 ${all.length} 个分支${word ? `，名字带「${filter}」的有 ${matched.length} 个` : ""}，按最近提交从新到旧` +
-      `${more > 0 ? `，只列出前 ${MAX_LIST_BRANCHES} 个，用 filter 缩小范围` : ""}：`;
-    return [head, ...lines].join("\n");
+      out.line(`- ${b.name}${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`, { branch: b.name });
+    }
+    return out.build();
   }
 
   /**
@@ -503,7 +511,7 @@ export class Workspace {
       await this.saveState();
       const [sha, last] = (await this.git(["log", "-1", "--format=%h%x00%cs %an「%s」"], signal)).trim().split("\0");
       return this.output()
-        .line(`已切到 ${name} 分支，最新提交 ${sha} ${last}。这个话题后面看代码、改代码、开${this.host.requestName}都基于这个分支。`, { commit: sha })
+        .line(`已切到 ${name} 分支，最新提交 ${sha} ${last}。这个话题后面看代码、改代码、开${this.host.requestName}都基于这个分支。`, { commit: sha }, { branch: name })
         .build();
     });
   }
@@ -530,10 +538,10 @@ export class Workspace {
     const where = await this.label(ref, signal);
     const out = this.output();
     if (files.length === 0) {
-      return out.line(`没有匹配的文件（${where.text}）。`, { commit: where.sha }).build();
+      return out.line(`没有匹配的文件（${where.text}）。`, ...where.refs).build();
     }
     const more = files.length - MAX_LIST_FILES;
-    out.line(`共 ${files.length} 个文件（${where.text}）${more > 0 ? `，只列出前 ${MAX_LIST_FILES} 个，缩小范围再看` : ""}：`, { commit: where.sha });
+    out.line(`共 ${files.length} 个文件（${where.text}）${more > 0 ? `，只列出前 ${MAX_LIST_FILES} 个，缩小范围再看` : ""}：`, ...where.refs);
     for (const file of files.slice(0, MAX_LIST_FILES)) {
       out.line(shownPath(file), { path: file });
     }
@@ -617,12 +625,12 @@ export class Workspace {
       const where = await this.label(undefined, signal);
       const out = this.output();
       if (matches.length === 0) {
-        return out.line(`没有搜到「${pattern}」（${where.text}）。`, { commit: where.sha }).build();
+        return out.line(`没有搜到「${pattern}」（${where.text}）。`, ...where.refs).build();
       }
       const more = matches.length - MAX_SEARCH_MATCHES;
       out.line(
         `共 ${matches.length} 处（${where.text}）${more > 0 ? `，只列出前 ${MAX_SEARCH_MATCHES} 处，换个更具体的搜法或加 glob 缩小范围` : ""}：`,
-        { commit: where.sha },
+        ...where.refs,
       );
       matches.slice(0, MAX_SEARCH_MATCHES).forEach((match) => addMatch(out, match));
       return out.build();
@@ -642,7 +650,7 @@ export class Workspace {
     const miss = names.filter((name) => found.get(name)!.length === 0);
     const out = this.output();
     if (hit.length === 0) {
-      return out.line(`在这 ${names.length} 个分支上都没有搜到「${pattern}」：${names.join("、")}。`).build();
+      return out.line(`在这 ${names.length} 个分支上都没有搜到「${pattern}」：${names.join("、")}。`, ...names.map((branch) => ({ branch }))).build();
     }
     const labels = await Promise.all(hit.map((name) => this.label({ name, ref: `refs/remotes/origin/${name}` }, signal)));
     const total = hit.reduce((sum, name) => sum + found.get(name)!.length, 0);
@@ -650,12 +658,12 @@ export class Workspace {
     let budget = MAX_SEARCH_MATCHES;
     hit.forEach((name, i) => {
       const matches = found.get(name)!;
-      out.line(`【${labels[i].text}，${matches.length} 处】`, { commit: labels[i].sha });
+      out.line(`【${labels[i].text}，${matches.length} 处】`, ...labels[i].refs);
       matches.slice(0, Math.max(0, budget)).forEach((match) => addMatch(out, match));
       budget -= matches.length;
     });
     if (miss.length > 0) {
-      out.line(`没搜到的分支：${miss.join("、")}`);
+      out.line(`没搜到的分支：${miss.join("、")}`, ...miss.map((branch) => ({ branch })));
     }
     return out.build();
   }
@@ -729,11 +737,12 @@ export class Workspace {
   }
 
   /** 结果里写明是哪个分支、哪个提交，如「aiops 分支 @ 3f2a1c9」 */
-  private async label(ref: BranchRef | undefined, signal?: AbortSignal): Promise<{ text: string; sha: string }> {
+  private async label(ref: BranchRef | undefined, signal?: AbortSignal): Promise<Label> {
     const sha = (await this.git(["rev-parse", "--short", ref?.ref ?? "HEAD"], signal)).trim();
+    const branch = ref?.name ?? this.baseBranch;
     return {
-      text: ref ? `${ref.name} 分支 @ ${sha}` : `${this.baseBranch} 分支 @ ${sha}${this.state.branch ? "，含机器人的改动" : ""}`,
-      sha,
+      text: `${branch} 分支 @ ${sha}${!ref && this.state.branch ? "，含机器人的改动" : ""}`,
+      refs: [{ commit: sha }, { branch }],
     };
   }
 
@@ -1082,7 +1091,7 @@ function numberedLines(
   text: string,
   start: number,
   end: number | undefined,
-  where?: { text: string; sha: string },
+  where?: Label,
 ): ToolOutput {
   const lines = text.split("\n");
   if (lines.at(-1) === "") {
@@ -1106,7 +1115,7 @@ function numberedLines(
     last = i;
   }
   const head = `${shownPath(file)}（${where ? `${where.text}，` : ""}共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`;
-  out.line(head, { path: file }, ...(where ? [{ commit: where.sha }] : []));
+  out.line(head, { path: file }, ...(where?.refs ?? []));
   body.forEach((row, i) => out.line(row, { path: file, lines: [from + i, from + i] }));
   return out.build();
 }

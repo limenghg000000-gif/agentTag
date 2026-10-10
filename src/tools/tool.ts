@@ -7,8 +7,8 @@ export interface ToolContext {
   onFacts?: (facts: readonly CodeFact[]) => void;
 }
 
-/** 代码工具查到的一处代码位置：真实存在的文件（整理过的相对路径，可带查到的行，起止含），或者结果里写明的提交号 */
-export type CodeLocation = { path: string; lines?: [number, number] } | { commit: string };
+/** 代码工具查到的一处代码位置：真实存在的文件（整理过的相对路径，可带查到的行，起止含），或者结果里写明的提交号、真实存在的分支名 */
+export type CodeLocation = { path: string; lines?: [number, number] } | { commit: string } | { branch: string };
 
 /**
  * 代码位置和它出自哪个仓库、在结果文字里结束的位置（at）。结果太长被截短时，at 在截断处以后的模型没看到，不算查到。

@@ -1227,6 +1227,21 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
     review("在 ai/agent-tag/internal/k8s/tools.go:12", searched),
     unseenCodeAnswer(["ai/agent-tag/internal/k8s/tools.go:12"], ["ai/aiops-mcp", "ai/agent-tag"]),
   );
+  // 整段当路径找也只认写明的仓库：ai/agent-tag 里恰好有个 ai/aiops-mcp/src/foo.ts，不能当成 ai/aiops-mcp 里的 src/foo.ts；日志里写的照样认
+  const nested = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_list_files", [{ path: "ai/aiops-mcp/src/foo.ts" }], "ai/agent-tag")]);
+  assert.equal(nested("ai/aiops-mcp/src/foo.ts"), false);
+  assert.equal(nested("ai/agent-tag/ai/aiops-mcp/src/foo.ts"), true);
+  const own = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_list_files", [{ path: "src/foo.ts" }], "ai/aiops-mcp")]);
+  assert.equal(own("ai/aiops-mcp/src/foo.ts"), true);
+  const logged = codeEvidence(["ai/aiops-mcp"], [{ tool: "aiops_query_logs", output: "caller=ai/aiops-mcp/src/foo.ts:3" }]);
+  assert.equal(logged("ai/aiops-mcp/src/foo.ts", 3), true);
+  // 分支名可以长得像路径：列出来的分支照样认，在哪个仓库列的就是哪个仓库的；分支没有行号
+  const branched = codeEvidence(["ai/aiops-mcp", "ai/agent-tag"], [found("code_branches", [{ branch: "feature/foo.ts" }], "ai/aiops-mcp")]);
+  assert.equal(branched("feature/foo.ts"), true);
+  assert.equal(branched("ai/aiops-mcp/feature/foo.ts"), true);
+  assert.equal(branched("ai/agent-tag/feature/foo.ts"), false);
+  assert.equal(branched("feature/foo.ts", 3), false);
+  assert.equal(codeEvidence([], [{ tool: "aiops_query_logs", facts: [{ branch: "feature/foo.ts", repo: "ai/aiops-mcp", at: 0 }] }])("feature/foo.ts"), false);
   // 文件是真的，行号是编的
   assert.equal(review("在 internal/k8s/tools.go:99", searched), unseenCodeAnswer(["internal/k8s/tools.go:99"], ["ai/aiops-mcp", "ai/agent-tag"]));
   // 2026-10-09：调了一次代码工具，回答里的仓库提交和文件都是编的
@@ -1483,6 +1498,17 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     assert.equal(prefixed.requests.length, 3, question);
     assert.deepEqual(prefixed.replies, [missing], question);
   }
+  // 照着复述要连行号一起：问的是第 10 行（或者没写行号），回答写的是第 99 行，不算复述
+  const otherLine = "`src/legacy/user.ts:99` 初始化配置";
+  for (const question of ["src/legacy/user.ts 第 10 行是干嘛的", "src/legacy/user.ts 是干嘛的"]) {
+    const moved = await ask([otherLine, otherLine], { question, tool: "code_read_file" });
+    assert.deepEqual(moved.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], question);
+  }
+  const sameLine = await ask(["`src/legacy/user.ts:10` 读不到", "`src/legacy/user.ts:10` 读不到"], {
+    question: "src/legacy/user.ts:10 是干嘛的",
+    tool: "code_read_file",
+  });
+  assert.deepEqual(sameLine.replies, ["`src/legacy/user.ts:10` 读不到"]);
 
   // 读失败、没搜到以后照样讲这个文件写了什么，或者自己猜的路径读失败了还写着：打回重做，重做后还这么写就不发出
   for (const [claim, tool] of [

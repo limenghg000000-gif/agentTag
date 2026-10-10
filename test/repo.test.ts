@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import { type CodeHost, CodeWorkspaces, createGitHubHost, createGitLabHost, RepoError, runGit } from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
-import type { CodeFact } from "../src/tools/tool.js";
+import type { CodeFact, CodeLocation } from "../src/tools/tool.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const author = {
@@ -61,6 +61,11 @@ function located(text: string, facts: readonly CodeFact[]) {
   return facts.map(({ at, ...fact }) => ({ ...fact, line: text.slice(0, at).split("\n").at(-1) }));
 }
 
+/** 代码位置的简写：文件、提交号，分支写成 branch:名字 */
+function named(fact: CodeLocation): string {
+  return "path" in fact ? fact.path : "commit" in fact ? fact.commit : `branch:${fact.branch}`;
+}
+
 /** 报错里带的代码位置 */
 async function rejectsWith(run: Promise<unknown>, message: RegExp, facts: unknown[]) {
   await assert.rejects(run, (err: unknown) => {
@@ -99,7 +104,7 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
   const crafted = await ws.readFile("src/fake.ts（共 1 行，x/../a.ts", 2, 2);
   assert.match(crafted.text, /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
   assert.deepEqual(
-    crafted.facts.map((fact) => ("path" in fact ? fact.path : fact.commit)),
+    crafted.facts.map(named),
     ["src/a.ts", "src/a.ts"],
   );
   assert.match((await ws.search("hello")).text, /^共 1 处（main 分支 @ [0-9a-f]{7}）：\nsrc\/a.ts:2:export function hello\(\) \{$/);
@@ -109,12 +114,13 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
   const sha = /@ ([0-9a-f]{7})/.exec(found.text)![1];
   assert.deepEqual(located(found.text, found.facts), [
     { repo: "acme/demo", commit: sha, line: `共 1 处（main 分支 @ ${sha}）：` },
+    { repo: "acme/demo", branch: "main", line: `共 1 处（main 分支 @ ${sha}）：` },
     { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "src/a.ts:2:export function hello() {" },
   ]);
   const listed = await ws.listFiles({ glob: "src/**/*.ts" });
   assert.deepEqual(
-    listed.facts.map((fact) => ("path" in fact ? fact.path : fact.commit)),
-    [sha, "src/a.ts", "src/b.ts"],
+    listed.facts.map(named),
+    [sha, "branch:main", "src/a.ts", "src/b.ts"],
   );
   // 文件在、只是读不了：报错里记下这个文件；没有这个文件的什么都不记
   await rejectsWith(ws.readFile("./logo.bin"), /^logo\.bin 是二进制文件/, [{ repo: "acme/demo", path: "logo.bin" }]);
@@ -414,15 +420,28 @@ test("分支：列出分支、在最近活跃的分支上一起搜、读别的�
   const ws = await branchWorkspaces().all.open("om_b1", "ai/aiops-mcp");
   assert.match((await ws.search("k8s", { ignoreCase: true })).text, /^没有搜到「k8s」（main 分支 @ [0-9a-f]{7}）。$/);
 
-  const branches = await ws.listBranches();
+  const listed = await ws.listBranches();
+  const branches = listed.text;
   assert.match(branches, /^ai\/aiops-mcp 共 4 个分支，按最近提交从新到旧：\n/);
   assert.deepEqual(
     branches.split("\n").slice(1).map((line) => line.split("：")[0]),
     ["- feature/x", "- aiops", "- old", "- main（默认分支，当前在看）"],
   );
+  // 每个分支记在它那一行：分支名可以长得像路径，回答里写到它不算编的
+  assert.deepEqual(
+    located(branches, listed.facts).map(({ line, ...fact }) => [named(fact), line?.split("：")[0]]),
+    [
+      ["branch:feature/x", "- feature/x"],
+      ["branch:aiops", "- aiops"],
+      ["branch:old", "- old"],
+      ["branch:main", "- main（默认分支，当前在看）"],
+    ],
+  );
   assert.match(branches, /- aiops：2026-09-20 Seed「feat: k8s tools」/);
-  assert.equal((await ws.listBranches("AIO")).split("\n").length, 2);
-  assert.match(await ws.listBranches("nothing"), /没有名字里带「nothing」的分支，共 4 个分支/);
+  assert.equal((await ws.listBranches("AIO")).text.split("\n").length, 2);
+  const none = await ws.listBranches("nothing");
+  assert.match(none.text, /没有名字里带「nothing」的分支，共 4 个分支/);
+  assert.deepEqual(none.facts, []);
 
   const found = (await ws.search("k8s", { ignoreCase: true, branches: ["recent"] })).text;
   assert.match(found, /^在 2 个分支上共搜到 2 处：\n/);
@@ -431,18 +450,24 @@ test("分支：列出分支、在最近活跃的分支上一起搜、读别的�
   assert.match(found, /没搜到的分支：feature\/x、main$/);
   const grouped = await ws.search("k8s", { ignoreCase: true, branches: ["aiops", "old"] });
   assert.deepEqual(
-    grouped.facts.map((fact) => ("path" in fact ? `${fact.path}:${fact.lines?.[0]}` : fact.commit)),
-    [...grouped.text.matchAll(/分支 @ ([0-9a-f]{7})/g)].flatMap((m, i) => [m[1], ["internal/tools/k8s.go:3", "legacy.go:1"][i]]),
+    grouped.facts.map((fact) => ("path" in fact ? `${fact.path}:${fact.lines?.[0]}` : named(fact))),
+    [...grouped.text.matchAll(/分支 @ ([0-9a-f]{7})/g)].flatMap((m, i) => [
+      m[1],
+      ["branch:aiops", "branch:old"][i],
+      ["internal/tools/k8s.go:3", "legacy.go:1"][i],
+    ]),
   );
   assert.match((await ws.search("RegisterK8sTools", { branches: ["aiops"], glob: "**/*.go" })).text, /在 1 个分支上共搜到 1 处/);
-  assert.match((await ws.search("nothing_here", { branches: ["aiops", "old"] })).text, /在这 2 个分支上都没有搜到「nothing_here」：aiops、old。/);
+  const missed = await ws.search("nothing_here", { branches: ["aiops", "old"] });
+  assert.match(missed.text, /在这 2 个分支上都没有搜到「nothing_here」：aiops、old。/);
+  assert.deepEqual(missed.facts.map(named), ["branch:aiops", "branch:old"]);
 
   const other = await ws.readFile("internal/tools/k8s.go", 3, undefined, "origin/aiops");
   assert.match(other.text, /^internal\/tools\/k8s.go（aiops 分支 @ [0-9a-f]{7}，共 3 行，下面是第 3 到 3 行）\n3\| func RegisterK8sTools\(\) \{\}$/);
   // 别的分支上读的：记下文件、那一行和分支的提交号
   assert.deepEqual(
-    other.facts.map((fact) => ("path" in fact ? [fact.path, fact.lines] : fact.commit)),
-    [["internal/tools/k8s.go", undefined], /@ ([0-9a-f]{7})/.exec(other.text)![1], ["internal/tools/k8s.go", [3, 3]]],
+    other.facts.map((fact) => ("path" in fact ? [fact.path, fact.lines] : named(fact))),
+    [["internal/tools/k8s.go", undefined], /@ ([0-9a-f]{7})/.exec(other.text)![1], "branch:aiops", ["internal/tools/k8s.go", [3, 3]]],
   );
   assert.match((await ws.readFile("internal", 1, undefined, "aiops")).text, /internal\/tools\/k8s.go/);
   assert.match((await ws.listFiles({ glob: "**/*.go", branch: "aiops" })).text, /^共 1 个文件（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go$/);
@@ -461,10 +486,10 @@ test("切换分支：之后读、搜、开合并请求都基于它，下个任�
   const ws = await all.open("om_b2", "ai/aiops-mcp");
   const switched = await ws.switchBranch("origin/aiops");
   assert.match(switched.text, /^已切到 aiops 分支，最新提交 [0-9a-f]{7} 2026-09-20 Seed「feat: k8s tools」。/);
-  assert.deepEqual(switched.facts.map((fact) => ("commit" in fact ? fact.commit : "")), [/提交 ([0-9a-f]{7})/.exec(switched.text)![1]]);
+  assert.deepEqual(switched.facts.map(named), [/提交 ([0-9a-f]{7})/.exec(switched.text)![1], "branch:aiops"]);
   assert.equal(ws.baseBranch, "aiops");
   assert.match((await ws.search("RegisterK8sTools")).text, /^共 1 处（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go:3:/);
-  assert.match(await ws.listBranches(), /- aiops（当前在看）/);
+  assert.match((await ws.listBranches()).text, /- aiops（当前在看）/);
 
   const again = await all.open("om_b2", "ai/aiops-mcp");
   assert.equal(again.baseBranch, "aiops");
