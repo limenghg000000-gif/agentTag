@@ -315,10 +315,9 @@ async function runTask(
       const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
-      const unprefixed = repos.reduce(
-        (text, repo) => text.replace(new RegExp(`(?<!${PATH_CHAR})${escapeRegExp(repo)}/`, "gi"), " "),
-        userText,
-      );
+      // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉
+      const unprefixed =
+        repos.length === 0 ? userText : userText.replace(new RegExp(`(?<!${PATH_CHAR})(?:${repos.map(escapeRegExp).join("|")})/`, "gi"), " ");
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
@@ -444,17 +443,25 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
 }
 
 const CODE_TOOL_PREFIX = "code_";
-/** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
+/** 路径里会有的字符（Go 模块的 @ 和 !、pnpm 的 +）：前面紧挨着这些的，是一个更长的路径的后半截 */
+const PATH_CHAR = "[\\w./@+!~-]";
+/**
+ * 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go。
+ * 目录和文件名里可以有 @、+、!（pkg@v1/src/foo.ts 按整段认，不拿后半截 v1/src/foo.ts 充数）；
+ * 前后紧挨着路径字符的不认（src/foo.ts@backup 不是代码文件，~/.config/x.yaml 是家目录下的文件），后面的句号、叹号是标点
+ */
 const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
-const CODE_PATHS = new RegExp(`(?<![\\w./-])((?:[\\w.-]+\\/)+[\\w.-]+\\.${CODE_EXT})(?![\\w/-]|\\.\\w)`, "g");
+const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})((?:[\\w.@+!-]+\\/)+[\\w.@+!-]+\\.${CODE_EXT})(?![\\w/@+~-]|[.!]\\w)`, "g");
 /** 反引号里带空格的路径（`src/my files/app.ts:12`）：CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations） */
 const SPACED_CODE_PATHS = new RegExp(`(?<=\`)((?:[\\w.-]+(?: [\\w.-]+)*\\/)+[\\w.-]+(?: [\\w.-]+)*\\.${CODE_EXT})(?=[\`:#])`, "g");
 /**
  * 回答里明说是分支的路径（分支名可以长得像路径）：前面写着「分支」「branch」「切到」，或者后面跟着「分支」「branch」「@ 提交号」，
- * 如「`feature/foo.ts` 分支」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」
+ * 如「`feature/foo.ts` 分支上」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」。
+ * 「分支」也常说代码里的分支（src/a.ts 分支覆盖率、分支逻辑），后面只能是「上」「@」、标点或者到头了；「branch coverage」不算
  */
 const BRANCH_BEFORE = /(?:分支|\bbranch|切到|切换到)\s*[:：]?\s*[`'"“「*]*$/i;
-const BRANCH_AFTER = /^[`'"”」*]*\s*(?:分支|branch\b|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
+const BRANCH_AFTER =
+  /^[`'"”」*]*\s*(?:分支(?=\s*(?:$|@|上|[，。、；：！？,.;:!?）)」』"'`*]))|branch\b(?!\s*coverage)|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
 /** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
 const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
 /** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
@@ -629,8 +636,6 @@ function mentions(text: string, cite: string): boolean {
 }
 
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
-/** 路径里会有的字符（Go 模块的 @ 和 !、pnpm 的 +）：前面紧挨着这些的，是一个更长的路径的后半截 */
-const PATH_CHAR = "[\\w./@+!~-]";
 /**
  * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、src/a.tsx 都不是 src/a.ts）。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。

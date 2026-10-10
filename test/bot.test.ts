@@ -1261,6 +1261,10 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
     assert.deepEqual(unseenCodeCitations(answer, (text, line, branch) => branched(text, line, branch) || text === "3f2a1c9"), [], answer);
   }
   assert.deepEqual(unseenCodeCitations("`feature/foo.ts` 关掉了鉴权", branched), [{ text: "feature/foo.ts", located: false }]);
+  // 说的是代码里的分支（分支覆盖率、分支逻辑、branch coverage），不是 Git 分支
+  for (const answer of ["`feature/foo.ts` 分支覆盖率为 0%", "feature/foo.ts 分支逻辑有问题", "`feature/foo.ts` branch coverage is 0%"]) {
+    assert.deepEqual(unseenCodeCitations(answer, branched), [{ text: "feature/foo.ts", located: false }], answer);
+  }
   assert.deepEqual(unseenCodeCitations("切到 `feature/foo.ts:3`", branched), [{ text: "feature/foo.ts:3", located: true }]);
   // 文件是真的，行号是编的
   assert.equal(review("在 internal/k8s/tools.go:99", searched), unseenCodeAnswer(["internal/k8s/tools.go:99"], ["ai/aiops-mcp", "ai/agent-tag"]));
@@ -1422,6 +1426,14 @@ test("没查到的代码位置：带行号的路径和提交号算「说查过�
     { text: "src/a.ts", located: false },
   ]);
   assert.deepEqual(unseenCodeCitations("https://lab.example.com/ai/agent-tag/-/blob/master/src/bot.ts#L12 和 dist/a.ts.map", none), []);
+  // 路径里的 @、+、! 是路径的一部分，整段认，不拿后半截充数；后面紧挨着 @ 的不是代码文件，家目录下的文件不认，句末的叹号是标点
+  assert.deepEqual(unseenCodeCitations("读了 `pkg@v1/src/foo.ts:9`，见 github.com/!acme/svc@v1.2.3/internal/x.go，还有 lib/@acme+web/a.js", none), [
+    { text: "pkg@v1/src/foo.ts:9", located: true },
+    { text: "github.com/!acme/svc@v1.2.3/internal/x.go", located: false },
+    { text: "lib/@acme+web/a.js", located: false },
+  ]);
+  assert.deepEqual(unseenCodeCitations("`src/foo.ts@backup`，编辑 ~/.config/x.yaml 或 ~deploy/conf/app.yaml", none), []);
+  assert.deepEqual(unseenCodeCitations("注意 src/a.ts!", none), [{ text: "src/a.ts", located: false }]);
 });
 
 test("调过代码工具还编出仓库里没有的文件：打回重做，重做后还编就不发出", async () => {
@@ -1524,7 +1536,12 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     assert.deepEqual(prefixed.replies, [missing], question);
   }
   // 仓库名要在路径开头才去掉：vendor/ai/aiops-mcp/src/legacy/user.ts 不是这个仓库里的 src/legacy/user.ts
-  for (const question of ["vendor/ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的", "node_modules/@ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的"]) {
+  for (const question of [
+    "vendor/ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
+    "node_modules/@ai/aiops-mcp/src/legacy/user.ts 第 10 行是干嘛的",
+    // 只去掉开头的一个仓库名：去掉 ai/aiops-mcp/ 以后露出来的 ai/agent-tag/ 不再去掉
+    "ai/aiops-mcp/ai/agent-tag/src/legacy/user.ts 第 10 行是干嘛的",
+  ]) {
     const vendored = await ask([missing, missing], { question, tool: "code_read_file" });
     assert.deepEqual(vendored.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], question);
   }
