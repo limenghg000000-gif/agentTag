@@ -10,6 +10,7 @@ import { splitMarkdown } from "./markdown.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   CardUpdater,
+  LIVE_THOUGHT_CHARS,
   type ProgressState,
   type ProgressStep,
   renderPlainProgressCard,
@@ -287,9 +288,10 @@ async function runTask(
     // 卡片上显示思考、不是用英文问的（群里一般说中文），思考却被英文的日志、代码带成了英文：提醒模型接着用中文想，最多提醒几次
     let nudged = 0;
     const steerReasoning =
-      deps.showThinking !== false && card && !askedInEnglish(question)
+      deps.showThinking !== false && card && askedInChinese(question)
         ? (reasoning: string) => {
-            if (nudged >= MAX_THINKING_NUDGES || !writtenInEnglish(reasoning)) {
+            // 卡片上显示的是这一轮思考的最后一段：开头中文、后面写成英文的，卡片上看到的就是英文
+            if (nudged >= MAX_THINKING_NUDGES || !writtenInEnglish(reasoning.slice(-LIVE_THOUGHT_CHARS))) {
               return undefined;
             }
             nudged++;
@@ -311,6 +313,7 @@ async function runTask(
         memory: memory?.prompt,
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
+        showThinking: deps.showThinking !== false,
       }),
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
@@ -1231,36 +1234,46 @@ function deflects(answer: string): boolean {
 /** 一次任务里最多提醒几次「接着用中文想」 */
 const MAX_THINKING_NUDGES = 3;
 /**
- * 思考被英文带跑时接在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
+ * 思考被英文带跑时加在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
  * 进度卡片上整段英文，群里看着费劲。系统提示词里也写了，但模型想用什么语言跟着最近读到的内容走，离得近的提醒更管用
  */
-export const THINK_IN_CHINESE = "（系统提醒，不是工具返回的内容）接下来的思考请用中文写：思考会显示在进度卡片上给群里的人看。代码、日志、报错原文、函数名、命令照原样引用，不用翻译。";
+export const THINK_IN_CHINESE = "（系统提醒，不用回复这句）接下来的思考请用中文写：思考会显示在进度卡片上给群里的人看。代码、日志、报错原文、函数名、命令照原样引用，不用翻译。";
 
-/** 网址只算到第一个非 ASCII 字符：中文里网址后面常常直接跟着汉字、全角标点，没有空格 */
-const URL_TEXT = /https?:\/\/[\x21-\x7e]+/g;
+/** 代码块整块去掉：里面的反引号不成对也不会错开后面的配对 */
+const FENCED_CODE = /```[\s\S]*?(?:```|$)/g;
 /** 引号、反引号、书名号里引用的原文：英文思考里引用的中文报错、商品名，中文思考里引用的英文日志 */
-const QUOTED_TEXT = /`[^`]*`|「[^」]*」|“[^”]*”|【[^】]*】|"[^"\n]*"/g;
-/** 英文行文才有的虚词。日志、报错、路径、函数名里几乎没有，拿它们认英文，中文思考里夹着英文原文不会误判 */
-const ENGLISH_PROSE = /\b(?:the|I|I'm|I'll|let|let's|me|we|we're|need|should|now|so|okay|wait|maybe|but|which|it's|there|then|seems|looks)\b/gi;
+const QUOTED_TEXT = /`[^`\n]*`|「[^」]*」|“[^”]*”|【[^】]*】|"[^"\n]*"/g;
+/**
+ * 连着的一串 ASCII 字符里带代码标点的：网址、路径、函数调用（time.Now()）、key=value、日志时间、图片和文件占位符。
+ * 只吃 ASCII，网址后面直接跟着的汉字、全角标点不受影响
+ */
+const CODE_TOKEN = /[\x21-\x7e]*[._/\\()[\]{}=;:<>|][\x21-\x7e]*/g;
+/** 英文行文才有的虚词，大小写照行文的写法（单独的小写 i 多半是循环变量）。带代码标点的词先去掉了，wg.Wait()、time.Now() 不算 */
+const ENGLISH_PROSE = /\b(?:[Tt]he|I|[Ll]et|[Mm]e|[Ww]e|[Nn]eed|[Ss]hould|[Nn]ow|[Ss]o|[Oo]kay|[Ww]ait|[Mm]aybe|[Bb]ut|[Ww]hich|[Tt]here|[Tt]hen|[Ss]eems|[Ll]ooks)\b/g;
+/** 英文提问里几乎总有的词 */
+const ENGLISH_QUESTION = /\b(?:what|why|how|when|where|who|which|is|are|was|were|does|do|did|can|could|would|should|please|I|my|we|our|you|your|it|this|that|the|a|an)\b/i;
 
 /**
- * 思考是不是用英文写的：去掉网址和引用的原文以后，英文虚词至少 3 个，而且汉字数不到虚词数的 8 倍。
+ * 思考是不是用英文写的：去掉代码块、引用的原文和带代码标点的词以后，英文虚词至少 3 个，而且汉字数不到虚词数的 8 倍。
  * 中文思考里引用的英文日志、路径、函数名不带这些虚词；英文思考里没加引号提到的商品名、中文报错也压不过虚词
  */
 export function writtenInEnglish(text: string): boolean {
-  const plain = text.replace(URL_TEXT, " ").replace(QUOTED_TEXT, " ");
+  const plain = text.replace(FENCED_CODE, " ").replace(QUOTED_TEXT, " ").replace(CODE_TOKEN, " ");
   const han = plain.match(/\p{Script=Han}/gu)?.length ?? 0;
   const prose = plain.match(ENGLISH_PROSE)?.length ?? 0;
   return prose >= 3 && han < prose * 8;
 }
 
 /**
- * 提问是不是用英文写的：去掉网址和 @ 的名字以后一个汉字都没有，至少两个英文单词。
- * 群里一般说中文，拿不准时（只 @ 了一下、只写了一个词）按中文算
+ * 提问是不是该按中文算：有汉字，或者没有英文提问的常用词（只 @ 了一下、只贴了告警名、链接）；
+ * 有日文假名、韩文的不算。@ 的名字、网址、带代码标点的词不看。群里一般说中文，拿不准时按中文
  */
-export function askedInEnglish(question: string): boolean {
-  const plain = question.replace(URL_TEXT, " ").replace(/@\S+/g, " ");
-  return !/\p{Script=Han}/u.test(plain) && (plain.match(/[A-Za-z]+/g)?.length ?? 0) >= 2;
+export function askedInChinese(question: string): boolean {
+  if (/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(question)) {
+    return false;
+  }
+  const plain = question.replace(/@\S+/g, " ").replace(CODE_TOKEN, " ");
+  return /\p{Script=Han}/u.test(plain) || !ENGLISH_QUESTION.test(plain);
 }
 
 export const DEFLECTED_ANSWER =

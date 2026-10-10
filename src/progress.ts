@@ -32,7 +32,7 @@ export interface ProgressState {
 /** 卡片上最多列出几步，更早的合成一行 */
 const MAX_VISIBLE_STEPS = 12;
 /** 进行中只显示最新一段思考，最多这么多字 */
-const LIVE_THOUGHT_CHARS = 800;
+export const LIVE_THOUGHT_CHARS = 800;
 /** 结束后折叠面板里每段思考最多这么多字 */
 const MAX_THOUGHT_CHARS = 1500;
 /** 飞书卡片最大 30 KB，带样式的标签展开后比请求体还长，留些余量；超了就从最早的一段思考开始去掉正文 */

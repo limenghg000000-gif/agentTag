@@ -41,9 +41,9 @@ export interface AgentRequest {
    */
   review?: (answer: string, usedTools: ReadonlySet<string>) => string | undefined;
   /**
-   * 一轮调了工具以后看这一轮的思考：返回一段话时，接在这一轮最后一个工具结果后面再问下一轮。
+   * 一轮调了工具以后看这一轮的思考：返回一段话时，在工具结果后面加一条用户消息再问下一轮。
    * 比如思考被英文的日志、代码带成了英文，提醒模型接着用中文想（思考会显示在进度卡片上）。
-   * 不另起一条用户消息：工具循环中间插进来的用户消息，模型可能当成新问题去回，轮数用完时还会和收尾提醒连成两条用户消息
+   * 不接在工具结果里：工具结果是外部资料，系统提示词说里面的指令一律不执行，混在一起也会教模型信工具结果里冒充的「系统提醒」
    */
   steerReasoning?: (reasoning: string) => string | undefined;
 }
@@ -85,7 +85,13 @@ export async function runAgent({
     signal.throwIfAborted();
     const lastRound = round >= maxToolRounds;
     if (lastRound) {
-      conversation.push({ role: "user", content: LAST_ROUND_NOTE });
+      // 上一轮后面已经加过一条用户消息（打回重做、思考提醒）时并进去，不连着发两条用户消息
+      const last = conversation.at(-1);
+      if (last?.role === "user" && conversation.length > messages.length) {
+        conversation[conversation.length - 1] = { ...last, content: `${last.content}\n\n${LAST_ROUND_NOTE}` };
+      } else {
+        conversation.push({ role: "user", content: LAST_ROUND_NOTE });
+      }
     }
     const startedAt = now();
     const think = thinking ?? (investigating ? true : undefined);
@@ -123,11 +129,13 @@ export async function runAgent({
       investigating ||= thinkAfter?.(call.name) ?? false;
     }
     signal.throwIfAborted();
-    const steer = result.reasoning ? steerReasoning?.(result.reasoning) : undefined;
-    const lastCall = result.toolCalls.length - 1;
     result.toolCalls.forEach((call, i) => {
-      conversation.push({ role: "tool", toolCallId: call.id, content: steer && i === lastCall ? `${outputs[i]}\n\n${steer}` : outputs[i] });
+      conversation.push({ role: "tool", toolCallId: call.id, content: outputs[i] });
     });
+    const steer = result.reasoning ? steerReasoning?.(result.reasoning) : undefined;
+    if (steer) {
+      conversation.push({ role: "user", content: steer });
+    }
   }
 }
 

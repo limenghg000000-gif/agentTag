@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
-  askedInEnglish,
+  askedInChinese,
   BLOCKED_OPS_ANSWER,
   blockedCodeAnswer,
   blockUnverifiedOps,
@@ -651,7 +651,7 @@ test("中文提问、思考被英文带跑时，在工具结果后面提醒接�
     })),
     { text: "查完了", finish: "stop" },
   ];
-  const nudges = (requests: ChatRequest[]) => requests.map((req) => req.messages.at(-1)?.content.endsWith(THINK_IN_CHINESE) ?? false);
+  const nudges = (requests: ChatRequest[]) => requests.map((req) => req.messages.at(-1)?.content === THINK_IN_CHINESE);
 
   let results = rounds("The log shows a parse error, let me read GetGoodIdAndOriginUrl next.", 5);
   const english = fakeModel(() => results.shift()!);
@@ -672,42 +672,63 @@ test("中文提问、思考被英文带跑时，在工具结果后面提醒接�
   const hidden = fakeModel(() => results.shift()!);
   await setup({ model: hidden.model, tools: [tool], showThinking: false }).handle(message("转链为什么失败了"));
   assert.deepEqual(nudges(hidden.requests), [false, false, false]);
+  // 系统提示词里思考语言那条也只在卡片显示思考时才写
+  assert.match(english.requests[0].system, /思考过程也用提问者使用的语言写/);
+  assert.doesNotMatch(hidden.requests[0].system, /思考过程/);
 });
 
-test("writtenInEnglish：认英文行文里的虚词，中文思考里夹着日志、路径、函数名、网址不算英文", () => {
-  assert.equal(writtenInEnglish("No results with the token. Let me try searching with the short link URL instead."), true);
-  assert.equal(writtenInEnglish("Okay, the logs show the conversion failed at 13:12. I need to check whether the fix was deployed."), true);
-  assert.equal(writtenInEnglish("The log shows `URL 解析失败`, so read the caller next."), true);
-  assert.equal(writtenInEnglish("The user asks '转链为什么失败了'. Let me check the logs next."), true);
-  assert.equal(writtenInEnglish("The user asked why 转链 failed; the logs show a parse error in the share text, so the caller is next."), true);
-  assert.equal(writtenInEnglish("先查一下日志"), false);
-  assert.equal(writtenInEnglish("12:00 → 500"), false);
-  assert.equal(writtenInEnglish("Checking logs."), false);
-  assert.equal(writtenInEnglish("日志里是 invalid control character in URL，下一步读 GetGoodIdAndOriginUrl"), false);
-  assert.equal(
-    writtenInEnglish("报错是 ERROR parse failed: invalid control character in URL at position 12，说明分享文本整段被当成了链接"),
-    false,
-  );
-  assert.equal(writtenInEnglish("看 app/appservice/internal/service/tb/convert_link.go:98 和 app/appservice/internal/handler/link.go:40"), false);
-  assert.equal(
-    writtenInEnglish("日志：2026-10-10 12:00:01 ERROR [convert_link.go:98] parse share text failed: invalid control character in URL request_id=abc user_id=123"),
-    false,
-  );
-  assert.equal(writtenInEnglish("报错原文：\n```\nERROR the request was rejected because the token is invalid\n```\n所以要看 token 是怎么取的"), false);
-  assert.equal(
-    writtenInEnglish("读了 https://lab.yuebai.site/golang/appservice/-/blob/master/tb.go#L2431，这里先用正则匹配短链再请求解析，失败时就返回 the error"),
-    false,
-  );
+test("writtenInEnglish：认英文行文里的虚词，中文思考里夹着日志、路径、代码、网址不算英文", () => {
+  const english = [
+    "No results with the token. Let me try searching with the short link URL instead.",
+    "Okay, the logs show the conversion failed at 13:12. I need to check whether the fix was deployed.",
+    "The log shows `URL 解析失败`, so read the caller next.",
+    "The user asks '转链为什么失败了'. Let me check the logs next.",
+    "The user asked why 转链 failed; the logs show a parse error in the share text, so the caller is next.",
+    // 开头一大段中文、后面写成英文：调用方只拿卡片上显示的最后一段来判断
+    "Wait, the log shows the request went through. Let me look at the caller, then I should check the fix.",
+  ];
+  for (const text of english) {
+    assert.equal(writtenInEnglish(text), true, text);
+  }
+  const chinese = [
+    "先查一下日志",
+    "12:00 → 500",
+    "Checking logs.",
+    "日志里是 invalid control character in URL，下一步读 GetGoodIdAndOriginUrl",
+    "报错是 ERROR parse failed: invalid control character in URL at position 12，说明分享文本整段被当成了链接",
+    "看 app/appservice/internal/service/tb/convert_link.go:98 和 app/appservice/internal/handler/link.go:40",
+    "日志：2026-10-10 12:00:01 ERROR [convert_link.go:98] parse share text failed: invalid control character in URL request_id=abc user_id=123",
+    "报错原文：\n```\nERROR the request was rejected because the token is invalid\n```\n所以要看 token 是怎么取的",
+    "读了 https://lab.yuebai.site/golang/appservice/-/blob/master/tb.go#L2431，这里先用正则匹配短链再请求解析，失败时就返回 the error",
+    "先打开 `https://c.tb.cn/h.8AYbSqZ7` 看看跳到哪，日志里报错是 `the request was rejected because the token is invalid, so we need a new one`，说明要先查 token 是怎么取的",
+    "看下 for i := 0; i < n; i++ 这段",
+    "读 handler：let ok = await fetch(url).then(r => r.json())，所以 then 之后没处理异常",
+    "调用 time.Now() 再 wg.Wait()，然后 libssl.so 报错",
+    "代码是这样的：\n```\nconst s = 'a`b';\n```\n然后看日志 `the token is invalid so we need to refresh it, then retry` 说明 token 过期",
+  ];
+  for (const text of chinese) {
+    assert.equal(writtenInEnglish(text), false, text);
+  }
 });
 
-test("askedInEnglish：没有汉字、至少两个英文单词才算英文提问，@ 的名字和网址不算，拿不准按中文", () => {
-  assert.equal(askedInEnglish("what failed?"), true);
-  assert.equal(askedInEnglish("@张三 why did the link conversion fail?"), true);
-  assert.equal(askedInEnglish("转链为什么失败了"), false);
-  assert.equal(askedInEnglish("看下 [FIRING] HighErrorRate service=appservice error_rate=5.2% threshold=1%"), false);
-  assert.equal(askedInEnglish(""), false);
-  assert.equal(askedInEnglish("@飞书 CLI"), false);
-  assert.equal(askedInEnglish("https://c.tb.cn/h.8AYbSqZ7SeriAVy?tk=lSzFTJwYSlv 转不了"), false);
+test("askedInChinese：有汉字，或者没有英文提问的常用词就按中文；@ 的名字、链接、告警里的 key=value 不看；日文、韩文不算", () => {
+  for (const question of [
+    "转链为什么失败了",
+    "",
+    "@飞书 CLI",
+    "@Li Ming Hao",
+    "c.tb.cn/h.xxx",
+    "[FIRING:1] HighErrorRate service=appservice",
+    "HighErrorRate appservice",
+    "看下 [FIRING] HighErrorRate service=appservice error_rate=5.2% threshold=1%",
+    "https://c.tb.cn/h.8AYbSqZ7SeriAVy?tk=lSzFTJwYSlv 转不了",
+    "![image](img_v3_02ab_1234abcd)",
+  ]) {
+    assert.equal(askedInChinese(question), true, question);
+  }
+  for (const question of ["what failed?", "@张三 why did the link conversion fail?", "日本語で答えてください", "이거 왜 실패했어?"]) {
+    assert.equal(askedInChinese(question), false, question);
+  }
 });
 
 test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {
