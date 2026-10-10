@@ -4,6 +4,7 @@ aiops 的飞书补充说明。开了 aiops 工具时写进系统提示词，排�
 这里只写飞书群里特有的、服务端说明没讲的，以及 aiops 还没做、暂时要模型自己注意的。
 2026-10-08 对照 aiops 0.14.0（5f7d48c）的 instructions 原文精简过，原文见共享文件夹 plans/aiops-instructions-live.md。aiops 改了 instructions 后再对照一次。
 aiops 每做完一项（见 plans/aiops-orchestration-review.md 附录 P1），就删掉这里对应的临时条目，不用改代码。
+aiops 用 MCP prompts 下发的排查剧本（转链等业务场景）由机器人列进提示词、让模型按需读取，业务知识写在剧本里，这里不重复。
 HTML 注释不会发给模型。改完不用重启，机器人每 10 分钟重新读一次。
 -->
 - 群里问线上服务的事（报错、慢、告警、Pod 重启、CPU 内存、某个请求怎么回事），用 aiops 工具查。每个问题都要重新查：话题里之前的回答只能当线索，不能照搬其中的数据，换了服务更不能套用。
@@ -13,7 +14,7 @@ HTML 注释不会发给模型。改完不用重启，机器人每 10 分钟重�
 - diagnose_service 的 scenario：报错、5xx 选 error_log；接口慢选 slow_api；CPU、内存、OOM 选 resource；「看看 prod 整体怎么样」选 overview。贴了告警就按告警类型选。
 - 「这个 requestId 怎么回事」：用 aiops_query_logs 直接搜 requestId，不加 error 过滤；跨服务时按下游 URL 的 hostname 找到服务再查。
 - 「接着查案例 #N」：先用 aiops_get_case 取出来，按它缺的证据补查。
-- 命名空间：自己写 LogQL、PromQL（query_logs、query_metrics 这类）时，用户没说命名空间，先用 find_service 定位，不要自己填 prod。只找到一个就用它，回答里说查的是哪个命名空间；aiops 返回多个候选时，把这次结果里的候选（命名空间、副本数和就绪数）列给用户，问一次查哪个；候选只能来自这次调用的结果，话题里之前列过的是别的服务的，不能照着列。用户选了以后，这个话题里再查同一个服务就沿用，不再问；换了别的服务，用户没说命名空间就照样重新定位。
+- 命名空间：自己写 LogQL、PromQL（query_logs、query_metrics 这类）时，用户没说命名空间，先用 find_service 定位，不要自己填 prod。读过的剧本里写明了服务和命名空间的（比如转链剧本里的 product-service-api 在 prod），照剧本写，不用再定位。只找到一个就用它，回答里说查的是哪个命名空间；aiops 返回多个候选时，把这次结果里的候选（命名空间、副本数和就绪数）列给用户，问一次查哪个；候选只能来自这次调用的结果，话题里之前列过的是别的服务的，不能照着列。用户选了以后，这个话题里再查同一个服务就沿用，不再问；换了别的服务，用户没说命名空间就照样重新定位。
 <!-- aiops 的自动定位能找到单独跑的 Pod 以后删掉下面这条 -->
 - aiops 说找不到这个服务时，先用 aiops_query_metrics 查 `kube_pod_info{pod=~".*名字.*"}` 再下结论：aiops 的自动定位不一定找得到单独跑的 Pod（不属于 Deployment 的）。diagnose_service 返回 pod_count=0 时，先用 find_service 看工作负载在不在：在但期望副本是 0，就照实说副本是 0（这可能就是故障原因），不算找不到；不在才按找不到处理。指标只查到一个 Pod 时，它的 pod 标签就是 Pod 全名，接着自己用它和命名空间调 describe_pod（重启次数、退出码在这里）、get_pod_logs、get_events，不要再问用户要 Pod 名；查到好几个，先按用户说过的命名空间筛，还剩几个就把 Pod 名和命名空间列给用户，问一次查哪个。单独的 Pod 不一定有 app 标签，查日志按 pod 名过滤。指标里也没有，再说找不到，列出相近的名字让用户确认。
 - 时间：用户只给了一个时间点，就查前后 30 分钟；不要只给 end_time。

@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
@@ -20,7 +21,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import type { TaskRegistry } from "./tasks.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
-import type { Tool } from "./tools/tool.js";
+import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
  * 每条回复的字数上限。SDK 超过 3500 字会自己切分，但切出来的后续片段会发到群主界面而不是话题里，
@@ -118,6 +119,8 @@ export interface BotDeps {
     tools(task: TaskToolContext): readonly Tool[];
     /** 这些工具的使用说明，写进系统提示词。toolNames 是这次任务的全部工具名 */
     prompt(toolNames: readonly string[]): string | undefined;
+    /** 调过这个工具以后，这次任务后面几轮打开思考 */
+    thinksAfter?(name: string): boolean;
   };
 }
 
@@ -223,29 +226,41 @@ async function runTask(
     };
     const knowledge = await lookupKnowledge(deps, taskContext, asked, history, task.signal, state, () => card?.update(render()));
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
-    // 回答里引用的文件路径、行号、提交号要在这些结果里出现过（代码工具读到的，或者 aiops 查到的报错堆栈），才算查证过
+    // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
-    const evidence: string[] = [];
-    const failures: string[] = [];
+    const evidence: ToolEvidence[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
+          // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
+          if (tool.instructionsOnly) {
+            return tool.run(args, ctx);
+          }
           attempted.add(tool.spec.name);
+          const code = isCodeTool(tool.spec.name);
+          let facts: CodeFact[] = [];
           let output: string;
           try {
-            output = await tool.run(args, ctx);
+            output = await tool.run(args, { ...ctx, onFacts: (found) => (facts = [...facts, ...found]) });
           } catch (err) {
-            // 失败的原因也记下：读文件报「没有这个文件：src/foo.ts」以后，回答说这个文件不存在不算编
-            failures.push(err instanceof Error ? err.message : String(err));
+            // 代码工具找到了文件、只是读不了（太大、二进制）：报错里带着这个文件，算查到了路径，不算查到哪一行
+            if (err instanceof ToolError) {
+              evidence.push({ tool: tool.spec.name, facts: err.facts });
+            }
             throw err;
           }
           succeeded.add(tool.spec.name);
-          // 和交给模型的一样截短：被截掉、模型没看到的部分不算查到
-          evidence.push(output.slice(0, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
+          // 和 runAgent 交给模型时一样截短：截断处以后的模型没看到，不算
+          const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
+          evidence.push(
+            code
+              ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
+              : { tool: tool.spec.name, output: seenByModel(output, limit) },
+          );
           return output;
         },
       }),
@@ -269,15 +284,17 @@ async function runTask(
     }
     const toolNames = taskTools.map((tool) => tool.spec.name);
     const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
-    const seen = codeEvidence(deps.codeRepos ?? [], evidence, failures);
+    const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     const reviews = [
       ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
     ];
+    const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
+      ...(thinksAfter ? { thinkAfter: thinksAfter } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
@@ -328,8 +345,19 @@ async function runTask(
       // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
-      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, deps.codeRepos ?? []);
-      const unseen = unseenCodeCitations(result.text, (text, line) => seen(text, line) || userText.includes(text)).filter(
+      const repos = deps.codeRepos ?? [];
+      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
+      // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
+      // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
+      // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
+      // 仓库名互相包含时去掉最长的那个（长的排前面），和 codeEvidence 一样；前面的 ./、/ 一起去掉（./ai/aiops-mcp/src/foo.ts），和 repoPath 一样
+      const longestFirst = [...repos].sort((a, b) => b.length - a.length).map(escapeRegExp);
+      const unprefixed =
+        repos.length === 0 ? userText : userText.replace(new RegExp(`${NOT_GLUED}(?:\\.?\\/+)?(?:${longestFirst.join("|")})/`, "gi"), " ");
+      // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
+      const inQuestion = (text: string, line?: number) =>
+        [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
+      const unseen = unseenCodeCitations(result.text, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -491,7 +519,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
       ? ` 输入=${event.usage.input} 输出=${event.usage.output}${event.usage.reasoning ? ` 其中思考=${event.usage.reasoning}` : ""}`
       : "";
     const next = event.toolNames.length > 0 ? `调用 ${event.toolNames.join(", ")}` : "给出回答";
-    logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${usage} → ${next}`);
+    const think = event.thinking ? " 思考=开" : "";
+    logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${think}${usage} → ${next}`);
   } else if (event.type === "retry") {
     logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);
   } else if (event.type === "tool_end") {
@@ -511,13 +540,93 @@ const LOOKUP_RECENT_TURNS = 3;
 const LOOKUP_TURN_CHARS = 200;
 
 const CODE_TOOL_PREFIX = "code_";
-/** 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go */
-const CODE_PATHS =
-  /(?:^|[\s`'"(（:：,，、])((?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto))\b/g;
-/** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
-const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
-/** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
-const COMMIT_REFS = /(?:@|\bcommit\b|提交|版本)\s*[:：]?\s*[`'"]?((?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40})(?![0-9a-z])/gi;
+/**
+ * 路径和前后文字的分界：空白、引号、括号、Markdown 的 * 和 |、, ; = : #、中文标点、汉字和假名、全角字符、各种符号和 emoji
+ * （# ; , ' 和括号夹在路径字符中间时除外，见 SOFT_DELIM）。
+ * 别的字符都算路径的一部分（字母数字和 . _ - / @ + ! ~ $ % \ 等，Go 模块的 @ 和 !、pnpm 的 +）：
+ * 不一个个列路径里能有什么字符，没想到的字符也算在路径里，紧挨着它的是一个更长的路径的一截（pkg$v1/src/foo.ts 不是 v1/src/foo.ts）
+ */
+const PATH_DELIM = "\\s\"'`()\\[\\]<>{}*|,;=:#\\u2010-\\u2027\\u2190-\\u2bff\\u3000-\\u30ff\\u3400-\\u9fff\\uff00-\\uffef\\ud800-\\udfff";
+/** 路径里的一个字符：前面紧挨着这样的字符的，是一个更长的路径的后半截 */
+const PATH_CHAR = `[^${PATH_DELIM}]`;
+/**
+ * 分界字符里，Git 文件名里也常有的 # ; , ' 和括号：一个或连着几个，两边都紧挨着路径字符时是路径的一部分
+ * （pkg#v1/src/foo.ts、Next.js 的 app/(auth)/login/page.tsx、app/[[...slug]]/page.tsx），不然是分界（(src/a.ts)、src/a.ts#L3、'src/a.ts'）。
+ * = 和 : 一直是分界：日志里的 caller=src/a.ts:3、"file":"src/a.ts" 要能认出 src/a.ts
+ */
+const SOFT_DELIM = "#;,'()\\[\\]{}";
+/** 两边都紧挨着路径字符（中间可以隔着别的 SOFT_DELIM 字符）、算路径一部分的 SOFT_DELIM 字符 */
+const GLUED = `(?<=${PATH_CHAR}[${SOFT_DELIM}]*)[${SOFT_DELIM}](?=[${SOFT_DELIM}]*${PATH_CHAR})`;
+/** 路径从这儿开始：前面没有紧挨着路径字符，也没有紧挨着跟在路径字符后面的 SOFT_DELIM 字符（pkg#v1/src/foo.ts、pkg##v1/src/foo.ts 里的 v1/src/foo.ts 不是开头） */
+const NOT_GLUED = `(?<!${PATH_CHAR}[${SOFT_DELIM}]*)`;
+/** 目录名、文件名里的一个字符 */
+const NAME_CHAR = `(?:[^${PATH_DELIM}/]|${GLUED})`;
+/**
+ * 路径到这儿完了：后面是分界字符或者到头了；中间可以隔着句号、叹号、问号这些标点（src/a.ts。src/a.ts!）。
+ * 后面紧挨着的 SOFT_DELIM 字符接着的是更深的路径时（src/a.ts#v2/b.ts、src/a.ts,src/b.ts）没完，是一个更长的路径的前半截；
+ * 只是行号、参数的照样算完了（src/a.ts#L3、PHP 堆栈的 /app/src/a.php(12)）
+ */
+const PATH_END = `(?=$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}]))(?![${SOFT_DELIM}]+(?=${PATH_CHAR})(?:${NAME_CHAR})*\\/)`;
+/**
+ * 回答里像仓库文件路径的写法：至少一层目录加常见代码文件后缀，如 src/index.ts、internal/k8s/client.go。
+ * 按整段路径认（pkg@v1/src/foo.ts、pkg$v1/src/foo.ts、pkg#v1/src/foo.ts 不拿后半截 v1/src/foo.ts 充数）；
+ * 后面紧挨着路径字符的不是代码文件（src/foo.ts@backup、a.ts.map），~ 开头的是家目录下的文件（~/.config/x.yaml）
+ */
+const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
+const CODE_PATHS = new RegExp(`${NOT_GLUED}(?!~)((?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
+/**
+ * 反引号、加粗、引号里带空格的路径（`src/my files/app.ts:12`、**src/my files/app.ts**:12、"src/my files/app.ts":12）：
+ * CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，
+ * 词之间可以是连着几个空格、制表符、全角空格；后面是收尾的符号，或者 LINE_AFTER_PATH 认的行号写法（:12、：12、#L12、 第 12 行）
+ */
+const SPACED_CODE_PATHS = new RegExp(
+  `(?<=[\`*"“「『])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})(?=[\`*"”」』:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
+  "g",
+);
+/**
+ * Markdown 的下划线、删除线包着的路径（_src/a.ts_:12、__src/a.ts__、~~src/a.ts~~，中间也可以带空格）：_ 和 ~ 也是路径字符，
+ * CODE_PATHS 会把两头的符号算进路径里、认不出来。前面是分界、两头是一样的一对符号时，中间按一整段路径认（见 unseenCodeCitations）
+ */
+const WRAPPED_CODE_PATHS = new RegExp(
+  `(?<=(?:^|[${PATH_DELIM}])([_~]{1,2}))(?![_~])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})` +
+    `(?=\\1(?:$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}])))`,
+  "g",
+);
+/**
+ * 回答里明说是 Git 分支的路径（分支名可以长得像路径）：前面写着「切到」「切换到」「checkout」「on/to branch」「分支：」「branch:」，
+ * 或者后面跟着「分支」「branch」再接「上」「@」、标点或者到头了，或者后面跟着「@ 提交号」，
+ * 如「`feature/foo.ts` 分支上」「on the `feature/foo.ts` branch.」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」。
+ * 「分支」「branch」也常说代码里的分支（src/a.ts 分支覆盖率、分支逻辑、branch condition、分支 src/a.ts 里），这些不算
+ */
+const BRANCH_BEFORE = /(?:(?:切到|切换到)\s*(?:分支)?|\bcheckout|\b(?:on|to)\s+branch|(?:分支|\bbranch)\s*[:：])\s*[`'"“「*]*$/i;
+const BRANCH_AFTER =
+  /^[`'"”」*]*\s*(?:(?:分支|branch\b)(?=\s*(?:$|@|上|[，。、；：！？,;:?）)」』"'`*]|[.!](?!\w)))|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
+/**
+ * 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行；
+ * 中间可以隔着 Markdown 的收尾符号：`src/foo.ts`:99、**src/foo.ts**:99、「src/foo.ts」第 99 行
+ */
+const LINE_AFTER_PATH = /^[`*_~'"”」』]*(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
+/** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」「commit **3f2a1c9**」，7～40 位十六进制，字母和数字都有；前后可以有引号和 Markdown 的符号 */
+const COMMIT_REFS = /(?:@|\bcommit\b|提交|版本)[`'"“「『*_~]*\s*[:：]?\s*[`'"“「『*_~]*((?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40})(?![0-9a-z])/gi;
+/** 一句话到这儿完了：换行、句号、叹号、问号、分号（英文的句号、叹号、问号后面要跟着空白或者到头了，v1.2 里的点不算） */
+const SENTENCE_END = /[\n。！？；;]|[.!?](?=\s|$)/g;
+/** 一句话里的一小句到这儿完了：逗号、顿号 */
+const CLAUSE_END = /[，,、]/g;
+/**
+ * 反引号、加粗、引号里带空格的一整段读起来是命令、不是路径：开头是常见的命令（go、kubectl、cat，或者 bin/、.bin/ 下面的这些命令，如 vendor/bin/phpunit），
+ * 或者有以 - 开头的参数（-f），或者最后一个词前面就有一个完整的代码文件（cp src/a.ts src/c.ts、src/a.ts or src/c.ts）。
+ * 别的（`src/my files/app.ts`、`my dir/app.ts`）按一个带空格的路径整段认
+ */
+const COMMANDS =
+  "go|gofmt|node|npm|npx|pnpm|yarn|bun|deno|tsx|tsc|jest|vitest|eslint|prettier|python3?|pip3?|pytest|php|composer|phpunit|java|mvn|gradle|cargo|rustc|make|" +
+  "docker|kubectl|helm|git|bash|sh|zsh|source|cat|less|more|head|tail|grep|rg|sed|awk|vim?|nano|code|open|cp|mv|rm|ls|cd|mkdir|touch|chmod|chown|curl|wget|ssh|scp|jq|sudo|env";
+const COMMAND_WORD = new RegExp(`^(?:(?:\\S*\\/)?\\.?bin\\/)?(?:${COMMANDS})$`);
+const CODE_FILE_WORD = new RegExp(`\\.${CODE_EXT}$`);
+
+function looksLikeCommand(span: string): boolean {
+  const words = span.split(/\s+/);
+  return COMMAND_WORD.test(words[0]) || words.some((word) => word.startsWith("-")) || words.slice(0, -1).some((word) => CODE_FILE_WORD.test(word));
+}
 
 export const UNVERIFIED_CODE_ANSWER =
   "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
@@ -528,7 +637,7 @@ export const UNVERIFIED_CODE_ANSWER =
 export function unseenCodeAnswer(cites: readonly string[], repos: readonly string[]): string {
   return (
     `（系统检查）你的回答引用了这些代码位置，但它们在这次的工具结果里都没有出现：${cites.join("、")}。` +
-    "只能引用工具结果里真出现过的文件、行号和提交号。先用 code_search、code_read_file 查到再写；" +
+    "只能引用工具结果里真出现过的文件、行号和提交号，读失败、没搜到的路径也不算，不用写出来。先用 code_search、code_read_file 查到再写；" +
     `要查的代码不在能读的仓库（${repos.join("、")}）里时，直说读不到这部分代码，不要拿别的仓库里的文件或常见的项目结构来回答。不要提这段检查。`
   );
 }
@@ -548,8 +657,14 @@ export interface CodeCitation {
   located: boolean;
 }
 
-/** 认不认得回答里的路径、提交号；line 是路径后面写的行号 */
-export type CitationCheck = (text: string, line?: number) => boolean;
+/** 提交号所在的这句话里它前面和后面的部分（ai/agent-tag master @ 3f2a1c9 里的「ai/agent-tag master」，commit 3f2a1c9 in ai/agent-tag 里的「 in ai/agent-tag」） */
+export interface Sentence {
+  before: string;
+  after: string;
+}
+
+/** 认不认得回答里的路径、提交号；line 是路径后面写的行号，branch 是回答里明说了这是个分支（见 BRANCH_BEFORE），sentence 是提交号所在的这句话 */
+export type CitationCheck = (text: string, line?: number, branch?: boolean, sentence?: Sentence) => boolean;
 
 /**
  * 回答里引用、但 seen 认不出来的代码位置（文件路径、行号和提交号）。
@@ -557,53 +672,294 @@ export type CitationCheck = (text: string, line?: number) => boolean;
  * 和 userlogic.go:35 这些仓库里根本没有的提交和文件，把握写高
  */
 export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCitation[] {
+  const lineAfter = (end: number) => {
+    const at = LINE_AFTER_PATH.exec(answer.slice(end));
+    return at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
+  };
+  const branchAt = (start: number, end: number) =>
+    BRANCH_BEFORE.test(answer.slice(Math.max(0, start - 12), start)) || BRANCH_AFTER.test(answer.slice(end));
   const cites = new Map<string, CodeCitation>();
-  for (const match of answer.matchAll(CODE_PATHS)) {
-    const path = match[1];
-    const at = LINE_AFTER_PATH.exec(answer.slice(match.index + match[0].length));
-    const line = at ? Number(at[1] ?? at[2] ?? at[3]) : undefined;
-    if (!seen(path, line)) {
+  const check = (path: string, line: number | undefined, start: number) => {
+    if (!seen(path, line, branchAt(start, start + path.length))) {
       const text = line === undefined ? path : `${path}:${line}`;
       cites.set(text, { text, located: line !== undefined });
     }
+  };
+  // 反引号、加粗、引号里带空格的一整段（`src/my files/app.ts`、`src/my files/app.ts:12`）按整段认，
+  // 里面空格后面那段（files/app.ts）不能拿来充数。读起来是命令的（`go run cmd/main.go`、`vendor/bin/phpunit tests/UserTest.php`，
+  // 见 looksLikeCommand）没写行号、整段也没查到过时，按 CODE_PATHS 一个个认
+  const spans: Array<[number, number]> = [];
+  for (const match of answer.matchAll(SPACED_CODE_PATHS)) {
+    const path = match[1];
+    const line = lineAfter(match.index + path.length);
+    if (/\s/.test(path) && (line !== undefined || seen(path, line) || !looksLikeCommand(path))) {
+      spans.push([match.index, match.index + path.length]);
+      check(path, line, match.index);
+    }
   }
+  // 下划线、删除线包着的：中间是一个路径的按整段认；中间带空格的和上面一样，读起来是命令的、没写行号也没查到过的，里面的路径一个个认
+  for (const match of answer.matchAll(WRAPPED_CODE_PATHS)) {
+    const path = match[2];
+    const line = lineAfter(match.index + path.length);
+    spans.push([match.index, match.index + path.length]);
+    if (!/\s/.test(path) || line !== undefined || seen(path, line) || !looksLikeCommand(path)) {
+      check(path, line, match.index);
+    } else {
+      for (const piece of path.matchAll(CODE_PATHS)) {
+        const at = match.index + piece.index;
+        check(piece[1], lineAfter(at + piece[1].length), at);
+      }
+    }
+  }
+  for (const match of answer.matchAll(CODE_PATHS)) {
+    if (!spans.some(([from, to]) => match.index >= from && match.index < to)) {
+      check(match[1], lineAfter(match.index + match[1].length), match.index);
+    }
+  }
+  // 提交号所在的这句话：写着仓库名的，只认这个仓库里查到的提交（见 codeEvidence）
+  const sentence = (start: number, end: number): Sentence => {
+    const before = answer.slice(0, start);
+    const after = answer.slice(end);
+    const from = [...before.matchAll(SENTENCE_END)].at(-1);
+    const to = new RegExp(SENTENCE_END.source).exec(after);
+    return { before: before.slice(from === undefined ? 0 : from.index + 1), after: to === null ? after : after.slice(0, to.index) };
+  };
   for (const match of answer.matchAll(COMMIT_REFS)) {
-    if (!seen(match[1])) {
+    if (!seen(match[1], undefined, undefined, sentence(match.index, match.index + match[0].length))) {
       cites.set(match[1], { text: match[1], located: true });
     }
   }
   return [...cites.values()];
 }
 
+/** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact），别的工具是模型看到的原文 */
+export interface ToolEvidence {
+  tool: string;
+  output?: string;
+  facts?: readonly CodeFact[];
+}
+
 /**
- * 按这次的工具结果认引用：路径、提交号出现在结果里就算；带行号的还要那一行真在结果里：搜索结果、报错堆栈里的「路径:行号」，
- * 或者读这个文件时读到了那一行（「35| …」）。只列过文件、读了别的段落，编一个行号照样不认。
- * 工具报的错里提到的路径也认（「没有这个文件：src/foo.ts」以后说它不存在）。
- * 回答里写成「./路径」或「仓库名/路径」（ai/aiops-mcp/internal/x.go）时，去掉前缀再找
+ * 按这次的工具结果认引用：路径、提交号查到过就算；带行号的还要那一行真的查到过。
+ * 代码工具的结果只认工具自己记下的代码位置（CodeFact）：读到的文件和每一行、搜到的每处「文件:行号」、列出的文件、改过的文件和改动后的行、
+ * diff 和开 PR 时改动了的文件、结果里写明的提交号。工具按它实际查到的记，不从给模型看的文字里反解析，
+ * 读到、搜到的代码正文里写的路径、行号、提交号也就不算：仓库里的测试和文档常常写着别的路径，机器人自己的仓库 ai/agent-tag 的测试里
+ * 就有 2026-10-09 编出来的那几个引用。
+ * 别的工具（aiops 查到的日志、报错堆栈）没有固定格式，按原文找：路径要整段对上，前面是绝对路径的也算（/app/src/a.ts:12）。
+ * 没查到的（「没有这个文件：src/foo.ts」、没搜到、没有匹配的文件）不算：从回答的字面上分不清是在说「它不存在」，
+ * 还是没查到以后照样讲它写了什么。照实说找不到的回答，打回重做时会被告知别写这个路径；路径是群成员自己问的，重做以后照着复述也不拦（见 runTask）。
+ * 回答里写成「./路径」时去掉前缀再找，路径和读文件时一样整理（src/./a.ts 就是 src/a.ts）；
+ * 写成「仓库名/路径」（ai/aiops-mcp/internal/x.go）时，只认在这个仓库里查到的，日志里写的照样去掉仓库名再找；
+ * 提交号所在的这句话里写着仓库名的（ai/agent-tag master @ 3f2a1c9、commit 3f2a1c9 in ai/agent-tag），也只认这个仓库里查到的提交（见 commitRepo）
  */
-export function codeEvidence(repos: readonly string[], outputs: readonly string[], failures: readonly string[] = []): CitationCheck {
-  return (cite, line) => {
-    const text = cite.replace(/^\.\//, "");
-    const forms = [
-      text,
-      ...repos.filter((repo) => text.toLowerCase().startsWith(`${repo.toLowerCase()}/`)).map((repo) => text.slice(repo.length + 1)),
-    ];
-    return forms.some(
-      (form) =>
-        failures.some((failure) => failure.includes(form)) ||
-        outputs.some((output) => (line === undefined ? output.includes(form) : hasLine(output, form, line))),
-    );
+export function codeEvidence(repos: readonly string[], results: readonly ToolEvidence[]): CitationCheck {
+  // 任务进行中结果还会变多，按条数缓存
+  let cache: { size: number; facts: CodeFacts } | undefined;
+  return (cite, line, branch, sentence) => {
+    if (cache?.size !== results.length) {
+      cache = { size: results.length, facts: codeFacts(results) };
+    }
+    const facts = cache.facts;
+    const named = sentence !== undefined && COMMIT_ID.test(cite) ? commitRepo(sentence, repos) : undefined;
+    const written = named === undefined ? cite : `${named}/${cite}`;
+    // 文件名里可以真有反斜杠（src/foo\bar.ts）：先按原样找，再把 \ 当成 / 找（Windows 的写法）
+    return [...new Set([repoPath(written), repoPath(written.replace(/\\/g, "/"))])].some((text) => {
+      // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算。
+      // 仓库名互相包含时（team/backend、team/backend/api）只按最长的那个算：team/backend/api/src/x.ts 说的是 team/backend/api 里的
+      const prefix = longestRepoPrefix(text, repos);
+      const forms: Array<{ path: string; repos?: string[] }> = [
+        { path: text, repos: prefix === undefined ? undefined : [prefix] },
+        ...(prefix === undefined ? [] : [{ path: text.slice(prefix.length + 1), repos: [prefix] }]),
+      ];
+      return matchesFacts(facts, forms, line, branch);
+    });
   };
 }
 
-/** 这段工具结果里有没有 path 的第 line 行 */
-function hasLine(output: string, path: string, line: number): boolean {
-  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`${escaped}(?::|", line )${line}(?!\\d)`).test(output)) {
-    return true;
+/** 按 forms 里的几种写法（整段、去掉仓库名的）在查到的里找 */
+function matchesFacts(facts: CodeFacts, forms: Array<{ path: string; repos?: string[] }>, line?: number, branch?: boolean): boolean {
+  return forms.some(({ path, repos: scope }) => {
+    const inRepo = (found: { repo: string }) => scope === undefined || scope.includes(found.repo);
+    let found: boolean;
+    if (COMMIT_ID.test(path)) {
+      // 回答里的提交号可以是查到的提交号的前几位，不能比查到的长：多出来的几位是编的
+      const sha = path.toLowerCase();
+      found = facts.commits.some((seen) => inRepo(seen) && seen.sha.startsWith(sha));
+    } else {
+      // 分支名可以长得像路径（feature/foo.ts）：回答里明说是分支的，查到过这个分支也算；别的只按文件认，分支不能给文件作证。
+      // 「分支」也可能说的是代码里的分支（src/a.ts 分支覆盖率），所以明说是分支的，查到过这个文件照样算
+      found =
+        (facts.files.get(path) ?? []).some(
+          (seen) => inRepo(seen) && (line === undefined || (seen.lines !== undefined && line >= seen.lines[0] && line <= seen.lines[1])),
+        ) ||
+        (branch === true && line === undefined && facts.branches.some((seen) => inRepo(seen) && seen.name === path));
+    }
+    return found || facts.text.some((output) => (line === undefined ? mentions(output, path) : hasLine(output, path, line)));
+  });
+}
+
+/**
+ * 提交号是哪个仓库的：这句话里写着的配置的仓库名。先看提交号所在的这一小句（逗号、顿号隔开），前面离它最近的，没有再看后面离它最近的；
+ * 这一小句里没写再看整句，也是先前面后后面。都没写的（master @ 3f2a1c9）不限仓库
+ */
+function commitRepo({ before, after }: Sentence, repos: readonly string[]): string | undefined {
+  const clauseStart = [...before.matchAll(CLAUSE_END)].at(-1);
+  const clauseEnd = new RegExp(CLAUSE_END.source).exec(after);
+  return (
+    lastRepo(before.slice(clauseStart === undefined ? 0 : clauseStart.index + 1), repos) ??
+    firstRepo(clauseEnd === null ? after : after.slice(0, clauseEnd.index), repos) ??
+    lastRepo(before, repos) ??
+    firstRepo(after, repos)
+  );
+}
+
+/**
+ * text 里写着的配置的仓库名（小写）和位置：前面不能紧挨着路径字符（pkg#ai/aiops-mcp 不是这个仓库），后面可以接 /路径；
+ * 后面紧挨着的括号、# 这些照样算写的是这个仓库（ai/agent-tag(master) @ 3f2a1c9）
+ */
+function repoMentions(text: string, repos: readonly string[]): Array<{ repo: string; start: number; end: number }> {
+  return repos
+    .map((name) => name.toLowerCase())
+    .flatMap((repo) =>
+      [...text.matchAll(new RegExp(`${NOT_GLUED}${escapeRegExp(repo)}(?![^${PATH_DELIM}/])`, "gi"))].map((match) => ({
+        repo,
+        start: match.index,
+        end: match.index + match[0].length,
+      })),
+    );
+}
+
+/** text 里离结尾最近的配置的仓库名；同一处对得上几个时取最长的 */
+function lastRepo(text: string, repos: readonly string[]): string | undefined {
+  return repoMentions(text, repos).reduce<{ repo: string; end: number } | undefined>(
+    (best, seen) => (best === undefined || seen.end > best.end || (seen.end === best.end && seen.repo.length > best.repo.length) ? seen : best),
+    undefined,
+  )?.repo;
+}
+
+/** text 里离开头最近的配置的仓库名；同一处对得上几个时取最长的 */
+function firstRepo(text: string, repos: readonly string[]): string | undefined {
+  return repoMentions(text, repos).reduce<{ repo: string; start: number } | undefined>(
+    (best, seen) => (best === undefined || seen.start < best.start || (seen.start === best.start && seen.repo.length > best.repo.length) ? seen : best),
+    undefined,
+  )?.repo;
+}
+
+/** path 开头写着的配置的仓库名（小写）；几个都对得上时取最长的 */
+function longestRepoPrefix(path: string, repos: readonly string[]): string | undefined {
+  return repos
+    .map((repo) => repo.toLowerCase())
+    .filter((repo) => path.toLowerCase().startsWith(`${repo}/`))
+    .reduce<string | undefined>((longest, repo) => (longest === undefined || repo.length > longest.length ? repo : longest), undefined);
+}
+
+/** 这次查到的：代码工具记下的文件（和查到的行）、提交号、分支，按仓库分；别的工具的原文 */
+interface CodeFacts {
+  files: Map<string, Array<{ repo: string; lines?: [number, number] }>>;
+  commits: Array<{ repo: string; sha: string }>;
+  branches: Array<{ repo: string; name: string }>;
+  text: string[];
+}
+
+function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
+  const facts: CodeFacts = { files: new Map(), commits: [], branches: [], text: [] };
+  for (const { tool, output, facts: found } of results) {
+    // 代码工具的结果文字一概不认，只认它记下的代码位置
+    if (!isCodeTool(tool)) {
+      if (output !== undefined) {
+        facts.text.push(output);
+      }
+      continue;
+    }
+    for (const fact of found ?? []) {
+      const repo = fact.repo.toLowerCase();
+      if ("commit" in fact) {
+        facts.commits.push({ repo, sha: fact.commit.toLowerCase() });
+      } else if ("branch" in fact) {
+        facts.branches.push({ repo, name: fact.branch });
+      } else {
+        facts.files.set(fact.path, [...(facts.files.get(fact.path) ?? []), { repo, lines: fact.lines }]);
+      }
+    }
   }
-  const read = output.startsWith(`${path}（`) || output.startsWith(`./${path}（`);
-  return read && output.includes(`\n${line}| `);
+  return facts;
+}
+
+/** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
+function mentions(text: string, cite: string): boolean {
+  return COMMIT_ID.test(cite) ? text.includes(cite) : containsPath(text, cite);
+}
+
+const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
+/**
+ * 在没有固定格式的结果里（aiops 的日志、堆栈）找路径：前后不能紧挨着别的路径字符（mysrc/a.ts、pkg/src/a.ts、pkg@src/a.ts、pkg#src/a.ts、src/a.tsx 都不是 src/a.ts），
+ * 前后的分界和回答里认路径（CODE_PATHS）一样。
+ * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。
+ * 绝对路径前面的引号、括号要是分界（(/app/src/a.ts:12)），夹在路径字符中间的（x(/app/src/a.ts）是一个更长的路径的一截，不是绝对路径。
+ * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
+ */
+const PATH_START = `(?:${NOT_GLUED}|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])/(?:[^\\s/"'\`()（）<>]+/)*)|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])\\./))`;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 按 path 在 text 里找、前后的分界和 containsPath 一样的正则；先认 path 本身，再看前后（长长一串 SOFT_DELIM 字符时不用每处都往前看一遍） */
+function pathPattern(path: string, after: string, flags?: string): RegExp {
+  const literal = escapeRegExp(path);
+  return new RegExp(`(?=${literal})${PATH_START}${literal}${after}`, flags);
+}
+
+function containsPath(text: string, path: string): boolean {
+  return pathPattern(path, PATH_END).test(text);
+}
+
+/** text 里有没有写 path 的第 line 行，写法和回答里认行号的一样（path:35、path#L35、path 第 35 行） */
+function mentionsLine(text: string, path: string, line: number): boolean {
+  for (const match of text.matchAll(pathPattern(path, PATH_END, "g"))) {
+    const at = LINE_AFTER_PATH.exec(text.slice(match.index + match[0].length));
+    if (at && Number(at[1] ?? at[2] ?? at[3]) === line) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 这段没有固定格式的结果里有没有 path 的第 line 行：path:35，或者 Python 堆栈的 "path", line 35 */
+function hasLine(output: string, path: string, line: number): boolean {
+  return pathPattern(path, `(?::|", line )${line}(?!\\d)`).test(output);
+}
+
+/**
+ * 别的工具（aiops）结果里模型看到的部分：和 runAgent 交给模型时一样截短。被截掉的不算查到，截断处被切开的也去掉：
+ * 切在行号里（src/foo.ts:12 后面其实还有个 3）只去掉行号，路径是完整的；切在路径里（src/foo.t、src/a.ts 后面其实是 #v2/b.ts）整个去掉；
+ * 正好切在路径结尾（src/foo.ts 后面是 :123、#L3）路径是完整的，都留着
+ */
+function seenByModel(output: string, limit: number): string {
+  if (output.length <= limit) {
+    return output;
+  }
+  const kept = output.slice(0, limit);
+  // 截断处后面在原文里是路径的结尾（见 PATH_END）：没有切开路径
+  const end = new RegExp(PATH_END, "y");
+  end.lastIndex = limit;
+  if (end.test(output)) {
+    return kept;
+  }
+  // 往前找到被切开的这一段：路径字符、冒号、SOFT_DELIM 字符。这一段开头的 SOFT_DELIM 字符前面不是路径字符，是分界，一起去掉也不影响认路径
+  const part = new RegExp(`${PATH_CHAR}|[:${SOFT_DELIM}]`);
+  let start = limit;
+  while (start > 0 && part.test(output[start - 1])) {
+    start--;
+  }
+  // 冒号是分界，最后一个冒号前面的路径是完整的
+  const colon = kept.lastIndexOf(":");
+  return colon >= start ? kept.slice(0, colon) : kept.slice(0, start);
+}
+
+/** 回答里写的路径和 src/repo.ts 读写文件时一样整理（见 Workspace.relative）：去掉前后的空格和开头的 ./、/，合并多余的 / 和 ./（反斜杠见 codeEvidence） */
+function repoPath(file: string): string {
+  return posix.normalize(file.trim().replace(/^\.?\/+/, ""));
 }
 
 function isCodeTool(name: string): boolean {

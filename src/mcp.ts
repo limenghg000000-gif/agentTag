@@ -2,12 +2,19 @@ import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { type CallToolResult, ErrorCode, McpError, type Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
+import {
+  type CallToolResult,
+  ErrorCode,
+  type GetPromptResult,
+  McpError,
+  type Prompt as RemotePrompt,
+  type Tool as RemoteTool,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
 import { containsSecret } from "./knowledge.js";
 import { RESULT_NOTES } from "./mcp-notes.js";
-import { formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
+import { COMMON_SUFFIX, compactText, formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
 import type { Tool } from "./tools/tool.js";
 
 /** 普通工具的超时。个别工具在配置里单独定，如 aiops 的 diagnose_service 两分钟 */
@@ -15,8 +22,8 @@ export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
 /** 一次任务里同一个 MCP 服务的工具最多调几次，到了就让模型按已有证据回答 */
 export const MAX_MCP_CALLS_PER_TASK = 10;
 /** 一次任务里同一个 MCP 服务的结果一共交给模型多少字。快用完时后面的结果截得更短，免得撑爆上下文 */
-export const MAX_MCP_CHARS_PER_TASK = 150_000;
-/** 总字数快用完或用完时，单个结果至少还给这么多字（加上调用次数的上限，一次任务最多比总字数多出 3 个这么多） */
+export const MAX_MCP_CHARS_PER_TASK = 300_000;
+/** 总字数快用完或用完时，单个结果至少还给这么多字（加上调用次数的上限，一次任务最多比总字数多出 5 个这么多） */
 const MIN_RESULT_CHARS = 6000;
 /** 服务端说「服务繁忙」时隔多久重试，重试几次就有几项 */
 const BUSY_RETRY_MS = [1000, 3000];
@@ -32,6 +39,14 @@ const RETIRE_MS = 3 * 60_000;
 const RESYNC_GAP_MS = 30_000;
 /** 服务端使用说明写进提示词的字数上限 */
 const MAX_INSTRUCTIONS_CHARS = 8000;
+/** 读剧本的工具名（加上服务名前缀，如 aiops_playbook） */
+export const PLAYBOOK_TOOL = "playbook";
+/** 一份剧本交给模型的字数上限 */
+const MAX_PLAYBOOK_CHARS = 40_000;
+/** 一次任务里同一个服务最多读几份剧本（不占查询的调用次数，单独限，免得剧本撑爆上下文） */
+export const MAX_PLAYBOOKS_PER_TASK = 3;
+/** 剧本说明写进提示词的字数上限（每份） */
+const MAX_PLAYBOOK_DESCRIPTION_CHARS = 300;
 
 const BUSY = /服务繁忙|server (is )?busy|too many (concurrent )?requests/i;
 /** 程序调用的报错原文里像有密钥时，报错和审计日志里换成这句 */
@@ -89,6 +104,10 @@ interface ServerState {
   enabled: RemoteTool[];
   /** 服务端的全部工具，程序自己调用（callDirect）时用 */
   catalog: Map<string, RemoteTool>;
+  /** 服务端下发的排查剧本（MCP prompts，只留不用填参数的） */
+  playbooks: RemotePrompt[];
+  /** 剧本清单连续拉失败了几次（工具照常能用，按这个退避重试） */
+  playbookFailures: number;
   instructions?: string;
   /** 飞书这边的补充说明（promptFile 的内容） */
   prompt?: string;
@@ -105,6 +124,8 @@ interface ServerState {
 }
 
 interface TaskBudget {
+  /** 这次任务读过或正在读的剧本：剧本名 → 读的结果。同一轮里并行读同一份时，后一个等前一个 */
+  playbooks: Map<string, Promise<string>>;
   calls: number;
   /** 已经交给模型的字数 */
   chars: number;
@@ -136,6 +157,8 @@ export class McpHub {
       conn: new McpConnection(config, this.logger),
       enabled: [],
       catalog: new Map(),
+      playbooks: [],
+      playbookFailures: 0,
       synced: false,
       syncedAt: 0,
       failures: 0,
@@ -159,12 +182,24 @@ export class McpHub {
     await Promise.all(this.servers.map((server) => server.conn.close()));
   }
 
-  /** 给一个任务用的 MCP 工具，名字带服务名前缀（aiops_diagnose_service） */
+  /** 给一个任务用的 MCP 工具，名字带服务名前缀（aiops_diagnose_service）；服务端下发了剧本的，再加一个读剧本的工具（aiops_playbook） */
   tools(task: McpTaskContext): Tool[] {
     return this.servers.flatMap((server) => {
-      const budget: TaskBudget = { calls: 0, chars: 0, results: new Map() };
-      return server.enabled.map((remote) => this.wrap(server, remote, task, budget));
+      const budget: TaskBudget = { playbooks: new Map(), calls: 0, chars: 0, results: new Map() };
+      const tools = server.enabled.map((remote) => this.wrap(server, remote, task, budget));
+      return server.playbooks.length > 0 ? [...tools, this.playbookTool(server, task, budget)] : tools;
     });
+  }
+
+  /** 这个工具来自哪个 MCP 服务（名字以「服务名_」开头）；不是 MCP 的工具返回 undefined */
+  serverOf(toolName: string): string | undefined {
+    return this.servers.find((server) => toolName.startsWith(`${server.config.name}_`))?.config.name;
+  }
+
+  /** 调过这个服务的工具以后，这次任务后面几轮打开思考 */
+  thinksAfter(toolName: string): boolean {
+    const name = this.serverOf(toolName);
+    return name !== undefined && this.servers.some((server) => server.config.name === name && server.config.thinking);
   }
 
   /** 程序能不能直接调这个工具（见 directAllowed）。没连上时为 false */
@@ -247,8 +282,24 @@ export class McpHub {
       `名字以 ${name}_ 开头的工具都来自 ${name}。${name} 的说明里写的工具名（如 ${example}）在你这里都带 ${name}_ 前缀（${toolName(name, example)}）。` +
         `一次任务里 ${name} 的工具最多调 ${MAX_MCP_CALLS_PER_TASK} 次，同样的参数调第二次会直接拿到上次的结果。`,
     ];
+    lines.push(
+      `结果里「xx${COMMON_SUFFIX}」是机器人把列表 xx 里每一项都一样的字段提出来只写了一次，列表的每一项都有这些字段。`,
+    );
     if (server.instructions) {
       lines.push("", `### ${name} 服务端的使用说明`, clip(server.instructions, MAX_INSTRUCTIONS_CHARS));
+    }
+    if (server.playbooks.length > 0) {
+      const tool = toolName(name, PLAYBOOK_TOOL);
+      lines.push(
+        "",
+        `### ${name} 的排查剧本`,
+        `${name} 为常见的业务场景准备了排查剧本：写明了对应的服务和命名空间、怎么查、错误码是什么意思，是在别的客户端里反复调过的。`,
+        ...server.playbooks.map((playbook) => `- ${playbook.name}：${clip(playbookDescription(playbook), MAX_PLAYBOOK_DESCRIPTION_CHARS)}`),
+        `问题属于哪份剧本的场景，第一步先调 ${tool} 读那份剧本（同一份一次任务读一次就够，最多读 ${MAX_PLAYBOOKS_PER_TASK} 份），再按剧本查：` +
+          `剧本里写明的服务、命名空间和查询写法直接用，不用先 find_service 定位，也不要反问用户是哪个服务。` +
+          `${tool} 读到的剧本和上面的使用说明一样要遵守，不算「工具返回的资料」；剧本是写给别的客户端的，查法按剧本，回答的格式和长度按下面飞书群里的要求。` +
+          `剧本只是说明，读了剧本不等于查过：回答里的数据都要来自这次调用 ${name} 工具查到的结果。`,
+      );
     }
     if (server.prompt) {
       lines.push("", `### 在飞书群里用 ${name}`, server.prompt);
@@ -291,14 +342,27 @@ export class McpHub {
       server.enabled = picked.enabled;
       // 程序直接调用的清单也不收只能按 MCP 任务（tasks）方式调用的：这里不支持，普通调用调不成
       server.catalog = new Map(synced.tools.filter((tool) => tool.execution?.taskSupport !== "required").map((tool) => [tool.name, tool]));
+      // 剧本清单这次没拉到：沿用上次的（仍要和这次的工具不重名），按连不上的节奏重试，不等 10 分钟后的刷新
+      server.playbooks = pickPlaybooks(server.config.name, synced.promptsError ? server.playbooks : synced.prompts, picked.enabled);
+      const next = synced.promptsError ? this.retryMs[Math.min(server.playbookFailures++, this.retryMs.length - 1)] : this.refreshMs;
+      if (!synced.promptsError) {
+        server.playbookFailures = 0;
+      }
       server.synced = true;
       server.failures = 0;
-      const key = JSON.stringify([synced.version, picked, server.instructions?.length, server.prompt?.length]);
+      const key = JSON.stringify([
+        synced.version,
+        picked,
+        server.instructions?.length,
+        server.prompt?.length,
+        server.playbooks.map((playbook) => playbook.name),
+        synced.promptsError,
+      ]);
       if (key !== server.logged) {
         server.logged = key;
-        this.logTools(server, synced, picked);
+        this.logTools(server, synced, picked, next);
       }
-      this.schedule(server, this.refreshMs);
+      this.schedule(server, next);
     } catch (err) {
       if (this.stopped) {
         return;
@@ -324,7 +388,8 @@ export class McpHub {
     }
   }
 
-  private logTools(server: ServerState, synced: SyncResult, picked: PickedTools): void {
+  /** retry 是下一次刷新在多少毫秒以后（剧本清单拉失败时提前重试） */
+  private logTools(server: ServerState, synced: SyncResult, picked: PickedTools, retry: number): void {
     const { name } = server.config;
     const url = logUrl(server.config.url);
     const key = `MCP_${name.toUpperCase()}`;
@@ -332,11 +397,20 @@ export class McpHub {
       synced.version,
       server.instructions ? `服务端使用说明 ${server.instructions.length} 字` : "服务端没有下发使用说明",
       server.prompt ? `飞书补充说明 ${server.config.promptFile}` : "",
+      server.playbooks.length > 0 ? `排查剧本 ${server.playbooks.length} 份：${server.playbooks.map((playbook) => playbook.name).join(", ")}` : "",
     ].filter(Boolean);
     this.logger.info(
       `MCP ${name}：已连上 ${url}，服务端 ${synced.tools.length} 个工具，开了 ${picked.enabled.length} 个` +
         `（${extras.join("，")}）：${picked.enabled.map((tool) => tool.name).join(", ") || "无"}`,
     );
+    if (synced.promptsError) {
+      const kept = server.playbooks.length > 0 ? `先沿用上次的 ${server.playbooks.length} 份剧本` : "这期间没有剧本";
+      this.logger.warn(`MCP ${name}：服务端说有剧本（prompts），但拉清单失败：${synced.promptsError}。${kept}，${retry / 1000} 秒后重试`);
+    }
+    const skipped = synced.prompts.filter((prompt) => !server.playbooks.includes(prompt));
+    if (skipped.length > 0) {
+      this.logger.info(`MCP ${name}：${skipped.map((prompt) => prompt.name).join(", ")} 要填参数、重复，或者和工具重名，没当剧本用`);
+    }
     if (picked.notEnabled.length > 0) {
       this.logger.info(`MCP ${name}：服务端还有 ${picked.notEnabled.length} 个工具没开：${picked.notEnabled.join(", ")}（要开就加进 ${key}_TOOLS）`);
     }
@@ -412,6 +486,93 @@ export class McpHub {
         return pending;
       },
     };
+  }
+
+  /**
+   * 读剧本：从服务端取 MCP prompt 的正文。不算调用次数（不查线上），另外限一次任务最多读几份；同一份一次任务里只给一次全文。
+   * 用建工具时的剧本清单，任务进行中清单刷新了也不影响这个任务
+   */
+  private playbookTool(server: ServerState, task: McpTaskContext, budget: TaskBudget): Tool {
+    const { name } = server.config;
+    const playbooks = server.playbooks;
+    const names = playbooks.map((playbook) => playbook.name);
+    return {
+      spec: {
+        name: toolName(name, PLAYBOOK_TOOL),
+        description: `读 ${name} 服务端下发的排查剧本（业务场景对应的服务、查法、错误码表），按剧本去查。可读的剧本：${names.join("、")}`,
+        parameters: {
+          type: "object",
+          properties: { name: { type: "string", enum: names, description: "剧本名" } },
+          required: ["name"],
+        },
+      },
+      instructionsOnly: true,
+      maxOutputChars: MAX_PLAYBOOK_CHARS + 1000,
+      describe: (args) => {
+        const playbook = playbooks.find((item) => item.name === args.name);
+        return `${name} · 读剧本 ${playbook?.title || String(args.name ?? "")}`.trim();
+      },
+      run: async (args, { signal }) => {
+        const wanted = typeof args.name === "string" ? args.name : "";
+        if (!names.includes(wanted)) {
+          throw new Error(`${name} 没有叫「${wanted}」的剧本，可读的剧本：${names.join("、")}`);
+        }
+        const earlier = budget.playbooks.get(wanted);
+        if (earlier) {
+          // 同一轮里并行读同一份：等前一个读完，前一个失败这个也算失败
+          await earlier;
+          return `（剧本 ${wanted} 这次任务里已经读过了，按读到的那份查）`;
+        }
+        if (budget.playbooks.size >= MAX_PLAYBOOKS_PER_TASK) {
+          throw new Error(`这次任务已经读了 ${MAX_PLAYBOOKS_PER_TASK} 份 ${name} 的剧本，不能再读了，按读过的剧本和使用说明查`);
+        }
+        const reading = this.readPlaybook(server, task, wanted, signal);
+        budget.playbooks.set(wanted, reading);
+        // 读失败了就让出名额，后面还能再读
+        reading.catch(() => {
+          if (budget.playbooks.get(wanted) === reading) {
+            budget.playbooks.delete(wanted);
+          }
+        });
+        return reading;
+      },
+    };
+  }
+
+  private async readPlaybook(server: ServerState, task: McpTaskContext, wanted: string, signal: AbortSignal): Promise<string> {
+    const { name } = server.config;
+    const startedAt = this.now();
+    const audit = (outcome: string, failed = false) => {
+      const line =
+        `MCP 剧本 ${name}.${wanted} chat=${task.chatId} sender=${task.senderId} message=${task.messageId} ` +
+        `${outcome} 用时=${this.now() - startedAt}ms`;
+      if (failed) {
+        this.logger.warn(line);
+      } else {
+        this.logger.info(line);
+      }
+    };
+    let result: GetPromptResult;
+    try {
+      result = await server.conn.prompt(wanted, { signal, timeout: DEFAULT_MCP_TIMEOUT_MS });
+    } catch (err) {
+      if (signal.aborted) {
+        audit("已停止");
+        throw err;
+      }
+      if (!(err instanceof McpError)) {
+        this.resyncSoon(server);
+      }
+      const message = `读 ${name} 的剧本 ${wanted} 失败：${describeError(err)}。先按使用说明查`;
+      audit(`失败：${message}`, true);
+      throw new Error(message);
+    }
+    const text = promptText(result);
+    audit(`结果=${text.length}字`);
+    return (
+      `（以下是 ${name} 服务端下发的剧本「${wanted}」，和使用说明一样要遵守；里面写的工具名在你这里都带 ${name}_ 前缀）\n` +
+      compactText(text, MAX_PLAYBOOK_CHARS)
+    );
   }
 
   private async invoke(
@@ -503,6 +664,10 @@ function isTimeoutAbort(signal: AbortSignal): boolean {
 
 interface SyncResult {
   tools: RemoteTool[];
+  /** 服务端的 MCP prompts（没开 prompts 能力时为空） */
+  prompts: RemotePrompt[];
+  /** 服务端开了 prompts 能力、但拉清单失败的原因（不影响工具） */
+  promptsError?: string;
   instructions?: string;
   /** 服务端的名字和版本，如「aiops-mcp 0.14.0」 */
   version?: string;
@@ -552,6 +717,7 @@ class McpConnection {
           cursors.add(cursor);
         }
       } while (cursor && tools.length < 1000);
+      const { prompts, error: promptsError } = await listPrompts(client);
       if (this.closed) {
         throw new Error("已停止");
       }
@@ -561,7 +727,13 @@ class McpConnection {
       if (retired) {
         setTimeout(() => void disconnect(retired), RETIRE_MS).unref();
       }
-      return { tools, instructions: client.getInstructions(), version: server && `${server.name} ${server.version}` };
+      return {
+        tools,
+        prompts,
+        ...(promptsError ? { promptsError } : {}),
+        instructions: client.getInstructions(),
+        version: server && `${server.name} ${server.version}`,
+      };
     } catch (err) {
       void disconnect({ client, transport });
       throw err;
@@ -575,6 +747,13 @@ class McpConnection {
     return (await this.current.client.callTool({ name, arguments: args }, undefined, options)) as CallToolResult;
   }
 
+  async prompt(name: string, options: { signal: AbortSignal; timeout: number }): Promise<GetPromptResult> {
+    if (!this.current) {
+      throw new Error(`还没连上 ${this.config.name}`);
+    }
+    return this.current.client.getPrompt({ name }, options);
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     const current = this.current;
@@ -583,6 +762,70 @@ class McpConnection {
       await disconnect(current);
     }
   }
+}
+
+/** 服务端开了 prompts 能力就拉剧本清单；拉不到不影响工具，只是这次不用剧本 */
+async function listPrompts(client: Client): Promise<{ prompts: RemotePrompt[]; error?: string }> {
+  if (!client.getServerCapabilities()?.prompts) {
+    return { prompts: [] };
+  }
+  const prompts: RemotePrompt[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  try {
+    do {
+      const page = await client.listPrompts(cursor ? { cursor } : undefined, { timeout: CONNECT_TIMEOUT_MS });
+      prompts.push(...page.prompts);
+      cursor = page.nextCursor;
+      if (cursor && cursors.has(cursor)) {
+        throw new Error("剧本清单分页出错（重复返回同一页）");
+      }
+      if (cursor) {
+        cursors.add(cursor);
+      }
+    } while (cursor && prompts.length < 200);
+  } catch (err) {
+    return { prompts: [], error: describeError(err) };
+  }
+  return { prompts };
+}
+
+/** 当剧本用的 prompts：不用填参数的（有必填参数的没法替模型填），名字换成工具参数后不和工具重名 */
+function pickPlaybooks(server: string, prompts: readonly RemotePrompt[], enabled: readonly RemoteTool[]): RemotePrompt[] {
+  const clash = enabled.some((tool) => toolName(server, tool.name) === toolName(server, PLAYBOOK_TOOL));
+  if (clash) {
+    return [];
+  }
+  const seen = new Set<string>();
+  return prompts.filter((prompt) => {
+    if (prompt.arguments?.some((arg) => arg.required) || seen.has(prompt.name)) {
+      return false;
+    }
+    seen.add(prompt.name);
+    return true;
+  });
+}
+
+function playbookDescription(prompt: RemotePrompt): string {
+  return [prompt.title, prompt.description].filter(Boolean).join("：").replace(/\s+/g, " ").trim() || "（服务端没写说明）";
+}
+
+/** 剧本正文：各条消息里的文字连起来；图片等只说明类型 */
+function promptText(result: GetPromptResult): string {
+  const parts = result.messages.map((message) => {
+    const content = message.content;
+    switch (content.type) {
+      case "text":
+        return content.text;
+      case "resource":
+        return "text" in content.resource && typeof content.resource.text === "string" ? content.resource.text : `[资源 ${content.resource.uri}，没有展示]`;
+      case "resource_link":
+        return `[资源 ${content.name} ${content.uri}]`;
+      default:
+        return `[${content.type}，没有展示]`;
+    }
+  });
+  return parts.filter((part) => part.trim()).join("\n\n") || "（剧本是空的）";
 }
 
 /** 断开一个连接。有状态的服务端（返回了会话 ID）先发 DELETE 结束会话，免得每次刷新都在服务端留下一个；aiops 无状态，直接关 */

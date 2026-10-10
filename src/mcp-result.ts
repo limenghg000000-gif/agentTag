@@ -1,7 +1,10 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-/** 单个 MCP 工具结果交给模型前的字数上限 */
-export const MCP_RESULT_LIMIT = 24_000;
+/**
+ * 单个 MCP 工具结果交给模型前的字数上限。原先是 2.4 万字：2026-10-10 转链排查时 aiops 的 query_logs 返回 50 条日志（每条都带一遍 labels），
+ * 截到只剩最新一秒的 12 条，模型照着这 12 条就下了结论；同样的查询 Open WebUI 原样交给模型。现在每项都一样的字段只写一次，上限也放宽
+ */
+export const MCP_RESULT_LIMIT = 60_000;
 
 /** 顶层有这些字段就挪到最前，结论和提示先给模型看（比如诊断报告的 summary 原本在最后） */
 const LEAD_KEYS = [
@@ -38,10 +41,17 @@ function levelAt(scale: number): Level {
   };
 }
 
+/** 列表里至少有几项才把每项都一样的字段提出来 */
+const HOIST_MIN_ITEMS = 3;
+/** 提出来的字段 JSON 至少这么长才提，短的不值得改结构 */
+const HOIST_MIN_CHARS = 24;
+/** 提出来的字段放在列表前面，键名是列表的键名加上这个后缀 */
+export const COMMON_SUFFIX = "（每项都有的字段）";
+
 /**
  * 把一次 MCP 工具调用的结果整理成交给模型的文本。对任何 MCP 服务都适用，不认具体字段的含义：
- * JSON 去掉缩进，summary、warning、hint 这类字段挪到最前；还超长时按字段截短长字符串和长列表，省略处注明省略了多少；
- * 不是 JSON 的长文本保留开头和结尾。
+ * JSON 去掉缩进，summary、warning、hint 这类字段挪到最前；对象列表里每一项都一样的字段只写一次（不丢信息）；
+ * 还超长时按字段截短长字符串和长列表，省略处注明省略了多少；不是 JSON 的长文本保留开头和结尾。
  */
 export function formatToolResult(result: CallToolResult, limit = MCP_RESULT_LIMIT): string {
   const parts = (result.content ?? []).map(describeContent).filter((part) => part.trim());
@@ -70,7 +80,7 @@ export function compactText(text: string, limit = MCP_RESULT_LIMIT): string {
   if (json === undefined) {
     return trimPlain(trimmed, limit);
   }
-  const value = leadFirst(json);
+  const value = hoistCommon(leadFirst(json));
   const flat = JSON.stringify(value);
   if (flat.length <= limit) {
     return flat;
@@ -134,24 +144,121 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 重新拼对象用没有原型的空对象：结果里可能有 __proto__、toString 这类键名，
+ * 赋给普通对象会被当成原型、用 in 判断时会被继承来的属性冒充，都会丢字段
+ */
+function record(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
 function leadFirst(value: unknown): unknown {
   if (!isPlainObject(value)) {
     return value;
   }
-  const lead = LEAD_KEYS.filter((key) => key in value);
+  const lead = LEAD_KEYS.filter((key) => Object.hasOwn(value, key));
   if (lead.length === 0) {
     return value;
   }
-  const out: Record<string, unknown> = {};
+  const out = record();
   for (const key of lead) {
     out[key] = value[key];
   }
   for (const [key, item] of Object.entries(value)) {
-    if (!(key in out)) {
+    if (!Object.hasOwn(out, key)) {
       out[key] = item;
     }
   }
   return out;
+}
+
+/**
+ * 对象列表里每一项都一样的字段提到列表前面，只写一次：键名是「列表名（每项都有的字段）」，各项里去掉这些字段。
+ * 值是对象的字段（比如 query_logs 每条日志都带一遍的 labels）只提各项都一样的那部分键，剩下不一样的（pod）留在各项里。
+ * 只处理对象里的列表（要有键名放提出来的字段），列表里的值先递归处理
+ */
+function hoistCommon(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(hoistCommon);
+  }
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  const out = record();
+  for (const [key, item] of Object.entries(value)) {
+    const inner = hoistCommon(item);
+    const split = Array.isArray(inner) ? splitCommon(inner) : undefined;
+    if (split && !Object.hasOwn(value, `${key}${COMMON_SUFFIX}`)) {
+      out[`${key}${COMMON_SUFFIX}`] = split.common;
+      out[key] = split.items;
+    } else {
+      out[key] = inner;
+    }
+  }
+  return out;
+}
+
+function splitCommon(list: unknown[]): { common: Record<string, unknown>; items: Record<string, unknown>[] } | undefined {
+  if (list.length < HOIST_MIN_ITEMS || !list.every(isPlainObject)) {
+    return undefined;
+  }
+  const items = list as Record<string, unknown>[];
+  const [first, ...rest] = items;
+  const common = record();
+  const sub = new Map<string, string[]>();
+  const own = (item: Record<string, unknown>, key: string) => (Object.hasOwn(item, key) ? item[key] : undefined);
+  for (const [field, sample] of Object.entries(first)) {
+    const flat = JSON.stringify(sample);
+    if (rest.every((item) => Object.hasOwn(item, field) && JSON.stringify(item[field]) === flat)) {
+      common[field] = sample;
+      continue;
+    }
+    if (isPlainObject(sample) && rest.every((item) => isPlainObject(own(item, field)))) {
+      const keys = Object.entries(sample)
+        .filter(([key, v]) =>
+          rest.every((item) => {
+            const inner = item[field] as Record<string, unknown>;
+            return Object.hasOwn(inner, key) && JSON.stringify(inner[key]) === JSON.stringify(v);
+          }),
+        )
+        .map(([key]) => key);
+      if (keys.length > 0) {
+        const part = record();
+        for (const key of keys) {
+          part[key] = sample[key];
+        }
+        common[field] = part;
+        sub.set(field, keys);
+      }
+    }
+  }
+  if (Object.keys(common).length === 0 || JSON.stringify(common).length < HOIST_MIN_CHARS) {
+    return undefined;
+  }
+  const strip = (item: Record<string, unknown>) => {
+    const kept = record();
+    for (const [field, v] of Object.entries(item)) {
+      const keys = sub.get(field);
+      if (Object.hasOwn(common, field) && !keys) {
+        continue;
+      }
+      if (keys && isPlainObject(v)) {
+        const left = record();
+        for (const [key, inner] of Object.entries(v)) {
+          if (!keys.includes(key)) {
+            left[key] = inner;
+          }
+        }
+        if (Object.keys(left).length > 0) {
+          kept[field] = left;
+        }
+        continue;
+      }
+      kept[field] = v;
+    }
+    return kept;
+  };
+  return { common, items: items.map(strip) };
 }
 
 function shrink(value: unknown, level: Level, top = false): unknown {
@@ -163,7 +270,7 @@ function shrink(value: unknown, level: Level, top = false): unknown {
     return value.length > level.items ? [...kept, `…（省略后面 ${value.length - level.items} 项，共 ${value.length} 项）`] : kept;
   }
   if (isPlainObject(value)) {
-    const out: Record<string, unknown> = {};
+    const out = record();
     for (const [key, item] of Object.entries(value)) {
       const lead = top && LEAD_KEYS.includes(key);
       out[key] = shrink(item, lead ? { text: Math.max(level.text, LEAD_LEVEL.text), items: Math.max(level.items, LEAD_LEVEL.items) } : level);

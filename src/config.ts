@@ -73,6 +73,8 @@ export interface McpServerConfig {
   timeoutsMs: Readonly<Record<string, number>>;
   /** 进度卡片上的步骤名，如 diagnose_service → 诊断；没列的显示工具原名 */
   labels: Readonly<Record<string, string>>;
+  /** 调过这个服务的工具（包括读剧本）以后，这次任务后面几轮打开思考（MCP_<名字>_THINKING，默认 on） */
+  thinking: boolean;
 }
 
 /** 阿里云百炼 OpenAI 兼容接口（华北2 北京）。百炼建议换成业务空间专属域名，见 README。 */
@@ -314,6 +316,10 @@ function loadMcpConfig(env: NodeJS.ProcessEnv): McpServerConfig[] {
     }
     const prompt = env[`${key}_PROMPT`]?.trim();
     const token = env[`${key}_TOKEN`]?.trim();
+    const thinking = env[`${key}_THINKING`]?.trim().toLowerCase();
+    if (thinking && thinking !== "on" && thinking !== "off") {
+      throw new Error(`${key}_THINKING 只能是 on 或 off，当前为 ${env[`${key}_THINKING`]}`);
+    }
     return {
       name,
       url: parsed.href,
@@ -323,6 +329,7 @@ function loadMcpConfig(env: NodeJS.ProcessEnv): McpServerConfig[] {
       promptFile: prompt ? path.resolve(prompt) : path.join(PROMPTS_DIR, `${name}.md`),
       timeoutsMs: defaults?.timeoutsMs ?? {},
       labels: defaults?.labels ?? {},
+      thinking: thinking !== "off",
     };
   });
 }
