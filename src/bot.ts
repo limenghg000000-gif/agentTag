@@ -471,8 +471,11 @@ const SPACED_CODE_PATHS = new RegExp(
 const BRANCH_BEFORE = /(?:(?:切到|切换到)\s*(?:分支)?|\bcheckout|\b(?:on|to)\s+branch|(?:分支|\bbranch)\s*[:：])\s*[`'"“「*]*$/i;
 const BRANCH_AFTER =
   /^[`'"”」*]*\s*(?:(?:分支|branch\b)(?=\s*(?:$|@|上|[，。、；：！？,;:?）)」』"'`*]|[.!](?!\w)))|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
-/** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
-const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
+/**
+ * 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行；
+ * 中间可以隔着 Markdown 的收尾符号：`src/foo.ts`:99、**src/foo.ts**:99、「src/foo.ts」第 99 行
+ */
+const LINE_AFTER_PATH = /^[`*_'"”」』]*(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
 /** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */
 const COMMIT_REFS = /(?:@|\bcommit\b|提交|版本)\s*[:：]?\s*[`'"]?((?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40})(?![0-9a-z])/gi;
 

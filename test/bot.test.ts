@@ -1325,6 +1325,14 @@ test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号�
   assert.equal(seen("internal/logic/order.go", 88), true);
   assert.equal(seen("internal/logic/order.go", 8), false);
   assert.equal(seen("src/other.ts"), false);
+  // 行号写在反引号、加粗、引号外面的，照样按行认
+  for (const answer of ["见 `src/app.ts`:60", "见 **src/app.ts**:60", "见 `src/app.ts`#L60", "见 `src/app.ts` 第 60 行", "见「src/app.ts」第 60 行"]) {
+    assert.deepEqual(unseenCodeCitations(answer, seen), [{ text: "src/app.ts:60", located: true }], answer);
+  }
+  assert.deepEqual(unseenCodeCitations("见 `src/app.ts`:35", seen), []);
+  // 收尾符号后面不是行号的，只是路径
+  assert.deepEqual(unseenCodeCitations("见 `src/app.ts`，`src/other.ts`:3", seen), [{ text: "src/other.ts:3", located: true }]);
+  assert.deepEqual(unseenCodeCitations("见 `src/app.ts`：入口", seen), []);
 });
 
 test("代码引用的路径要整段对上，改文件记下的行也认", () => {
@@ -1405,6 +1413,7 @@ test("代码引用：反引号里带空格的路径按整段认，命令里的�
   for (const cite of ["src/my files/app.ts：2", "src/my files/app.ts#L2", "src/my files/app.ts 第 2 行", "src/my files/app.ts 的第 2 行"]) {
     assert.deepEqual(unseenCodeCitations(`在 \`${cite}\``, suffix), [{ text: "src/my files/app.ts:2", located: true }], cite);
   }
+  assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts`:2", suffix), [{ text: "src/my files/app.ts:2", located: true }]);
   // 换行不算：代码块的语言名和下一行的路径（```ts 换行 files/app.ts:2）不是一个路径
   assert.deepEqual(unseenCodeCitations("```ts\nfiles/app.ts:2\n```", suffix), []);
   // 整段里带 @、+、! 的一样按整段认
@@ -1613,16 +1622,23 @@ test("调过代码工具还编出仓库里没有的文件：打回重做，重�
     assert.deepEqual(outer.replies, [blockedCodeAnswer(repos)], repos.join());
   }
   // 照着复述要连行号一起：问的是第 10 行（或者没写行号），回答写的是第 99 行，不算复述
-  const otherLine = "`src/legacy/user.ts:99` 初始化配置";
-  for (const question of ["src/legacy/user.ts 第 10 行是干嘛的", "src/legacy/user.ts 是干嘛的"]) {
-    const moved = await ask([otherLine, otherLine], { question, tool: "code_read_file" });
-    assert.deepEqual(moved.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], question);
+  for (const otherLine of ["`src/legacy/user.ts:99` 初始化配置", "`src/legacy/user.ts`:99 初始化配置", "**src/legacy/user.ts**:99 初始化配置"]) {
+    for (const question of ["src/legacy/user.ts 第 10 行是干嘛的", "src/legacy/user.ts 是干嘛的"]) {
+      const moved = await ask([otherLine, otherLine], { question, tool: "code_read_file" });
+      assert.deepEqual(moved.replies, [blockedCodeAnswer(["ai/aiops-mcp", "ai/agent-tag"])], `${question} / ${otherLine}`);
+    }
   }
   const sameLine = await ask(["`src/legacy/user.ts:10` 读不到", "`src/legacy/user.ts:10` 读不到"], {
     question: "src/legacy/user.ts:10 是干嘛的",
     tool: "code_read_file",
   });
   assert.deepEqual(sameLine.replies, ["`src/legacy/user.ts:10` 读不到"]);
+  // 群成员把行号写在反引号外面（`src/legacy/user.ts`:10），一样是问的第 10 行
+  const askedOutside = await ask(["`src/legacy/user.ts:10` 读不到", "`src/legacy/user.ts:10` 读不到"], {
+    question: "`src/legacy/user.ts`:10 是干嘛的",
+    tool: "code_read_file",
+  });
+  assert.deepEqual(askedOutside.replies, ["`src/legacy/user.ts:10` 读不到"]);
 
   // 读失败、没搜到以后照样讲这个文件写了什么，或者自己猜的路径读失败了还写着：打回重做，重做后还这么写就不发出
   for (const [claim, tool] of [
