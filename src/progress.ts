@@ -32,7 +32,7 @@ export interface ProgressState {
 /** 卡片上最多列出几步，更早的合成一行 */
 const MAX_VISIBLE_STEPS = 12;
 /** 进行中只显示最新一段思考，最多这么多字 */
-export const LIVE_THOUGHT_CHARS = 800;
+const LIVE_THOUGHT_CHARS = 800;
 /** 结束后折叠面板里每段思考最多这么多字 */
 const MAX_THOUGHT_CHARS = 1500;
 /** 飞书卡片最大 30 KB，带样式的标签展开后比请求体还长，留些余量；超了就从最早的一段思考开始去掉正文 */
@@ -125,13 +125,23 @@ function roundLabel(thought: ProgressThought): string {
 
 /** 太长时留开头一小段和结尾（想到最后决定做什么），中间省略。按字符切，不把 emoji 切成两半 */
 function clip(text: string, max: number): string {
+  const ends = clipEnds(text, max);
+  return ends ? `${ends[0]}\n…（中间省略 ${Array.from(text).length - max} 字）…\n${ends[1]}` : text;
+}
+
+/** 太长时只留开头三分之一和结尾三分之二；不长时返回 undefined */
+function clipEnds(text: string, max: number): [string, string] | undefined {
   const chars = Array.from(text);
   if (chars.length <= max) {
-    return text;
+    return undefined;
   }
   const head = Math.floor(max / 3);
-  const tail = max - head;
-  return `${chars.slice(0, head).join("")}\n…（中间省略 ${chars.length - max} 字）…\n${chars.slice(chars.length - tail).join("")}`;
+  return [chars.slice(0, head).join(""), chars.slice(chars.length - (max - head)).join("")];
+}
+
+/** 进度卡片上「最新的思考」实际显示的那部分文字（不含中间省略的标记） */
+export function visibleThought(text: string): string {
+  return clipEnds(text, LIVE_THOUGHT_CHARS)?.join("\n") ?? text;
 }
 
 /** 折叠面板渲染不了时（比如飞书客户端太旧导致更新失败）用的简单版本 */

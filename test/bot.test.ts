@@ -31,7 +31,7 @@ import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
-import { STOP_ACTION } from "../src/progress.js";
+import { STOP_ACTION, visibleThought } from "../src/progress.js";
 import { TaskRegistry } from "../src/tasks.js";
 import { type CodeLocation, type Tool, type ToolContext, ToolError, ToolOutputBuilder } from "../src/tools/tool.js";
 
@@ -709,6 +709,22 @@ test("writtenInEnglish：认英文行文里的虚词，中文思考里夹着日�
   for (const text of chinese) {
     assert.equal(writtenInEnglish(text), false, text);
   }
+});
+
+test("writtenInEnglish 配 visibleThought：只看卡片上显示的开头和结尾，先去掉代码块再截，长消息也不卡", () => {
+  const chineseOpening = "先看日志里这次转链请求的完整过程，确认主链路在哪一步失败，再看同款推荐兜底。".repeat(20);
+  const englishTail = " Wait, the log shows the request went through. Let me look at the caller, then I should check the fix.".repeat(5);
+  assert.equal(writtenInEnglish(chineseOpening + englishTail), false);
+  assert.equal(writtenInEnglish(chineseOpening + englishTail, visibleThought), true);
+
+  const comment = "  // we need to check the token, then retry so the caller should not see it\n";
+  const quotedCode = `调用方是这样写的：\n\`\`\`go\n${comment.repeat(30)}\`\`\`\n${"所以先看 token 是怎么取的，再看重试逻辑有没有吞掉报错。".repeat(4)}`;
+  assert.equal(writtenInEnglish(quotedCode, visibleThought), false);
+
+  const started = Date.now();
+  askedInChinese("6".repeat(150_000));
+  writtenInEnglish("a".repeat(150_000));
+  assert.ok(Date.now() - started < 500, `用时 ${Date.now() - started}ms`);
 });
 
 test("askedInChinese：有汉字，或者没有英文提问的常用词就按中文；@ 的名字、链接、告警里的 key=value 不看；日文、韩文不算", () => {
