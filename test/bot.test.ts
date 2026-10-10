@@ -1313,6 +1313,7 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
       { tool: "aiops_query_logs", output: "Error: boom\n    at f (/app/node_modules/.pnpm/@acme+web@1.0.0/node_modules/@acme/web/lib/handler.js:7:3)" },
       { tool: "aiops_query_logs", output: "caller=vendor/svc@v1.2.3/internal/repo/order.go:9" },
       { tool: "aiops_query_logs", output: "at vendor/pkg@src/glued.ts:10 and vendor/pkg+lib/glued.go:3 and mod/!x!lib/glued.py:4" },
+      { tool: "aiops_query_logs", output: "loaded src/tail.ts@v2 and src/tail.go+x, then failed in src/end.ts!" },
     ],
   );
   // 结果里只有 src/index.tsx、pkg/mysrc/util.ts、src/app.ts.map、pkg/src/nested.ts，不能认 src/index.ts、src/util.ts、src/app.ts、src/nested.ts
@@ -1340,6 +1341,10 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   assert.equal(seen("src/glued.ts", 10), false);
   assert.equal(seen("lib/glued.go", 3), false);
   assert.equal(seen("lib/glued.py", 4), false);
+  // 后面紧挨着 @、+ 的也不是这个文件；句末的叹号是标点
+  assert.equal(seen("src/tail.ts"), false);
+  assert.equal(seen("src/tail.go"), false);
+  assert.equal(seen("src/end.ts"), true);
   // 提交号可以只写前几位，不能在查到的后面再编几位
   const commit = codeEvidence([], [found("code_search", [{ commit: "3f2a1c9d8e7b" }])]);
   assert.equal(commit("3f2a1c9"), true);

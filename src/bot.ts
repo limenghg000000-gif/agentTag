@@ -642,7 +642,8 @@ const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
  * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
  */
 const PATH_START = "(?:(?<!" + PATH_CHAR + ")|(?<=(?:^|[\\s\"'`(（=])/(?:[^\\s/\"'`()（）<>]+/)*)|(?<=(?:^|[\\s\"'`(（=])\\./))";
-const PATH_END = "(?![\\w/-]|\\.\\w)";
+/** 路径后面不能紧挨着路径字符（src/a.ts@v2 不是 src/a.ts），句号、叹号是标点；和回答里认路径（CODE_PATHS）一样 */
+const PATH_END = "(?![\\w/@+~-]|[.!]\\w)";
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
