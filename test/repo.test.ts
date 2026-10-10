@@ -691,6 +691,21 @@ test("GitLab 查提交历史：只按说明里的词时用搜索接口，带文�
   );
   assert.equal(fellBack.scanned, 3);
   assert.equal(fallbackUrls[1], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=100");
+  // 没开高级搜索时搜索接口把几个词当一句话找，搜不到；搜索出错（5xx）也一样：再列出最近的提交按词筛
+  for (const search of [new Response("[]", { status: 200 }), new Response("{}", { status: 500 })]) {
+    const phraseUrls: string[] = [];
+    const phrase = createGitLabHost("https://lab.corp", "glpat-x", (async (url: string) => {
+      phraseUrls.push(url);
+      return url.includes("/search?") ? search : new Response(JSON.stringify(commits), { status: 200 });
+    }) as unknown as typeof fetch);
+    const words = await phrase.searchCommits!("golang/appservice", { ref: "master", query: "c.tb.cn 转链", limit: 10 });
+    assert.deepEqual(
+      words.commits.map((c) => c.sha.slice(0, 9)),
+      ["4a677c0a4", "1bfb19b1a"],
+    );
+    assert.equal(words.scanned, 3);
+    assert.equal(phraseUrls[1], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=100");
+  }
   const missing = createGitLabHost("https://lab.corp", "glpat-x", (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch);
   await assert.rejects(missing.searchCommits!("golang/appservice", { ref: "nope", limit: 10 }), /GitLab 查提交历史失败（HTTP 404）：找不到项目或分支/);
 });
@@ -704,7 +719,7 @@ test("GitHub 查提交历史：列出这个分支的提交再按说明筛", asyn
         {
           sha: "aaaaaaaa11111111111111111111111111111111",
           html_url: "https://github.com/o/r/commit/aaaaaaaa",
-          commit: { message: "fix: retry on 429\n\ndetails", author: { name: "张三", date: "2026-10-01T00:00:00Z" } },
+          commit: { message: "fix: retry on 429\n\ndetails", author: { name: "张三", date: "2026-10-01T00:00:00Z" }, committer: { date: "2026-10-10T00:00:00Z" } },
         },
         { sha: "bbbbbbbb22222222222222222222222222222222", commit: { message: "docs", author: { name: "李四", date: "2026-10-02T00:00:00Z" } } },
       ]),
@@ -718,7 +733,8 @@ test("GitHub 查提交历史：列出这个分支的提交再按说明筛", asyn
         sha: "aaaaaaaa11111111111111111111111111111111",
         title: "fix: retry on 429",
         message: "fix: retry on 429\n\ndetails",
-        date: "2026-10-01T00:00:00Z",
+        // 合进分支的时间，不是写的时间
+        date: "2026-10-10T00:00:00Z",
         author: "张三",
         url: "https://github.com/o/r/commit/aaaaaaaa",
       },
@@ -769,6 +785,14 @@ test("代码工具 code_log：查当前分支的提交历史，列出的提交�
     "ai/aiops-mcp 的 aiops 分支上说明里有「topIds」的提交一个都没找到（只翻了最近 100 个提交，更早的没看，可以加 since 或换个词再查）。",
   );
   assert.deepEqual(queries[1], { ref: "aiops", query: "topIds", path: undefined, since: undefined, limit: 30 });
+  // 分支名和别的代码工具一样整理；没写时区的时间按北京时间
+  await tools.code_log.run({ branch: "origin/aiops", since: "2026-10-10 09:00" }, { signal });
+  assert.equal(queries[2].ref, "aiops");
+  assert.equal(queries[2].since, "2026-10-10T01:00:00.000Z");
+  await tools.code_log.run({ since: "2026-10-1" }, { signal });
+  assert.equal(queries[3].since, "2026-09-30T16:00:00.000Z");
+  await tools.code_log.run({ since: "2026-10-10T09:00:00Z" }, { signal });
+  assert.equal(queries[4].since, "2026-10-10T09:00:00.000Z");
   await assert.rejects(tools.code_log.run({ since: "上周" }, { signal }), /since 要写成 2026-10-01 这样的日期/);
   await assert.rejects(tools.code_log.run({ path: "../etc/passwd" }, { signal }), /路径要在仓库里面/);
   // 平台没有查提交的接口时直说
@@ -805,6 +829,9 @@ test("读代码只要了一小段：扩到所在的整个函数，同一个函�
   // 跨了两个函数、不在函数里、函数太长：照要的给
   assert.equal(enclosingFunction(go, 4, 7, "services/goods/tb.go"), undefined);
   assert.equal(enclosingFunction(go, 18, 18, "services/goods/tb.go"), undefined);
+  // 一行写完的函数下面的几行（var 块）不在它里面
+  const oneLine = ["package x", "func (x X) Len() int { return len(x) }", "", "var m = map[string]int{", '\t"a": 1,', "}"];
+  assert.equal(enclosingFunction(oneLine, 5, 5, "x.go"), undefined);
   const long = ["func Long() {", ...Array.from({ length: 300 }, () => "\tx++"), "}"];
   assert.equal(enclosingFunction(long, 10, 12, "a.go"), undefined);
   // PHP：认 function 关键字，往下数大括号，字符串里的括号不算
@@ -838,4 +865,8 @@ test("读代码只要了一小段：扩到所在的整个函数，同一个函�
   assert.deepEqual(enclosingFunction(wide, 90, 92, "a.go"), { start: 1, end: 102, name: "Wide" });
   const narrow = numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", wide.join("\n"), 90, 92);
   assert.match(narrow.text, /^a\.go（共 102 行，下面是第 90 到 92 行，要看后面用 start_line=93）\n90\| \tx88 /);
+  // 不到一次能读的 2 万字、但超过工具结果交给模型的上限（1.6 万字）减去说明：也不扩，扩了后半段会被截掉
+  const mid = ["func Mid() {", ...Array.from({ length: 100 }, (_, i) => `\tx${i} := "${"y".repeat(130)}"`), "}"];
+  assert.ok(mid.join("\n").length > 14_000 && mid.join("\n").length < 20_000);
+  assert.match(numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", mid.join("\n"), 90, 92).text, /下面是第 90 到 92 行，/);
 });

@@ -1461,6 +1461,9 @@ test("排查过以后把问题推到服务之外的结论，打回一次让模�
     "原因在淘宝平台限制",
     // 同一句里有举例的分句，说结论的分句照样算
     "示例链接被淘宝拒绝，不是服务故障",
+    // 「是否已部署」「不确定是否已修复」不是修好了
+    "淘宝返回链接不符合规范，线上是否已部署未确认，建议让用户重新分享。",
+    "不确定是否已修复，建议让用户重新分享。",
   ];
   for (const answer of deflecting) {
     assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
@@ -2370,18 +2373,42 @@ test("aiops 按线上版本读的代码：结果里的永久链接写明了仓�
   assert.equal(cut("services/goods/tb.go"), true);
   assert.equal(cut("services/goods/tb.go", 100), false);
   assert.equal(cut("services/goods/tb.go", 2440), false);
+  // 内容被截短、链接还在：链接标了一段的，只认结果里真有「行号|」的那几行
+  const shortened = codeEvidence([], [
+    {
+      tool: "aiops_get_repo_file",
+      output: compactText(JSON.stringify({ permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go#L2000-2600", content: "2000| func a() {\n2001| \tb()…（省略 30000 字）" })),
+      links: true,
+    },
+  ]);
+  assert.equal(shortened("services/goods/tb.go", 2001), true);
+  assert.equal(shortened("services/goods/tb.go", 2550), false);
+  assert.equal(shortened("services/goods/tb.go"), true);
+  // 日志里别的网址路径里有 blob 的不是代码；链接后面紧跟着中文标点、英文句号的，标点不算进路径
+  const other = codeEvidence([], [
+    {
+      tool: "aiops_query_logs",
+      output: "GET https://oss.example.com/img/blob/abc1234/avatar/user.php 200；修复见 https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go，见上；另见 https://lab.yuebai.site/golang/appservice/-/blob/master/README.md.",
+      links: true,
+    },
+  ]);
+  assert.equal(other("avatar/user.php"), false);
+  assert.equal(other("services/goods/tb.go"), true);
+  assert.equal(other("README.md"), true);
+  assert.equal(other("da67e31c4"), true);
 
   // GitHub 的写法（#L10-L20）、路径里转义过的字、结果又被 JSON 转义了一层
   const hits = JSON.stringify({
     line: JSON.stringify({
       hits: [
-        { path: "src/a.ts", permalink: "https://github.com/o/r/blob/0123abcd/src/a.ts#L10-L20" },
+        { path: "src/a.ts", permalink: "https://github.com/o/r/blob/0123abcd/src/a.ts#L10-L20", snippet: "14| a();\n15| b();" },
         { path: "src/中.ts", permalink: "https://github.com/o/r/blob/main/src/%E4%B8%AD.ts#L3" },
       ],
     }),
   });
   const github = codeEvidence([], [{ tool: "aiops_search_code", output: hits, links: true }]);
   assert.equal(github("src/a.ts", 15), true);
+  assert.equal(github("src/a.ts", 16), false);
   assert.equal(github("src/a.ts", 21), false);
   assert.equal(github("src/中.ts", 3), true);
   assert.equal(github("0123abcd"), true);
@@ -2397,6 +2424,34 @@ test("aiops 按线上版本读的代码：结果里的永久链接写明了仓�
     reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen)("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])),
     UNVERIFIED_CODE_ANSWER,
   );
+});
+
+test("日志里别的网址路径里有 blob 的不算读过代码：提到仓库的回答照样要先读代码", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const logs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => "2026-10-10 10:00:00 GET https://oss.example.com/img/blob/abc1234/avatar/user.php 500",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "golang/appservice 的 avatar/user.php 处理头像时出错", finish: "stop" },
+    { text: "日志里 10:00 有 500，还没读代码，确认不了是哪一行", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["golang/appservice"],
+    mcp: { names: ["aiops"], tools: () => [logs], prompt: () => undefined },
+  });
+  await handle(message("golang/appservice 的头像接口为什么报 500"));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["avatar/user.php"]) });
 });
 
 test("用 aiops 按线上版本读了代码、回答提到仓库和行号：不再打回让模型用代码工具重读一遍", async () => {

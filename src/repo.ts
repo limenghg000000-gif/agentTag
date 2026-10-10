@@ -221,36 +221,45 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
             per_page: String(query.query ? LOG_SCAN_COMMITS : query.limit),
           })}`,
         );
+      const read = async (res: Response) => {
+        if (!res.ok) {
+          const hint = res.status === 404 ? "：找不到项目或分支" : res.status === 401 || res.status === 403 ? "：令牌没有读这个项目的权限" : "";
+          throw new RepoError(`GitLab 查提交历史失败（HTTP ${res.status}）${hint}`);
+        }
+        const body = (await res.json()) as {
+          id: string;
+          title?: string;
+          message?: string;
+          author_name?: string;
+          committed_date?: string;
+          created_at?: string;
+          web_url?: string;
+        }[];
+        const commits = body.map((c) => ({
+          sha: c.id,
+          title: c.title ?? firstLine(c.message),
+          message: c.message,
+          date: c.committed_date ?? c.created_at,
+          author: c.author_name,
+          url: c.web_url,
+        }));
+        return { commits: pickCommits(commits, query), scanned: body.length };
+      };
       let res = bySearch
         ? await get(`${project}/search?${new URLSearchParams({ scope: "commits", search: query.query ?? "", ref: query.ref, per_page: String(LOG_SCAN_COMMITS) })}`)
         : await list();
-      // 自建 GitLab 可能关了提交搜索（400、403）：退回列出最近的提交再按说明筛
-      if (bySearch && (res.status === 400 || res.status === 403)) {
+      // 自建 GitLab 可能关了提交搜索（400、403），搜的词里有正则符号时也可能出错（5xx）：退回列出最近的提交再按说明筛
+      if (bySearch && (res.status === 400 || res.status === 403 || res.status >= 500)) {
         bySearch = false;
         res = await list();
       }
-      if (!res.ok) {
-        const hint = res.status === 404 ? "：找不到项目或分支" : res.status === 401 || res.status === 403 ? "：令牌没有读这个项目的权限" : "";
-        throw new RepoError(`GitLab 查提交历史失败（HTTP ${res.status}）${hint}`);
+      let found = await read(res);
+      // 没开高级搜索时，搜索接口把整串当成一句话找（git log --grep），几个词不挨着就搜不到：搜不到再列出最近的提交按词筛一遍
+      if (bySearch && found.commits.length === 0) {
+        bySearch = false;
+        found = await read(await list());
       }
-      const body = (await res.json()) as {
-        id: string;
-        title?: string;
-        message?: string;
-        author_name?: string;
-        committed_date?: string;
-        created_at?: string;
-        web_url?: string;
-      }[];
-      const commits = body.map((c) => ({
-        sha: c.id,
-        title: c.title ?? firstLine(c.message),
-        message: c.message,
-        date: c.committed_date ?? c.created_at,
-        author: c.author_name,
-        url: c.web_url,
-      }));
-      return { commits: pickCommits(commits, query), ...(bySearch || !query.query ? {} : { scanned: body.length }) };
+      return { commits: found.commits, ...(bySearch || !query.query ? {} : { scanned: found.scanned }) };
     },
   };
 }
@@ -342,12 +351,17 @@ export function createGitHubHost(token: string, fetchImpl: typeof fetch = fetch)
       if (!res.ok) {
         throw new RepoError(`GitHub 查提交历史失败（HTTP ${res.status}）${res.status === 404 || res.status === 422 ? "：找不到仓库或分支" : ""}`);
       }
-      const body = (await res.json()) as { sha: string; html_url?: string; commit?: { message?: string; author?: { name?: string; date?: string } } }[];
+      const body = (await res.json()) as {
+        sha: string;
+        html_url?: string;
+        commit?: { message?: string; author?: { name?: string; date?: string }; committer?: { date?: string } };
+      }[];
       const commits = body.map((c) => ({
         sha: c.sha,
         title: firstLine(c.commit?.message),
         message: c.commit?.message,
-        date: c.commit?.author?.date,
+        // 提交进这个分支的时间（rebase、cherry-pick 过的提交，写的时间可能早得多），和 GitLab 的 committed_date 一样
+        date: c.commit?.committer?.date ?? c.commit?.author?.date,
         author: c.commit?.author?.name,
         url: c.html_url,
       }));
@@ -628,7 +642,7 @@ export class Workspace {
     if (!this.host.searchCommits) {
       throw new RepoError(`${this.host.name} 还不支持查提交历史`);
     }
-    const ref = options.branch?.trim() || this.baseBranch;
+    const ref = options.branch?.trim() ? branchName(options.branch) : this.baseBranch;
     const query = options.query?.trim() || undefined;
     const rel = options.path?.trim() ? this.relative(options.path) : undefined;
     const file = rel === "." ? undefined : rel;
@@ -1297,8 +1311,8 @@ export function numberedLines(
   // 只要了一小段：扩到所在的整个函数，同一个函数里后面的分支也看得到
   const asked = { from, to };
   const fn = end ? enclosingFunction(lines, from, to, file) : undefined;
-  // 整个函数一次给不完（超过 MAX_READ_CHARS 字）就不扩：不然从函数头开始给，没到要的那几行就截断了
-  if (fn && (fn.start < from || fn.end > to) && lastShown(lines, fn.start, fn.end) === fn.end) {
+  // 整个函数一次给不完就不扩：不然从函数头开始给，没到要的那几行就截断了
+  if (fn && (fn.start < from || fn.end > to) && lastShown(lines, fn.start, fn.end, MAX_FUNCTION_CHARS) === fn.end) {
     from = fn.start;
     to = fn.end;
   }
@@ -1318,13 +1332,13 @@ export function numberedLines(
   return out.build();
 }
 
-/** 从 from 往下给到 to，不超过 MAX_READ_CHARS 字时给到哪一行（至少给一行） */
-function lastShown(lines: readonly string[], from: number, to: number): number {
+/** 从 from 往下给到 to，不超过 budget 字时给到哪一行（至少给一行） */
+function lastShown(lines: readonly string[], from: number, to: number, budget = MAX_READ_CHARS): number {
   let size = 0;
   let last = from - 1;
   for (let i = from; i <= to; i++) {
     const length = `${i}| ${lines[i - 1]}`.length;
-    if (size + length > MAX_READ_CHARS && i > from) {
+    if (size + length > budget && i > from) {
       break;
     }
     size += length + 1;
@@ -1335,6 +1349,11 @@ function lastShown(lines: readonly string[], from: number, to: number): number {
 
 /** 只要了一小段时，所在的函数最多这么多行就整段给出；更长的照要的给 */
 const MAX_FUNCTION_LINES = 250;
+/**
+ * 扩到整个函数时，整段最多这么多字。要比工具结果交给模型前的上限（MAX_TOOL_OUTPUT_CHARS，1.6 万字）小，留出结果开头的说明：
+ * 超过那个上限的部分模型看不到，扩出来的函数后半段、连同要的那几行就被截掉了
+ */
+const MAX_FUNCTION_CHARS = 12_000;
 /** 往上找函数头最多找多少行 */
 const MAX_FUNCTION_LOOKBACK = 400;
 /** PHP、JS/TS 用 function 关键字的函数头 */
@@ -1358,6 +1377,10 @@ export function enclosingFunction(lines: readonly string[], from: number, to: nu
         return undefined;
       }
       const header = /^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/.exec(line);
+      // 一行写完的函数（func (x X) Len() int { return len(x) }）：在它下面的几行不在它里面
+      if (header && /\{.*\}\s*(?:\/\/.*)?$/.test(line)) {
+        return undefined;
+      }
       if (header) {
         const close = lines.findIndex((text, index) => index >= i - 1 && /^}/.test(text));
         return close >= 0 ? fit(i, close + 1, header[1]) : undefined;
@@ -1447,10 +1470,14 @@ function oneLine(text: string): string {
   return line.length > 60 ? `${line.slice(0, 60)}…` : line;
 }
 
-/** 模型写的日期（2026-10-01，或带时间的）换成平台接口要的 ISO 时间；只写日期的按北京时间当天 0 点 */
+/** 模型写的日期（2026-10-01，或带时间的）换成平台接口要的 ISO 时间；没写时区的按北京时间，只写日期的是当天 0 点 */
 function isoDate(text: string): string {
   const value = text.trim();
-  const date = new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00+08:00` : value);
+  const local = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(value);
+  const pad = (part: string | undefined) => (part ?? "0").padStart(2, "0");
+  const date = new Date(
+    local ? `${local[1]}-${pad(local[2])}-${pad(local[3])}T${pad(local[4])}:${pad(local[5])}:${pad(local[6])}+08:00` : value,
+  );
   if (Number.isNaN(date.getTime())) {
     throw new RepoError(`since 要写成 2026-10-01 这样的日期：${text}`);
   }

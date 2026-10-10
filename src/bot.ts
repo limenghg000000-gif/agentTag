@@ -826,8 +826,10 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
       if (output !== undefined) {
         const forms = unescapedForms(output);
         facts.text.push(...forms);
+        const marked = links ? markedLines(forms) : new Set<number>();
         for (const link of links ? new Map(forms.flatMap(codeLinks).map((link) => [JSON.stringify(link), link])).values() : []) {
-          facts.files.set(link.path, [...(facts.files.get(link.path) ?? []), { repo: link.repo, lines: link.lines }]);
+          const shown = shownLines(link.lines, marked).map((lines) => ({ repo: link.repo, lines }));
+          facts.files.set(link.path, [...(facts.files.get(link.path) ?? []), { repo: link.repo }, ...shown]);
           if (COMMIT_ID.test(link.ref)) {
             facts.commits.push({ repo: link.repo, sha: link.ref.toLowerCase() });
           }
@@ -877,10 +879,12 @@ function unescapedForms(output: string): string[] {
  * aiops 的代码工具（get_repo_file、search_code）按线上版本读到代码时都附这样的链接，写明了读的是哪个仓库、哪个提交、哪个文件的哪几行；
  * 结果里的行号写在代码前面（「2468| ...」），回答里的「tb.go:2468」在原文里找不到，只能按链接认。
  * 认链接不认字段名：aiops 的代码工具还在开发，字段可能改，链接是代码平台自己的格式。
- * 结果太长被截短时，链接可能断在中间（…#L2440-24…（省略 2 字））：后面紧跟着省略号、字母数字的不认，断在行号里的只认文件
+ * 结果太长被截短时，链接可能断在中间（…#L2440-24…（省略 2 字））：后面紧跟着省略号、字母数字的不认，断在行号里的只认文件。
+ * 只认 GitLab 的 /-/blob/ 和 github.com 的 /blob/：日志里别的网址（对象存储 https://oss…/img/blob/abc1234/a.php、用户分享的链接）路径里也可能有 blob，不是代码。
+ * 路径里不收中文标点和 , ; { }：链接后面紧跟着「，见上」时不能把标点算进路径
  */
 const CODE_LINK =
-  /https?:\/\/[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/(?:-\/)?blob\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/g;
+  /https?:\/\/(?:github\.com\/([^\s/"'`<>()（）…\\#?]+\/[^\s/"'`<>()（）…\\#?]+)\/blob|[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/-\/blob)\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?，。；：、！？「」『』【】,;{}]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/g;
 
 interface CodeLink {
   /** 仓库（小写） */
@@ -895,10 +899,12 @@ interface CodeLink {
 function codeLinks(text: string): CodeLink[] {
   const links: CodeLink[] = [];
   for (const match of text.matchAll(CODE_LINK)) {
-    const [, repo, ref, file, from, to] = match;
+    const [, github, gitlab, ref, file, from, to] = match;
+    const repo = github ?? gitlab;
     let decoded: string;
     try {
-      decoded = decodeURIComponent(file);
+      // 链接写在句末时，后面的英文句号、冒号不是路径的一部分（中文标点本来就不收进路径）
+      decoded = decodeURIComponent(from === undefined ? file.replace(/[.:!]+$/, "") : file);
     } catch {
       continue;
     }
@@ -913,6 +919,40 @@ function codeLinks(text: string): CodeLink[] {
     });
   }
   return links;
+}
+
+/** 结果里带行号的代码行（aiops 读代码、搜代码的结果写成「2468| ...」）的行号。转义过的结果（\n2468|）在还原过的那份里认 */
+function markedLines(forms: readonly string[]): Set<number> {
+  const marked = new Set<number>();
+  for (const form of forms) {
+    for (const match of form.matchAll(/(?<![\w.])(\d{1,7})\|/g)) {
+      marked.add(Number(match[1]));
+    }
+  }
+  return marked;
+}
+
+/**
+ * 链接标的行里，哪些算查到了：只标一行的（搜代码命中的那一行）算；标了一段的（读文件），只算结果里真有「行号|」的那几行，连着的并成一段。
+ * 结果太长时长字段会被截短（见 compactText），链接还在、后面的代码已经没了：那些行模型没看到
+ */
+function shownLines(lines: [number, number] | undefined, marked: ReadonlySet<number>): Array<[number, number]> {
+  if (lines === undefined) {
+    return [];
+  }
+  if (lines[0] === lines[1]) {
+    return [lines];
+  }
+  const runs: Array<[number, number]> = [];
+  for (const line of [...marked].filter((n) => n >= lines[0] && n <= lines[1]).sort((a, b) => a - b)) {
+    const last = runs.at(-1);
+    if (last && last[1] === line - 1) {
+      last[1] = line;
+    } else {
+      runs.push([line, line]);
+    }
+  }
+  return runs;
 }
 
 /** 这次结果里有 MCP 服务读代码给的永久链接：算读过代码 */
@@ -1152,7 +1192,8 @@ const DEFLECTING = new RegExp(
 const USER_REDO = new RegExp(
   String.raw`(?<!(?:不|(?<![特识区个类级])别|勿|无需|无须|没必要)(?:应该?|能|可以?|该|要|用|必|需|建议)?|而不是|不要再|别再|不再|避免)(?:建议|请|让|需要|可以|引导|提示|告诉|通知)用户[^。；;！!？?\n]{0,20}?(?:重新|再次|重试|再试|换个|换一个|换成|改用)`,
 );
-const FIXED = /已经?(?:修复|修好|改好|部署|上线|发版)|等[^，,。；;]{0,8}(?:修复|修好|改好|部署|上线|发版)/;
+// 「是否已部署」「不确定是否已修复」不是说修好了
+const FIXED = /(?<!是否|是不是|有没有|有无|不确定)已经?(?:修复|修好|改好|部署|上线|发版)|等[^，,。；;]{0,8}(?:修复|修好|改好|部署|上线|发版)/;
 
 /** 回答里有没有把问题推出去的结论。问句（「系统本身没有问题吗？」）、举例的分句（「比如回答『不是服务故障』之前…」）不算 */
 function deflects(answer: string): boolean {
@@ -1173,7 +1214,7 @@ export const DEFLECTED_ANSWER =
   "1. 拿失败请求的特征（链接的域名和关键参数、报错原文、错误码）搜代码，从入口沿主流程看这种输入在哪一步被处理或拒绝，不要只看报错附近的几行；\n" +
   "2. 日志是当时线上那一版打的，代码可能已经改过：用 code_log 按同样的特征查最近的提交，看是不是已经修过，能查线上版本就查，查不了就在结论里写明看的是哪个分支的代码；\n" +
   "3. 结论分开写：当时为什么失败（带日志时间）、现在的代码处不处理、线上部署了没有。\n" +
-  "核对完还是服务之外的问题，就照常这么写，并写明核对了哪些代码（只写这次用代码工具查到的文件和行号）；读不到相关代码就直说没法确认是不是服务的问题。不要提这段检查。";
+  "核对完还是服务之外的问题，就照常这么写，并写明核对了哪些代码（只写这次实际读到、搜到的文件和行号）；读不到相关代码就直说没法确认是不是服务的问题。不要提这段检查。";
 
 /**
  * 排查线上问题（调过 aiops 这类 MCP 服务的工具，成没成功都算）以后，回答把问题推到服务之外时，打回一次，让模型先拿代码核对。
