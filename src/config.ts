@@ -44,6 +44,8 @@ export interface Config {
   };
   /** 通过 MCP 接入的服务（MCP_SERVERS），没配时为空数组 */
   mcp: McpServerConfig[];
+  /** 进度卡片上显示模型每轮的思考（SHOW_THINKING，默认 on） */
+  showThinking: boolean;
 }
 
 export interface McpServerConfig {
@@ -196,6 +198,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`MODEL_THINKING_BUDGET 要填不小于 0 的整数（0 表示不限），当前为 ${env.MODEL_THINKING_BUDGET}`);
   }
 
+  const showThinking = (env.SHOW_THINKING?.trim() || "on").toLowerCase();
+  if (showThinking !== "on" && showThinking !== "off") {
+    throw new Error(`SHOW_THINKING 只能是 on 或 off，当前为 ${env.SHOW_THINKING}`);
+  }
+
   const code = loadCodeConfig(env);
   const writers = (env.WRITE_ALLOWED_USERS ?? "").split(",").map((id) => id.trim()).filter(Boolean);
   const badWriter = writers.find((id) => !/^ou_[\w-]+$/.test(id));
@@ -237,6 +244,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : undefined,
     code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
     mcp: loadMcpConfig(env),
+    showThinking: showThinking === "on",
   };
 }
 

@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CardUpdater, formatDuration, type ProgressState, renderPlainProgressCard, renderProgressCard, STOP_ACTION } from "../src/progress.js";
+import {
+  CardUpdater,
+  formatDuration,
+  MAX_CARD_BYTES,
+  type ProgressState,
+  renderPlainProgressCard,
+  renderProgressCard,
+  STOP_ACTION,
+} from "../src/progress.js";
 
 const state = (extra: Partial<ProgressState>): ProgressState => ({ phase: "thinking", steps: [], startedAt: 0, ...extra });
 const text = (card: object) => JSON.stringify(card);
@@ -39,6 +47,86 @@ test("步骤太多时只列出最近的", () => {
   const steps = Array.from({ length: 15 }, (_, i) => ({ id: `${i}`, label: `第 ${i} 步`, status: "ok" as const }));
   const card = renderProgressCard(state({ steps }), "t") as any;
   assert.match(card.body.elements[0].content, /前面还有 3 步\n✔️ 第 3 步/);
+});
+
+test("进行中在步骤下面显示最新一段思考：标明是草稿，太长时留开头和结尾，尖括号转义", () => {
+  const long = `开头${"想".repeat(2000)}<font>结尾：先按链接 ID 搜 req_id`;
+  const card = renderProgressCard(
+    state({
+      steps: [{ id: "1", label: "aiops · 查日志", status: "running" }],
+      thoughts: [
+        { round: 1, ms: 2000, text: "旧的思考", at: 0 },
+        { round: 2, ms: 4000, text: long, at: 1 },
+      ],
+    }),
+    "t",
+  ) as any;
+
+  const [, thought, button] = card.body.elements;
+  assert.equal(button.tag, "button");
+  assert.equal(thought.text_size, "notation");
+  assert.match(thought.content, /^\*\*💭 最新的思考（第 2 轮，4 秒，草稿，结论以回答为准）\*\*\n开头想+\n…（中间省略 \d+ 字）…\n想+&lt;font&gt;结尾：先按链接 ID 搜 req_id$/);
+  assert.ok(thought.content.length < 1000);
+  assert.doesNotMatch(text(card), /旧的思考/);
+
+  // 按字符切：emoji 不会被切成两半
+  const emoji = renderProgressCard(state({ thoughts: [{ round: 1, ms: 0, text: "😀".repeat(900), at: 0 }] }), "t") as any;
+  assert.doesNotMatch(text(emoji), /\\ud83d/i);
+  assert.match(emoji.body.elements[1].content, /中间省略 100 字/);
+});
+
+test("结束后思考和步骤按先后折进面板：每段思考后面跟着这一轮调的工具，步骤全部列出", () => {
+  const steps = Array.from({ length: 14 }, (_, i) => ({ id: `${i}`, label: `第 ${i} 步`, status: "ok" as const }));
+  const card = renderProgressCard(
+    state({
+      phase: "done",
+      endedAt: 9000,
+      steps,
+      thoughts: [
+        { round: 2, ms: 3000, text: "按 req_id 再查一次", at: 1 },
+        { round: 3, ms: 5000, text: "可以下结论了", at: 14 },
+      ],
+    }),
+    "t",
+  ) as any;
+
+  const [panel] = card.body.elements;
+  assert.equal(card.body.elements.length, 1);
+  assert.equal(panel.tag, "collapsible_panel");
+  assert.equal(panel.expanded, false);
+  assert.equal(panel.header.title.content, "✅ 已完成 · 14 步 · 用时 9 秒");
+  assert.deepEqual(
+    panel.elements.map((e: any) => e.content.split("\n")[0]),
+    ["💭 是模型的思考草稿，里面的猜测没有核实，结论以回答为准", "✔️ 第 0 步", "**💭 第 2 轮，3 秒**", "✔️ 第 1 步", "**💭 第 3 轮，5 秒**"],
+  );
+  assert.equal(panel.elements[3].content.split("\n").length, 13);
+  assert.doesNotMatch(text(card), /前面还有/);
+});
+
+test("没有步骤、只有思考时也折进面板", () => {
+  const card = renderProgressCard(state({ phase: "done", endedAt: 1000, thoughts: [{ round: 1, ms: 1000, text: "想好了", at: 0 }] }), "t") as any;
+  assert.equal(card.body.elements[0].tag, "collapsible_panel");
+  assert.match(text(card), /想好了/);
+});
+
+test("卡片超过大小上限时，从最早的一段思考开始去掉正文，只留标题", () => {
+  const thoughts = Array.from({ length: 8 }, (_, i) => ({ round: i + 1, ms: 1000, text: `第${i + 1}段${"思".repeat(1500)}`, at: i }));
+  const steps = thoughts.map((_, i) => ({ id: `${i}`, label: `第 ${i} 步`, status: "ok" as const }));
+  const card = renderProgressCard(state({ phase: "done", endedAt: 1000, steps, thoughts }), "t") as any;
+
+  assert.ok(Buffer.byteLength(text(card)) <= MAX_CARD_BYTES);
+  const contents: string[] = card.body.elements[0].elements.map((e: any) => e.content);
+  assert.ok(contents.includes("**💭 第 1 轮，1 秒**\n（太长，卡片里放不下）"));
+  assert.ok(contents.some((c) => c.startsWith("**💭 第 8 轮，1 秒**\n第8段思")));
+});
+
+test("思考正文全去掉还放不下时（步骤太多）不显示思考，和以前一样只列最近的步骤", () => {
+  const steps = Array.from({ length: 200 }, (_, i) => ({ id: `${i}`, label: `aiops · 查日志 ${"x".repeat(150)} ${i}`, status: "ok" as const }));
+  const card = renderProgressCard(state({ phase: "done", endedAt: 1000, steps, thoughts: [{ round: 1, ms: 1000, text: "想", at: 0 }] }), "t") as any;
+
+  assert.ok(Buffer.byteLength(text(card)) <= MAX_CARD_BYTES);
+  assert.doesNotMatch(text(card), /💭/);
+  assert.match(card.body.elements[0].elements[0].content, /^…前面还有 188 步/);
 });
 
 test("formatDuration", () => {

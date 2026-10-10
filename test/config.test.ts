@@ -177,6 +177,13 @@ test("MODEL_THINKING_BUDGET 限制思考长度：百炼默认 4000，0 表示不
   assert.throws(() => loadConfig({ ...base, MODEL_THINKING_BUDGET: "-1" }), /MODEL_THINKING_BUDGET/);
 });
 
+test("SHOW_THINKING：默认在进度卡片上显示思考，off 关掉，写错时报错", () => {
+  assert.equal(loadConfig(base).showThinking, true);
+  assert.equal(loadConfig({ ...base, SHOW_THINKING: " OFF " }).showThinking, false);
+  assert.equal(loadConfig({ ...base, SHOW_THINKING: "on" }).showThinking, true);
+  assert.throws(() => loadConfig({ ...base, SHOW_THINKING: "yes" }), /SHOW_THINKING 只能是 on 或 off/);
+});
+
 test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开第一批 19 个只读工具，令牌从 MCP_AIOPS_TOKEN 读", () => {
   assert.deepEqual(loadConfig(base).mcp, []);
   const [aiops, ...rest] = loadConfig({ ...base, MCP_SERVERS: " aiops=https://aiops.example.com/mcp ", MCP_AIOPS_TOKEN: " t0k " }).mcp;

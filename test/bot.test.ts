@@ -17,12 +17,14 @@ import {
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
   unseenCodeAnswer,
+  unverifiedCodeAnswer,
   unseenCodeCitations,
   unverifiedOpsAnswer,
 } from "../src/bot.js";
 import type { ImageRef, ThreadContext } from "../src/history.js";
 import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
+import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION } from "../src/progress.js";
 import { TaskRegistry } from "../src/tasks.js";
@@ -600,6 +602,35 @@ test("日志里记下每轮模型调用和每次工具调用的用时", async ()
   assert.match(text, /模型第2轮 message=om_1 用时=\d+ms 输入=1600 输出=300 → 给出回答/);
 });
 
+test("模型返回了思考内容时，进度卡片上显示最新一段，结束后和步骤一起折叠；SHOW_THINKING=off 时不显示", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const script = (): ChatResult[] => [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }], reasoning: "先查资料 A" },
+    { text: "总结", finish: "stop", reasoning: "资料够了，可以总结" },
+  ];
+
+  let results = script();
+  const shown = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool] });
+  await shown.handle(message("查一下"));
+  assert.ok(shown.updates.some((u) => /最新的思考（第 1 轮.*先查资料 A/.test(cardText(u.card))));
+  const final = shown.updates.at(-1)!.card;
+  assert.deepEqual(
+    final.body.elements[0].elements.map((e: any) => e.content.split("\n").at(-1)),
+    ["💭 是模型的思考草稿，里面的猜测没有核实，结论以回答为准", "先查资料 A", "✔️ 查资料 A", "资料够了，可以总结"],
+  );
+  assert.deepEqual(markdowns(shown.sent), ["总结"]);
+
+  results = script();
+  const hidden = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool], showThinking: false });
+  await hidden.handle(message("查一下"));
+  assert.ok(hidden.updates.length > 0);
+  assert.ok(hidden.updates.every((u) => !/💭|先查资料/.test(cardText(u.card))));
+});
+
 test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const { handle } = setup({ model });
@@ -821,7 +852,7 @@ test("有代码工具时，没读代码就说仓库内容的回答被打回去�
   await handle(message("在 ai/aiops-mcp 里搜一下 k8s 相关的 tool 在哪里定义？"));
 
   assert.equal(requests.length, 3);
-  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["src/index.ts:30"]) });
   assert.deepEqual(markdowns(sent), ["定义在 `internal/k8s/tools.go:12`"]);
   assert.match(warnings.join("\n"), /回答没通过检查，已让模型重做 message=om_1/);
 });
@@ -904,7 +935,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
 
   const guessed = await ask(["panic 在 `internal/logic/order.go:88`，是 `internal/svc/context.go` 里没初始化", "panic 在 `internal/logic/order.go:88`"]);
   assert.equal(guessed.requests.length, 3);
-  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["internal/svc/context.go"]) });
   assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
 
   // 截断以前的部分照样算，截断处被切开的「user.go:12」不算（其实是 123 行）
@@ -932,6 +963,60 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   const beforeAnchor = await ask(["报错在 `src/index.ts` 里"], "aiops_get_anchor");
   assert.equal(beforeAnchor.requests.length, 2);
   assert.deepEqual(beforeAnchor.replies, ["报错在 `src/index.ts` 里"]);
+});
+
+test("aiops 结果里转义过的报错堆栈（\\n\\t/build/...）照样算查到：2026-10-10 转链排查的回答就是因为认不出被拦下的", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  // Go 的报错堆栈：日志行里的换行、缩进是 JSON 转义（\n\t），整理 aiops 结果时又 JSON.stringify 一次，路径前面紧挨着 \t 的 t
+  const stack =
+    "get similar goods by channel fail\nyuebai-api-app/services/goods.(*TaoBao).similarGoods\n\t/build/services/goods/tb.go:8220 +0x5c4\n" +
+    "yuebai-api-app/controller/convert.ConvertLink\n\t/build/controller/convert/convert_link.go:98 +0x1b4";
+  const once = compactText(JSON.stringify({ logs: [{ msg: stack }] }));
+  // 日志行本身是 JSON 字符串、aiops 原样返回时转义两层
+  const twice = compactText(JSON.stringify({ logs: [{ line: JSON.stringify({ level: "error", content: stack }) }] }));
+  assert.match(once, /\\n\\t\/build\/services\/goods\/tb\.go:8220/);
+  assert.match(twice, /\\\\n\\\\t\/build\/services\/goods\/tb\.go:8220/);
+  const ask = async (output: string, answers: string[]) => {
+    const queryLogs: Tool = {
+      spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+      describe: () => "aiops · 查日志",
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["ai/aiops-mcp"],
+      mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+    });
+    await handle(message("用户反馈转链失败，排查一下"));
+    return { requests, replies: markdowns(sent) };
+  };
+
+  const answer = "同款推荐失败，报在 `services/goods/tb.go:8220`，是从 `controller/convert/convert_link.go:98` 调进来的";
+  for (const output of [once, twice]) {
+    const cited = await ask(output, [answer]);
+    assert.equal(cited.requests.length, 2);
+    assert.deepEqual(cited.replies, [answer]);
+  }
+  // 还原转义只是认出分界：行号对不上、堆栈里没有的文件照样打回
+  for (const output of [once, twice]) {
+    const wrong = await ask(output, ["报在 `services/goods/tb.go:8221`，`services/goods/jd.go` 也有", "报在 `services/goods/tb.go:8220`"]);
+    assert.equal(wrong.requests.length, 3);
+    assert.deepEqual(wrong.requests[2].messages.at(-1), {
+      role: "user",
+      content: unverifiedCodeAnswer(["services/goods/tb.go:8221", "services/goods/jd.go"]),
+    });
+    assert.deepEqual(wrong.replies, ["报在 `services/goods/tb.go:8220`"]);
+  }
 });
 
 test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
@@ -1081,6 +1166,122 @@ test("打回重做以后还是没查证就给出线上数据：不发出去，�
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
   assert.deepEqual(context.remembered, [{ question: "[群成员] prod", answer: BLOCKED_OPS_ANSWER }]);
+});
+
+test("回答照抄了剧本里的核对记录（提交号）：打回时点名是哪处，去掉以后照常发出", async () => {
+  // 2026-10-10 复测转链：剧本开头写着「按 golang/appservice 的 master，提交 fa02ac8 核对」，模型抄进了回答，整条被拦
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":["淘口令生成：链接不符合规范"]}',
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "淘宝返回「淘口令生成：链接不符合规范」（错误码表按 appservice 提交 fa02ac8 核对）", finish: "stop" },
+    { text: "淘宝返回「淘口令生成：链接不符合规范」", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [{ ...queryLogs, spec: { ...queryLogs.spec, name: "code_search" } }],
+    codeRepos: ["ai/aiops-mcp"],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("转链失败了，排查一下"));
+
+  assert.equal(requests.length, 3);
+  assert.match(requests[2].messages.at(-1)!.content, /引用了这些代码位置：fa02ac8.*去掉这几处，其余查到的结论照常写/);
+  assert.deepEqual(markdowns(sent), ["淘宝返回「淘口令生成：链接不符合规范」"]);
+});
+
+test("回答被模型服务的内容审核拦下时，卡片上前面几轮的思考也去掉", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }], reasoning: "先查资料 A" },
+    { text: "", finish: "filtered" },
+  ];
+  const { sent, updates, handle } = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool] });
+
+  await handle(message("查一下"));
+
+  assert.match(markdowns(sent)[0], /内容审核拦下/);
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|先查资料 A/);
+});
+
+test("回答因为没查证被拦下时，卡片上的思考也去掉", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const results: ChatResult[] = [
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop", reasoning: "不用查，直接说没有报错" },
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop", reasoning: "还是不查了" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { sent, updates, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("prod"));
+
+  assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
+  // 被打回的那一轮的思考：打回紧跟在这一轮后面，卡片还没推出去就去掉了，过程中也不显示
+  assert.ok(!updates.some((u) => /不用查/.test(cardText(u.card))));
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|不用查|还是不查了/);
+});
+
+test("引用了没查到的代码位置被拦下时，卡片上的思考也去掉", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }], reasoning: "搜一下 user.go" },
+    { text: "问题在 src/user.go:99", finish: "stop", reasoning: "多半是 src/user.go:99" },
+    { text: "问题在 src/user.go:99", finish: "stop", reasoning: "就是 src/user.go:99" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { sent, updates, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|user\.go/);
+});
+
+test("打回重做以后通过了：被打回的那一轮的思考不留在卡片上，前面几轮的照样留", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const ask = async (rejected: ChatResult) => {
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }], reasoning: "搜一下用户服务" },
+      rejected,
+      { text: "代码里没搜到相关的位置", finish: "stop", reasoning: "查不到就直说" },
+    ];
+    const { model } = fakeModel(() => results.shift()!);
+    const { sent, updates, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+    await handle(message("user 服务为什么报错"));
+    return { replies: markdowns(sent), updates };
+  };
+
+  const { replies, updates } = await ask({ text: "问题在 src/user.go:99", finish: "stop", reasoning: "多半是 src/user.go:99" });
+  assert.deepEqual(replies, ["代码里没搜到相关的位置"]);
+  const final = cardText(updates.at(-1)!.card);
+  assert.match(final, /搜一下用户服务/);
+  assert.match(final, /查不到就直说/);
+  assert.doesNotMatch(final, /多半是/);
+  // 被打回的那一轮没有思考时，不去动前面几轮的
+  const quiet = await ask({ text: "问题在 src/user.go:99", finish: "stop" });
+  assert.deepEqual(quiet.replies, ["代码里没搜到相关的位置"]);
+  assert.match(cardText(quiet.updates.at(-1)!.card), /搜一下用户服务[\s\S]*查不到就直说/);
 });
 
 test("打回重做以后没再给线上数据、查过工具、或者是整理之前内容的请求时，照常发出", async () => {
@@ -1255,7 +1456,7 @@ test("代码和线上数据两项检查都没过时，重做时一起告诉模�
 
   await handle(message("order-api 为什么重启"));
 
-  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${unverifiedOpsAnswer(["aiops"])}` });
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${unverifiedCodeAnswer(["internal/logic/order.go:88"])}\n${unverifiedOpsAnswer(["aiops"])}` });
 });
 
 test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {
@@ -1267,7 +1468,7 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   assert.equal(byShortName("Go", new Set()), UNVERIFIED_CODE_ANSWER);
   // 没提仓库，但回答里写了代码文件路径
   const general = reviewCodeAnswer("这个服务怎么启动", ["ai/aiops-mcp"]);
-  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), unverifiedCodeAnswer(["cmd/server/main.go"]));
   // 和仓库无关的一般问题不管
   assert.equal(general("用 systemctl 重启，配置写在 tsconfig.json", new Set()), undefined);
   assert.equal(reviewCodeAnswer("今天周几", ["ai/api"])("周一，api 文档见 https://x.com/a/b.js", new Set()), undefined);
@@ -1276,9 +1477,9 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   const seen = (path: string) => logs.some((output) => output.includes(path));
   const crash = reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"], seen);
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["aiops_get_pod_logs"])), undefined);
-  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), unverifiedCodeAnswer(["cmd/server/main.go"]));
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["web_search"])), undefined);
-  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), UNVERIFIED_CODE_ANSWER);
+  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), unverifiedCodeAnswer(["internal/logic/order.go:88"]));
   // 问的是配置的仓库，结果里出现过路径也不算读过代码
   const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], () => true);
   assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
@@ -1375,8 +1576,11 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
     unseenCodeAnswer(["yuebai-user/rpc/internal/logic/common/userlogic.go:35", "2c6a7d9"], ["ai/aiops-mcp", "ai/agent-tag"]),
   );
   assert.match(unseenCodeAnswer(["a/b.go"], ["ai/aiops-mcp"]), /工具结果里都没有出现：a\/b\.go.*直说读不到这部分代码/);
+  // 没调代码工具时也点名是哪几处，模型才知道去掉什么；只是提到了仓库、没写具体位置时还是原来那段
+  assert.match(unverifiedCodeAnswer(["fa02ac8", "a/b.go:3"]), /引用了这些代码位置：fa02ac8、a\/b\.go:3.*剧本和使用说明里写的文件路径、提交号.*去掉这几处，其余查到的结论照常写/);
+  assert.equal(unverifiedCodeAnswer([]), UNVERIFIED_CODE_ANSWER);
   // 群成员在提问里写的路径不算查证：没读代码就照着提问讲，照样要先读
-  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), UNVERIFIED_CODE_ANSWER);
+  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), unverifiedCodeAnswer(["src/foo.ts:10"]));
 });
 
 test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行", () => {

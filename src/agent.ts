@@ -10,8 +10,8 @@ const LAST_ROUND_NOTE = "工具调用次数已经用完了。请根据上面已�
 const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限（${MAX_TOOL_ROUNDS} 轮工具调用），我先停在这里。可以把任务拆小一点再交给我。`;
 
 export type AgentEvent =
-  /** 一轮模型调用结束。toolNames 为空表示这一轮给出了回答 */
-  | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[]; thinking?: boolean }
+  /** 一轮模型调用结束。toolNames 为空表示这一轮给出了回答；reasoning 是这一轮的思考内容（模型返回了才有） */
+  | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[]; thinking?: boolean; reasoning?: string }
   | { type: "tool_start"; id: string; label: string }
   /** error 是交给模型的失败原因 */
   | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string }
@@ -90,6 +90,7 @@ export async function runAgent({
       ...(result.usage ? { usage: result.usage } : {}),
       toolNames: result.finish === "tool_calls" ? (result.toolCalls ?? []).map((call) => call.name) : [],
       ...(think !== undefined ? { thinking: think } : {}),
+      ...(result.reasoning ? { reasoning: result.reasoning } : {}),
     });
     if (result.finish !== "tool_calls" || !result.toolCalls?.length) {
       const redo = !lastRound && !reviewed && result.finish !== "filtered" ? review?.(result.text, usedTools) : undefined;

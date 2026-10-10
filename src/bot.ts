@@ -98,6 +98,8 @@ export interface BotDeps {
   now?: () => number;
   /** 同一张进度卡片两次更新的最小间隔 */
   cardIntervalMs?: number;
+  /** 进度卡片上显示模型每轮的思考（SHOW_THINKING）。不传时显示 */
+  showThinking?: boolean;
   /** 配置的代码仓库（CODE_REPOS）。用来检查回答是不是没读代码就说了仓库里的内容 */
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
@@ -277,6 +279,8 @@ async function runTask(
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
+    // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
+    let lastRound = 0;
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
@@ -304,13 +308,24 @@ async function runTask(
         : {}),
       onEvent: (event) => {
         logEvent(logger, msg.messageId, event);
+        if (event.type === "model") {
+          lastRound = event.round;
+        }
         if (event.type === "tool_start" || event.type === "tool_end") {
           applyEvent(state, event);
+          card?.update(render());
+        } else if (event.type === "model" && event.reasoning && deps.showThinking !== false) {
+          (state.thoughts ??= []).push({ round: event.round, ms: event.ms, text: event.reasoning, at: state.steps.length });
+          card?.update(render());
+        } else if (event.type === "retry" && state.thoughts?.some((thought) => thought.round === lastRound)) {
+          // 被打回的那版回答是紧挨着的上一轮想出来的，多半就是没查证的说法：重做通过以后卡片上也不留这一轮的思考
+          state.thoughts = state.thoughts.filter((thought) => thought.round !== lastRound);
           card?.update(render());
         }
       },
     });
     answer = toReply(result.text, result.finish);
+    let blockedCode = false;
     if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
@@ -337,7 +352,12 @@ async function runTask(
       if (unseen.length > 0) {
         logger.warn(`回答打回重做以后还是引用了没查到的代码位置，没有发出 message=${msg.messageId}：${unseen.map((cite) => cite.text).join("、")}`);
         answer = blockedCodeAnswer(deps.codeRepos ?? []);
+        blockedCode = true;
       }
+    }
+    // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
+    if (answer === BLOCKED_OPS_ANSWER || blockedCode || result.finish === "filtered") {
+      state.thoughts = undefined;
     }
     state.phase = "done";
     deps.context.remember(msg, prompt, answer);
@@ -546,6 +566,22 @@ export const UNVERIFIED_CODE_ANSWER =
   "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
   "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
   "如果和仓库无关，去掉没查证的文件路径后重新回答。不要提这段检查。";
+
+/**
+ * 没调代码工具，回答里却有没查证的文件、提交号时，点名是哪几处让模型重做。2026-10-10 复测转链：模型把剧本里的核对记录
+ * （「提交 fa02ac8」）抄进了回答，打回时只说「去掉没查证的文件路径」，它不知道是哪处，重做后照样带着，整条回答被拦
+ */
+export function unverifiedCodeAnswer(cites: readonly string[]): string {
+  if (cites.length === 0) {
+    return UNVERIFIED_CODE_ANSWER;
+  }
+  return (
+    `（系统检查）你的回答引用了这些代码位置：${cites.join("、")}，但这次一次代码工具都没调用，它们没有经过查证；` +
+    "排查剧本和使用说明里写的文件路径、提交号是写说明的人核对时用的，也不算这次查到过。" +
+    "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
+    "如果和仓库无关，去掉这几处，其余查到的结论照常写，重新回答。不要提这段检查。"
+  );
+}
 
 /** 调过代码工具，回答里却引用了工具结果里没有的文件、提交号时，让模型重做 */
 export function unseenCodeAnswer(cites: readonly string[], repos: readonly string[]): string {
@@ -781,7 +817,7 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     // 代码工具的结果文字一概不认，只认它记下的代码位置
     if (!isCodeTool(tool)) {
       if (output !== undefined) {
-        facts.text.push(output);
+        facts.text.push(...unescapedForms(output));
       }
       continue;
     }
@@ -797,6 +833,29 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     }
   }
   return facts;
+}
+
+const JSON_ESCAPE = /\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g;
+const JSON_ESCAPED: Record<string, string> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+
+/**
+ * aiops 结果里的报错堆栈常常是转义过的：日志行里的换行、缩进写成 \n\t，整理结果时又 JSON.stringify 一次，
+ * 路径前面紧挨着的是 \t 里的 t（\n\t/build/services/goods/tb.go:8220），就认不出是绝对路径；日志行本身是 JSON 字符串时还会转义两层（\\n\\t）。
+ * 2026-10-10 转链排查时回答引用的堆栈位置就是因为这个被当成没查证、整段拦下。
+ * 按 JSON 的转义还原一层、两层，和原文一起拿来找：还原只是把转义符变回空白、引号这些分界，不会多出原文里没有的路径
+ */
+function unescapedForms(output: string): string[] {
+  const forms = [output];
+  for (let i = 0; i < 2 && forms[i].includes("\\"); i++) {
+    const next = forms[i].replace(JSON_ESCAPE, (_, hex: string | undefined, char: string) =>
+      hex !== undefined ? String.fromCharCode(parseInt(hex, 16)) : (JSON_ESCAPED[char] ?? char),
+    );
+    if (next === forms[i]) {
+      break;
+    }
+    forms.push(next);
+  }
+  return forms;
 }
 
 /** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
@@ -903,7 +962,7 @@ export function reviewCodeAnswer(question: string, repos: readonly string[], see
     if ([...usedTools].some(isCodeTool)) {
       return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
     }
-    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? UNVERIFIED_CODE_ANSWER : undefined;
+    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;
   };
 }
 
