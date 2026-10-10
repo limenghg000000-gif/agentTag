@@ -74,7 +74,6 @@ const knowledgeTable = config.knowledge
       share: {
         chatIds: [...config.feishu.allowedChatIds],
         editors: [...(config.feishu.writeAllowedUsers ?? [])],
-        chatPerm: config.feishu.writeAllowedUsers ? "view" : "edit",
       },
     })
   : undefined;

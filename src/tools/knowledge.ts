@@ -819,7 +819,7 @@ export class KnowledgeDesk {
 
   /**
    * 表格里这一行现在的内容，是写权限名单里的人确认过的才返回。aiops 里的经验告警自动排查会引用，有编辑权限的人在表格里改的
-   * （KNOWLEDGE_BITABLE 指的表格、没配写权限名单时群里人人都能改）不能不经确认就同步过去：卡片上列出来，名单里的人点「再试一次」才算确认
+   * （写权限名单里的人；KNOWLEDGE_BITABLE 指的表格谁能改看飞书里怎么设）不能不经确认就同步过去：卡片上列出来，名单里的人点「再试一次」才算确认
    */
   private approvedDraft(proposal: SaveProposal, entry: KnowledgeEntry, out: Outcome): KnowledgeDraft | undefined {
     let current: KnowledgeDraft;

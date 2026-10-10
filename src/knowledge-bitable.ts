@@ -274,10 +274,10 @@ export interface BitableBackendOptions {
   /** KNOWLEDGE_BITABLE 指定的表；指定了就不自己建 */
   target?: BitableTarget;
   /**
-   * 机器人自己建表时共享给谁：白名单群默认只读，写权限名单里的人可编辑。
-   * 没配写权限名单时群里谁都能点「保存」，群也给可编辑。可管理只留给机器人：能管协作者的人才能把表格共享出名单
+   * 机器人自己建表时共享给谁：白名单群只读，写权限名单里的人可编辑。
+   * 群一直只读：经验库所有群共用，群里谁都能改表格的话，任何人都能绕过确认卡片往里写内容。可管理只留给机器人：能管协作者的人才能把表格共享出名单
    */
-  share: { chatIds: readonly string[]; editors: readonly string[]; chatPerm?: "view" | "edit" };
+  share: { chatIds: readonly string[]; editors: readonly string[] };
   logger?: Logger;
 }
 
@@ -502,7 +502,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
 
   /**
    * 先把表格设成只有机器人能管协作者、只有协作者能打开，名单里的人就没法再共享给名单外的人；这一步没成功就先不共享给任何人。
-   * 再拿白名单群（默认只读）和写权限名单里的人（可编辑）要有的权限，和机器人已经共享出去的比：
+   * 再拿白名单群（只读）和写权限名单里的人（可编辑）要有的权限，和机器人已经共享出去的比：
    * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
    * 加协作者之前先把它记进数据目录：加上了却没来得及记下就退出的话，以后移出名单时就不知道要撤它。
  * 撤之前也记成结果不明：撤掉了却没来得及记下的，以后加回名单时会重新加，不会以为它还有权限。
@@ -510,9 +510,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
    */
   private async reconcile(target: BitableState): Promise<void> {
     const { api, share } = this.options;
-    const chatPerm = share.chatPerm ?? "view";
     const wanted = new Map<string, [BitableMember, BitablePerm]>([
-      ...share.chatIds.map((id): [string, [BitableMember, BitablePerm]] => [`openchat:${id}`, [{ type: "openchat", id }, chatPerm]]),
+      ...share.chatIds.map((id): [string, [BitableMember, BitablePerm]] => [`openchat:${id}`, [{ type: "openchat", id }, "view"]]),
       ...share.editors.map((id): [string, [BitableMember, BitablePerm]] => [`openid:${id}`, [{ type: "openid", id }, "edit"]]),
     ]);
     const granted = parseShared(target.shared ?? []);

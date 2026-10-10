@@ -145,16 +145,16 @@ test("第一次保存时建多维表格：只留经验库这张表，先设成�
   assert.equal(calls.filter((c) => c.startsWith("createApp")).length, 1);
 });
 
-test("没配写权限名单时群也给可编辑；用 KNOWLEDGE_BITABLE 指定的表时不自己建", async () => {
+test("没配写权限名单时群也只给只读；用 KNOWLEDGE_BITABLE 指定的表时不自己建", async () => {
   const { api, calls, shared } = fakeBitable();
   const backend = new BitableKnowledgeBackend({
     api,
     stateFile: path.join(dir, "edit", "bitable.json"),
-    share: { chatIds: ["oc_1"], editors: [], chatPerm: "edit" },
+    share: { chatIds: ["oc_1"], editors: [] },
     logger: quiet,
   });
   await new KnowledgeBase(backend, { logger: quiet }).save(dau);
-  assert.deepEqual(shared, [[{ type: "openchat", id: "oc_1" }, "edit"]]);
+  assert.deepEqual(shared, [[{ type: "openchat", id: "oc_1" }, "view"]]);
 
   const target = fakeBitable();
   target.tables.set("tblX", { fields: [], records: [] });
@@ -199,11 +199,14 @@ test("共享跟着名单走：启动时把移出白名单的群、移出写权�
   const first = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1", "oc_2"], editors: ["ou_admin", "ou_old"] }, logger: quiet });
   await new KnowledgeBase(first, { logger: quiet }).save(dau);
 
-  // 重启：oc_2 和 ou_old 移出了名单；写权限名单清空后群改成可编辑
-  const restarted = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [], chatPerm: "edit" }, logger: quiet });
+  // 重启：oc_2 和 ou_old 移出了名单，写权限名单清空；数据目录里记的 oc_1 是可编辑（比如以前的版本给的），改回只读
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  state.shared = state.shared.map((key: string) => (key === "openchat:oc_1:view" ? "openchat:oc_1:edit" : key));
+  await writeFile(stateFile, JSON.stringify(state));
+  const restarted = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet });
   await restarted.syncSharing();
-  assert.deepEqual(calls.slice(3), ["update oc_1 edit", "remove oc_2", "remove ou_admin", "remove ou_old"]);
-  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:edit"]);
+  assert.deepEqual(calls.slice(3), ["update oc_1 view", "remove oc_2", "remove ou_admin", "remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
   await restarted.syncSharing();
   assert.equal(calls.length, 7, "名单没变就不再调");
 
