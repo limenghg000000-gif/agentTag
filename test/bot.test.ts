@@ -1450,16 +1450,19 @@ test("排查过以后把问题推到服务之外的结论，打回一次让模�
     "淘宝无法识别，建议用户换个链接再试",
     "属于用户侧问题",
     "这个无需修复",
+    "服务端没有问题，是淘宝拒绝了链接",
+    "是淘宝那边拒绝的，跟我们无关",
+    "这个问题没法修复，建议用户重新分享",
+    "线上部署的还是旧版本，建议用户重新分享",
     // 同一句里有举例的分句，说结论的分句照样算
     "示例链接被淘宝拒绝，不是服务故障",
   ];
   for (const answer of deflecting) {
     assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
-    // 调过代码工具也算在排查，调用失败的也算
-    assert.equal(review("code_search")(answer), DEFLECTED_ANSWER, answer);
-    // 没排查过（没调工具、只调了群记忆）的不管，那是别的检查的事
+    // 没查线上（没调工具、只调了群记忆、只问代码）的不管
     assert.equal(review()(answer), undefined, answer);
     assert.equal(review("memory_search")(answer), undefined, answer);
+    assert.equal(review("code_search")(answer), undefined, answer);
   }
   const fine = [
     // 看状态、没说到服务、说某条线索不是根因
@@ -1472,10 +1475,16 @@ test("排查过以后把问题推到服务之外的结论，打回一次让模�
     "这不是淘宝平台限制，是我们解析 pages-fast 的 bug，要修代码",
     "不是用户侧的问题，是转链服务没处理这种链接",
     "不是代码问题，是配置里的超时设成了 1s，改配置就行",
+    "无需修改代码，把超时配置改成 5s 即可",
+    "前端不需要修改，只改后端 order.go 就行",
+    "用户端操作后接口没校验，这是我们的 bug",
+    "根因是淘宝风控返回的 code 我们没处理",
     "问题在转链服务没处理 pages-fast 这种落地页，要修代码",
     // 否定、假设、修好以后让用户重试
     "修好以后不需要用户重新分享",
     "不建议让用户重新分享，应该在解析阶段识别",
+    "不应该让用户重新分享，要在解析阶段处理",
+    "等修复上线后通知用户重试",
     "除非服务故障，这个接口不会返回 code=8",
     "已修复并部署，通知用户重试即可",
     // 举例的分句
