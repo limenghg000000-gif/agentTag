@@ -35,6 +35,9 @@ export class ToolError extends Error {
   }
 }
 
+/** 结果里的一段文字，和写在这段里的代码位置 */
+export type Piece = string | readonly [string, ...CodeLocation[]];
+
 /** 一行一行拼代码工具的结果，同时记下每行里查到的代码位置 */
 export class ToolOutputBuilder {
   private readonly lines: string[] = [];
@@ -45,10 +48,23 @@ export class ToolOutputBuilder {
 
   /** 加一行，locations 是这一行里查到的代码位置：这一行完整交给了模型才算 */
   line(text: string, ...locations: CodeLocation[]): this {
+    return this.parts([text, ...locations]);
+  }
+
+  /**
+   * 加一行，由几段拼成。[文字, ...代码位置] 这一段交给了模型，里面的代码位置就算，不用等这一行后面的部分：
+   * 搜索结果「src/a.ts:12:很长的一行代码」截断在代码里时，src/a.ts:12 模型是看到了的
+   */
+  parts(...pieces: Piece[]): this {
     const start = this.lines.length === 0 ? 0 : this.size + 1;
+    let text = "";
+    for (const piece of pieces) {
+      const [part, ...locations] = typeof piece === "string" ? [piece] : piece;
+      text += part;
+      this.facts.push(...locations.map((location) => ({ ...location, repo: this.repo, at: start + text.length })));
+    }
     this.lines.push(text);
     this.size = start + text.length;
-    this.facts.push(...locations.map((location) => ({ ...location, repo: this.repo, at: this.size })));
     return this;
   }
 

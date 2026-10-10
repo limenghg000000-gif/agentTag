@@ -452,16 +452,20 @@ const PATH_CHAR = "[\\w./@+!~-]";
  */
 const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
 const CODE_PATHS = new RegExp(`(?<!${PATH_CHAR})((?:[\\w.@+!-]+\\/)+[\\w.@+!-]+\\.${CODE_EXT})(?![\\w/@+~-]|[.!]\\w)`, "g");
-/** 反引号里带空格的路径（`src/my files/app.ts:12`）：CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations） */
-const SPACED_CODE_PATHS = new RegExp(`(?<=\`)((?:[\\w.-]+(?: [\\w.-]+)*\\/)+[\\w.-]+(?: [\\w.-]+)*\\.${CODE_EXT})(?=[\`:#])`, "g");
 /**
- * 回答里明说是分支的路径（分支名可以长得像路径）：前面写着「分支」「branch」「切到」，或者后面跟着「分支」「branch」「@ 提交号」，
- * 如「`feature/foo.ts` 分支上」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」。
- * 「分支」也常说代码里的分支（src/a.ts 分支覆盖率、分支逻辑），后面只能是「上」「@」、标点或者到头了；「branch coverage」不算
+ * 反引号里带空格的路径（`src/my files/app.ts:12`、`pkg@v1/my files/app.ts:2`）：CODE_PATHS 只认得出空格后面那段，
+ * 这种先按整段认（见 unseenCodeCitations），目录和文件名里能有的字符和 CODE_PATHS 一样
  */
-const BRANCH_BEFORE = /(?:分支|\bbranch|切到|切换到)\s*[:：]?\s*[`'"“「*]*$/i;
+const SPACED_CODE_PATHS = new RegExp(`(?<=\`)((?:[\\w.@+!-]+(?: [\\w.@+!-]+)*\\/)+[\\w.@+!-]+(?: [\\w.@+!-]+)*\\.${CODE_EXT})(?=[\`:#])`, "g");
+/**
+ * 回答里明说是 Git 分支的路径（分支名可以长得像路径）：前面写着「切到」「切换到」「checkout」「on/to branch」「分支：」「branch:」，
+ * 或者后面跟着「分支」「branch」再接「上」「@」、标点或者到头了，或者后面跟着「@ 提交号」，
+ * 如「`feature/foo.ts` 分支上」「on the `feature/foo.ts` branch.」「切到 feature/foo.ts」「feature/foo.ts @ 3f2a1c9」。
+ * 「分支」「branch」也常说代码里的分支（src/a.ts 分支覆盖率、分支逻辑、branch condition、分支 src/a.ts 里），这些不算
+ */
+const BRANCH_BEFORE = /(?:(?:切到|切换到)\s*(?:分支)?|\bcheckout|\b(?:on|to)\s+branch|(?:分支|\bbranch)\s*[:：])\s*[`'"“「*]*$/i;
 const BRANCH_AFTER =
-  /^[`'"”」*]*\s*(?:分支(?=\s*(?:$|@|上|[，。、；：！？,.;:!?）)」』"'`*]))|branch\b(?!\s*coverage)|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
+  /^[`'"”」*]*\s*(?:(?:分支|branch\b)(?=\s*(?:$|@|上|[，。、；：！？,;:?）)」』"'`*]|[.!](?!\w)))|@\s*[0-9a-f]{7,40}(?![0-9a-z]))/i;
 /** 路径后面跟着的行号：internal/k8s/client.go:35、:140-146（取第一行）、#L12、 第 35 行 */
 const LINE_AFTER_PATH = /^(?:[:：]\s*(\d+)|#L(\d+)|\s*(?:的)?\s*第\s*(\d+))/;
 /** 回答里写的提交号：「master 分支 @ 3f2a1c9」「提交 3f2a1c9」，7～40 位十六进制，字母和数字都有 */

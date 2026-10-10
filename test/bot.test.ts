@@ -1250,19 +1250,34 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
     codeEvidence([], [{ tool: "aiops_query_logs", facts: [{ branch: "feature/foo.ts", repo: "ai/aiops-mcp", at: 0 }] }])("feature/foo.ts", undefined, true),
     false,
   );
-  // 回答里写明是分支（前面写「分支」「branch」「切到」，后面跟「分支」「branch」「@ 提交号」）才按分支认；同名当文件讲的照样拦
+  // 回答里写明是 Git 分支（前面写「切到」「checkout」「on branch」「分支：」，后面跟「分支」「branch」再接标点或「上」，或者「@ 提交号」）
+  // 才按分支认；同名当文件讲的照样拦
   for (const answer of [
     "在 `feature/foo.ts` 分支上",
     "已切到 feature/foo.ts",
+    "已切到分支 feature/foo.ts",
+    "git checkout feature/foo.ts",
+    "On branch feature/foo.ts",
     "branch: `feature/foo.ts`",
+    "分支：feature/foo.ts",
     "看的是 **feature/foo.ts** 分支",
+    "on the `feature/foo.ts` branch.",
+    "the `feature/foo.ts` branch, not main",
     "feature/foo.ts @ 3f2a1c9 上没有改动",
   ]) {
     assert.deepEqual(unseenCodeCitations(answer, (text, line, branch) => branched(text, line, branch) || text === "3f2a1c9"), [], answer);
   }
   assert.deepEqual(unseenCodeCitations("`feature/foo.ts` 关掉了鉴权", branched), [{ text: "feature/foo.ts", located: false }]);
-  // 说的是代码里的分支（分支覆盖率、分支逻辑、branch coverage），不是 Git 分支
-  for (const answer of ["`feature/foo.ts` 分支覆盖率为 0%", "feature/foo.ts 分支逻辑有问题", "`feature/foo.ts` branch coverage is 0%"]) {
+  // 说的是代码里的分支（分支覆盖率、分支逻辑、branch condition），不是 Git 分支
+  for (const answer of [
+    "`feature/foo.ts` 分支覆盖率为 0%",
+    "feature/foo.ts 分支逻辑有问题",
+    "`feature/foo.ts` branch coverage is 0%",
+    "`feature/foo.ts` branch condition disables authentication",
+    "the else branch feature/foo.ts disables authentication",
+    "分支 feature/foo.ts 关掉了鉴权",
+    "`feature/foo.ts` branch.go 里",
+  ]) {
     assert.deepEqual(unseenCodeCitations(answer, branched), [{ text: "feature/foo.ts", located: false }], answer);
   }
   assert.deepEqual(unseenCodeCitations("切到 `feature/foo.ts:3`", branched), [{ text: "feature/foo.ts:3", located: true }]);
@@ -1368,6 +1383,12 @@ test("代码引用：反引号里带空格的路径按整段认，命令里的�
   const suffix = codeEvidence([], [found("code_read_file", [{ path: "files/app.ts" }, { path: "files/app.ts", lines: [2, 2] }])]);
   assert.deepEqual(unseenCodeCitations("在 `src/my files/app.ts:2`", suffix), [{ text: "src/my files/app.ts:2", located: true }]);
   assert.deepEqual(unseenCodeCitations("在 `files/app.ts:2`", suffix), []);
+  // 整段里带 @、+、! 的一样按整段认
+  for (const path of ["pkg@v1/my files/app.ts", "lib/@acme+web/my files/app.ts", "github.com/!acme/my files/app.ts"]) {
+    assert.deepEqual(unseenCodeCitations(`在 \`${path}:2\``, suffix), [{ text: `${path}:2`, located: true }], path);
+  }
+  const special = codeEvidence([], [found("code_read_file", [{ path: "pkg@v1/my files/app.ts", lines: [2, 2] }])]);
+  assert.deepEqual(unseenCodeCitations("在 `pkg@v1/my files/app.ts:2`", special), []);
   // 不带行号、分不清是路径还是命令的：里面的路径一个个认
   for (const answer of ["跑 `go run cmd/main.go`", "`bin/server -f etc/user.yaml` 启动", "见 `src/a.ts or src/c.ts`", "`cp src/a.ts src/c.ts`", "`vendor/bin/phpunit src/a.ts`"]) {
     assert.deepEqual(unseenCodeCitations(answer, seen), [], answer);
@@ -1634,6 +1655,42 @@ test("代码工具的结果被截断时，截断处以后的代码位置不算�
   // 正好截在换行处：最后一行是完整的，照样算
   const atNewline = await ask(output.indexOf("\nsrc/foo.ts"), ["入口在 `src/index.ts`"]);
   assert.equal(atNewline.requests.length, 2);
+});
+
+test("代码工具的结果截在一行中间时，这一行里已经露出来的代码位置照样算", async () => {
+  const header = "共 1 处（master 分支 @ 1a2b3c4）：";
+  const row = "src/a.ts:2";
+  const ask = async (limit: number, answers: string[]) => {
+    const codeSearch: Tool = {
+      spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+      describe: () => "搜代码",
+      maxOutputChars: limit,
+      run: async (_args, ctx) => {
+        const out = new ToolOutputBuilder("ai/aiops-mcp")
+          .parts("共 1 处（", ["master 分支 @ 1a2b3c4", { commit: "1a2b3c4" }, { branch: "master" }], "）：")
+          .parts([row, { path: "src/a.ts", lines: [2, 2] }], `:${"x".repeat(200)}`);
+        const { text, facts } = out.build();
+        ctx.onFacts?.(facts);
+        return text;
+      },
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({ model, taskTools: () => [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+    await handle(message("ai/aiops-mcp 里 hello 在哪"));
+    return { requests, replies: markdowns(sent) };
+  };
+
+  // 搜到的那一行很长，截在匹配的代码中间：「src/a.ts:2」模型已经看到了
+  const cut = await ask(header.length + 1 + row.length + 50, ["在 src/a.ts:2"]);
+  assert.equal(cut.requests.length, 2);
+  assert.deepEqual(cut.replies, ["在 src/a.ts:2"]);
+  // 截在「src/a.ts:」处，行号还没露出来，不算
+  const early = await ask(header.length + 1 + row.length - 1, ["在 src/a.ts:2", "没找到"]);
+  assert.equal(early.requests.length, 3);
 });
 
 test("没读代码、也没问仓库时，重做后还写着举例的路径照常发出", async () => {

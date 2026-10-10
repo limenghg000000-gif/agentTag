@@ -56,7 +56,7 @@ function fakeHost(fail = 0) {
   return { host, prs };
 }
 
-/** 记下的代码位置，at 换成结果里到它为止的那一行，好读 */
+/** 记下的代码位置，at 换成结果里它所在那一行到 at 为止的文字，好读：代码位置在它自己那段文字露出来时就算数 */
 function located(text: string, facts: readonly CodeFact[]) {
   return facts.map(({ at, ...fact }) => ({ ...fact, line: text.slice(0, at).split("\n").at(-1) }));
 }
@@ -94,9 +94,9 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
   // 记下读到的文件和每一行，不从结果文字里解析
   const read = await ws.readFile("src/a.ts", 2, 3);
   assert.deepEqual(located(read.text, read.facts), [
-    { repo: "acme/demo", path: "src/a.ts", line: "src/a.ts（共 4 行，下面是第 2 到 3 行，要看后面用 start_line=4）" },
-    { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "2| export function hello() {" },
-    { repo: "acme/demo", path: "src/a.ts", lines: [3, 3], line: "3|   return 'hi';" },
+    { repo: "acme/demo", path: "src/a.ts", line: "src/a.ts" },
+    { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "2|" },
+    { repo: "acme/demo", path: "src/a.ts", lines: [3, 3], line: "3|" },
   ]);
   assert.match((await ws.readFile("./src")).text, /src\/a.ts/);
   // 结果里写读到的文件整理过的路径，不写传进来的原样：原样里可以夹着像结果格式的文字
@@ -113,9 +113,9 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
   const found = await ws.search("hello");
   const sha = /@ ([0-9a-f]{7})/.exec(found.text)![1];
   assert.deepEqual(located(found.text, found.facts), [
-    { repo: "acme/demo", commit: sha, line: `共 1 处（main 分支 @ ${sha}）：` },
-    { repo: "acme/demo", branch: "main", line: `共 1 处（main 分支 @ ${sha}）：` },
-    { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "src/a.ts:2:export function hello() {" },
+    { repo: "acme/demo", commit: sha, line: `共 1 处（main 分支 @ ${sha}` },
+    { repo: "acme/demo", branch: "main", line: `共 1 处（main 分支 @ ${sha}` },
+    { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "src/a.ts:2" },
   ]);
   const listed = await ws.listFiles({ glob: "src/**/*.ts" });
   assert.deepEqual(
@@ -157,8 +157,8 @@ test("改文件：替换唯一的片段、新建文件，找不到或不唯一�
   assert.match(diff.text, /-  return 'hi';\n\+  return 'hello';/);
   // 记下改动了的文件，diff 正文里的不算
   assert.deepEqual(located(diff.text, diff.facts), [
-    { repo: "acme/demo", path: "src/a.ts", line: "src/a.ts（+1 -1）" },
-    { repo: "acme/demo", path: "src/util/new.ts", line: "src/util/new.ts（+1 -0）" },
+    { repo: "acme/demo", path: "src/a.ts", line: "src/a.ts" },
+    { repo: "acme/demo", path: "src/util/new.ts", line: "src/util/new.ts" },
   ]);
 });
 
@@ -379,7 +379,7 @@ test("代码工具：只有一个仓库时可以不填 repo，PR 描述带上发
   const opened: CodeFact[] = [];
   const result = await tools.code_open_pr.run({ title: "a 改成 3\n多余的行", body: "原因" }, { signal, onFacts: (facts) => opened.push(...facts) });
   assert.equal(result, "已开合并请求 !1：https://example.com/pr/1\n\n改动了 1 个文件（+1 -1）：\nsrc/a.ts（+1 -1）");
-  assert.deepEqual(located(result, opened), [{ repo: "acme/demo", path: "src/a.ts", line: "src/a.ts（+1 -1）" }]);
+  assert.deepEqual(located(result, opened), [{ repo: "acme/demo", path: "src/a.ts", line: "src/a.ts" }]);
   assert.equal(prs[0].title, "a 改成 3");
   assert.equal(prs[0].body, "原因\n\n---\n由 张三 在飞书群里让「飞书 CLI」提交。");
   assert.equal(opens, 1);
@@ -434,7 +434,7 @@ test("分支：列出分支、在最近活跃的分支上一起搜、读别的�
       ["branch:feature/x", "- feature/x"],
       ["branch:aiops", "- aiops"],
       ["branch:old", "- old"],
-      ["branch:main", "- main（默认分支，当前在看）"],
+      ["branch:main", "- main"],
     ],
   );
   assert.match(branches, /- aiops：2026-09-20 Seed「feat: k8s tools」/);
@@ -487,7 +487,14 @@ test("切换分支：之后读、搜、开合并请求都基于它，下个任�
   const ws = await all.open("om_b2", "ai/aiops-mcp");
   const switched = await ws.switchBranch("origin/aiops");
   assert.match(switched.text, /^已切到 aiops 分支，最新提交 [0-9a-f]{7} 2026-09-20 Seed「feat: k8s tools」。/);
-  assert.deepEqual(switched.facts.map(named), [/提交 ([0-9a-f]{7})/.exec(switched.text)![1], "branch:aiops"]);
+  const switchedTo = /提交 ([0-9a-f]{7})/.exec(switched.text)![1];
+  assert.deepEqual(
+    located(switched.text, switched.facts).map(({ line, ...fact }) => [named(fact), line]),
+    [
+      ["branch:aiops", "已切到 aiops"],
+      [switchedTo, `已切到 aiops 分支，最新提交 ${switchedTo}`],
+    ],
+  );
   assert.equal(ws.baseBranch, "aiops");
   assert.match((await ws.search("RegisterK8sTools")).text, /^共 1 处（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go:3:/);
   assert.match((await ws.listBranches()).text, /- aiops（当前在看）/);

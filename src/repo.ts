@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./history.js";
-import { type CodeFact, type CodeLocation, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
+import { type CodeFact, type CodeLocation, type Piece, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
 
 /** 读文件时一次最多返回的行数和字数 */
 export const MAX_READ_LINES = 400;
@@ -483,7 +483,7 @@ export class Workspace {
     for (const b of shown) {
       const tags = [b.isDefault ? "默认分支" : "", b.name === this.baseBranch ? "当前在看" : ""].filter(Boolean);
       const commit = [b.date?.slice(0, 10), b.author].filter(Boolean).join(" ") + (b.title ? `「${oneLine(b.title)}」` : "");
-      out.line(`- ${b.name}${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`, { branch: b.name });
+      out.parts("- ", [b.name, { branch: b.name }], `${tags.length > 0 ? `（${tags.join("，")}）` : ""}${commit ? `：${commit}` : ""}`);
     }
     return out.build();
   }
@@ -497,7 +497,7 @@ export class Workspace {
       const name = branchName(branch);
       if (this.state.branch || (await this.hasChanges(signal))) {
         if (name === this.baseBranch) {
-          return this.output().line(`已经在 ${name} 分支上了。`, { branch: name }).build();
+          return this.output().parts("已经在 ", [name, { branch: name }], " 分支上了。").build();
         }
         throw new RepoError(
           `这个话题里已经基于 ${this.baseBranch} 分支改了代码${this.pullRequest ? `，开了${this.host.requestName} ${this.pullRequest.url}` : ""}，不能再切分支。` +
@@ -512,7 +512,13 @@ export class Workspace {
       await this.saveState();
       const [sha, last] = (await this.git(["log", "-1", "--format=%h%x00%cs %an「%s」"], signal)).trim().split("\0");
       return this.output()
-        .line(`已切到 ${name} 分支，最新提交 ${sha} ${last}。这个话题后面看代码、改代码、开${this.host.requestName}都基于这个分支。`, { commit: sha }, { branch: name })
+        .parts(
+          "已切到 ",
+          [name, { branch: name }],
+          " 分支，最新提交 ",
+          [sha, { commit: sha }],
+          ` ${last}。这个话题后面看代码、改代码、开${this.host.requestName}都基于这个分支。`,
+        )
         .build();
     });
   }
@@ -539,10 +545,10 @@ export class Workspace {
     const where = await this.label(ref, signal);
     const out = this.output();
     if (files.length === 0) {
-      return out.line(`没有匹配的文件（${where.text}）。`, ...where.refs).build();
+      return out.parts("没有匹配的文件（", [where.text, ...where.refs], "）。").build();
     }
     const more = files.length - MAX_LIST_FILES;
-    out.line(`共 ${files.length} 个文件（${where.text}）${more > 0 ? `，只列出前 ${MAX_LIST_FILES} 个，缩小范围再看` : ""}：`, ...where.refs);
+    out.parts(`共 ${files.length} 个文件（`, [where.text, ...where.refs], `）${more > 0 ? `，只列出前 ${MAX_LIST_FILES} 个，缩小范围再看` : ""}：`);
     for (const file of files.slice(0, MAX_LIST_FILES)) {
       out.line(shownPath(file), { path: file });
     }
@@ -626,12 +632,13 @@ export class Workspace {
       const where = await this.label(undefined, signal);
       const out = this.output();
       if (matches.length === 0) {
-        return out.line(`没有搜到「${pattern}」（${where.text}）。`, ...where.refs).build();
+        return out.parts(`没有搜到「${pattern}」（`, [where.text, ...where.refs], "）。").build();
       }
       const more = matches.length - MAX_SEARCH_MATCHES;
-      out.line(
-        `共 ${matches.length} 处（${where.text}）${more > 0 ? `，只列出前 ${MAX_SEARCH_MATCHES} 处，换个更具体的搜法或加 glob 缩小范围` : ""}：`,
-        ...where.refs,
+      out.parts(
+        `共 ${matches.length} 处（`,
+        [where.text, ...where.refs],
+        `）${more > 0 ? `，只列出前 ${MAX_SEARCH_MATCHES} 处，换个更具体的搜法或加 glob 缩小范围` : ""}：`,
       );
       matches.slice(0, MAX_SEARCH_MATCHES).forEach((match) => addMatch(out, match));
       return out.build();
@@ -651,7 +658,7 @@ export class Workspace {
     const miss = names.filter((name) => found.get(name)!.length === 0);
     const out = this.output();
     if (hit.length === 0) {
-      return out.line(`在这 ${names.length} 个分支上都没有搜到「${pattern}」：${names.join("、")}。`, ...names.map((branch) => ({ branch }))).build();
+      return out.parts(`在这 ${names.length} 个分支上都没有搜到「${pattern}」：`, ...branchList(names), "。").build();
     }
     const labels = await Promise.all(hit.map((name) => this.label({ name, ref: `refs/remotes/origin/${name}` }, signal)));
     const total = hit.reduce((sum, name) => sum + found.get(name)!.length, 0);
@@ -659,12 +666,12 @@ export class Workspace {
     let budget = MAX_SEARCH_MATCHES;
     hit.forEach((name, i) => {
       const matches = found.get(name)!;
-      out.line(`【${labels[i].text}，${matches.length} 处】`, ...labels[i].refs);
+      out.parts("【", [labels[i].text, ...labels[i].refs], `，${matches.length} 处】`);
       matches.slice(0, Math.max(0, budget)).forEach((match) => addMatch(out, match));
       budget -= matches.length;
     });
     if (miss.length > 0) {
-      out.line(`没搜到的分支：${miss.join("、")}`, ...miss.map((branch) => ({ branch })));
+      out.parts("没搜到的分支：", ...branchList(miss));
     }
     return out.build();
   }
@@ -1048,7 +1055,12 @@ function grepMatches(out: string): GrepMatch[] {
 
 /** 搜索结果的一行「文件:行号:内容」，记下这个文件的这一行 */
 function addMatch(out: ToolOutputBuilder, match: GrepMatch): void {
-  out.line(`${shownPath(match.file)}:${match.line}:${clip(match.text)}`, { path: match.file, lines: [match.line, match.line] });
+  out.parts([`${shownPath(match.file)}:${match.line}`, { path: match.file, lines: [match.line, match.line] }], `:${clip(match.text)}`);
+}
+
+/** 用顿号隔开的分支名，每个分支记在它自己那段 */
+function branchList(names: readonly string[]): Piece[] {
+  return names.flatMap((name, i): Piece[] => [...(i > 0 ? ["、"] : []), [name, { branch: name }]]);
 }
 
 /** 改动了哪些文件：一个文件一行，加减了几行 */
@@ -1057,7 +1069,7 @@ export function addChanges(out: ToolOutputBuilder, files: readonly ChangedFile[]
   const deleted = files.reduce((sum, file) => sum + (file.deleted ?? 0), 0);
   out.line(`改动了 ${files.length} 个文件（+${added} -${deleted}）：`);
   for (const file of files) {
-    out.line(`${shownPath(file.path)}（${file.added === undefined ? "二进制文件" : `+${file.added} -${file.deleted}`}）`, { path: file.path });
+    out.parts([shownPath(file.path), { path: file.path }], `（${file.added === undefined ? "二进制文件" : `+${file.added} -${file.deleted}`}）`);
   }
   return out;
 }
@@ -1106,23 +1118,28 @@ function numberedLines(
   const from = Math.max(1, Math.floor(start));
   const to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
   if (from > lines.length) {
-    return out.line(`${shownPath(file)} 只有 ${lines.length} 行。`, { path: file }).build();
+    return out.parts([shownPath(file), { path: file }], ` 只有 ${lines.length} 行。`).build();
   }
-  const body: string[] = [];
   let size = 0;
   let last = from - 1;
   for (let i = from; i <= to; i++) {
-    const line = `${i}| ${lines[i - 1]}`;
-    if (size + line.length > MAX_READ_CHARS && body.length > 0) {
+    const length = `${i}| ${lines[i - 1]}`.length;
+    if (size + length > MAX_READ_CHARS && i > from) {
       break;
     }
-    body.push(line);
-    size += line.length + 1;
+    size += length + 1;
     last = i;
   }
-  const head = `${shownPath(file)}（${where ? `${where.text}，` : ""}共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`;
-  out.line(head, { path: file }, ...(where?.refs ?? []));
-  body.forEach((row, i) => out.line(row, { path: file, lines: [from + i, from + i] }));
+  out.parts(
+    [shownPath(file), { path: file }],
+    "（",
+    ...(where ? [[where.text, ...where.refs] as const, "，"] : []),
+    `共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`,
+  );
+  // 每一行的行号「12|」交给了模型，这一行就算查到了
+  for (let i = from; i <= last; i++) {
+    out.parts([`${i}|`, { path: file, lines: [i, i] }], ` ${lines[i - 1]}`);
+  }
   return out.build();
 }
 
