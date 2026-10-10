@@ -29,8 +29,8 @@ export interface FakeMcpOptions {
   stateful?: boolean;
   /** 自己控制工具清单怎么分页（测分页出错时用）；不配就一页返回全部 */
   list?: (cursor: string | undefined) => { tools: Tool[]; nextCursor?: string };
-  /** 配了就开 prompts 能力：每个 prompt 的定义和正文（text） */
-  prompts?: (Prompt & { text: string })[];
+  /** 配了就开 prompts 能力：每个 prompt 的定义和正文（text）；error 是取这个 prompt 时报的错 */
+  prompts?: (Prompt & { text: string; error?: string })[];
   /** 拉 prompts 清单时报错（测清单失败） */
   promptsError?: string;
 }
@@ -43,6 +43,8 @@ export interface FakeMcp {
   calls: { name: string; args: Record<string, unknown> }[];
   /** 收到的取 prompt 请求（prompt 名） */
   promptGets: string[];
+  /** 拉 prompts 清单时报的错，测试中途可以改 */
+  promptsError?: string;
   /** 收到的 initialize 次数 */
   initializes: number;
   tools: Tool[];
@@ -60,6 +62,7 @@ export async function startFakeMcp(options: FakeMcpOptions): Promise<FakeMcp> {
     token: options.token,
     calls: [],
     promptGets: [],
+    ...(options.promptsError ? { promptsError: options.promptsError } : {}),
     initializes: 0,
     tools: options.tools,
     sessions: new Set(),
@@ -77,16 +80,19 @@ export async function startFakeMcp(options: FakeMcpOptions): Promise<FakeMcp> {
     if (options.prompts) {
       const prompts = options.prompts;
       server.setRequestHandler(ListPromptsRequestSchema, async () => {
-        if (options.promptsError) {
-          throw new McpError(ErrorCode.InternalError, options.promptsError);
+        if (state.promptsError) {
+          throw new McpError(ErrorCode.InternalError, state.promptsError);
         }
-        return { prompts: prompts.map(({ text: _text, ...prompt }) => prompt) };
+        return { prompts: prompts.map(({ text: _text, error: _error, ...prompt }) => prompt) };
       });
       server.setRequestHandler(GetPromptRequestSchema, async (request) => {
         state.promptGets.push(request.params.name);
         const prompt = prompts.find((item) => item.name === request.params.name);
         if (!prompt) {
           throw new McpError(ErrorCode.InvalidParams, `没有 ${request.params.name}`);
+        }
+        if (prompt.error) {
+          throw new McpError(ErrorCode.InternalError, prompt.error);
         }
         return { description: prompt.description, messages: [{ role: "user", content: { type: "text", text: prompt.text } }] };
       });

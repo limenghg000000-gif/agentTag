@@ -140,20 +140,28 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 重新拼对象用没有原型的空对象：结果里可能有 __proto__、toString 这类键名，
+ * 赋给普通对象会被当成原型、用 in 判断时会被继承来的属性冒充，都会丢字段
+ */
+function record(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
 function leadFirst(value: unknown): unknown {
   if (!isPlainObject(value)) {
     return value;
   }
-  const lead = LEAD_KEYS.filter((key) => key in value);
+  const lead = LEAD_KEYS.filter((key) => Object.hasOwn(value, key));
   if (lead.length === 0) {
     return value;
   }
-  const out: Record<string, unknown> = {};
+  const out = record();
   for (const key of lead) {
     out[key] = value[key];
   }
   for (const [key, item] of Object.entries(value)) {
-    if (!(key in out)) {
+    if (!Object.hasOwn(out, key)) {
       out[key] = item;
     }
   }
@@ -172,11 +180,11 @@ function hoistCommon(value: unknown): unknown {
   if (!isPlainObject(value)) {
     return value;
   }
-  const out: Record<string, unknown> = {};
+  const out = record();
   for (const [key, item] of Object.entries(value)) {
     const inner = hoistCommon(item);
     const split = Array.isArray(inner) ? splitCommon(inner) : undefined;
-    if (split && !(`${key}${COMMON_SUFFIX}` in value)) {
+    if (split && !Object.hasOwn(value, `${key}${COMMON_SUFFIX}`)) {
       out[`${key}${COMMON_SUFFIX}`] = split.common;
       out[key] = split.items;
     } else {
@@ -192,21 +200,31 @@ function splitCommon(list: unknown[]): { common: Record<string, unknown>; items:
   }
   const items = list as Record<string, unknown>[];
   const [first, ...rest] = items;
-  const common: Record<string, unknown> = {};
-  const sub: Record<string, string[]> = {};
+  const common = record();
+  const sub = new Map<string, string[]>();
+  const own = (item: Record<string, unknown>, key: string) => (Object.hasOwn(item, key) ? item[key] : undefined);
   for (const [field, sample] of Object.entries(first)) {
     const flat = JSON.stringify(sample);
-    if (rest.every((item) => field in item && JSON.stringify(item[field]) === flat)) {
+    if (rest.every((item) => Object.hasOwn(item, field) && JSON.stringify(item[field]) === flat)) {
       common[field] = sample;
       continue;
     }
-    if (isPlainObject(sample) && rest.every((item) => isPlainObject(item[field]))) {
+    if (isPlainObject(sample) && rest.every((item) => isPlainObject(own(item, field)))) {
       const keys = Object.entries(sample)
-        .filter(([key, v]) => rest.every((item) => key in (item[field] as object) && JSON.stringify((item[field] as Record<string, unknown>)[key]) === JSON.stringify(v)))
+        .filter(([key, v]) =>
+          rest.every((item) => {
+            const inner = item[field] as Record<string, unknown>;
+            return Object.hasOwn(inner, key) && JSON.stringify(inner[key]) === JSON.stringify(v);
+          }),
+        )
         .map(([key]) => key);
       if (keys.length > 0) {
-        common[field] = Object.fromEntries(keys.map((key) => [key, sample[key]]));
-        sub[field] = keys;
+        const part = record();
+        for (const key of keys) {
+          part[key] = sample[key];
+        }
+        common[field] = part;
+        sub.set(field, keys);
       }
     }
   }
@@ -214,15 +232,21 @@ function splitCommon(list: unknown[]): { common: Record<string, unknown>; items:
     return undefined;
   }
   const strip = (item: Record<string, unknown>) => {
-    const kept: Record<string, unknown> = {};
+    const kept = record();
     for (const [field, v] of Object.entries(item)) {
-      if (field in common && !(field in sub)) {
+      const keys = sub.get(field);
+      if (Object.hasOwn(common, field) && !keys) {
         continue;
       }
-      if (field in sub && isPlainObject(v)) {
-        const rest = Object.fromEntries(Object.entries(v).filter(([key]) => !sub[field].includes(key)));
-        if (Object.keys(rest).length > 0) {
-          kept[field] = rest;
+      if (keys && isPlainObject(v)) {
+        const left = record();
+        for (const [key, inner] of Object.entries(v)) {
+          if (!keys.includes(key)) {
+            left[key] = inner;
+          }
+        }
+        if (Object.keys(left).length > 0) {
+          kept[field] = left;
         }
         continue;
       }
@@ -242,7 +266,7 @@ function shrink(value: unknown, level: Level, top = false): unknown {
     return value.length > level.items ? [...kept, `…（省略后面 ${value.length - level.items} 项，共 ${value.length} 项）`] : kept;
   }
   if (isPlainObject(value)) {
-    const out: Record<string, unknown> = {};
+    const out = record();
     for (const [key, item] of Object.entries(value)) {
       const lead = top && LEAD_KEYS.includes(key);
       out[key] = shrink(item, lead ? { text: Math.max(level.text, LEAD_LEVEL.text), items: Math.max(level.items, LEAD_LEVEL.items) } : level);

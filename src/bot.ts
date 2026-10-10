@@ -111,8 +111,6 @@ export interface BotDeps {
     tools(task: TaskToolContext): readonly Tool[];
     /** 这些工具的使用说明，写进系统提示词。toolNames 是这次任务的全部工具名 */
     prompt(toolNames: readonly string[]): string | undefined;
-    /** 读剧本的工具（如 aiops_playbook）：只是读说明，不算查过线上，读到的内容也不算证据 */
-    isPlaybookTool?(name: string): boolean;
     /** 调过这个工具以后，这次任务后面几轮打开思考 */
     thinksAfter?(name: string): boolean;
   };
@@ -228,8 +226,8 @@ async function runTask(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
-          // 剧本是服务端下发的说明，不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
-          if (deps.mcp?.isPlaybookTool?.(tool.spec.name)) {
+          // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
+          if (tool.instructionsOnly) {
             return tool.run(args, ctx);
           }
           attempted.add(tool.spec.name);

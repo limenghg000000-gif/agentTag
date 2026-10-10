@@ -126,3 +126,13 @@ test("50 条带 labels 的日志：每条都一样的 labels 只写一次，上�
   assert.equal(json[`logs${COMMON_SUFFIX}`].labels.app, "product-service-api");
   assert.deepEqual(json.logs[49].labels, { pod: "product-service-api-7d9f-1" });
 });
+
+test("键名是 __proto__、toString 这类的字段不丢：不会被当成原型，也不会被继承来的属性冒充成每项都有的字段", () => {
+  assert.equal(compactText('{"__proto__":{"x":1},"a":2}'), '{"__proto__":{"x":1},"a":2}');
+  const host = "node-a.cluster.internal.example";
+  const input = `{"list":[{"id":1,"host":"${host}","toString":"第一项自己的"},{"id":2,"host":"${host}"},{"id":3,"host":"${host}","__proto__":{"y":2}}]}`;
+  assert.equal(
+    compactText(input),
+    `{"list${COMMON_SUFFIX}":{"host":"${host}"},"list":[{"id":1,"toString":"第一项自己的"},{"id":2},{"id":3,"__proto__":{"y":2}}]}`,
+  );
+});

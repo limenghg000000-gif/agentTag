@@ -83,6 +83,8 @@ export interface Tool {
   writes?: boolean;
   /** 结果交给模型前的字数上限，不填用 MAX_TOOL_OUTPUT_CHARS。自己已经按字段截短的工具（如 MCP 工具）可以放宽 */
   maxOutputChars?: number;
+  /** 只是说明（如 MCP 服务端下发的排查剧本），不是查到的数据：调过不算查过，读到的内容也不算回答的证据 */
+  instructionsOnly?: boolean;
   /** 进度卡片上显示的一句话，如「读取网页 example.com」 */
   describe(args: Record<string, unknown>): string;
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<string>;

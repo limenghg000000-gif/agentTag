@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CallToolResult, Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "../src/config.js";
-import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, McpHub } from "../src/mcp.js";
+import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
 import { MCP_RESULT_LIMIT } from "../src/mcp-result.js";
 import { type FakeMcp, freePort, startFakeMcp } from "./helpers/fake-mcp.js";
 
@@ -526,8 +526,8 @@ test("服务端下发了 MCP prompts：当剧本用，提示词列出剧本并�
   }
   assert.equal(server.calls.length, MAX_MCP_CALLS_PER_TASK);
 
-  assert.ok(hub.isPlaybookTool("aiops_playbook"));
-  assert.ok(!hub.isPlaybookTool("aiops_query_logs"));
+  assert.equal(playbook.instructionsOnly, true, "读剧本的工具标成只是说明，机器人不把它算成查过");
+  assert.ok(!logs.instructionsOnly);
   assert.equal(hub.serverOf("aiops_playbook"), "aiops");
   assert.equal(hub.serverOf("web_search"), undefined);
 });
@@ -538,7 +538,6 @@ test("没开 prompts 能力、拉清单失败、和工具重名时没有读剧�
   assert.ok(!plain.tools(task).some((tool) => tool.spec.name === "aiops_playbook"));
   assert.equal(plainLog.find(/剧本/), undefined, "服务端没开 prompts 能力就不去拉清单");
   assert.doesNotMatch(plain.prompt(plain.tools(task).map((tool) => tool.spec.name))!, /排查剧本/);
-  assert.ok(!plain.isPlaybookTool("aiops_playbook"));
   assert.ok(plain.thinksAfter("aiops_query_logs"));
   assert.ok(!plain.thinksAfter("web_search"));
 
@@ -558,6 +557,55 @@ test("没开 prompts 能力、拉清单失败、和工具重名时没有读剧�
 
   const quiet = await fakeHub(await fake(), { thinking: false });
   assert.ok(!quiet.thinksAfter("aiops_query_logs"));
+});
+
+test("同一轮里并行读同一份剧本只取一次；一次任务最多读 3 份，读失败的不占名额", async () => {
+  const server = await fake({
+    prompts: [
+      { name: "p1", description: "一号", text: "一号剧本", error: "磁盘坏了" },
+      { name: "p2", description: "二号", text: "二号剧本" },
+      { name: "p3", description: "三号", text: "三号剧本" },
+      { name: "p4", description: "四号", text: "四号剧本" },
+    ],
+  });
+  const hub = await fakeHub(server);
+  const playbook = hub.tools(task).find((tool) => tool.spec.name === "aiops_playbook")!;
+
+  const [first, second] = await Promise.all([playbook.run({ name: "p2" }, { signal }), playbook.run({ name: "p2" }, { signal })]);
+  assert.match(first, /二号剧本/);
+  assert.match(second, /剧本 p2 这次任务里已经读过了/);
+  assert.deepEqual(server.promptGets, ["p2"]);
+
+  const failed = await Promise.allSettled([playbook.run({ name: "p1" }, { signal }), playbook.run({ name: "p1" }, { signal })]);
+  assert.deepEqual(
+    failed.map((item) => item.status),
+    ["rejected", "rejected"],
+    "并行读的那个跟着失败，不说读过了",
+  );
+  assert.match(String((failed[0] as PromiseRejectedResult).reason), /读 aiops 的剧本 p1 失败：.*磁盘坏了/);
+
+  assert.match(await playbook.run({ name: "p3" }, { signal }), /三号剧本/);
+  assert.match(await playbook.run({ name: "p4" }, { signal }), /四号剧本/);
+  await assert.rejects(playbook.run({ name: "p1" }, { signal }), new RegExp(`已经读了 ${MAX_PLAYBOOKS_PER_TASK} 份 aiops 的剧本`));
+  assert.deepEqual(server.promptGets, ["p2", "p1", "p3", "p4"]);
+});
+
+test("刷新时剧本清单拉失败：沿用上次的剧本，按重试间隔提前再拉", async () => {
+  const server = await fake({ prompts: PLAYBOOKS });
+  const log = recorder();
+  const hub = await hubFor([config(server.url)], { logger: log.logger, refreshMs: 30, retryMs: [40] });
+  assert.ok(hub.tools(task).some((tool) => tool.spec.name === "aiops_playbook"));
+
+  server.promptsError = "数据库挂了";
+  for (let i = 0; i < 100 && !log.find(/拉清单失败/); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(log.find(/拉清单失败/)!.text, /数据库挂了。先沿用上次的 2 份剧本，0\.04 秒后重试/);
+  assert.deepEqual(
+    (hub.tools(task).find((tool) => tool.spec.name === "aiops_playbook")!.spec.parameters as { properties: { name: { enum: string[] } } }).properties
+      .name.enum,
+    ["convert_link", "troubleshoot"],
+  );
 });
 
 async function fakeHub(server: FakeMcp, overrides: Partial<McpServerConfig> = {}) {

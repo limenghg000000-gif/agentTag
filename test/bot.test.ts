@@ -959,6 +959,7 @@ test("有 aiops 工具时，一个工具都没调就给出线上数据的回答�
 test("读剧本不算查过线上，剧本里举例的路径也不算证据；调过 aiops 的工具以后后面几轮打开思考", async () => {
   const playbook: Tool = {
     spec: { name: "aiops_playbook", description: "读剧本", parameters: { type: "object", properties: { name: { type: "string" } } } },
+    instructionsOnly: true,
     describe: () => "aiops · 读剧本 转链",
     run: async () => "（以下是 aiops 服务端下发的剧本「convert_link」）转链服务 product-service-api 在 prod。崩溃堆栈例：/build/internal/cache/map.go:42",
   };
@@ -979,7 +980,6 @@ test("读剧本不算查过线上，剧本里举例的路径也不算证据；�
     names: ["aiops"],
     tools: () => [playbook, queryLogs],
     prompt: () => undefined,
-    isPlaybookTool: (name: string) => name === "aiops_playbook",
     thinksAfter: (name: string) => name.startsWith("aiops_"),
   };
   const { sent, handle } = setup({ model, mcp });
