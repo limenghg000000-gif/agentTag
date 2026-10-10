@@ -380,6 +380,14 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`,
     // 以结束标记开头、后面还有别的字的行（EOT-not-the-end）还是内容，不是结束
     `password = <<EOT\n\${var.db_password}\nEOT-not-the-end\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOT`,
+    // 名字和值分开写的：k8s 的 env、JSON 和 HCL 里的 name/value，value 写在前面的也算；Makefile 的 ?= += := ::=
+    `env:\n- name: DB_PASSWORD\n  value: ${["Correct", "Horse", "Battery", "Staple9"].join("")}\n- name: LOG_LEVEL\n  value: debug`,
+    `containers:\n  - env:\n      - value: "${["correct", "horse", "battery", "staple"].join(" ")}"  # 生产\n        name: api_token`,
+    `{"env":[{"name":"MCP_AIOPS_TOKEN","value":"${["correct", "horse", "battery", "staple"].join("")}"}]}`,
+    `[{name:"LOG_LEVEL",value:"debug"},{value:'${["Correct", "Horse", "Battery", "Staple9"].join("")}',name:'db.password'}]`,
+    `environment = [{ name = "DB_PASSWORD", value = "${["Correct", "Horse", "Battery", "Staple9"].join("")}" }]`,
+    `DB_PASSWORD ?= ${["Correct", "Horse", "Battery", "Staple9"].join("")}`,
+    `MCP_AIOPS_TOKEN += ${["correct", "horse", "battery", "staple"].join("")}\ndb_password ::= ${["Correct", "Horse", "Battery", "Staple9"].join("")}`,
     // 字符串里套着转义过的 JSON，转义了几层都算
     `payload="{\\"password\\":\\"${["CorrectHorse", "BatteryStaple9"].join("")}\\"}"`,
     `{"body":"{\\"config\\":\\"{\\\\\\"api_key\\\\\\":\\\\\\"${["correct", "horse", "battery", "staple"].join("")}\\\\\\"}\\"}"}`,
@@ -490,6 +498,10 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `certificate-authority-data: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "pem" }))}\npub: ${base64(rsaKeys.publicKey.export({ type: "spki", format: "der" }))}`,
     // heredoc 里是变量引用、打了码的、中文说明的，名字不是密钥的
     "password = <<EOT\n${var.db_password}\nEOT\npassword = <<EOT\n******\nEOT\npassword = <<EOT\n请找管理员要\nEOT\ndescription = <<EOT\nCorrect-Horse-Battery-Staple9!\nEOT",
+    // name/value 里名字不是密钥的、值是引用或占位的、valueFrom 引用 Secret 的（下面的 name、key 是引用，不是值）
+    "env:\n- name: LOG_LEVEL\n  value: verbose-debugging\n- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password\n- name: API_TOKEN\n  value: \"{{ .Values.apiToken }}\"",
+    '{"name":"token_ttl","value":"86400000"}；{"name":"MCP_AIOPS_TOKEN","value":"${MCP_AIOPS_TOKEN}"}；environment = [{ name = "DB_PASSWORD", value = var.db_password }]',
+    "LOG_LEVEL ?= verbose-debugging；password ?= ******",
     // 只提到令牌前缀、配置名的
     "npm_config_registry=https://registry.npmmirror.com；hf_hub_download；SG.example；glsa_ 是 Grafana 服务账号令牌的前缀；hvs. 开头的是 Vault 令牌；Credential=AKIDEXAMPLE/20150830",
     // age 的公钥、只写了私钥开头的说明

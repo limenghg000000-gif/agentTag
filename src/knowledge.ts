@@ -731,12 +731,14 @@ const TOKEN_ASSIGNMENT = new RegExp(String.raw`(?:${SECRET_LABEL}|${PASS_ALIAS})
  * 引号开头的不在这里取（等号后面的空白也不让它退回去取），由 quotedValue 取引号里的
  */
 const LINE_VALUE = String.raw`[ \t]*(?![ \t"'])([^\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+?)(?=[ \t]+#|(?:[,;][ \t]*|[ \t]+)[\w.-]+[ \t]*=|[ \t]*(?:$|[\n\`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]))`;
+/** 等号前面可以带 Makefile 的 ?= += := ::=（bash 的 += 也是） */
+const MAKE_ASSIGN = String.raw`(?:::?|[?+])?=`;
 /**
  * 大写的密钥变量（MCP_AIOPS_TOKEN=…、DB_PASSWORD=…）在句子中间也算（「设置 GITLAB_TOKEN=… 后重启」）；
  * 单独的 PWD 是当前目录、PASS 是一个词，前面带别的词的（MYSQL_PWD、DB_PASS）才是密码
  */
 const ENV_ASSIGNMENT = new RegExp(
-  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|ACCOUNT_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+(?:PWD|PASS))(?:_[A-Z0-9]+)*[ \t]*=${LINE_VALUE}`,
+  String.raw`\b(?:(?:[A-Z0-9]+_)*(?:SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|ACCOUNT_?KEY|PASSWORD|PASSWD)|(?:[A-Z0-9]+_)+(?:PWD|PASS))(?:_[A-Z0-9]+)*[ \t]*${MAKE_ASSIGN}${LINE_VALUE}`,
   "gm",
 );
 /**
@@ -744,7 +746,7 @@ const ENV_ASSIGNMENT = new RegExp(
  * 名字要以密钥的词结尾（token_ttl、tokenizer 说的不是密钥）；句子中间小写的 token=…、token: … 是报错原文，不在这里认
  */
 const CONFIG_KEY = String.raw`[\w.-]*(?:${SECRET_LABEL}|password|passwd|[_.-]pwd|${PASS_ALIAS})\d*`;
-const LINE_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?${CONFIG_KEY}[ \t]*(?:=|:(?!:))${LINE_VALUE}`, "gim");
+const LINE_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:export[ \t]+|-[ \t]+)?${CONFIG_KEY}[ \t]*(?:${MAKE_ASSIGN}|:(?![:=]))${LINE_VALUE}`, "gim");
 /**
  * YAML 里值写在下面几行的配置项：块写法（api_key: |-、api_key: >）或者冒号后面空着、下一行缩进着写。
  * 第 1 组是这一行的缩进，第 2 组是块写法的标记（| 或 >，可带 - + 和数字）
@@ -1314,6 +1316,75 @@ function xmlNamedValues(text: string): string[] {
   return values;
 }
 
+/** 一行花括号里的对象（JSON、JS、HCL）：{"name": "MCP_AIOPS_TOKEN", "value": "…"}、{ name = "DB_PASSWORD", value = "…" } */
+const INLINE_OBJECT = /\{[^{}]*\}/g;
+/** 对象里的 name、key、value 字段，名字可以带引号，冒号或等号都算。第 1 组是字段名，第 2 到 4 组有一个是值 */
+const PAIR_FIELD = /["']?\b(name|key|value)["']?[ \t]*(?::|=(?![=>]))[ \t]*(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|([^\s,;}"']+))/gi;
+/** YAML 的一行「名字: 值」，前面可以带列表的 -。第 1 组是缩进，第 2 组是 -（列表里新的一项），第 3 组是名字，第 4 组是值 */
+const YAML_FIELD = /^([ \t]*)(-[ \t]+)?["']?([\w.-]+)["']?[ \t]*:(?:[ \t]+(.*))?$/;
+
+/** YAML 一行里的值：去掉行内注释和两边的引号 */
+function yamlScalar(raw: string): string {
+  const value = raw.replace(/[ \t]+#.*$/, "").trim();
+  return /^(["']).*\1$/.test(value) ? value.slice(1, -1) : value;
+}
+
+/**
+ * 名字和值分开写的配置项，名字是密钥的名字时取它的值：k8s 的 env（- name: DB_PASSWORD 下面 value: …）、
+ * JSON 和 HCL 里的 {"name": "MCP_AIOPS_TOKEN", "value": "…"}，value 写在 name 前面的也算。
+ * YAML 只看同一项里同一层的 value（valueFrom 下面 secretKeyRef 的 name、key 是引用，不是值）
+ */
+function namedPairValues(text: string): string[] {
+  const values: string[] = [];
+  for (const [object] of text.matchAll(INLINE_OBJECT)) {
+    const fields = new Map<string, string>();
+    for (const [, field, double, single, bare] of object.matchAll(PAIR_FIELD)) {
+      fields.set(field.toLowerCase(), double ?? single ?? bare);
+    }
+    const value = fields.get("value");
+    if (value !== undefined && namesCredential(fields)) {
+      values.push(value);
+    }
+  }
+  const lines = text.split(/\r?\n/).map((line) => {
+    const field = YAML_FIELD.exec(line);
+    return field && { column: field[1].length + (field[2]?.length ?? 0), item: field[2] !== undefined, name: field[3].toLowerCase(), value: yamlScalar(field[4] ?? "") };
+  });
+  lines.forEach((line, i) => {
+    if (!line || (line.name !== "name" && line.name !== "key")) {
+      return;
+    }
+    // 同一项里同一层的字段：往上到这一项的 - 为止，往下到下一项的 - 或者缩进更浅的行为止，更深的是嵌套的子项，跳过
+    const siblings: { name: string; value: string }[] = [];
+    for (let j = i - 1; !line.item && j >= 0; j--) {
+      const other = lines[j];
+      if (other && other.column < line.column) {
+        break;
+      }
+      if (other?.column === line.column) {
+        siblings.push(other);
+        if (other.item) {
+          break;
+        }
+      }
+    }
+    for (let j = i + 1; j < lines.length; j++) {
+      const other = lines[j];
+      if (other && (other.column < line.column || (other.column === line.column && other.item))) {
+        break;
+      }
+      if (other?.column === line.column) {
+        siblings.push(other);
+      }
+    }
+    const value = siblings.find((other) => other.name === "value")?.value;
+    if (value && namesCredential(new Map([[line.name, line.value]]))) {
+      values.push(value);
+    }
+  });
+  return values;
+}
+
 /** XML 注释（<!-- 生产库 -->） */
 const XML_COMMENT = /<!--[\s\S]*?-->/g;
 
@@ -1324,10 +1395,13 @@ const XML_COMMENT = /<!--[\s\S]*?-->/g;
 function xmlValues(text: string): string[] {
   const texts = text.includes("<!--") ? [text, text.replace(XML_COMMENT, "")] : [text];
   const raws = texts.flatMap((xml) => [...[...xml.matchAll(XML_ELEMENT)].map(([, , cdata, plain]) => cdata ?? plain), ...xmlNamedValues(xml)]);
-  return raws.flatMap((raw) => {
-    const value = raw.replace(/\s+/g, " ").trim();
-    return value.length >= 6 && !/[　-〿一-鿿＀-￯]/.test(value) && !isMasked(value) ? [value] : [];
-  });
+  return raws.flatMap(credentialValue);
+}
+
+/** 取出来的值：换行和连续的空白算一个空格。有中文的是说明，整个打了码的、短于 6 个字符的不算 */
+function credentialValue(raw: string): string[] {
+  const value = raw.replace(/\s+/g, " ").trim();
+  return value.length >= 6 && !/[　-〿一-鿿＀-￯]/.test(value) && !isMasked(value) ? [value] : [];
 }
 
 /** 这段文字里是不是像有密钥（拦草稿、表格里的行用的同一套规则） */
@@ -1405,6 +1479,7 @@ export function findSecret(text: string): string | undefined {
     ...tripleQuotedValues(text),
     ...heredocValues(text),
     ...xmlValues(text),
+    ...namedPairValues(text).flatMap(credentialValue),
     ...curlPasswords(text),
     ...netrcPasswords(text),
     ...pgpassPasswords(text),
