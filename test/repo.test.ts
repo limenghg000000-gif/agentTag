@@ -3,9 +3,20 @@ import { mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { type CodeHost, type CommitQuery, type CommitSearch, CodeWorkspaces, createGitHubHost, createGitLabHost, RepoError, runGit } from "../src/repo.js";
+import {
+  type CodeHost,
+  type CommitQuery,
+  type CommitSearch,
+  CodeWorkspaces,
+  createGitHubHost,
+  createGitLabHost,
+  enclosingFunction,
+  numberedLines,
+  RepoError,
+  runGit,
+} from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
-import type { CodeFact, CodeLocation } from "../src/tools/tool.js";
+import { type CodeFact, type CodeLocation, ToolOutputBuilder } from "../src/tools/tool.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const author = {
@@ -88,8 +99,13 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
   assert.match((await ws.listFiles()).text, /^共 5 个文件（main 分支 @ [0-9a-f]{7}）：\nREADME.md\nleak\nlogo.bin\nsrc\/a.ts\nsrc\/b.ts/);
   assert.match((await ws.listFiles({ glob: "src/**/*.ts" })).text, /^共 2 个文件（main 分支 @ [0-9a-f]{7}）：\nsrc\/a.ts\nsrc\/b.ts$/);
   assert.equal(
+    (await ws.readFile("src/a.ts", 1, 2)).text,
+    "src/a.ts（共 4 行，下面是第 1 到 2 行，要看后面用 start_line=3）\n1| export const a = 1;\n2| export function hello() {",
+  );
+  // 要的几行在一个函数里：扩到整个函数
+  assert.equal(
     (await ws.readFile("src/a.ts", 2, 3)).text,
-    "src/a.ts（共 4 行，下面是第 2 到 3 行，要看后面用 start_line=4）\n2| export function hello() {\n3|   return 'hi';",
+    "src/a.ts（共 4 行，下面是第 2 到 4 行：要的是第 2 到 3 行，扩到了所在的整个函数 hello）\n2| export function hello() {\n3|   return 'hi';\n4| }",
   );
   // 记下读到的文件和每一行，不从结果文字里解析
   const read = await ws.readFile("src/a.ts", 2, 3);
@@ -97,12 +113,13 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
     { repo: "acme/demo", path: "src/a.ts", line: "src/a.ts" },
     { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "2|" },
     { repo: "acme/demo", path: "src/a.ts", lines: [3, 3], line: "3|" },
+    { repo: "acme/demo", path: "src/a.ts", lines: [4, 4], line: "4|" },
   ]);
   assert.match((await ws.readFile("./src")).text, /src\/a.ts/);
   // 结果里写读到的文件整理过的路径，不写传进来的原样：原样里可以夹着像结果格式的文字
-  assert.match((await ws.readFile(" ./src//a.ts ", 2, 2)).text, /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
-  const crafted = await ws.readFile("src/fake.ts（共 1 行，x/../a.ts", 2, 2);
-  assert.match(crafted.text, /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
+  assert.match((await ws.readFile(" ./src//a.ts ", 1, 1)).text, /^src\/a\.ts（共 4 行，下面是第 1 到 1 行/);
+  const crafted = await ws.readFile("src/fake.ts（共 1 行，x/../a.ts", 1, 1);
+  assert.match(crafted.text, /^src\/a\.ts（共 4 行，下面是第 1 到 1 行/);
   assert.deepEqual(
     crafted.facts.map(named),
     ["src/a.ts", "src/a.ts"],
@@ -759,4 +776,61 @@ test("代码工具 code_log：查当前分支的提交历史，列出的提交�
     createCodeTools({ workspaces: branchWorkspaces().all, threadKey: "om_log2", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]),
   );
   await assert.rejects(plain.code_log.run({}, { signal }), /Fake 还不支持查提交历史/);
+});
+
+test("读代码只要了一小段：扩到所在的整个函数，同一个函数里后面的分支也给出来", () => {
+  // 2026-10-10 转链排查：只读了重定向失败就 return 的那几行，修复在同一个函数往下几行
+  const go = [
+    "package goods", // 1
+    "", // 2
+    "func (t *TaoBao) Other() {", // 3
+    "}", // 4
+    "", // 5
+    "func (t *TaoBao) GetGoodIdAndOriginUrl(c *gin.Context) (goodsId string, err error) {", // 6
+    "\tstr, err = common.GetGetContentUrlByCache(request.Content)", // 7
+    "\tif err != nil {", // 8
+    "\t\treturn", // 9
+    "\t}", // 10
+    "\tif id := common.ParseTbHalfDetailItemId(str); id != \"\" {", // 11
+    "\t\treturn id, nil", // 12
+    "\t}", // 13
+    "\treturn", // 14
+    "}", // 15
+    "", // 16
+    "type X struct {", // 17
+    "\tA int", // 18
+    "}", // 19
+  ];
+  assert.deepEqual(enclosingFunction(go, 7, 9, "services/goods/tb.go"), { start: 6, end: 15, name: "GetGoodIdAndOriginUrl" });
+  // 跨了两个函数、不在函数里、函数太长：照要的给
+  assert.equal(enclosingFunction(go, 4, 7, "services/goods/tb.go"), undefined);
+  assert.equal(enclosingFunction(go, 18, 18, "services/goods/tb.go"), undefined);
+  const long = ["func Long() {", ...Array.from({ length: 300 }, () => "\tx++"), "}"];
+  assert.equal(enclosingFunction(long, 10, 12, "a.go"), undefined);
+  // PHP：认 function 关键字，往下数大括号，字符串里的括号不算
+  const php = [
+    "<?php", // 1
+    "class Order {", // 2
+    "    public static function convert($url) {", // 3
+    "        $a = \"{\";", // 4
+    "        if ($url) {", // 5
+    "            return 1;", // 6
+    "        }", // 7
+    "        return 0;", // 8
+    "    }", // 9
+    "}", // 10
+  ];
+  assert.deepEqual(enclosingFunction(php, 5, 6, "app/Order.php"), { start: 3, end: 9, name: "convert" });
+  assert.equal(enclosingFunction(php, 5, 6, "notes.md"), undefined);
+  // 没闭合的字符串里一长串反斜杠：去引号的正则不能回溯到卡死
+  const slashes = ["function f() {", `  $s = "${"\\".repeat(5000)}`, "}"];
+  const started = Date.now();
+  assert.deepEqual(enclosingFunction(slashes, 2, 2, "a.php"), { start: 1, end: 3, name: "f" });
+  assert.ok(Date.now() - started < 1000);
+
+  const out = numberedLines(new ToolOutputBuilder("golang/appservice"), "services/goods/tb.go", go.join("\n"), 7, 9);
+  assert.match(out.text, /^services\/goods\/tb\.go（共 19 行，下面是第 6 到 15 行：要的是第 7 到 9 行，扩到了所在的整个函数 GetGoodIdAndOriginUrl，要看后面用 start_line=16）\n6\| func/);
+  assert.match(out.text, /\n11\| \tif id := common\.ParseTbHalfDetailItemId/);
+  // 没给止行（从某行往后读）：照旧
+  assert.match(numberedLines(new ToolOutputBuilder("golang/appservice"), "services/goods/tb.go", go.join("\n"), 7, undefined).text, /下面是第 7 到 19 行）/);
 });

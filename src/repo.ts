@@ -1277,7 +1277,7 @@ function safeName(name: string): string {
 }
 
 /** 文件内容加上行号，一次最多 MAX_READ_LINES 行、MAX_READ_CHARS 字。where 写明是哪个分支上的。记下读到的文件和每一行 */
-function numberedLines(
+export function numberedLines(
   out: ToolOutputBuilder,
   file: string,
   text: string,
@@ -1289,10 +1289,17 @@ function numberedLines(
   if (lines.at(-1) === "") {
     lines.pop();
   }
-  const from = Math.max(1, Math.floor(start));
-  const to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
+  let from = Math.max(1, Math.floor(start));
+  let to = Math.min(lines.length, end ? Math.floor(end) : from + MAX_READ_LINES - 1, from + MAX_READ_LINES - 1);
   if (from > lines.length) {
     return out.parts([shownPath(file), { path: file }], ` 只有 ${lines.length} 行。`).build();
+  }
+  // 只要了一小段：扩到所在的整个函数，同一个函数里后面的分支也看得到
+  const asked = { from, to };
+  const fn = end ? enclosingFunction(lines, from, to, file) : undefined;
+  if (fn && (fn.start < from || fn.end > to)) {
+    from = fn.start;
+    to = fn.end;
   }
   let size = 0;
   let last = from - 1;
@@ -1308,13 +1315,90 @@ function numberedLines(
     [shownPath(file), { path: file }],
     "（",
     ...(where ? [[where.text, ...where.refs] as const, "，"] : []),
-    `共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`,
+    `共 ${lines.length} 行，下面是第 ${from} 到 ${last} 行` +
+      (from !== asked.from || to !== asked.to ? `：要的是第 ${asked.from} 到 ${asked.to} 行，扩到了所在的整个函数 ${fn?.name}` : "") +
+      `${last < lines.length ? `，要看后面用 start_line=${last + 1}` : ""}）`,
   );
   // 每一行的行号「12|」交给了模型，这一行就算查到了
   for (let i = from; i <= last; i++) {
     out.parts([`${i}|`, { path: file, lines: [i, i] }], ` ${lines[i - 1]}`);
   }
   return out.build();
+}
+
+/** 只要了一小段时，所在的函数最多这么多行就整段给出；更长的照要的给 */
+const MAX_FUNCTION_LINES = 250;
+/** 往上找函数头最多找多少行 */
+const MAX_FUNCTION_LOOKBACK = 400;
+/** PHP、JS/TS 用 function 关键字的函数头 */
+const FUNCTION_HEADER = /^\s*(?:(?:export|default|public|private|protected|static|final|abstract|async)\s+)*function\s*&?\s*([A-Za-z_$][\w$]*)\s*\(/;
+const BRACE_FILE = /\.(?:php|js|jsx|mjs|cjs|ts|tsx)$/i;
+
+/**
+ * 读的这几行（from 到 to）所在的函数，起止行（含）和函数名；不在函数里、或者函数超过 MAX_FUNCTION_LINES 行时不给。
+ * 2026-10-10 转链排查：模型只读了 tb.go 报错附近几行（2431-2436，重定向失败就 return），
+ * 修复在同一个函数往下 30 行（2468 从 topIds 取商品 ID），没看到，下了「不是服务故障」的结论。
+ * Go 按 gofmt 的写法认：顶格的 func 到下一个顶格的 }。PHP、JS/TS 认 function 关键字的函数头，往下数大括号找到结尾
+ * （字符串、注释里的大括号会数错，数出来超长的就不扩）
+ */
+export function enclosingFunction(lines: readonly string[], from: number, to: number, file: string): { start: number; end: number; name: string } | undefined {
+  const limit = Math.max(1, from - MAX_FUNCTION_LOOKBACK);
+  if (file.toLowerCase().endsWith(".go")) {
+    for (let i = from; i >= limit; i--) {
+      const line = lines[i - 1];
+      // 先碰到上一个函数的结尾：要的这几行不在函数里
+      if (i < from && /^}/.test(line)) {
+        return undefined;
+      }
+      const header = /^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/.exec(line);
+      if (header) {
+        const close = lines.findIndex((text, index) => index >= i - 1 && /^}/.test(text));
+        return close >= 0 ? fit(i, close + 1, header[1]) : undefined;
+      }
+    }
+    return undefined;
+  }
+  if (!BRACE_FILE.test(file)) {
+    return undefined;
+  }
+  // 由近到远找函数头，第一个把要的这几行包在里面的就是所在的函数（方法里的闭包也是函数，取最近的那个）
+  for (let i = from; i >= limit; i--) {
+    const header = FUNCTION_HEADER.exec(lines[i - 1]);
+    if (!header) {
+      continue;
+    }
+    const close = closingBrace(lines, i);
+    if (close !== undefined && close >= to) {
+      return fit(i, close, header[1]);
+    }
+  }
+  return undefined;
+
+  function fit(start: number, end: number, name: string) {
+    return end >= to && end - start + 1 <= MAX_FUNCTION_LINES ? { start, end, name } : undefined;
+  }
+}
+
+/** 从函数头那一行往下数大括号，回到 0 的那一行；数不到（或者超过 MAX_FUNCTION_LINES 还没完）不给 */
+function closingBrace(lines: readonly string[], header: number): number | undefined {
+  let depth = 0;
+  let opened = false;
+  for (let i = header; i <= Math.min(lines.length, header + MAX_FUNCTION_LINES); i++) {
+    // 去掉行尾的 // 注释和引号里的内容，少数错一些。反斜杠只当转义符认（[^\\]），不然一长串没闭合的反斜杠会让正则回溯到卡死
+    const code = lines[i - 1].replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/g, "").replace(/\/\/.*$/, "");
+    for (const char of code) {
+      if (char === "{") {
+        depth++;
+        opened = true;
+      } else if (char === "}") {
+        depth--;
+      }
+    }
+    if (opened && depth <= 0) {
+      return i;
+    }
+  }
+  return undefined;
 }
 
 /** 分支名：去掉 origin/、refs/heads/ 前缀，只许 git 分支名里常见的字符 */
