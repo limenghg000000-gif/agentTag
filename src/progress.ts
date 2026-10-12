@@ -1,5 +1,6 @@
 import { stripThinkTags } from "./llm.js";
 import { nextFence, richCardLine, stripRichTags } from "./markdown.js";
+import { type AnswerSegment, hasUiBlocks, segmentElements, segmentsAsText, splitAnswer, streamingAnswer } from "./rich-ui.js";
 
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
@@ -36,6 +37,8 @@ export interface ProgressState {
   answer?: string;
   /** 卡片即回答：还没有回答可显示时，回答位置上的说明（比如上一版没通过检查、正在重做） */
   answerNote?: string;
+  /** 卡片即回答：结束后的回答拆成的几段（图和数字卡片已经核对过查询结果），有图或数字卡片时按段显示 */
+  answerSegments?: AnswerSegment[];
 }
 
 export interface CardOptions {
@@ -80,7 +83,14 @@ export function renderProgressCard(state: ProgressState, taskId: string, now = D
     card = buildProgressCard(state, taskId, now, ++omitted, options);
   }
   // 正文全去掉还放不下（步骤太多、步骤名很长）：不显示思考，和以前一样只列最近的步骤
-  return total > 0 && !fits(card) ? buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options) : card;
+  if (total > 0 && !fits(card)) {
+    card = buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options);
+  }
+  // 还放不下就是图的数据太多：图换成文字说明
+  if (!fits(card) && state.answerSegments && hasUiBlocks(state.answerSegments)) {
+    card = buildProgressCard({ ...state, thoughts: undefined, answerSegments: undefined }, taskId, now, 0, options);
+  }
+  return card;
 }
 
 /** omitted：最早的几段思考只显示标题、不显示正文 */
@@ -102,7 +112,8 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
     }
     const answer = streaming ? (liveText(state) || state.answerNote || state.answer) : undefined;
     if (answer) {
-      elements.push(answerElement(answer));
+      // 图和数字卡片的代码块不把 JSON 显示出来，写完回答以后再画
+      elements.push(answerElement(streamingAnswer(answer)));
     }
     elements.push({
       tag: "button",
@@ -128,9 +139,19 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
     });
   }
   if (streaming && finished && state.answer) {
-    elements.push(answerElement(state.answer));
+    const segments = state.answerSegments;
+    if (segments && hasUiBlocks(segments) && answerFitsCard(state.answer)) {
+      elements.push(...segmentElements(segments, (text) => ({ tag: "markdown", content: escapeAnswer(text) })));
+    } else {
+      elements.push(answerElement(finalText(state)));
+    }
   }
   return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
+}
+
+/** 结束后只能放文字时的回答：图换成一句说明，数字卡片换成一行 */
+function finalText(state: ProgressState): string {
+  return segmentsAsText(state.answerSegments ?? splitAnswer(state.answer ?? "").segments);
 }
 
 function isFinished(state: ProgressState): boolean {
@@ -144,7 +165,7 @@ function isFinished(state: ProgressState): boolean {
  */
 function cardConfig(state: ProgressState, streaming: boolean | undefined): object {
   const finished = isFinished(state);
-  const preview = streaming && finished && state.answer ? previewOf(state.answer) : undefined;
+  const preview = streaming && finished && state.answer ? previewOf(finalText(state)) : undefined;
   return {
     update_multi: true,
     ...(streaming ? { streaming_mode: !finished && liveText(state) !== "", streaming_config: STREAMING_CONFIG } : {}),
@@ -171,9 +192,9 @@ function answerElement(answer: string): object {
   return { tag: "markdown", element_id: ELEMENT.answer, content: escapeAnswer(clipAnswer(answer)) };
 }
 
-/** 回答能不能完整放进卡片。放不下时卡片里只有开头，要另外发全文 */
+/** 回答能不能完整放进卡片（图和数字卡片的代码块不算字数，卡片放不下图时另有处理）。放不下时卡片里只有开头，要另外发全文 */
 export function answerFitsCard(answer: string): boolean {
-  return Array.from(answer).length <= MAX_CARD_ANSWER_CHARS;
+  return Array.from(streamingAnswer(answer)).length <= MAX_CARD_ANSWER_CHARS;
 }
 
 function clipAnswer(answer: string): string {
@@ -263,7 +284,7 @@ export function visibleThought(text: string): string {
 export function renderPlainProgressCard(state: ProgressState, now = Date.now(), { streaming }: CardOptions = {}): object {
   const elements: object[] = [{ tag: "markdown", content: [summaryLine(state, now), ...stepLines(state.steps)].join("\n") }];
   if (streaming && state.answer) {
-    elements.push(answerElement(state.answer));
+    elements.push(answerElement(finalText(state)));
   }
   return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
 }

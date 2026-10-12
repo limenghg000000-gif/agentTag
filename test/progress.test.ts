@@ -12,6 +12,7 @@ import {
   renderProgressCard,
   STOP_ACTION,
 } from "../src/progress.js";
+import { splitAnswer } from "../src/rich-ui.js";
 
 const state = (extra: Partial<ProgressState>): ProgressState => ({ phase: "thinking", steps: [], startedAt: 0, ...extra });
 const text = (card: object) => JSON.stringify(card);
@@ -289,4 +290,35 @@ test("卡片即回答：回答里的表格、小标题、<font>、<text_tag> 照
     "#### 结论 <text_tag color='red'>高风险</text_tag>\n\n| 服务 | CPU |\n|---|---|\n| union | <font color='red'>92%</font> |\n&lt;at id=all>&lt;/at>",
   );
   assert.match(card.config.summary.content, /^结论 高风险 \| 服务 \| CPU \|/);
+});
+
+test("卡片即回答：生成时图的代码块显示成一行说明；结束后按段画成图和数字卡片；放不下、简单版本时换成文字", () => {
+  const chart = '{"type":"line","title":"CPU","x":["a","b"],"series":[{"name":"p","data":[1,2]}]}';
+  const answer = `结论\n\`\`\`kpi\n[{"label":"CPU","value":"2%"}]\n\`\`\`\n\`\`\`chart\n${chart}\n\`\`\`\n下一步`;
+  const live = renderProgressCard(state({ live: { round: 1, reasoning: "", text: answer } }), "t", 0, streaming) as any;
+  assert.equal(live.body.elements.find((e: any) => e.element_id === ELEMENT.answer).content, "结论\n📌 关键数字整理好后显示在这里…\n📊 图表画好后显示在这里…\n下一步");
+
+  const segments = splitAnswer(answer).segments;
+  const done = renderProgressCard(state({ phase: "done", endedAt: 0, answer, answerSegments: segments }), "t", 0, streaming) as any;
+  assert.deepEqual(
+    done.body.elements.map((e: any) => e.tag),
+    ["markdown", "markdown", "column_set", "chart", "markdown"],
+  );
+  assert.equal(done.body.elements[1].content, "结论");
+  assert.equal(done.config.summary.content, "结论 **CPU** 2% 📊 CPU（这里显示不了图） 下一步");
+
+  // 简单版本、没核对过（answerSegments 为空）时都是文字
+  const plain = renderPlainProgressCard(state({ phase: "done", endedAt: 0, answer, answerSegments: segments }), 0, streaming) as any;
+  assert.equal(plain.body.elements.at(-1).content, "结论\n\n**CPU** 2%\n\n📊 CPU（这里显示不了图）\n\n下一步");
+  const unchecked = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any;
+  assert.doesNotMatch(text(unchecked), /"tag":"chart"/);
+
+  // 图的数据太多、卡片放不下：图换成文字
+  const big = JSON.stringify({ type: "line", title: "大图", x: Array.from({ length: 25 }, (_, i) => `第${i}个时间点`.padEnd(38, "长")), series: Array.from({ length: 8 }, (_, s) => ({ name: `系列${s}`.padEnd(38, "名"), data: Array(25).fill(123456.789) })) });
+  const bigAnswer = `结论\n\`\`\`chart\n${big}\n\`\`\``;
+  const bigSegments = splitAnswer(bigAnswer).segments;
+  assert.equal(bigSegments[1].kind, "chart");
+  const tooBig = renderProgressCard(state({ phase: "done", endedAt: 0, answer: bigAnswer, answerSegments: bigSegments }), "t", 0, streaming) as any;
+  assert.ok(Buffer.byteLength(text(tooBig)) <= MAX_CARD_BYTES);
+  assert.match(tooBig.body.elements.at(-1).content, /📊 大图（这里显示不了图）/);
 });

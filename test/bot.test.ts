@@ -2919,6 +2919,54 @@ test("卡片即回答：回答太长另外发全文时，表格改成列表、�
   assert.match(kit.last().body.elements.at(-1).content, /<text_tag color='red'>高风险<\/text_tag>/);
 });
 
+test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时换成文字", async () => {
+  const metrics: Tool = {
+    spec: { name: "aiops_query_metrics_range", description: "查指标趋势", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查指标趋势",
+    run: async () => '{"series":[{"pod":"pod-a","values":[["19:00","0.412"],["19:05","0.39"]]}]}',
+  };
+  const chart = (data: string) =>
+    `\`\`\`chart\n{"type":"line","title":"pod-a CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[${data}]}]}\n\`\`\``;
+  const answerWith = (data: string) => `结论：CPU 正常\n\`\`\`kpi\n[{"label":"CPU 最高","value":"41%","level":"ok"},{"label":"内存","value":"88%"}]\n\`\`\`\n${chart(data)}`;
+  const run = async (data: string, withCard: boolean) => {
+    const kit = fakeCardKit();
+    const warnings: string[] = [];
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_metrics_range", arguments: "{}" }] },
+      { text: answerWith(data), finish: "stop" },
+    ];
+    const { model } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      ...(withCard ? { cardKit: kit.api } : {}),
+      streamIntervalMs: 0,
+      mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined },
+      logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+    });
+    await handle(message("看看 pod-a 最近的 CPU"));
+    return { kit, sent, warnings };
+  };
+
+  const ok = await run("41.2,39", true);
+  const elements = ok.kit.last().body.elements;
+  assert.deepEqual(
+    elements.slice(1).map((e: any) => e.tag),
+    ["markdown", "column_set", "chart"],
+  );
+  // 内存 88% 查不到：这个数字卡片不放
+  assert.equal(elements[2].columns.length, 1);
+  assert.match(ok.warnings.join("\n"), /数字卡片「内存 88%」在查询结果里找不到/);
+  assert.deepEqual(markdowns(ok.sent), []);
+
+  const made = await run("41.2,55", true);
+  assert.doesNotMatch(JSON.stringify(made.kit.last()), /"tag":"chart"/);
+  assert.match(JSON.stringify(made.kit.last()), /图「pod-a CPU」里有数和这次查到的结果对不上，没画出来/);
+  assert.match(made.warnings.join("\n"), /图「pod-a CPU」有 1 个数在查询结果里找不到（如 55）/);
+
+  const plain = await run("41.2,39", false);
+  assert.deepEqual(markdowns(plain.sent), ["结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"]);
+});
+
 test("卡片即回答：停止时卡片标成已停止，不留草稿，不发回答", async () => {
   const kit = fakeCardKit();
   let started!: () => void;

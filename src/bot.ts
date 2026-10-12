@@ -7,6 +7,7 @@ import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type Th
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
+import { type AnswerSegment, hasUiBlocks, keepVerified, NumberEvidence, segmentsAsText, splitAnswer } from "./rich-ui.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   answerFitsCard,
@@ -260,6 +261,8 @@ async function runTask(
   let result: AgentResult | undefined;
   let source = "none";
   let memoryCount: number | undefined;
+  // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
+  const evidence: ToolEvidence[] = [];
   try {
     if (!(await task.waitTurn())) {
       throw new Error("stopped while queued");
@@ -291,7 +294,6 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
-    const evidence: ToolEvidence[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
     const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
@@ -511,6 +513,9 @@ async function runTask(
   state.live = undefined;
   state.answerNote = undefined;
   state.answer = answer;
+  // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画
+  const segments = answer === undefined ? [] : verifiedSegments(answer, evidence, logger, msg.messageId);
+  state.answerSegments = segments;
   try {
     const landed = await card?.finish(render(), renderPlainProgressCard(state, now(), { streaming }));
     if (answer !== undefined) {
@@ -522,7 +527,7 @@ async function runTask(
         }
       } else {
         // 没用流式卡片、卡片最后没更新上、或者回答太长卡片里只放了开头：和以前一样另外发全文
-        for (const chunk of splitMarkdown(toPostMarkdown(answer), CHUNK_CHARS)) {
+        for (const chunk of splitMarkdown(toPostMarkdown(segmentsAsText(segments)), CHUNK_CHARS)) {
           await reply(chunk);
         }
       }
@@ -535,6 +540,22 @@ async function runTask(
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
+}
+
+/** 拆出回答里的图和数字卡片，数对不上查询结果的去掉；去掉了什么、哪些块格式不对写日志 */
+function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string): AnswerSegment[] {
+  const { segments, invalid } = splitAnswer(answer);
+  if (invalid.length > 0) {
+    logger.warn(`回答里的 ${invalid.join("、")} 块格式不对，没画 message=${messageId}`);
+  }
+  if (!hasUiBlocks(segments)) {
+    return segments;
+  }
+  const checked = keepVerified(segments, new NumberEvidence(evidence.flatMap((item) => (item.output === undefined ? [] : [item.output]))));
+  if (checked.dropped.length > 0) {
+    logger.warn(`回答里的图、数字卡片对不上查询结果，没画 message=${messageId}：${checked.dropped.join("；")}`);
+  }
+  return checked.segments;
 }
 
 /** 记下这个话题的问答，之后别的话题用 chat_recent_threads 查。记不下只是别的话题查不到这次，不影响这次回答 */
