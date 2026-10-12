@@ -704,12 +704,18 @@ const PATH_END = `(?=$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}]))(?![${SOFT_DE
 const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
 const CODE_PATHS = new RegExp(`${NOT_GLUED}(?!~)((?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
 /**
+ * 回答里的绝对路径（报错堆栈里的 /app/internal/logic/user.go:35、Go 模块缓存 /go/pkg/mod/…/x.go）：CODE_PATHS 只认相对路径，
+ * 绝对路径整段都认不出来，原先回答里写 /app/src/user.ts:99 一概不查。和 CODE_PATHS 一样至少一层目录、按整段认；
+ * 前面要是分界：x(/app/…、~/.config/x.yaml、./src/a.ts 里的 / 前面紧挨着路径字符，不是绝对路径的开头
+ */
+const ABS_CODE_PATHS = new RegExp(`${NOT_GLUED}(\\/(?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
+/**
  * 反引号、加粗、引号里带空格的路径（`src/my files/app.ts:12`、**src/my files/app.ts**:12、"src/my files/app.ts":12）：
  * CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，
  * 词之间可以是连着几个空格、制表符、全角空格；后面是收尾的符号，或者 LINE_AFTER_PATH 认的行号写法（:12、：12、#L12、 第 12 行）
  */
 const SPACED_CODE_PATHS = new RegExp(
-  `(?<=[\`*"“「『])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})(?=[\`*"”」』:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
+  `(?<=[\`*"“「『])(\\/?(?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})(?=[\`*"”」』:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
   "g",
 );
 /**
@@ -717,7 +723,7 @@ const SPACED_CODE_PATHS = new RegExp(
  * CODE_PATHS 会把两头的符号算进路径里、认不出来。前面是分界、两头是一样的一对符号时，中间按一整段路径认（见 unseenCodeCitations）
  */
 const WRAPPED_CODE_PATHS = new RegExp(
-  `(?<=(?:^|[${PATH_DELIM}])([_~]{1,2}))(?![_~])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})` +
+  `(?<=(?:^|[${PATH_DELIM}])([_~]{1,2}))(?![_~])(\\/?(?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})` +
     `(?=\\1(?:$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}])))`,
   "g",
 );
@@ -850,15 +856,19 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
     if (!/\s/.test(path) || line !== undefined || seen(path, line) || !looksLikeCommand(path)) {
       check(path, line, match.index);
     } else {
-      for (const piece of path.matchAll(CODE_PATHS)) {
-        const at = match.index + piece.index;
-        check(piece[1], lineAfter(at + piece[1].length), at);
+      for (const pieces of [CODE_PATHS, ABS_CODE_PATHS]) {
+        for (const piece of path.matchAll(pieces)) {
+          const at = match.index + piece.index;
+          check(piece[1], lineAfter(at + piece[1].length), at);
+        }
       }
     }
   }
-  for (const match of answer.matchAll(CODE_PATHS)) {
-    if (!spans.some(([from, to]) => match.index >= from && match.index < to)) {
-      check(match[1], lineAfter(match.index + match[1].length), match.index);
+  for (const paths of [CODE_PATHS, ABS_CODE_PATHS]) {
+    for (const match of answer.matchAll(paths)) {
+      if (!spans.some(([from, to]) => match.index >= from && match.index < to)) {
+        check(match[1], lineAfter(match.index + match[1].length), match.index);
+      }
     }
   }
   // 提交号所在的这句话：写着仓库名的，只认这个仓库里查到的提交（见 codeEvidence）
@@ -901,6 +911,8 @@ export interface ToolEvidence {
  * 读到、搜到的代码正文里写的路径、行号、提交号也就不算：仓库里的测试和文档常常写着别的路径，机器人自己的仓库 ai/agent-tag 的测试里
  * 就有 2026-10-09 编出来的那几个引用。
  * 别的工具（aiops 查到的日志、报错堆栈）没有固定格式，按原文找：路径要整段对上，前面是绝对路径的也算（/app/src/a.ts:12）。
+ * 回答里写的就是绝对路径时，日志、堆栈里要有这整个绝对路径；代码工具查到的是仓库里的相对路径，去掉前面几级目录以后对得上就算
+ * （容器里的 /app/src/a.ts:12 就是读到的 src/a.ts 第 12 行）。
  * 没查到的（「没有这个文件：src/foo.ts」、没搜到、没有匹配的文件）不算：从回答的字面上分不清是在说「它不存在」，
  * 还是没查到以后照样讲它写了什么。照实说找不到的回答，打回重做时会被告知别写这个路径；路径是群成员自己问的，重做以后照着复述也不拦（见 runTask）。
  * 回答里写成「./路径」时去掉前缀再找，路径和读文件时一样整理（src/./a.ts 就是 src/a.ts）；
@@ -918,22 +930,52 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
     const named = sentence !== undefined && COMMIT_ID.test(cite) ? commitRepo(sentence, repos) : undefined;
     const written = named === undefined ? cite : `${named}/${cite}`;
     // 文件名里可以真有反斜杠（src/foo\bar.ts）：先按原样找，再把 \ 当成 / 找（Windows 的写法）
-    return [...new Set([repoPath(written), repoPath(written.replace(/\\/g, "/"))])].some((text) => {
-      // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算。
-      // 仓库名互相包含时（team/backend、team/backend/api）只按最长的那个算：team/backend/api/src/x.ts 说的是 team/backend/api 里的
-      const prefix = longestRepoPrefix(text, repos);
-      const forms: Array<{ path: string; repos?: string[] }> = [
-        { path: text, repos: prefix === undefined ? undefined : [prefix] },
-        ...(prefix === undefined ? [] : [{ path: text.slice(prefix.length + 1), repos: [prefix] }]),
-      ];
-      return matchesFacts(facts, forms, line, branch);
+    return [...new Set([written, written.replace(/\\/g, "/")])].some((raw) => {
+      // 绝对路径（/app/src/a.ts）：日志、堆栈里要整段对上，别的绝对路径（/build/app/src/a.ts）、相对路径（src/a.ts）不算；
+      // 代码工具查到的是仓库里的相对路径，按去掉前面几级目录以后的认（/app/src/a.ts 的 app/src/a.ts、src/a.ts，至少留一层目录）。
+      // 日志里的绝对路径不一定整理过（PHP 报错里的 /var/www/html/../vendor/autoload.php），回答照抄的也要认：按原样和整理后的都找
+      const absolute = /^\s*\/(?!\/)/.test(raw) ? posix.normalize(raw.trim()) : undefined;
+      const forms: Array<{ path: string; repos?: string[] }> = [];
+      for (const text of absolute === undefined ? [repoPath(raw)] : innerPaths(absolute)) {
+        // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算。
+        // 仓库名互相包含时（team/backend、team/backend/api）只按最长的那个算：team/backend/api/src/x.ts 说的是 team/backend/api 里的。
+        // 绝对路径里有仓库名的（/ai/agent-tag/src/x.ts），更短的那几段（src/x.ts）不再拿去别的仓库里找
+        const prefix = longestRepoPrefix(text, repos);
+        forms.push({ path: text, repos: prefix === undefined ? undefined : [prefix] });
+        if (prefix !== undefined) {
+          forms.push({ path: text.slice(prefix.length + 1), repos: [prefix] });
+          break;
+        }
+      }
+      return matchesFacts(facts, forms, line, branch, absolute === undefined ? undefined : [...new Set([raw.trim(), absolute])]);
     });
   };
 }
 
-/** 按 forms 里的几种写法（整段、去掉仓库名的）在查到的里找 */
-function matchesFacts(facts: CodeFacts, forms: Array<{ path: string; repos?: string[] }>, line?: number, branch?: boolean): boolean {
-  return forms.some(({ path, repos: scope }) => {
+/**
+ * 绝对路径最多去掉开头这么多级目录。容器、构建机、模块缓存的前缀（/app、/var/www/html、/home/runner/work/x/x、/go/pkg/mod/…@v1.2.3）没有这么深；
+ * 不设上限时每一段都拼一遍，回答里写一个几万字、几万级的路径，查一次就要几秒、几百 MB
+ */
+const MAX_DROPPED_DIRS = 32;
+
+/** 绝对路径去掉开头几级目录以后的各段，从长到短，至少留一层目录：/app/src/a.ts → app/src/a.ts、src/a.ts */
+function innerPaths(absolute: string): string[] {
+  const parts = absolute.split("/").filter(Boolean);
+  return parts.slice(0, Math.min(parts.length - 1, MAX_DROPPED_DIRS + 1)).map((_, i) => parts.slice(i).join("/"));
+}
+
+/**
+ * 按 forms 里的几种写法（整段、去掉仓库名的）在查到的里找。texts 是在没有固定格式的结果（日志、堆栈）里找的写法，
+ * 不传就是 forms 里的这几种；绝对路径只按它整段找
+ */
+function matchesFacts(
+  facts: CodeFacts,
+  forms: Array<{ path: string; repos?: string[] }>,
+  line?: number,
+  branch?: boolean,
+  texts: readonly string[] = forms.map((form) => form.path),
+): boolean {
+  const known = forms.some(({ path, repos: scope }) => {
     const inRepo = (found: { repo: string }) => scope === undefined || scope.includes(found.repo);
     let found: boolean;
     if (COMMIT_ID.test(path)) {
@@ -949,8 +991,9 @@ function matchesFacts(facts: CodeFacts, forms: Array<{ path: string; repos?: str
         ) ||
         (branch === true && line === undefined && facts.branches.some((seen) => inRepo(seen) && seen.name === path));
     }
-    return found || facts.text.some((output) => (line === undefined ? mentions(output, path) : hasLine(output, path, line)));
+    return found;
   });
+  return known || facts.text.some((output) => texts.some((path) => (line === undefined ? mentions(output, path) : hasLine(output, path, line))));
 }
 
 /**
