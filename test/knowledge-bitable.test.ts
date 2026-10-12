@@ -235,14 +235,56 @@ test("撤权限失败（没开 docs:permission.member:delete）时警告写明�
   const warnings: string[] = [];
   const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger }).syncSharing();
-  assert.equal(warnings.length, 1);
+  assert.equal(warnings.length, 2);
   assert.match(warnings[0], /撤掉 ou_old .*要用应用权限 docs:permission\.member:delete/);
+  assert.match(warnings[1], /还有 1 个协作者的权限没撤掉或没降成只读，10 分钟后再试/);
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view", "openid:ou_old:edit"]);
 
   api.removeCollaborator = remove;
   await new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, logger: quiet }).syncSharing();
   assert.deepEqual(calls.slice(-1), ["remove ou_old"]);
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+});
+
+test("撤权限、降成只读没成功时不等下次启动或保存，过一会儿自己再试，撤掉以后不再试", async () => {
+  const stateFile = path.join(dir, "revoke-retry", "bitable.json");
+  const { api, calls } = fakeBitable();
+  await new KnowledgeBase(new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: ["ou_old"] }, logger: quiet }), { logger: quiet }).save(dau);
+  // 数据目录里记的 oc_1 是可编辑（以前的版本给的），要降回只读
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  state.shared = state.shared.map((key: string) => (key === "openchat:oc_1:view" ? "openchat:oc_1:edit" : key));
+  await writeFile(stateFile, JSON.stringify(state));
+  const remove = api.removeCollaborator.bind(api);
+  const update = api.updateCollaborator.bind(api);
+  let failing = 2;
+  api.removeCollaborator = async (app, member) => {
+    if (failing-- > 0) {
+      throw new FeishuApiError(500, "飞书接口返回错误 500：内部错误");
+    }
+    return remove(app, member);
+  };
+  let updateFailing = 1;
+  api.updateCollaborator = async (app, member, perm) => {
+    if (updateFailing-- > 0) {
+      throw new FeishuApiError(500, "飞书接口返回错误 500：内部错误");
+    }
+    return update(app, member, perm);
+  };
+  const warnings: string[] = [];
+  const logger = { ...quiet, warn: (message: string) => void warnings.push(message) };
+  const backend = new BitableKnowledgeBackend({ api, stateFile, share: { chatIds: ["oc_1"], editors: [] }, revokeRetryMs: 20, logger });
+  await backend.syncSharing();
+  assert.match(warnings.join("\n"), /还有 2 个协作者的权限没撤掉或没降成只读/);
+
+  // 第一次再试：oc_1 降成了只读，ou_old 还没撤掉，接着再排一次；第二次再试撤掉了
+  const deadline = Date.now() + 5000;
+  while (!calls.includes("remove ou_old") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(calls.slice(3), ["update oc_1 view", "remove ou_old"]);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).shared, ["openchat:oc_1:view"]);
+  assert.equal(warnings.filter((w) => /分钟后再试/.test(w)).length, 2, "都撤掉以后不再排");
 });
 
 test("设置谁能管协作者失败（没开 docs:permission.setting:write_only）时先不共享给任何人，警告写明缺的权限；开了以后下次启动设好再共享", async () => {

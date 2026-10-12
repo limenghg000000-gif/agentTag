@@ -40,6 +40,8 @@ const FIELDS = {
 
 const STATUS_LABELS = { active: "有效", archived: "已归档" } as const;
 const PERM_LABELS = { view: "只读", edit: "可编辑", full_access: "可管理" } as const;
+/** 撤权限没成功时默认隔多久再试 */
+const REVOKE_RETRY_MS = 10 * 60_000;
 const APP_NAME = "AgentTag 经验库";
 const TABLE_NAME = "经验库";
 
@@ -277,6 +279,8 @@ export interface BitableBackendOptions {
    * 群一直只读：经验库所有群共用，群里谁都能改表格的话，任何人都能绕过确认卡片往里写内容。可管理只留给机器人：能管协作者的人才能把表格共享出名单
    */
   share: { chatIds: readonly string[]; editors: readonly string[] };
+  /** 撤权限（或降成只读）没成功时隔多久再试，默认 10 分钟。名单改了要重启，没配写权限名单时又不会再保存，不能只等下次启动或保存 */
+  revokeRetryMs?: number;
   logger?: Logger;
 }
 
@@ -294,7 +298,7 @@ interface BitableState extends BitableTarget {
  * 经验存在飞书多维表格里：大家在飞书里能直接看、筛选和修改，机器人每分钟重新读一次。
  * 没指定表时，第一次保存经验时机器人自己建一张，共享给白名单群（只读）和写权限名单里的人（可编辑）。
  * 表格设成只有机器人能加、移除协作者，链接分享关掉，所以能打开的只有名单里的群和人。
- * 共享跟着白名单群和写权限名单走：启动时和每次保存时补上没共享成的、改掉权限变了的、撤掉移出名单的。
+ * 共享跟着白名单群和写权限名单走：启动时和每次保存时补上没共享成的、改掉权限变了的、撤掉移出名单的；撤不掉的过一会儿自己再试。
  * 有人在表格里手动加的行没有编号时，用行的 record_id 当编号，照样能检索到
  */
 export class BitableKnowledgeBackend implements KnowledgeBackend {
@@ -311,6 +315,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
   private generation = 0;
   private warnedAmbiguous = "";
   private readonly logger: Logger;
+  /** 撤权限没成功时排上的下一次调整 */
+  private revokeRetry?: NodeJS.Timeout;
 
   constructor(private readonly options: BitableBackendOptions) {
     this.logger = options.logger ?? console;
@@ -505,7 +511,7 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
    * 没共享的加上，权限变了的改掉，移出名单的撤掉（被移出写权限名单的人不能再直接改表格）。
    * 加协作者之前先把它记进数据目录：加上了却没来得及记下就退出的话，以后移出名单时就不知道要撤它。
  * 撤之前也记成结果不明：撤掉了却没来得及记下的，以后加回名单时会重新加，不会以为它还有权限。
-   * 失败不影响保存，记一条警告，下次启动或保存时再试
+   * 失败不影响保存，记一条警告，下次启动或保存时再试；该撤的没撤掉、该降成只读的没降成时，隔 revokeRetryMs 自己再试
    */
   private async reconcile(target: BitableState): Promise<void> {
     const { api, share } = this.options;
@@ -625,6 +631,17 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
     }
     if (changed) {
       await persist().catch((err: unknown) => this.logger.warn("经验库：共享结果没能记进数据目录，下次会再调整一次", err));
+    }
+    // 还有该撤没撤掉、该降成只读没降成的：不等下次启动或保存（可能很久都不会有），过一会儿自己再试
+    const leftover = [...granted].filter(([key, { perm }]) => wanted.get(key)?.[1] !== perm).length;
+    if (leftover > 0 && !this.revokeRetry) {
+      const delay = this.options.revokeRetryMs ?? REVOKE_RETRY_MS;
+      this.logger.warn(`经验库：还有 ${leftover} 个协作者的权限没撤掉或没降成只读，${Math.max(1, Math.round(delay / 60_000))} 分钟后再试`);
+      this.revokeRetry = setTimeout(() => {
+        this.revokeRetry = undefined;
+        void this.syncSharing().catch((err: unknown) => this.logger.warn("经验库：再试撤权限时出错", err));
+      }, delay);
+      this.revokeRetry.unref();
     }
   }
 
