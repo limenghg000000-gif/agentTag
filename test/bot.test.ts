@@ -710,7 +710,7 @@ test("模型返回了思考内容时，进度卡片上显示最新一段，结�
   assert.ok(hidden.updates.every((u) => !/💭|先查资料/.test(cardText(u.card))));
 });
 
-test("中文提问、思考被英文带跑时，在工具结果后面提醒接着用中文想，一次任务最多提醒 3 次", async () => {
+test("中文提问、卡片显示思考时，每次查完、下一轮要思考之前都在工具结果后面提醒用中文想", async () => {
   const tool: Tool = {
     spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
     describe: () => "查资料",
@@ -727,15 +727,31 @@ test("中文提问、思考被英文带跑时，在工具结果后面提醒接�
   ];
   const nudges = (requests: ChatRequest[]) => requests.map((req) => req.messages.at(-1)?.content === THINK_IN_CHINESE);
 
+  const logged: string[] = [];
+  const logger = { ...quiet, info: (line: string) => logged.push(line) };
   let results = rounds("The log shows a parse error, let me read GetGoodIdAndOriginUrl next.", 5);
   const english = fakeModel(() => results.shift()!);
-  await setup({ model: english.model, tools: [tool] }).handle(message("转链为什么失败了"));
-  assert.deepEqual(nudges(english.requests), [false, true, true, true, false, false]);
+  await setup({ model: english.model, tools: [tool], logger }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(english.requests), [false, true, true, true, true, true]);
+  // 提醒过还是想成英文的，日志里记一行
+  assert.equal(logged.filter((line) => line.startsWith("思考是英文，提醒模型接着用中文想")).length, 5);
 
+  // 思考是中文也提前提醒，不等想成英文；日志里不记
+  logged.length = 0;
   results = rounds("日志里是 parse error，下一步读 GetGoodIdAndOriginUrl 看 c.tb.cn 怎么处理", 2);
   const chinese = fakeModel(() => results.shift()!);
-  await setup({ model: chinese.model, tools: [tool] }).handle(message("转链为什么失败了"));
-  assert.deepEqual(nudges(chinese.requests), [false, false, false]);
+  await setup({ model: chinese.model, tools: [tool], logger }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(chinese.requests), [false, true, true]);
+  assert.equal(logged.filter((line) => line.startsWith("思考是英文")).length, 0);
+
+  // 没开思考（这一轮没返回思考）时不提醒
+  results = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c0", name: "lookup", arguments: "{}" }] },
+    { text: "查完了", finish: "stop" },
+  ];
+  const noThinking = fakeModel(() => results.shift()!);
+  await setup({ model: noThinking.model, tools: [tool] }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(noThinking.requests), [false, false]);
 
   results = rounds("The log shows a parse error.", 2);
   const asked = fakeModel(() => results.shift()!);

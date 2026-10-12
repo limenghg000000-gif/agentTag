@@ -356,18 +356,17 @@ async function runTask(
       ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
-    // 卡片上显示思考、不是用英文问的（群里一般说中文），思考却被英文的日志、代码带成了英文：提醒模型接着用中文想，最多提醒几次
-    let nudged = 0;
-    const steerReasoning =
+    // 卡片上显示思考、不是用英文问的（群里一般说中文）：每次查完、下一轮要思考之前，提醒模型用中文想。
+    // 系统提示词开头虽然写了，隔着几万字英文的日志、代码，模型常常就用英文想了（2026-10-12 转链排查的第 3 轮）；
+    // 等它想成英文再提醒，卡片上已经有一轮英文
+    const steer =
       deps.showThinking !== false && card && askedInChinese(question)
-        ? (reasoning: string) => {
-            // 只看卡片上显示的那部分：思考很长时卡片只显示开头和结尾，中间写成什么样没人看到
-            if (nudged >= MAX_THINKING_NUDGES || !writtenInEnglish(reasoning, visibleThought)) {
-              return undefined;
+        ? ({ reasoning, thinkingNext }: { reasoning?: string; thinkingNext: boolean }) => {
+            // 提醒过还是想成了英文的记一行，看提醒管不管用。只看卡片上显示的那部分：思考很长时卡片只显示开头和结尾
+            if (reasoning !== undefined && writtenInEnglish(reasoning, visibleThought)) {
+              logger.info(`思考是英文${thinkingNext ? "，提醒模型接着用中文想" : ""} message=${msg.messageId}`);
             }
-            nudged++;
-            logger.info(`思考是英文，提醒模型接着用中文想（第 ${nudged} 次） message=${msg.messageId}`);
-            return THINK_IN_CHINESE;
+            return thinkingNext ? THINK_IN_CHINESE : undefined;
           }
         : undefined;
     // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
@@ -378,7 +377,7 @@ async function runTask(
       model,
       ...(deep ? { thinking: true } : {}),
       ...(thinksAfter ? { thinkAfter: thinksAfter } : {}),
-      ...(steerReasoning ? { steerReasoning } : {}),
+      ...(steer ? { steer } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
@@ -1369,11 +1368,10 @@ function deflects(answer: string): boolean {
   });
 }
 
-/** 一次任务里最多提醒几次「接着用中文想」 */
-const MAX_THINKING_NUDGES = 3;
 /**
- * 思考被英文带跑时加在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
- * 进度卡片上整段英文，群里看着费劲。系统提示词里也写了，但模型想用什么语言跟着最近读到的内容走，离得近的提醒更管用
+ * 每次查完、下一轮要思考之前加在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
+ * 进度卡片上整段英文，群里看着费劲。系统提示词里也写了，但模型想用什么语言跟着最近读到的内容走，离得近的提醒更管用。
+ * 原来等想成英文了才提醒，2026-10-12 那次第 3 轮还是先出了一轮英文，所以改成每轮都提前提醒
  */
 export const THINK_IN_CHINESE = "（系统提醒，不用回复这句）接下来的思考请用中文写：思考会显示在进度卡片上给群里的人看。代码、日志、报错原文、函数名、命令照原样引用，不用翻译。";
 

@@ -291,13 +291,13 @@ test("调过 thinkAfter 认的工具以后，后面每一轮都打开思考；�
   );
 });
 
-test("steerReasoning 返回一段话时，在这一轮工具结果后面加一条用户消息；没有思考内容、给出回答的那轮不看", async () => {
+test("steer 返回一段话时，在这一轮工具结果后面加一条用户消息；拿到这一轮的思考和下一轮开不开思考，给出回答的那轮不看", async () => {
   const { model, requests } = scriptedModel([
     { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" }), call("c2", "echo", { text: "b" })], reasoning: "check the logs" },
     { text: "", finish: "tool_calls", toolCalls: [call("c3", "echo", { text: "c" })] },
     { text: "好了", finish: "stop", reasoning: "done" },
   ]);
-  const seen: string[] = [];
+  const seen: { reasoning?: string; thinkingNext: boolean }[] = [];
 
   await runAgent({
     model,
@@ -305,13 +305,14 @@ test("steerReasoning 返回一段话时，在这一轮工具结果后面加一�
     messages: user,
     tools: [echoTool()],
     signal,
-    steerReasoning: (reasoning) => {
-      seen.push(reasoning);
-      return "用中文想";
+    steer: (round) => {
+      seen.push(round);
+      return round.reasoning ? "用中文想" : undefined;
     },
   });
 
-  assert.deepEqual(seen, ["check the logs"]);
+  // 没指定思考：这一轮返回了思考，下一轮就当开着
+  assert.deepEqual(seen, [{ reasoning: "check the logs", thinkingNext: true }, { thinkingNext: false }]);
   assert.deepEqual(requests[1].messages.slice(-3), [
     { role: "tool", toolCallId: "c1", content: "回声：a" },
     { role: "tool", toolCallId: "c2", content: "回声：b" },
@@ -320,13 +321,43 @@ test("steerReasoning 返回一段话时，在这一轮工具结果后面加一�
   assert.deepEqual(requests[2].messages.at(-1), { role: "tool", toolCallId: "c3", content: "回声：c" });
 });
 
+test("steer 的 thinkingNext 跟着这次任务的思考设置走：显式开关照它，调过 thinkAfter 认的工具以后开着", async () => {
+  const script = (): ChatResult[] => [
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c2", "probe", { text: "b" })], reasoning: "想一下" },
+    { text: "好了", finish: "stop" },
+  ];
+  const run = async (extra: { thinking?: boolean; thinkAfter?: (name: string) => boolean }) => {
+    const { model } = scriptedModel(script());
+    const seen: boolean[] = [];
+    await runAgent({
+      model,
+      system: "s",
+      messages: user,
+      tools: [echoTool(), echoTool("probe")],
+      signal,
+      steer: ({ thinkingNext }) => {
+        seen.push(thinkingNext);
+        return undefined;
+      },
+      ...extra,
+    });
+    return seen;
+  };
+
+  assert.deepEqual(await run({}), [false, true]);
+  assert.deepEqual(await run({ thinking: true }), [true, true]);
+  assert.deepEqual(await run({ thinking: false }), [false, false]);
+  assert.deepEqual(await run({ thinkAfter: (name) => name === "echo" }), [true, true]);
+});
+
 test("轮数用完时上一条已经是用户消息（思考提醒）就把收尾提醒并进去，不连着两条用户消息", async () => {
   const { model, requests } = scriptedModel([
     { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "check the logs" },
     { text: "只能先这样答", finish: "stop" },
   ]);
 
-  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, maxToolRounds: 1, steerReasoning: () => "用中文想" });
+  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, maxToolRounds: 1, steer: () => "用中文想" });
 
   const last = requests[1].messages.slice(-2);
   assert.deepEqual(
