@@ -908,10 +908,16 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
   };
 }
 
+/**
+ * 绝对路径最多去掉开头这么多级目录。容器、构建机、模块缓存的前缀（/app、/var/www/html、/home/runner/work/x/x、/go/pkg/mod/…@v1.2.3）没有这么深；
+ * 不设上限时每一段都拼一遍，回答里写一个几万字、几万级的路径，查一次就要几秒、几百 MB
+ */
+const MAX_DROPPED_DIRS = 32;
+
 /** 绝对路径去掉开头几级目录以后的各段，从长到短，至少留一层目录：/app/src/a.ts → app/src/a.ts、src/a.ts */
 function innerPaths(absolute: string): string[] {
   const parts = absolute.split("/").filter(Boolean);
-  return parts.slice(0, -1).map((_, i) => parts.slice(i).join("/"));
+  return parts.slice(0, Math.min(parts.length - 1, MAX_DROPPED_DIRS + 1)).map((_, i) => parts.slice(i).join("/"));
 }
 
 /**

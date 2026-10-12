@@ -2102,6 +2102,9 @@ test("回答里的绝对路径也要查证：日志、堆栈里要整段对上�
   // 绝对路径里有仓库名的，只认这个仓库里查到的：src/x.ts 读的是 ai/aiops-mcp 的
   assert.deepEqual(unseen("/ai/aiops-mcp/src/x.ts:3"), []);
   assert.deepEqual(unseen("/ai/agent-tag/src/x.ts:3"), ["/ai/agent-tag/src/x.ts:3"]);
+  // 开头最多去掉 32 级目录：再深的不是容器里的前缀，不一段段拼（几万级的路径查一次要几秒）
+  assert.deepEqual(unseen(`/${"d/".repeat(32)}src/x.ts:3`), []);
+  assert.deepEqual(unseen(`/${"d/".repeat(33)}src/x.ts:3`), [`/${"d/".repeat(33)}src/x.ts:3`]);
   // 不是绝对路径的开头：~ 家目录下的文件、网址里的路径
   assert.deepEqual(unseen("配置在 ~/.config/app.yaml"), []);
   assert.deepEqual(unseen("见 https://lab.yuebai.site/ai/agent-tag/-/blob/master/src/zz.ts"), []);
