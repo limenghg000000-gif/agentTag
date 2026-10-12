@@ -18,6 +18,7 @@ import {
   type ProgressStep,
   renderPlainProgressCard,
   renderProgressCard,
+  ASK_ACTION,
   STOP_ACTION,
   visibleThought,
 } from "./progress.js";
@@ -157,7 +158,7 @@ export function createMessageHandler(deps: BotDeps) {
   const duplicates = new DuplicateAsks(deps.now);
   const cardKit: CardKitHealth = { downUntil: 0 };
 
-  return async (msg: NormalizedMessage): Promise<void> => {
+  return async (msg: NormalizedMessage, options: TaskOptions = {}): Promise<void> => {
     if (!allowedChatIds.has(msg.chatId)) {
       // 机器人可能也在告警群等业务群里，没加进白名单的群一律不回应，只在日志里打出 chat_id 方便加白
       logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
@@ -182,7 +183,8 @@ export function createMessageHandler(deps: BotDeps) {
     const reply = (markdown: string) =>
       send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
 
-    if (STOP_COMMAND.test(question)) {
+    // 点「接着查」按钮问的不当成指令：按钮上的话是模型写的，写个「停止」不能停掉话题里别的任务
+    if (!options.readOnly && STOP_COMMAND.test(question)) {
       // 在话题里说「停止」停这个话题的任务；在群里直接说则停这个群的所有任务
       const stopped = msg.rootId ? tasks.stopThread(threadKeyOf(msg)) : tasks.stopChat(msg.chatId);
       logger.info(`停止指令 message=${msg.messageId} 停止了 ${stopped} 个任务`);
@@ -194,8 +196,13 @@ export function createMessageHandler(deps: BotDeps) {
       return;
     }
 
-    await runTask(deps, msg, question, reply, cardKit);
+    await runTask(deps, msg, question, reply, cardKit, options);
   };
+}
+
+export interface TaskOptions {
+  /** 只给读的工具（点「接着查」按钮问的） */
+  readOnly?: boolean;
 }
 
 /** 流式卡片最近一次建不了以后，到什么时候之前先不用 */
@@ -209,6 +216,7 @@ async function runTask(
   question: string,
   reply: (markdown: string) => Promise<SendResult>,
   cardKit: CardKitHealth,
+  options: TaskOptions,
 ): Promise<void> {
   const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
   const task = tasks.create(msg.chatId, threadKeyOf(msg));
@@ -269,6 +277,8 @@ async function runTask(
   let result: AgentResult | undefined;
   let source = "none";
   let memoryCount: number | undefined;
+  // 这次交给模型的工具有几个：模型一个工具都没调时，分得清是没给它工具还是它自己没调
+  let toolCount: number | undefined;
   // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
   const evidence: ToolEvidence[] = [];
   // 核对过的回答（拆成段）：回答定下来时就核对，记下来的、显示的都用它
@@ -312,10 +322,16 @@ async function runTask(
     const recentThreadTools = deps.recentThreads
       ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
       : [];
+    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
+    const followUp = options.readOnly === true;
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
+          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支
+          if (followUp && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+            throw new Error("这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数");
+          }
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
           if (tool.instructionsOnly) {
             return tool.run(args, ctx);
@@ -336,9 +352,16 @@ async function runTask(
           succeeded.add(tool.spec.name);
           // 和 runAgent 交给模型时一样截短：截断处以后的模型没看到，不算
           const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
+          const seenFacts = output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit);
           evidence.push(
             code
-              ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
+              ? {
+                  tool: tool.spec.name,
+                  facts: seenFacts,
+                  // 读文件、搜索读到的代码拿来核对图和数字卡片里的数（副本数、资源配置）；代码位置只认 facts。
+                  // 别的代码工具（提交记录、文件列表、改代码、看改动）的结果不算
+                  ...(CODE_SOURCE_TOOLS.has(tool.spec.name) ? { output: codeContent(seenByModel(output, limit), seenFacts) } : {}),
+                }
               : {
                   tool: tool.spec.name,
                   output: seenByModel(output, limit),
@@ -354,12 +377,22 @@ async function runTask(
       // 只查了经验库就给出线上结论、引用文件行号，照样要打回
       knowledgeTools,
     );
+    const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
-    const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
+    const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
+    const readOnly = noPermission || followUp;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
-    const taskTools = allTools.filter((tool) => !(readOnly && tool.writes) && (createDoc || tool.spec.name !== "feishu_doc_create"));
-    if (readOnly) {
+    const taskTools = allTools.filter(
+      (tool) =>
+        !(readOnly && tool.writes) &&
+        !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
+        (createDoc || tool.spec.name !== "feishu_doc_create"),
+    );
+    toolCount = taskTools.length;
+    if (followUp) {
+      logger.info(`点按钮接着问的，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (noPermission) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
@@ -406,7 +439,8 @@ async function runTask(
         now: new Date(now()),
         toolNames,
         memory: memory?.prompt,
-        readOnly,
+        readOnly: noPermission,
+        followUp,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
@@ -522,7 +556,7 @@ async function runTask(
     }
     state.phase = "done";
     // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画；记下来的也是核对过的（对不上的数后面的提问不能再看到）
-    segments = verifiedSegments(answer, evidence, logger, msg.messageId);
+    segments = verifiedSegments(answer, evidence, logger, msg.messageId, streaming);
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified);
     // 被拦下、被审核拦下的回答里没有结论，不记
@@ -550,7 +584,7 @@ async function runTask(
   state.live = undefined;
   state.answerNote = undefined;
   state.answer = answer;
-  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId));
+  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId, streaming));
   state.answerSegments = displayed;
   const displayedText = segmentsAsText(displayed);
   try {
@@ -575,12 +609,17 @@ async function runTask(
   logger.info(
     `${state.phase === "stopped" ? "已停止" : "已回复"} message=${msg.messageId} 上下文=${source} ` +
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
+      `${toolCount === undefined ? "" : `可用工具=${toolCount} `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
 }
 
 /** 拆出回答里的图和数字卡片，数对不上查询结果的去掉；去掉了什么、哪些块格式不对写日志 */
-function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string): AnswerSegment[] {
+function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string, rich: boolean): AnswerSegment[] {
+  // 没教模型写图和数字卡片（不是流式卡片）时，回答里的 ```chart 是用户要的代码示例，原样留着
+  if (!rich) {
+    return answer.trim() ? [{ kind: "markdown", text: answer }] : [];
+  }
   const { segments, invalid } = splitAnswer(answer);
   if (invalid.length > 0) {
     logger.warn(`回答里的 ${invalid.join("、")} 块格式不对，没画 message=${messageId}`);
@@ -995,7 +1034,35 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
  */
 const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
 
-/** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact），别的工具是模型看到的原文 */
+/** 结果里有代码原文的代码工具 */
+const CODE_SOURCE_TOOLS: ReadonlySet<string> = new Set(["code_read_file", "code_search"]);
+
+/**
+ * 代码工具结果里真正是代码的部分：工具记下的每一行代码（读文件的「12|」、搜索的「文件:12」后面）到行尾的内容，去掉分隔的空格或冒号。
+ * 只认 facts 记下的行，不从文字里认格式：行号、共几行、提交号、文件名不算读到的数（读了第 12 行，模型编一个 12 也对得上），
+ * 「没有搜到「foo:12: limit 99」」这类把搜的词原样写回来的也不算
+ */
+export function codeContent(output: string, facts: readonly CodeFact[]): string {
+  const starts = new Set(facts.flatMap((fact) => ("lines" in fact && fact.lines && fact.lines[0] === fact.lines[1] ? [fact.at] : [])));
+  return [...starts]
+    .sort((a, b) => a - b)
+    .flatMap((at) => {
+      const end = output.indexOf("\n", at);
+      const rest = output.slice(at, end === -1 ? undefined : end);
+      return /^[ :]/.test(rest) ? [rest.slice(1)] : [];
+    })
+    .join("\n");
+}
+
+/** 列分支、切分支的代码工具：点按钮问的不让切（见 runTask 里的 followUp） */
+const BRANCHES_TOOL = "code_branches";
+
+/** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
+const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
+/** 起草存进、归档经验库的确认卡片的工具：点按钮问的也不给（按钮上的话是模型写的，可以写成「沉淀成经验」） */
+const KNOWLEDGE_DRAFT_TOOLS: ReadonlySet<string> = new Set(["knowledge_propose", "knowledge_propose_archive"]);
+
+/** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact）和模型看到的原文（只核对数），别的工具是模型看到的原文 */
 export interface ToolEvidence {
   tool: string;
   output?: string;
@@ -1480,7 +1547,7 @@ export function unverifiedOpsAnswer(servers: readonly string[]): string {
   return (
     "（系统检查）这个问题像是在问线上服务，或者你的回答里有线上的情况（命名空间候选、具体时间、Pod 名、日志条数、「没有报错」这类），但这次没有成功调用过工具，没有经过查证。" +
     `问线上服务的情况，每次都要用 ${tools} 开头的工具重新查，话题里之前的回答只能当线索，不能照搬其中的命名空间、Pod 和数据。` +
-    "先查，再只按这次查到的结果回答；这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
+    "先查，再只按这次查到的结果回答；调用次数每次提问都重新算，话题里之前说过额度用完、到上限的，这次照样能查。这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
     "如果这个问题本来就不用查线上（比如解释概念、整理用户自己给的内容），照原来的意思再回答一次就行。不要提这段检查。"
   );
 }
@@ -1729,17 +1796,27 @@ export interface CardActionDeps {
   allowedChatIds: ReadonlySet<string>;
   /** 经验库的确认卡片 */
   knowledge?: Pick<KnowledgeDesk, "handleCardAction">;
+  /** 回答下面的「接着查」按钮（见 createFollowUp）。不传时不处理 */
+  followUp?: (evt: CardActionEvent, question: unknown) => Promise<void>;
   logger?: Logger;
 }
 
-/** 处理卡片上的按钮：进度卡片的「停止」（停止后卡片由任务自己更新成「已停止」），经验库确认卡片的「保存」「归档」「取消」 */
-export function createCardActionHandler({ tasks, allowedChatIds, knowledge, logger = console }: CardActionDeps) {
+/** 处理卡片上的按钮：经验库确认卡片的「保存」「归档」「取消」，回答下面的「接着查」，进度卡片的「停止」（停止后卡片由任务自己更新成「已停止」） */
+export function createCardActionHandler({ tasks, allowedChatIds, knowledge, followUp, logger = console }: CardActionDeps) {
   return async (evt: CardActionEvent): Promise<void> => {
     if (await knowledge?.handleCardAction(evt)) {
       return;
     }
-    const value = evt.action.value as { action?: unknown; task?: unknown } | undefined;
-    if (value?.action !== STOP_ACTION || typeof value.task !== "string" || !allowedChatIds.has(evt.chatId)) {
+    const value = evt.action.value as { action?: unknown; task?: unknown; q?: unknown } | undefined;
+    if (!allowedChatIds.has(evt.chatId)) {
+      return;
+    }
+    if (value?.action === ASK_ACTION && followUp) {
+      // 不等它跑完：SDK 按群排队处理按钮，等着的话这个群的停止按钮要等接着问的任务跑完才轮得到
+      followUp(evt, value.q).catch((err) => logger.error(`接着查按钮处理失败 card=${evt.messageId}`, err));
+      return;
+    }
+    if (value?.action !== STOP_ACTION || typeof value.task !== "string") {
       return;
     }
     const stopped = tasks.stop(value.task, evt.chatId);

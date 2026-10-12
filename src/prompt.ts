@@ -14,6 +14,8 @@ export interface PromptContext {
   memory?: { text: string; omitted: number };
   /** 提问的人不在写权限名单里，这次没给改文档、改代码的工具 */
   readOnly?: boolean;
+  /** 这次是点「接着查」按钮问的，只给了读的工具 */
+  followUp?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
   extra?: string;
   /**
@@ -31,14 +33,16 @@ export interface PromptContext {
 /** 回答写在卡片里时的排版：卡片能画表格、小标题和彩色标签 */
 const RICH_TEXT_RULES = [
   "- 回答显示在飞书卡片里，可以用 Markdown：粗体、列表、链接、引用、代码块、表格，分几块写时用 #### 小标题。",
-  "- 排查、巡检、对比这类有数据的回答按这个顺序写：第一行一句话结论；接着一行关键数字；明细用表格（一行一个服务或 Pod，不超过 6 列，单元格里只放短词和数字，一次回答最多 3 张表、每张不超过 20 行）；最后是要注意的地方和建议的下一步。普通问答几句话说清楚，不用套这个格式，也不用表格。",
+  "- 排查、巡检、对比这类有数据的回答按这个顺序写：第一行一句话结论；接着一行关键数字；明细用表格（一行一个服务或 Pod，不超过 6 列，单元格里只放短词和数字，同一列用同一个单位，单位不一样的另起一列或写在备注里，一次回答最多 3 张表、每张不超过 20 行）；最后是要注意的地方和建议的下一步。普通问答几句话说清楚，不用套这个格式，也不用表格。",
   "- 风险和状态用标签标出来：<text_tag color='red'>高风险</text_tag>、<text_tag color='orange'>注意</text_tag>、<text_tag color='green'>正常</text_tag>；要突出的数字可以上色，如 <font color='red'>92%</font>。<font> 的颜色只用 red、orange、yellow、green、blue、grey；<text_tag> 的颜色只用 red、orange、yellow、green、blue、neutral（灰色标签写 neutral，不是 grey）。颜色只拿来标风险和状态，不要满篇彩色。标签的开头和结尾写在同一行；代码路径、行号、提交号放在反引号里，不要放进标签。这些标签只用在回答里，写文档、记记忆、起草经验时不要用。",
-  '- 结论下面可以放一排关键数字：写一个 ```kpi 代码块，内容是 JSON 数组，最多 4 项，如 [{"label":"CPU 最高","value":"41%","level":"ok"}]，level 是 ok、warn 或 danger。',
+  '- 结论下面可以放一排关键数字：写一个 ```kpi 代码块，内容是 JSON 数组，最多 4 项，如 [{"label":"CPU 占 limit 最高 · user-rpc","value":"50%","level":"ok"}]，level 是 ok、warn 或 danger。value 只写数和单位（如 41%、3 个、1.2 GiB），是哪个服务、Pod 写进 label，不要写进 value（value 字号大，长了会被截断）。',
+  "- 同一个数在关键数字、表格和标签里颜色要一样，整篇回答用同一套档位：占 limit 的比例（CPU、内存、磁盘）低于 60% 算正常（green，关键数字的 level 写 ok），60% 及以上、低于 80% 算注意（orange，warn），80% 及以上算高风险（red，danger）；别的指标先定一套档位，整篇都按它来。表格里正常的数不用上色。",
   '- 有趋势或对比时可以画图：写一个 ```chart 代码块，内容是 JSON，如 {"type":"line","title":"pc-goods-site 各 Pod CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[41,39]}]}，data 和 x 一一对应。折线图（line）看趋势，x 是时间；柱状图（bar）做对比，x 是服务或 Pod；饼图（pie）看占比，只能有一个系列。一次最多 3 张图，每张不超过 8 个系列、200 个点。普通问答不画图。',
+  '- 查完数据的回答最后可以放 2～3 个「接着查」按钮：写一个 ```actions 代码块，内容是 JSON 数组，每项是群成员接下来最可能问的一句话（20 个字以内，说清楚查哪个服务、看什么），如 ["union 最近 1 小时的内存趋势","pc-goods-site 有没有重启过"]。点了按钮就在这个话题里接着问这句话，只查不改，所以不要放改东西的操作（重启、回滚、改配置、写文档）。普通问答不放按钮。',
   "- 图和关键数字里的每个数都会和这次工具查到的结果核对，对不上的不画：直接用查询结果里的数（可以四舍五入、把比例写成百分比、把字节换成 MiB 或 GiB），不要估算、心算；要百分比、差值这类算出来的数，在查询里算好（比如 PromQL 里除以 limit 再乘 100）。没查到数据就不画。",
 ];
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, showThinking, richText, knowledge }: PromptContext): string {
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, extra, showThinking, richText, knowledge }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -62,6 +66,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
   if (readOnly) {
     lines.push(
       "- 这次提问的人没有让你改东西的权限（管理员在 WRITE_ALLOWED_USERS 里配置），所以这次没有新建或修改文档、改代码、开合并请求的工具。可以帮他读、查、回答；他要改文档、改代码或开合并请求时，直接说明他没有这个权限，请他找有权限的同事，不要假装已经改了。",
+    );
+  }
+  if (followUp) {
+    lines.push(
+      "- 这次的问题是群成员点你上一条回答下面的「接着查」按钮问的，所以只给了读的工具：只查不改，群记忆也不记、不改、不删。要新建或修改文档、改代码、开合并请求、记住或忘掉什么时，说明按钮问的只能查，请他直接 @ 你说要做什么。",
     );
   }
   if (toolNames.includes("chat_recent_threads")) {
@@ -107,7 +116,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
     lines.push("", extra);
   }
   if (knowledge) {
-    lines.push("", ...knowledgeSection(knowledge, toolNames));
+    lines.push("", ...knowledgeSection(knowledge, toolNames, followUp === true));
   }
   if (memory) {
     lines.push("", ...memorySection(memory));
@@ -124,6 +133,7 @@ function knowledgeSection(
     aiopsSkipped,
   }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean },
   toolNames: readonly string[],
+  followUp: boolean,
 ): string[] {
   const canPropose = toolNames.includes("knowledge_propose");
   // 没有 aiops 的工具时不叫模型去调它们，免得调不存在的工具
@@ -172,8 +182,12 @@ function knowledgeSection(
     );
   }
   if (!canPropose) {
-    // 没有起草的工具：管理员没配写权限名单，经验库只能查
-    lines.push("- 现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）。有人要沉淀经验时如实说明，不要假装已经存了。");
+    // 没有起草的工具：点「接着查」按钮问的，或者管理员没配写权限名单，经验库只能查
+    lines.push(
+      followUp
+        ? "- 这次是点「接着查」按钮问的，不能起草存进或归档经验的卡片。有人要沉淀经验时，请他直接 @ 你说，不要假装已经存了。"
+        : "- 现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）。有人要沉淀经验时如实说明，不要假装已经存了。",
+    );
     return lines;
   }
   lines.push(

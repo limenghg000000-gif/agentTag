@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   answerFitsCard,
+  ASK_ACTION,
   CardUpdater,
   ELEMENT,
   formatDuration,
@@ -336,4 +337,21 @@ test("卡片即回答：图太大换成文字时用核对过的那几段，对�
 
   const unchecked = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any;
   assert.doesNotMatch(text(unchecked), /41%|88%/);
+});
+
+test("卡片即回答：回答最后的「接着查」按钮回传要问的话；生成时、简单版本里不放按钮", () => {
+  const answer = '结论\n```actions\n["union 有没有重启"]\n```';
+  const live = renderProgressCard(state({ live: { round: 1, reasoning: "", text: answer } }), "t", 0, streaming) as any;
+  assert.doesNotMatch(text(live), /ask_followup/);
+
+  const segments = splitAnswer(answer).segments;
+  const done = renderProgressCard(state({ phase: "done", endedAt: 0, answer, answerSegments: segments }), "t", 0, streaming) as any;
+  const button = done.body.elements.at(-1);
+  assert.equal(button.tag, "button");
+  assert.equal(button.text.content, "union 有没有重启");
+  assert.deepEqual(button.behaviors, [{ type: "callback", value: { action: ASK_ACTION, q: "union 有没有重启" } }]);
+  assert.equal(done.body.elements.at(-2).content, "可以接着查：");
+
+  const plain = renderPlainProgressCard(state({ phase: "done", endedAt: 0, answer, answerSegments: segments }), 0, streaming) as any;
+  assert.equal(plain.body.elements.at(-1).content, "结论\n\n可以接着问：「union 有没有重启」");
 });

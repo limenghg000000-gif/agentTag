@@ -13,7 +13,8 @@ export interface ChartBlock {
   unit?: string;
   /** 横轴（饼图是各块的名字） */
   x: string[];
-  series: { name: string; data: number[] }[];
+  /** null 是核对时对不上、空掉的点（模型写的只能是数） */
+  series: { name: string; data: (number | null)[] }[];
 }
 
 export interface KpiItem {
@@ -27,16 +28,25 @@ export interface KpiBlock {
   items: KpiItem[];
 }
 
-export type AnswerSegment = { kind: "markdown"; text: string } | ChartBlock | KpiBlock;
+/** 回答最后的「接着查」按钮：群成员接下来最可能问的几句话，点了就在话题里接着问 */
+export interface ActionsBlock {
+  kind: "actions";
+  questions: string[];
+}
+
+export type AnswerSegment = { kind: "markdown"; text: string } | ChartBlock | KpiBlock | ActionsBlock;
 
 /** 一次回答最多几张图、几个数字卡片，每张图最多几条线、几个点（卡片最大 30 KB，图的数据占地方） */
 export const MAX_CHARTS = 3;
 const MAX_SERIES = 8;
 const MAX_POINTS_PER_CHART = 200;
 const MAX_KPIS = 4;
+export const MAX_ACTIONS = 3;
+/** 按钮上的一句话最多几个字（飞书回调的 value 也有大小限制） */
+export const MAX_ACTION_CHARS = 40;
 const MAX_LABEL_CHARS = 40;
 
-const UI_LANGS = new Set(["chart", "kpi"]);
+const UI_LANGS = new Set(["chart", "kpi", "actions"]);
 
 /** 代码块开头那一行写的语言：```chart → chart */
 function langOf(line: string): string {
@@ -120,7 +130,7 @@ export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid:
  * 前几行能拼成完整的 JSON，块就到那里为止；拼不成（JSON 本身没写完、被截断）的，块到第一个空行为止。
  * used 是块用掉的行数，后面的行放回正文
  */
-function blockEnd(lang: string, body: string[]): { parsed?: ChartBlock | KpiBlock; used: number } {
+function blockEnd(lang: string, body: string[]): { parsed?: ReturnType<typeof parseBlock>; used: number } {
   for (let k = 1; k < body.length; k++) {
     const parsed = parseBlock(lang, body.slice(0, k).join("\n"));
     if (parsed) {
@@ -161,7 +171,10 @@ export function streamingAnswer(text: string): string {
     }
     const lang = !inCode && next.marker ? uiLang(line) : undefined;
     if (lang) {
-      out.push(lang === "chart" ? "📊 图表画好后显示在这里…" : "📌 关键数字整理好后显示在这里…");
+      // 按钮放在最后，生成时不用占位
+      if (lang !== "actions") {
+        out.push(lang === "chart" ? "📊 图表画好后显示在这里…" : "📌 关键数字整理好后显示在这里…");
+      }
       hidden = true;
       continue;
     }
@@ -170,14 +183,35 @@ export function streamingAnswer(text: string): string {
   return out.join("\n");
 }
 
-function parseBlock(lang: string, body: string): ChartBlock | KpiBlock | undefined {
+function parseBlock(lang: string, body: string): ChartBlock | KpiBlock | ActionsBlock | undefined {
   let json: unknown;
   try {
     json = JSON.parse(body);
   } catch {
     return undefined;
   }
-  return lang === "chart" ? parseChart(json) : parseKpi(json);
+  return lang === "chart" ? parseChart(json) : lang === "kpi" ? parseKpi(json) : parseActions(json);
+}
+
+function parseActions(json: unknown): ActionsBlock | undefined {
+  if (!Array.isArray(json)) {
+    return undefined;
+  }
+  const questions = [...new Set(json.map(actionQuestion))].filter((item): item is string => item !== undefined);
+  return questions.length === 0 ? undefined : { kind: "actions", questions: questions.slice(0, MAX_ACTIONS) };
+}
+
+/**
+ * 按钮上的一句话：尖括号换成全角（点了以后这句话会发到话题里，不能变成 @所有人）、合成一行；
+ * 太长的不要（截断了的问题点了也问不清楚）
+ */
+export function actionQuestion(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  // 尖括号换成全角：去掉的话「CPU > 80% 的 Pod」就成了「CPU 80% 的 Pod」；全角的也不会变成 <at> 这类标签
+  const question = value.replace(/</g, "＜").replace(/>/g, "＞").replace(/\s+/g, " ").trim();
+  return question && Array.from(question).length <= MAX_ACTION_CHARS ? question : undefined;
 }
 
 function text(value: unknown, max = MAX_LABEL_CHARS): string | undefined {
@@ -255,7 +289,8 @@ function parseKpi(json: unknown): KpiBlock | undefined {
       return undefined;
     }
     const raw = item as Record<string, unknown>;
-    const label = text(raw.label, 20);
+    // 标签里会带上服务、Pod 名（「CPU 占 limit 最高 · user-rpc」），字号小，可以长一点
+    const label = text(raw.label, 32);
     const value = text(raw.value, 16);
     if (!label || !value) {
       return undefined;
@@ -267,11 +302,15 @@ function parseKpi(json: unknown): KpiBlock | undefined {
 }
 
 /**
- * 全角字符（数字、％、－、ＭｉＢ）和数学减号（−）换成半角，再拆数、认单位：「９９％」是 99%，「−5」是 -5。
+ * 全角字符（数字、％、－、ＭｉＢ、￥）和数学减号（−）换成半角，再拆数、认单位：「９９％」是 99%，「−5」是 -5。
  * 不用 NFKC：它会把「10²」变成 102
  */
 function halfWidth(text: string): string {
-  return text.replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0)).replace(/\u2212/g, "-");
+  return text
+    .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/\u2212/g, "-")
+    .replace(/\uFFE5/g, "¥")
+    .replace(/\uFFE1/g, "£");
 }
 
 /** 数字卡片里写的数、工具结果里的数：1,234 是一个数，.5 是 0.5；10-20 里的 - 不当负号 */
@@ -292,7 +331,8 @@ export function unitFactors(raw: string | undefined): readonly number[] | undefi
   if (/(?<![A-Za-z])(?:[KMGT]i?B?|[kmgt]B|bytes?)(?![A-Za-z])|字节/.test(text)) {
     return [1, 1e-3, 1e-6, 1e-9, 1e-12, 1 / 1024, 1 / 1024 ** 2, 1 / 1024 ** 3, 1 / 1024 ** 4];
   }
-  if (/(?<![A-Za-z])m(?![A-Za-z])|毫核|millicores?/.test(text)) {
+  // 2026-10-12 测试群：模型把查到的核数 ×1000 写成「0.06 mCPU」，认不出 mCPU 就只认原数，对的数也被拦下
+  if (/(?<![A-Za-z])m(?:CPU|cpu)?(?![A-Za-z])|毫核|millicores?/.test(text)) {
     return [1, 1000];
   }
   if (/核|cores?(?![A-Za-z])/.test(text)) {
@@ -332,6 +372,10 @@ export class NumberEvidence {
    * 卡片里写成文字的数由 half 给出写出来的精度（0.000 是 ±0.0005，转成数就成了 0，按 0 算会放宽到 ±0.5）
    */
   has(v: number, factors: readonly number[] = [1], half = halfStep(v)): boolean {
+    // 1e309 这种转成数是 Infinity：区间算不出来，当查不到
+    if (!Number.isFinite(v) || !Number.isFinite(half)) {
+      return false;
+    }
     // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
     const slack = 8 * Number.EPSILON * Math.abs(v);
     return factors.some((factor) => this.within((v - half - slack) / factor, (v + half + slack) / factor));
@@ -357,14 +401,20 @@ export class NumberEvidence {
  * 用科学计数法数位数：很小的数 String() 出来是 1e-7 这样，按小数点数不出位数
  */
 function halfStep(v: number): number {
-  return writtenHalf(v.toExponential());
-}
-
-/** 写出来的数（41.20、0.000、1.5e-7）最后一位的半格：小数点后写了几位就按几位算，末尾的 0 也算 */
-function writtenHalf(token: string): number {
-  const [mantissa, exponent = "0"] = token.toLowerCase().split("e");
+  const [mantissa, exponent] = v.toExponential().split("e");
   const decimals = (mantissa.split(".")[1] ?? "").length;
   return 0.5 * 10 ** Math.min(0, Number(exponent) - decimals);
+}
+
+/**
+ * 写出来的数（41.20、0.000、1.5e-7）最后一位的半格：小数点后写了几位就按几位算，末尾的 0 也算。
+ * 科学计数法写了小数位的按写出来的那一位（1.50e3 写到十位 → ±5）；整数、1e9 这种按个位算
+ */
+function writtenHalf(token: string): number {
+  const [mantissa, exponent] = token.toLowerCase().split("e");
+  const decimals = (mantissa.split(".")[1] ?? "").length;
+  const place = Number(exponent ?? 0) - decimals;
+  return 0.5 * 10 ** (exponent !== undefined && decimals > 0 ? place : Math.min(0, place));
 }
 
 /**
@@ -384,8 +434,16 @@ function numbersIn(value: string): { n: number; half: number }[] {
 const NUMERIC_LABEL = new RegExp(`^\\s*[-+$¥€£~≈<>≤≥]?\\s*${NUMBER.source}\\s*[^\\d\\s]{0,8}\\s*$`, "i");
 
 /**
+ * 折线图、柱状图里对不上的点不超过这个比例时，只空掉这几个点，图照画，图下说一句；多了就整张不画。
+ * 2026-10-12 测试群：union 内存趋势几十个点里只有 1 个对不上，整张图没画
+ */
+const MAX_MISSING_POINTS = 0.1;
+
+/**
  * 只留下数都查得到的图和数字卡片。dropped 记下去掉了什么，写日志用。
- * 图里的数全都要对得上，对不上的图换成一句说明；数字卡片一个个看，对不上的去掉，值里没有数的（「正常」）照留
+ * 图里的数要对得上：折线图、柱状图里对不上的点不多（见 MAX_MISSING_POINTS）时只空掉这几个点；
+ * 横轴的数、饼图里的数（少一块比例就变了）对不上，或者对不上的点多了，整张图换成一句说明。
+ * 数字卡片一个个看，对不上的去掉，值里没有数的（「正常」）照留
  */
 export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence): { segments: AnswerSegment[]; dropped: string[] } {
   const dropped: string[] = [];
@@ -395,17 +453,34 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   for (const segment of segments) {
     if (segment.kind === "chart") {
       const factors = unitFactors(segment.unit) ?? [1];
-      const missing = [
-        ...segment.x.filter((value) => NUMERIC_LABEL.test(halfWidth(value))).flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? [1], half)).map(({ n }) => n)),
-        ...segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n, factors)),
-      ];
-      if (missing.length > 0) {
+      const found = (n: number | null): n is number => n !== null && evidence.has(n, factors);
+      const badX = segment.x
+        .filter((value) => NUMERIC_LABEL.test(halfWidth(value)))
+        .flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? [1], half)).map(({ n }) => n));
+      const points = segment.series.flatMap((s) => s.data);
+      const badPoints = points.filter((n) => !found(n));
+      const missing = [...badX, ...badPoints];
+      const gaps = missing.length > 0 && badX.length === 0 && segment.type !== "pie" && badPoints.length <= points.length * MAX_MISSING_POINTS;
+      if (missing.length > 0 && !gaps) {
         dropped.push(`图「${segment.title}」有 ${missing.length} 个数在查询结果里找不到（如 ${missing.slice(0, 3).join("、")}）`);
         kept.push({ kind: "markdown", text: `📊 图「${segment.title}」里有数和这次查到的结果对不上，没画出来。` });
         continue;
       }
       if (++charts > MAX_CHARTS) {
         dropped.push(`图「${segment.title}」超过 ${MAX_CHARTS} 张`);
+        continue;
+      }
+      if (gaps) {
+        dropped.push(`图「${segment.title}」有 ${badPoints.length} 个点在查询结果里找不到（如 ${badPoints.slice(0, 3).join("、")}），只空掉这几个点`);
+        kept.push(
+          { ...segment, series: segment.series.map((s) => ({ ...s, data: s.data.map((n) => (found(n) ? n : null)) })) },
+          { kind: "markdown", text: `📊 图「${segment.title}」里有 ${badPoints.length} 个点和这次查到的结果对不上，这几个点没画。` },
+        );
+        continue;
+      }
+    } else if (segment.kind === "actions") {
+      if (kept.some((item) => item.kind === "actions")) {
+        dropped.push("多写了一组按钮");
         continue;
       }
     } else if (segment.kind === "kpi") {
@@ -436,17 +511,39 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
 
 const LEVEL_COLOR: Record<NonNullable<KpiItem["level"]>, string> = { danger: "red", warn: "orange", ok: "green" };
 
-/** 卡片里的组件：markdown 段交给 renderMarkdown（转义、限长），图换成图表组件，数字卡片换成一排分栏 */
-export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text: string) => object): object[] {
-  return segments.map((segment) => {
+/**
+ * 卡片里的组件：markdown 段交给 renderMarkdown（转义、限长），图换成图表组件，数字卡片换成一排分栏，
+ * 「接着查」换成按钮放在最后（askValue 给出按钮回传的值；不给时不放按钮）
+ */
+export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text: string) => object, askValue?: (question: string) => object): object[] {
+  const elements: object[] = [];
+  const buttons: object[] = [];
+  for (const segment of segments) {
     if (segment.kind === "markdown") {
-      return renderMarkdown(segment.text);
+      elements.push(renderMarkdown(segment.text));
+    } else if (segment.kind === "kpi") {
+      elements.push(kpiElement(segment));
+    } else if (segment.kind === "chart") {
+      elements.push(chartElement(segment));
+    } else if (askValue) {
+      buttons.push(...segment.questions.map((question) => askButton(question, askValue(question))));
     }
-    if (segment.kind === "kpi") {
-      return kpiElement(segment);
-    }
-    return chartElement(segment);
-  });
+  }
+  if (buttons.length > 0) {
+    elements.push({ tag: "markdown", text_size: "notation", content: "可以接着查：" }, ...buttons);
+  }
+  return elements;
+}
+
+function askButton(question: string, value: object): object {
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: question },
+    type: "default",
+    size: "small",
+    width: "fill",
+    behaviors: [{ type: "callback", value }],
+  };
 }
 
 /** Markdown 符号换成长得像的全角字：直接去掉会把「10~20%」连成「1020%」 */
@@ -505,6 +602,8 @@ function chartElement(chart: ChartBlock): object {
       type: chart.type,
       title: { text: title },
       data: { values },
+      // 空掉的点（null）：折线在这里断开，不把前后两个点连起来
+      ...(chart.type === "line" && values.some((item) => item.value === null) ? { invalidType: "break" } : {}),
       // 柱状图几组并排：横轴按「横轴值 + 系列」分组
       xField: chart.type === "bar" && chart.series.length > 1 ? ["x", "series"] : "x",
       yField: "value",
@@ -523,6 +622,9 @@ export function segmentsAsText(segments: AnswerSegment[]): string {
       }
       if (segment.kind === "kpi") {
         return segment.items.map((item) => `**${plain(item.label)}** ${plain(item.value)}`).join(" · ");
+      }
+      if (segment.kind === "actions") {
+        return `可以接着问：${segment.questions.map((question) => `「${plain(question)}」`).join("")}`;
       }
       return `📊 ${segment.title}（这里显示不了图）`;
     })
