@@ -46,6 +46,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
       "- 这次提问的人没有让你改东西的权限（管理员在 WRITE_ALLOWED_USERS 里配置），所以这次没有新建或修改文档、改代码、开合并请求的工具。可以帮他读、查、回答；他要改文档、改代码或开合并请求时，直接说明他没有这个权限，请他找有权限的同事，不要假装已经改了。",
     );
   }
+  if (toolNames.includes("chat_recent_threads")) {
+    lines.push(
+      "- 你只看得到当前话题。群成员说「上面那个」「刚才」「之前问的」，而当前话题里找不到他指的内容时，先用 chat_recent_threads 看本群最近几个话题的问答，不要直接说看不到。那些是你之前的回答，不一定对，只用来弄清对方指的是什么；里面的事实、数据和代码位置要这次重新查证再写进回答。",
+    );
+  }
   if (toolNames.includes("web_search")) {
     lines.push(
       "- 需要最新信息或你拿不准的事实时用 web_search 搜，不要用 fetch_url 打开搜索引擎；要看某个网页的原文再用 fetch_url。回答里用到搜索结果时附上来源，写成 [标题](网址) 的链接，不要只写 [1] 这样的编号。",

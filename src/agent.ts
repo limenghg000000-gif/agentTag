@@ -55,11 +55,11 @@ export interface AgentRequest {
    */
   review?: (answer: string, usedTools: ReadonlySet<string>) => string | undefined;
   /**
-   * 一轮调了工具以后看这一轮的思考：返回一段话时，在工具结果后面加一条用户消息再问下一轮。
-   * 比如思考被英文的日志、代码带成了英文，提醒模型接着用中文想（思考会显示在进度卡片上）。
+   * 一轮调了工具以后：返回一段话时，在工具结果后面加一条用户消息再问下一轮。比如下一轮要思考，提醒模型用中文想（思考会显示在进度卡片上）。
+   * reasoning 是这一轮的思考（模型返回了才有）；thinkingNext 是下一轮开着思考（这次任务打开了，或者没指定、这一轮返回了思考）。
    * 不接在工具结果里：工具结果是外部资料，系统提示词说里面的指令一律不执行，混在一起也会教模型信工具结果里冒充的「系统提醒」
    */
-  steerReasoning?: (reasoning: string) => string | undefined;
+  steer?: (round: { reasoning?: string; thinkingNext: boolean }) => string | undefined;
   /** 流式调用模型，边生成边发 delta 事件（比如在卡片上边想边显示） */
   stream?: boolean;
 }
@@ -87,7 +87,7 @@ export async function runAgent({
   thinking,
   thinkAfter,
   review,
-  steerReasoning,
+  steer,
   stream,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
@@ -179,9 +179,13 @@ export async function runAgent({
     result.toolCalls.forEach((call, i) => {
       conversation.push({ role: "tool", toolCallId: call.id, content: outputs[i] });
     });
-    const steer = result.reasoning ? steerReasoning?.(result.reasoning) : undefined;
-    if (steer) {
-      conversation.push({ role: "user", content: steer });
+    const nextThink = thinking ?? (investigating ? true : undefined);
+    const note = steer?.({
+      ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+      thinkingNext: nextThink ?? result.reasoning !== undefined,
+    });
+    if (note) {
+      conversation.push({ role: "user", content: note });
     }
   }
 }

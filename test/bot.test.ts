@@ -234,6 +234,66 @@ test("回答被截断或被内容审核拦下时如实说明", async () => {
   assert.match(markdowns(sent)[1], /内容审核/);
 });
 
+test("答完以后记下这个话题的问答；模型能用 chat_recent_threads 看本群别的话题", async () => {
+  const recorded: { chatId: string; threadKey: string; turn: { question: string; answer: string; askerName?: string } }[] = [];
+  const listed: { chatId: string; exclude?: string }[] = [];
+  const recentThreads: BotDeps["recentThreads"] = {
+    async record(chatId, threadKey, turn) {
+      recorded.push({ chatId, threadKey, turn });
+    },
+    async list(chatId, exclude) {
+      listed.push({ chatId, exclude });
+      return [{ threadKey: "om_old", topic: "礼金链接为什么转不了", question: "礼金链接为什么转不了", answer: "礼金链接不走取券逻辑", turns: 1, at: 0 }];
+    },
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "上面那个说的是礼金链接", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "chat_recent_threads", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, recentThreads, context: fakeContext({ askerName: "ML" }).source });
+
+  await handle(message("给产品解释一下上面那个", { messageId: "om_now", rootId: "om_root" }));
+
+  assert.ok(requests[0].tools?.some((tool) => tool.name === "chat_recent_threads"));
+  assert.match(requests[0].system, /chat_recent_threads/);
+  assert.deepEqual(listed, [{ chatId: "oc_1", exclude: "om_root" }]);
+  assert.match(requests[1].messages.at(-1)!.content, /礼金链接不走取券逻辑/);
+  assert.deepEqual(markdowns(sent), ["上面那个说的是礼金链接"]);
+  assert.deepEqual(recorded, [
+    { chatId: "oc_1", threadKey: "om_root", turn: { question: "给产品解释一下上面那个", answer: "上面那个说的是礼金链接", askerName: "ML" } },
+  ]);
+});
+
+test("被内容审核拦下、出错的不记话题问答；记不下也照常回答", async () => {
+  const recorded: string[] = [];
+  const recentThreads: BotDeps["recentThreads"] = {
+    async record(_chatId, _threadKey, turn) {
+      recorded.push(turn.answer);
+      throw new Error("磁盘满了");
+    },
+    async list() {
+      return [];
+    },
+  };
+  const results: (ChatResult | Error)[] = [{ text: "", finish: "filtered" }, new LlmError("connection", "boom"), { text: "正常回答", finish: "stop" }];
+  const { model } = fakeModel(() => {
+    const next = results.shift()!;
+    if (next instanceof Error) {
+      throw next;
+    }
+    return next;
+  });
+  const { sent, handle } = setup({ model, recentThreads });
+
+  await handle(message("敏感问题", { messageId: "om_a" }));
+  await handle(message("你好", { messageId: "om_b" }));
+  await handle(message("正常问题", { messageId: "om_c" }));
+
+  assert.deepEqual(recorded, ["正常回答"]);
+  assert.equal(markdowns(sent).at(-1), "正常回答");
+});
+
 test("模型调用失败时卡片标成出错，并在话题里说明原因", async () => {
   const { model } = fakeModel(() => {
     throw new LlmError("connection", "boom");
@@ -650,7 +710,7 @@ test("模型返回了思考内容时，进度卡片上显示最新一段，结�
   assert.ok(hidden.updates.every((u) => !/💭|先查资料/.test(cardText(u.card))));
 });
 
-test("中文提问、思考被英文带跑时，在工具结果后面提醒接着用中文想，一次任务最多提醒 3 次", async () => {
+test("中文提问、卡片显示思考时，每次查完、下一轮要思考之前都在工具结果后面提醒用中文想", async () => {
   const tool: Tool = {
     spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
     describe: () => "查资料",
@@ -667,15 +727,31 @@ test("中文提问、思考被英文带跑时，在工具结果后面提醒接�
   ];
   const nudges = (requests: ChatRequest[]) => requests.map((req) => req.messages.at(-1)?.content === THINK_IN_CHINESE);
 
+  const logged: string[] = [];
+  const logger = { ...quiet, info: (line: string) => logged.push(line) };
   let results = rounds("The log shows a parse error, let me read GetGoodIdAndOriginUrl next.", 5);
   const english = fakeModel(() => results.shift()!);
-  await setup({ model: english.model, tools: [tool] }).handle(message("转链为什么失败了"));
-  assert.deepEqual(nudges(english.requests), [false, true, true, true, false, false]);
+  await setup({ model: english.model, tools: [tool], logger }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(english.requests), [false, true, true, true, true, true]);
+  // 提醒过还是想成英文的，日志里记一行
+  assert.equal(logged.filter((line) => line.startsWith("思考是英文，提醒模型接着用中文想")).length, 5);
 
+  // 思考是中文也提前提醒，不等想成英文；日志里不记
+  logged.length = 0;
   results = rounds("日志里是 parse error，下一步读 GetGoodIdAndOriginUrl 看 c.tb.cn 怎么处理", 2);
   const chinese = fakeModel(() => results.shift()!);
-  await setup({ model: chinese.model, tools: [tool] }).handle(message("转链为什么失败了"));
-  assert.deepEqual(nudges(chinese.requests), [false, false, false]);
+  await setup({ model: chinese.model, tools: [tool], logger }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(chinese.requests), [false, true, true]);
+  assert.equal(logged.filter((line) => line.startsWith("思考是英文")).length, 0);
+
+  // 没开思考（这一轮没返回思考）时不提醒
+  results = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c0", name: "lookup", arguments: "{}" }] },
+    { text: "查完了", finish: "stop" },
+  ];
+  const noThinking = fakeModel(() => results.shift()!);
+  await setup({ model: noThinking.model, tools: [tool] }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(noThinking.requests), [false, false]);
 
   results = rounds("The log shows a parse error.", 2);
   const asked = fakeModel(() => results.shift()!);
