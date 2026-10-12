@@ -50,8 +50,8 @@ function uiLang(line: string): string | undefined {
 }
 
 /**
- * 把回答拆成几段：普通的 Markdown 和 ```chart、```kpi 块。块里的 JSON 不对、格式不对的不要（记在 invalid 里），
- * 没写完的块（回答被截断）也不要
+ * 把回答拆成几段：普通的 Markdown 和 ```chart、```kpi 块。块里的 JSON 不对、格式不对的不要（记在 invalid 里）。
+ * 漏写了收尾 ``` 的块（模型忘了写，或者回答被截断）不能把后面的正文吞掉：见 blockEnd
  */
 export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid: string[] } {
   const segments: AnswerSegment[] = [];
@@ -66,20 +66,33 @@ export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid:
     }
     markdown = [];
   };
-  for (const line of text.split("\n")) {
+  /** 块到头了（closing 是收尾那一行，没收尾的是 undefined）：返回块后面还要当正文接着拆的行 */
+  const finish = (lang: string, body: string[], closing: string | undefined): string[] => {
+    const whole = parseBlock(lang, body.join("\n"));
+    const end = whole ? { parsed: whole, used: body.length } : blockEnd(lang, body);
+    if (end.parsed) {
+      flushMarkdown();
+      segments.push(end.parsed);
+    } else {
+      invalid.push(lang);
+    }
+    const rest = body.slice(end.used);
+    // 块在 used 那里就完了：收尾的 ``` 属于后面的正文（多半是后面别的代码块的收尾）
+    return rest.length > 0 && closing !== undefined ? [...rest, closing] : rest;
+  };
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const inCode = fence !== undefined;
     const next = nextFence(fence, line);
     fence = next.fence;
     if (block) {
       if (next.marker && !next.fence) {
-        const parsed = parseBlock(block.lang, block.lines.join("\n"));
-        if (parsed) {
-          flushMarkdown();
-          segments.push(parsed);
-        } else {
-          invalid.push(block.lang);
-        }
+        const rest = finish(block.lang, block.lines, line);
         block = undefined;
+        if (rest.length > 0) {
+          return joinSplits({ segments, invalid }, markdown, splitAnswer([...rest, ...lines.slice(i + 1)].join("\n")));
+        }
       } else {
         block.lines.push(line);
       }
@@ -93,10 +106,44 @@ export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid:
     markdown.push(line);
   }
   if (block) {
-    invalid.push(block.lang);
+    const rest = finish(block.lang, block.lines, undefined);
+    if (rest.length > 0) {
+      return joinSplits({ segments, invalid }, markdown, splitAnswer(rest.join("\n")));
+    }
   }
   flushMarkdown();
   return { segments, invalid };
+}
+
+/**
+ * 块里的内容不是一个完整的 JSON：多半是漏写了收尾，后面的正文、别的代码块被算进了块里。
+ * 前几行能拼成完整的 JSON，块就到那里为止；拼不成（JSON 本身没写完、被截断）的，块到第一个空行为止。
+ * used 是块用掉的行数，后面的行放回正文
+ */
+function blockEnd(lang: string, body: string[]): { parsed?: ChartBlock | KpiBlock; used: number } {
+  for (let k = 1; k < body.length; k++) {
+    const parsed = parseBlock(lang, body.slice(0, k).join("\n"));
+    if (parsed) {
+      return { parsed, used: k };
+    }
+  }
+  const started = body.findIndex((line) => line.trim() !== "");
+  const blank = started < 0 ? -1 : body.findIndex((line, j) => j > started && line.trim() === "");
+  return { used: blank < 0 ? body.length : blank };
+}
+
+/** 前面拆好的（加上还没放进去的正文 markdown）接上后面接着拆的 */
+function joinSplits(
+  head: { segments: AnswerSegment[]; invalid: string[] },
+  markdown: string[],
+  tail: { segments: AnswerSegment[]; invalid: string[] },
+): { segments: AnswerSegment[]; invalid: string[] } {
+  const pending = markdown.join("\n");
+  const segments = [...head.segments];
+  if (pending.trim()) {
+    segments.push({ kind: "markdown", text: pending.replace(/^\n+|\n+$/g, "") });
+  }
+  return { segments: [...segments, ...tail.segments], invalid: [...head.invalid, ...tail.invalid] };
 }
 
 /** 生成中的回答：图和数字卡片的代码块（写完的、没写完的）换成一行说明，不把 JSON 显示出来 */
@@ -219,6 +266,14 @@ function parseKpi(json: unknown): KpiBlock | undefined {
   return { kind: "kpi", items };
 }
 
+/**
+ * 全角字符（数字、％、－、ＭｉＢ）和数学减号（−）换成半角，再拆数、认单位：「９９％」是 99%，「−5」是 -5。
+ * 不用 NFKC：它会把「10²」变成 102
+ */
+function halfWidth(text: string): string {
+  return text.replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0)).replace(/\u2212/g, "-");
+}
+
 /** 数字卡片里写的数、工具结果里的数：1,234 是一个数，.5 是 0.5；10-20 里的 - 不当负号 */
 const NUMBER = /(?<![\d.])-?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?/gi;
 
@@ -226,10 +281,11 @@ const NUMBER = /(?<![\d.])-?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:e[+
  * 写出来的单位决定查到的数能怎么换算过来（查到的数 × 倍数 = 写出来的数）。认不出单位的只认原数，
  * 免得一个比例 0.412 既能当 0.4% 又能当 41.2%、一个字节数原样当成 MiB
  */
-export function unitFactors(text: string | undefined): readonly number[] | undefined {
-  if (!text) {
+export function unitFactors(raw: string | undefined): readonly number[] | undefined {
+  if (!raw) {
     return undefined;
   }
+  const text = halfWidth(raw);
   if (/%|百分/.test(text)) {
     return [1, 100];
   }
@@ -257,7 +313,8 @@ export class NumberEvidence {
 
   constructor(outputs: readonly string[]) {
     const found: number[] = [];
-    for (const output of outputs) {
+    for (const raw of outputs) {
+      const output = halfWidth(raw);
       // 两种拆法都算：「1,234」既是 1234，也可能是 JSON 数组里的 1 和 234
       for (const match of [...output.matchAll(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi), ...output.matchAll(NUMBER)]) {
         const n = Number(match[0].replace(/,/g, ""));
@@ -307,14 +364,14 @@ function halfStep(v: number): number {
 
 /** 数字卡片的值里写的数：「41%」「1.2 GiB」「1,234」「1e9」「.5」各是一个数；「10~20%」「10-20」是 10 和 20 */
 function numbersIn(value: string): number[] {
-  return [...value.matchAll(NUMBER)].map((match) => Number(match[0].replace(/,/g, "")));
+  return [...halfWidth(value).matchAll(NUMBER)].map((match) => Number(match[0].replace(/,/g, "")));
 }
 
 /**
  * 横轴上写成数的值（时间戳、编号，带千分位、单位的也算：1,000、500 ms、50%）：和图里的数一样要查得到。
  * 19:00、10-12 这种时间、日期不算（后面还跟着数）
  */
-const NUMERIC_LABEL = new RegExp(`^\\s*${NUMBER.source}\\s*[^\\d\\s]{0,8}\\s*$`, "i");
+const NUMERIC_LABEL = new RegExp(`^\\s*[-+$¥€£~≈<>≤≥]?\\s*${NUMBER.source}\\s*[^\\d\\s]{0,8}\\s*$`, "i");
 
 /**
  * 只留下数都查得到的图和数字卡片。dropped 记下去掉了什么，写日志用。
@@ -329,7 +386,7 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
     if (segment.kind === "chart") {
       const factors = unitFactors(segment.unit) ?? [1];
       const missing = [
-        ...segment.x.filter((value) => NUMERIC_LABEL.test(value)).flatMap((value) => numbersIn(value).filter((n) => !evidence.has(n, unitFactors(value) ?? [1]))),
+        ...segment.x.filter((value) => NUMERIC_LABEL.test(halfWidth(value))).flatMap((value) => numbersIn(value).filter((n) => !evidence.has(n, unitFactors(value) ?? [1]))),
         ...segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n, factors)),
       ];
       if (missing.length > 0) {

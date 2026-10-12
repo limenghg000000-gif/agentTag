@@ -34,8 +34,8 @@ test("拆回答：```chart、```kpi 换成图和数字卡片，别的代码块�
   assert.equal((segments[3] as { text: string }).text, '说明\n```json\n{"a":1}\n```');
   assert.deepEqual(invalid, ["chart"]);
 
-  // 没写完的块、长代码块里的 ```chart 不算
-  assert.deepEqual(splitAnswer("开头\n```chart\n" + chartJson).invalid, ["chart"]);
+  // JSON 没写完的块不算，长代码块里的 ```chart 不算
+  assert.deepEqual(splitAnswer("开头\n```chart\n{\"type\":\"li").invalid, ["chart"]);
   const nested = "````md\n```chart\n" + chartJson + "\n```\n````";
   assert.deepEqual(splitAnswer(nested).segments, [{ kind: "markdown", text: nested }]);
   // 数据和横轴对不上、饼图多个系列、点太多：不要
@@ -208,4 +208,55 @@ test("查到的数里 1,234 也算 1234；数字卡片里 .5 是 0.5；几组数
   assert.deepEqual(splitAnswer(example), { segments: [{ kind: "markdown", text: example }], invalid: [] });
   assert.equal(streamingAnswer(example), example);
   assert.equal(splitAnswer("   ```chart\n" + chartJson + "\n   ```").segments[0].kind, "chart");
+});
+
+test("漏写了收尾 ``` 的图、数字卡片块不吞掉后面的正文：JSON 写完的地方就是块的结尾，JSON 没写完的到空行为止", () => {
+  // 漏写收尾，后面是标题、表格、建议：都留着
+  const report = ["结论：没有风险", "```kpi", kpiJson, "", "#### 明细", "| Pod | CPU |", "| --- | --- |", "| a | 41% |", "", "建议：观察"].join("\n");
+  const split = splitAnswer(report);
+  assert.deepEqual(split.invalid, []);
+  assert.deepEqual(
+    split.segments.map((s) => s.kind),
+    ["markdown", "kpi", "markdown"],
+  );
+  assert.equal((split.segments[2] as { text: string }).text, "#### 明细\n| Pod | CPU |\n| --- | --- |\n| a | 41% |\n\n建议：观察");
+
+  // 漏写收尾，后面别的代码块的收尾 ``` 不算这块的：代码块原样留着
+  const code = ["```chart", chartJson, "说明", "```go", "x := 1", "```", "结尾"].join("\n");
+  const withCode = splitAnswer(code);
+  assert.deepEqual(
+    withCode.segments.map((s) => s.kind),
+    ["chart", "markdown"],
+  );
+  assert.equal((withCode.segments[1] as { text: string }).text, "说明\n```go\nx := 1\n```\n结尾");
+
+  // 被截断：JSON 没写完，后面的截断说明留着
+  const cut = splitAnswer('```chart\n{"type":"line","ti\n\n（回答太长，后面被截断了）');
+  assert.deepEqual(cut, { segments: [{ kind: "markdown", text: "（回答太长，后面被截断了）" }], invalid: ["chart"] });
+
+  // JSON 不对、写了收尾的块：和原来一样整块不要
+  assert.deepEqual(splitAnswer("开头\n```kpi\n{坏的\n```\n结尾"), {
+    segments: [{ kind: "markdown", text: "开头\n结尾" }],
+    invalid: ["kpi"],
+  });
+});
+
+test("全角数字、全角 ％、数学减号先换成半角再核对；横轴上 +5%、$1,000 这种带符号的数也要查得到", () => {
+  const kpi = (value: string, output: string) =>
+    keepVerified([{ kind: "kpi", items: [{ label: "x", value }] }], new NumberEvidence([output])).segments.length === 1;
+  assert.ok(!kpi("９９％", "nothing here"));
+  assert.ok(kpi("９９％", "ratio 0.99"));
+  assert.ok(kpi("99％", "ratio 0.99"));
+  assert.ok(!kpi("−99%", "ratio 0.99"));
+  assert.ok(kpi("−99%", "delta -0.99"));
+  assert.ok(kpi("1.2 ＧｉＢ", String(1.2 * 1024 ** 3)));
+  assert.ok(!kpi("102", "10²"));
+
+  const xs = (x: string, output: string) =>
+    keepVerified([{ kind: "chart", type: "bar", title: "t", x: [x], series: [{ name: "a", data: [39] }] }], new NumberEvidence([output])).segments[0].kind;
+  assert.equal(xs("+5%", "39"), "markdown");
+  assert.equal(xs("+5%", "0.05 39"), "chart");
+  assert.equal(xs("$1,000", "39"), "markdown");
+  assert.equal(xs("$1,000", "1000 39"), "chart");
+  assert.equal(xs("１,０００", "39"), "markdown");
 });
