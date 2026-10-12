@@ -392,6 +392,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `{"env":[{"name":"MCP_AIOPS_TOKEN","value":"${["correct", "horse", "battery", "staple"].join("")}"}]}`,
     `[{name:"LOG_LEVEL",value:"debug"},{value:'${["Correct", "Horse", "Battery", "Staple9"].join("")}',name:'db.password'}]`,
     `environment = [{ name = "DB_PASSWORD", value = "${["Correct", "Horse", "Battery", "Staple9"].join("")}" }]`,
+    // value 写在下面几行的：块写法（|-、>-、|2，标记后面带注释的）、冒号后面空着下一行写的（前面隔着注释行也算），块写法里 # 开头的也是值
+    `env:\n- name: DB_PASSWORD\n  value: |-\n    ${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`,
+    `- name: api_token\n  value: >-\n    correct horse\n    battery staple\n- name: LOG_LEVEL\n  value: debug`,
+    `- value: |2  # 生产\n     ${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\n  name: DB_PASSWORD`,
+    `- name: DB_PASSWORD\n  value:\n    # 生产库\n    ${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`,
+    `- name: DB_PASSWORD\n  value: |-\n    #${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`,
     `DB_PASSWORD ?= ${["Correct", "Horse", "Battery", "Staple9"].join("")}`,
     `MCP_AIOPS_TOKEN += ${["correct", "horse", "battery", "staple"].join("")}\ndb_password ::= ${["Correct", "Horse", "Battery", "Staple9"].join("")}`,
     // 字符串里套着转义过的 JSON，转义了几层都算
@@ -513,6 +519,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // name/value 里名字不是密钥的、值是引用或占位的、valueFrom 引用 Secret 的（下面的 name、key 是引用，不是值）
     "env:\n- name: LOG_LEVEL\n  value: verbose-debugging\n- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password\n- name: API_TOKEN\n  value: \"{{ .Values.apiToken }}\"",
     '{"name":"token_ttl","value":"86400000"}；{"name":"MCP_AIOPS_TOKEN","value":"${MCP_AIOPS_TOKEN}"}；environment = [{ name = "DB_PASSWORD", value = var.db_password }]',
+    // 写在下面几行的 value 是变量、打了码的、中文说明的，名字不是密钥的，冒号后面空着、下面是嵌套子项或者下一项的
+    "- name: DB_PASSWORD\n  value: |-\n    ${DB_PASSWORD}\n- name: API_TOKEN\n  value: >-\n    ******\n- name: db_password\n  value: |\n    请找管理员要\n- name: LOG_LEVEL\n  value: |-\n    verbose-debugging-output",
+    "- name: DB_PASSWORD\n  value:\n    secretKeyRef: db\n- name: API_TOKEN\n  value:\n- name: LOG_LEVEL\n  value: verbose-debugging-output",
     "LOG_LEVEL ?= verbose-debugging；password ?= ******",
     // 只提到令牌前缀、配置名的
     "npm_config_registry=https://registry.npmmirror.com；hf_hub_download；SG.example；glsa_ 是 Grafana 服务账号令牌的前缀；hvs. 开头的是 Vault 令牌；Credential=AKIDEXAMPLE/20150830",
@@ -3047,6 +3056,8 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(`gateway-api 报 code=8，请求头 Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${base64(Buffer.alloc(32, 9))}"`, task);
   await desk.lookup(`gateway-api 报 code=8，sops 用的 age 私钥是 ${["AGE", "SECRET", "KEY", `1${bech32(Buffer.alloc(32, 8)).toUpperCase()}`].join("-")}`, task);
   await desk.lookup(`gateway-api 报 code=8，terraform 里写的是 password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOT`, task);
+  // k8s env 里 value 用块写法写在下一行的
+  await desk.lookup(`gateway-api 报 code=8，env 是\n- name: DB_PASSWORD\n  value: |-\n    ${["Correct", "Horse", "Battery", "Staple9!"].join("-")}`, task);
   // 群机器人的 Webhook 地址：拿到就能往群里发消息
   await desk.lookup(["gateway-api 报 code=8，告警发到 https://discord.com/api/webhooks/", "123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789"].join(""), task);
   await desk.lookup(["gateway-api 报 code=8，告警发到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?", "key=693a91f6-7b2c-4bc4-97a0-0ec2a1fa5aaa"].join(""), task);

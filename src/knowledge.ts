@@ -1340,6 +1340,33 @@ function yamlScalar(raw: string): string {
   return /^(["']).*\1$/.test(value) ? value.slice(1, -1) : value;
 }
 
+/** 块写法的标记（|、>，可带 - + 和数字），后面可以跟注释 */
+const BLOCK_MARKER = /^[|>][1-9+-]{0,2}(?:[ \t]+#.*)?$/;
+
+/**
+ * 名字、值分开写时 value 的值。写在下面几行的（value: |-、value: >、冒号后面空着下一行缩进着写）把下面缩进比 value 深的几行连起来，
+ * 和 blockValues 一样：块写法里 # 是值本身，冒号后面空着时跳过注释行，下面是嵌套的子项时不是值
+ */
+function pairValue(raw: readonly string[], at: number, column: number, inline: string): string {
+  const head = inline.trim();
+  const block = BLOCK_MARKER.test(head);
+  if (!block && head !== "" && !head.startsWith("#")) {
+    return yamlScalar(inline);
+  }
+  const body: string[] = [];
+  for (const next of raw.slice(at + 1)) {
+    if (next.trim() === "" || (!block && COMMENT_LINE.test(next))) {
+      continue;
+    }
+    if (/^[ \t]*/.exec(next)![0].length <= column || (body.length === 0 && !block && NESTED_LINE.test(next))) {
+      break;
+    }
+    const note = (block ? BLOCK_NOTE_START : NOTE_START).exec(next);
+    body.push((note ? next.slice(0, note.index) : next).trim());
+  }
+  return body.join(" ").trim();
+}
+
 /**
  * 名字和值分开写的配置项，名字是密钥的名字时取它的值：k8s 的 env（- name: DB_PASSWORD 下面 value: …）、
  * JSON 和 HCL 里的 {"name": "MCP_AIOPS_TOKEN", "value": "…"}，value 写在 name 前面的也算。
@@ -1357,9 +1384,17 @@ function namedPairValues(text: string): string[] {
       values.push(value);
     }
   }
-  const lines = text.split(/\r?\n/).map((line) => {
+  const raw = text.split(/\r?\n/);
+  const lines = raw.map((line, at) => {
     const field = YAML_FIELD.exec(line);
-    return field && { column: field[1].length + (field[2]?.length ?? 0), item: field[2] !== undefined, name: field[3].toLowerCase(), value: yamlScalar(field[4] ?? "") };
+    if (!field) {
+      return undefined;
+    }
+    const column = field[1].length + (field[2]?.length ?? 0);
+    const name = field[3].toLowerCase();
+    // 只有 value 的值可能写在下面几行；name、key 的按这一行
+    const value = name === "value" ? pairValue(raw, at, column, field[4] ?? "") : yamlScalar(field[4] ?? "");
+    return { column, item: field[2] !== undefined, name, value };
   });
   lines.forEach((line, i) => {
     if (!line || (line.name !== "name" && line.name !== "key")) {
