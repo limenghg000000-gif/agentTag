@@ -1482,6 +1482,27 @@ test("回答里用 <font>、<text_tag> 包着没查到的代码位置照样拦",
   assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
 });
 
+test("写歪的标签卡片照原文显示，里面夹的没查到的代码位置也要拦", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const tagged = "问题在 <font data-x='src/user.go:99'>这里</font>";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: tagged, finish: "stop" },
+    { text: tagged, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  assert.match(JSON.stringify(requests.at(-1)!.messages), /src\/user\.go:99/);
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+});
+
 test("打回重做以后通过了：被打回的那一轮的思考不留在卡片上，前面几轮的照样留", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
