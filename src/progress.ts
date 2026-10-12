@@ -1,3 +1,5 @@
+import { stripThinkTags } from "./llm.js";
+
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
 
@@ -27,7 +29,24 @@ export interface ProgressState {
   thoughts?: ProgressThought[];
   startedAt: number;
   endedAt?: number;
+  /** 卡片即回答：模型这一轮到目前为止的思考和正文，边生成边显示。这一轮结束时清掉 */
+  live?: { round: number; reasoning: string; text: string };
+  /** 卡片即回答：卡片里的回答。进行中是最后一轮给出的那版（还没检查完），结束后是最终的回答 */
+  answer?: string;
+  /** 卡片即回答：还没有回答可显示时，回答位置上的说明（比如上一版没通过检查、正在重做） */
+  answerNote?: string;
 }
+
+export interface CardOptions {
+  /**
+   * 卡片即回答：卡片是飞书的卡片实体，回答写在卡片里。进行中的状态、思考、回答各是一个带 element_id 的组件，
+   * 模型生成时按组件流式更新（打字机效果），见 StreamingCard
+   */
+  streaming?: boolean;
+}
+
+/** 流式卡片里各组件的 element_id */
+export const ELEMENT = { status: "status", thought: "thought", answer: "answer", stop: "stop" } as const;
 
 /** 卡片上最多列出几步，更早的合成一行 */
 const MAX_VISIBLE_STEPS = 12;
@@ -38,37 +57,55 @@ const MAX_THOUGHT_CHARS = 1500;
 /** 飞书卡片最大 30 KB，带样式的标签展开后比请求体还长，留些余量；超了就从最早的一段思考开始去掉正文 */
 export const MAX_CARD_BYTES = 24_000;
 const THOUGHT_NOTE = "💭 是模型的思考草稿，里面的猜测没有核实，结论以回答为准";
+/** 卡片里的回答最多这么多字：再长卡片放不下（还要放步骤和思考），卡片里只显示开头，全文另外发 */
+export const MAX_CARD_ANSWER_CHARS = 4000;
+const ANSWER_CONTINUED = "…（回答较长，全文另外发在下面）";
+/** 打字机效果：每 50 毫秒出 2 个字；新内容到了就把还没打完的先显示出来（fast），不落后于模型 */
+const STREAMING_CONFIG = { print_frequency_ms: { default: 50 }, print_step: { default: 2 }, print_strategy: "fast" };
+/** 结束后消息列表里的预览：回答的开头 */
+const SUMMARY_CHARS = 50;
 
 /**
  * 进度卡片（飞书卡片 JSON 2.0）。进行中：当前状态 + 已执行的步骤 + 最新一段思考 + 停止按钮；
  * 结束后收成一行结果，步骤和每轮的思考按先后放进默认折叠的面板里，按钮去掉。
  */
-export function renderProgressCard(state: ProgressState, taskId: string, now = Date.now()): object {
+export function renderProgressCard(state: ProgressState, taskId: string, now = Date.now(), options: CardOptions = {}): object {
   const total = state.thoughts?.length ?? 0;
   const fits = (card: object) => Buffer.byteLength(JSON.stringify(card)) <= MAX_CARD_BYTES;
   // 卡片太大时从最早的一段思考开始，只留标题、去掉正文，直到放得下
   let omitted = 0;
-  let card = buildProgressCard(state, taskId, now, omitted);
+  let card = buildProgressCard(state, taskId, now, omitted, options);
   while (omitted < total && !fits(card)) {
-    card = buildProgressCard(state, taskId, now, ++omitted);
+    card = buildProgressCard(state, taskId, now, ++omitted, options);
   }
   // 正文全去掉还放不下（步骤太多、步骤名很长）：不显示思考，和以前一样只列最近的步骤
-  return total > 0 && !fits(card) ? buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0) : card;
+  return total > 0 && !fits(card) ? buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options) : card;
 }
 
 /** omitted：最早的几段思考只显示标题、不显示正文 */
-function buildProgressCard(state: ProgressState, taskId: string, now: number, omitted: number): object {
-  const finished = state.phase === "done" || state.phase === "stopped" || state.phase === "failed";
+function buildProgressCard(state: ProgressState, taskId: string, now: number, omitted: number, { streaming }: CardOptions): object {
+  const finished = isFinished(state);
   const thoughts = state.thoughts ?? [];
+  const id = (elementId: string) => (streaming ? { element_id: elementId } : {});
   const elements: object[] = [];
   if (!finished) {
-    elements.push({ tag: "markdown", content: [statusLine(state), ...stepLines(state.steps)].join("\n") });
+    elements.push({ tag: "markdown", ...id(ELEMENT.status), content: [statusLine(state), ...stepLines(state.steps)].join("\n") });
+    const live = streaming ? state.live : undefined;
     const latest = thoughts.at(-1);
-    if (latest && omitted < thoughts.length) {
-      elements.push(thoughtElement(`💭 最新的思考（${roundLabel(latest)}，草稿，结论以回答为准）`, clip(latest.text, LIVE_THOUGHT_CHARS)));
+    if (live?.reasoning) {
+      const title = `💭 第 ${live.round} 轮，正在想…（草稿，结论以回答为准）`;
+      elements.push({ ...thoughtElement(title, clip(live.reasoning, LIVE_THOUGHT_CHARS)), ...id(ELEMENT.thought) });
+    } else if (latest && omitted < thoughts.length) {
+      const title = `💭 最新的思考（${roundLabel(latest)}，草稿，结论以回答为准）`;
+      elements.push({ ...thoughtElement(title, clip(latest.text, LIVE_THOUGHT_CHARS)), ...id(ELEMENT.thought) });
+    }
+    const answer = streaming ? (liveText(state) || state.answerNote || state.answer) : undefined;
+    if (answer) {
+      elements.push(answerElement(answer));
     }
     elements.push({
       tag: "button",
+      ...id(ELEMENT.stop),
       text: { tag: "plain_text", content: "停止" },
       type: "danger",
       size: "small",
@@ -89,11 +126,81 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
       elements: thoughts.length === 0 ? [{ tag: "markdown", content: stepLines(state.steps).join("\n") }] : timeline(state.steps, thoughts, omitted),
     });
   }
+  if (streaming && finished && state.answer) {
+    elements.push(answerElement(state.answer));
+  }
+  return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
+}
+
+function isFinished(state: ProgressState): boolean {
+  return state.phase === "done" || state.phase === "stopped" || state.phase === "failed";
+}
+
+/**
+ * streaming_mode：模型正在生成（有 live）时要开着，组件才能流式更新；开着的时候卡片上的按钮可能点不了，
+ * 所以只在生成时开，工具执行时关掉（实际开关由 StreamingCard 调接口）。
+ * 卡片即回答时，结束后消息列表里的预览是回答的开头
+ */
+function cardConfig(state: ProgressState, streaming: boolean | undefined): object {
+  const finished = isFinished(state);
+  const preview = streaming && finished && state.answer ? previewOf(state.answer) : undefined;
   return {
-    schema: "2.0",
-    config: { update_multi: true, summary: { content: finished ? summaryText(state.phase) : "处理中…" } },
-    body: { elements },
+    update_multi: true,
+    ...(streaming ? { streaming_mode: !finished && state.live !== undefined, streaming_config: STREAMING_CONFIG } : {}),
+    summary: { content: preview || (finished ? summaryText(state.phase) : "处理中…") },
   };
+}
+
+function previewOf(answer: string): string {
+  const chars = Array.from(answer.replace(/\s+/g, " ").trim());
+  return chars.length <= SUMMARY_CHARS ? chars.join("") : `${chars.slice(0, SUMMARY_CHARS - 1).join("")}…`;
+}
+
+/** 模型这一轮已经写出来的正文。还在 <think> 标签里（有的模型把思考写在正文里）的不算 */
+function liveText(state: ProgressState): string {
+  const text = state.live?.text ?? "";
+  if (/^\s*<think>/.test(text) && !text.includes("</think>")) {
+    return "";
+  }
+  return stripThinkTags(text);
+}
+
+/** 卡片里的回答：太长时只放开头，后面说明全文另外发 */
+function answerElement(answer: string): object {
+  return { tag: "markdown", element_id: ELEMENT.answer, content: escapeOutsideCode(clipAnswer(answer)) };
+}
+
+/** 回答能不能完整放进卡片。放不下时卡片里只有开头，要另外发全文 */
+export function answerFitsCard(answer: string): boolean {
+  return Array.from(answer).length <= MAX_CARD_ANSWER_CHARS;
+}
+
+function clipAnswer(answer: string): string {
+  if (answerFitsCard(answer)) {
+    return answer;
+  }
+  const head = Array.from(answer).slice(0, MAX_CARD_ANSWER_CHARS).join("");
+  // 切在代码块中间时先把代码块合上，不然后面的说明也显示成代码
+  const fence = (head.match(/^[ \t]*```/gm)?.length ?? 0) % 2 === 1 ? "\n```" : "";
+  return `${head}${fence}\n\n${ANSWER_CONTINUED}`;
+}
+
+/**
+ * 回答里代码块以外的尖括号转义：卡片会把 <at>、<font> 当成标签（工具结果里冒充的 <at id=all></at> 会变成 @所有人）。
+ * 代码块里的照原样显示
+ */
+function escapeOutsideCode(text: string): string {
+  let inFence = false;
+  return text
+    .split("\n")
+    .map((line) => {
+      if (/^[ \t]*```/.test(line)) {
+        inFence = !inFence;
+        return line;
+      }
+      return inFence ? line : escapeMarkdown(line);
+    })
+    .join("\n");
 }
 
 /** 结束后面板里按先后排：每段思考后面跟着这一轮调的工具。步骤全部列出（面板是折叠的） */
@@ -145,17 +252,20 @@ export function visibleThought(text: string): string {
 }
 
 /** 折叠面板渲染不了时（比如飞书客户端太旧导致更新失败）用的简单版本 */
-export function renderPlainProgressCard(state: ProgressState, now = Date.now()): object {
-  return {
-    schema: "2.0",
-    config: { update_multi: true, summary: { content: summaryText(state.phase) } },
-    body: { elements: [{ tag: "markdown", content: [summaryLine(state, now), ...stepLines(state.steps)].join("\n") }] },
-  };
+export function renderPlainProgressCard(state: ProgressState, now = Date.now(), { streaming }: CardOptions = {}): object {
+  const elements: object[] = [{ tag: "markdown", content: [summaryLine(state, now), ...stepLines(state.steps)].join("\n") }];
+  if (streaming && state.answer) {
+    elements.push(answerElement(state.answer));
+  }
+  return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
 }
 
 function statusLine(state: ProgressState): string {
   if (state.phase === "queued") {
     return "⏳ 排队中：等这个话题里上一个任务完成";
+  }
+  if (liveText(state)) {
+    return "✍️ 正在写回答…";
   }
   return state.steps.some((step) => step.status === "running") ? "⏳ 正在执行…" : "⏳ 思考中…";
 }
@@ -196,11 +306,18 @@ function escapeMarkdown(text: string): string {
 
 export type PatchCard = (card: object) => Promise<void>;
 
+/** 已发出的进度卡片：进行中的更新合并着推，结束时推最终状态 */
+export interface ProgressCard {
+  update(card: object): void;
+  /** 推送最终状态并等它完成。失败时再试一次 fallback（如果给了）。返回卡片最后有没有更新成功 */
+  finish(card: object, fallback?: object): Promise<boolean>;
+}
+
 /**
  * 把进度更新推到已发出的卡片上。飞书对同一条消息的更新有频率限制，这里合并短时间内的多次更新，
  * 同一时间只有一个请求在途，间隔至少 minIntervalMs。更新失败只记日志，不影响任务本身。
  */
-export class CardUpdater {
+export class CardUpdater implements ProgressCard {
   private pending?: object;
   private running?: Promise<void>;
   private lastAt = 0;
@@ -221,7 +338,7 @@ export class CardUpdater {
   }
 
   /** 推送最终状态并等它完成。失败时再试一次 fallback（如果给了） */
-  async finish(card: object, fallback?: object): Promise<void> {
+  async finish(card: object, fallback?: object): Promise<boolean> {
     this.closed = true;
     this.pending = undefined;
     while (this.running) {
@@ -230,15 +347,18 @@ export class CardUpdater {
     await this.wait();
     try {
       await this.patch(card);
+      return true;
     } catch (err) {
       if (!fallback) {
         this.logger.error("更新进度卡片失败", err);
-        return;
+        return false;
       }
       try {
         await this.patch(fallback);
+        return true;
       } catch (err2) {
         this.logger.error("更新进度卡片失败", err2);
+        return false;
       }
     }
   }

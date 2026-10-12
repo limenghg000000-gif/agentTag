@@ -160,3 +160,39 @@ test("在群里直接 @ 时没有上文；用「回复」引用消息时带上�
   const quoted = await loader.load(message({ rootId: "om_quoted", replyToMessageId: "om_quoted" }));
   assert.deepEqual(quoted.history, [{ role: "user", content: "[张三] 明天下午开会" }]);
 });
+
+test("卡片即回答：机器人的卡片记过回答的换成回答，没记过的（进度卡片）照样去掉", async () => {
+  const { api } = fakeApi([
+    item("om_1", { senderName: "张三", content: "@机器人 查一下" }),
+    item("om_card_1", { fromBot: true, msgType: "interactive", content: "请升级至最新版本客户端" }),
+    item("om_card_old", { fromBot: true, msgType: "interactive", content: "✅ 已完成" }),
+    item("om_answer_old", { fromBot: true, content: "以前另外发的回答" }),
+    item("om_3", { createTime: 3000 }),
+  ]);
+  const asked: { chatId: string; ids: readonly string[] }[] = [];
+  const loader = new ThreadContextLoader(api, quiet, 500, {
+    async get(chatId, ids) {
+      asked.push({ chatId, ids });
+      return new Map([["om_card_1", "卡片里的回答"]]);
+    },
+  });
+
+  const context = await loader.load(message({ rootId: "om_1", threadId: "omt_1" }));
+
+  assert.deepEqual(asked, [{ chatId: "oc_1", ids: ["om_card_1", "om_card_old"] }]);
+  assert.deepEqual(context.history, [
+    { role: "user", content: "[张三] @机器人 查一下" },
+    { role: "assistant", content: "卡片里的回答\n以前另外发的回答" },
+  ]);
+
+  // 读不出记下的回答时照常读话题，只是没有卡片里的回答
+  const broken = new ThreadContextLoader(api, quiet, 500, {
+    get: async () => {
+      throw new Error("disk");
+    },
+  });
+  assert.deepEqual((await broken.load(message({ rootId: "om_1", threadId: "omt_1" }))).history, [
+    { role: "user", content: "[张三] @机器人 查一下" },
+    { role: "assistant", content: "以前另外发的回答" },
+  ]);
+});

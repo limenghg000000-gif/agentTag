@@ -337,3 +337,30 @@ test("轮数用完时上一条已经是用户消息（思考提醒）就把收�
   // 调用方传进来的消息没被改
   assert.deepEqual(user, [{ role: "user", content: "帮我做事" }]);
 });
+
+test("stream 打开时把模型的 onDelta 转成这一轮的 delta 事件；不打开时不传 onDelta", async () => {
+  const requests: ChatRequest[] = [];
+  const model: ChatModel = {
+    model: "fake",
+    async chat(req) {
+      requests.push(req);
+      req.onDelta?.({ reasoning: "想", text: "" });
+      req.onDelta?.({ reasoning: "想", text: "答" });
+      return { text: "答", finish: "stop" };
+    },
+  };
+  const events: AgentEvent[] = [];
+
+  await runAgent({ model, system: "s", messages: user, tools: [], signal, stream: true, onEvent: (e) => events.push(e) });
+  await runAgent({ model, system: "s", messages: user, tools: [], signal });
+
+  assert.deepEqual(
+    events.filter((e) => e.type === "delta"),
+    [
+      { type: "delta", round: 1, reasoning: "想", text: "" },
+      { type: "delta", round: 1, reasoning: "想", text: "答" },
+    ],
+  );
+  assert.equal(typeof requests[0].onDelta, "function");
+  assert.equal(requests[1].onDelta, undefined);
+});

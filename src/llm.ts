@@ -28,6 +28,11 @@ export interface ChatRequest {
   signal?: AbortSignal;
   /** 这次单独打开或关掉思考；不传用配置里的 */
   thinking?: boolean;
+  /**
+   * 传了就流式调用：边生成边回调，给的是到目前为止的全部思考和正文（不是增量），用来在进度卡片上边想边显示。
+   * 最终结果和不传时一样由 chat() 返回
+   */
+  onDelta?: (soFar: { reasoning: string; text: string }) => void;
 }
 
 /** 一次模型调用用掉的 token，用来看时间花在哪 */
@@ -99,19 +104,21 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   let parallelToolCalls = true;
   let thinkingSupported = true;
   let budgetSupported = true;
-  type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & { enable_thinking?: boolean; thinking_budget?: number };
-  const create = async (body: Body, thinkingWanted: boolean | undefined, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> => {
+  type Extra = { enable_thinking?: boolean; thinking_budget?: number };
+  type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
+  /** 发请求，参数不认（400）时去掉重试。send 发出最终的请求体，流式和非流式各自用 */
+  const create = async <T>(body: Body, thinkingWanted: boolean | undefined, send: (request: Body & Extra) => Promise<T>): Promise<T> => {
     for (let attempt = 0; ; attempt++) {
       const thinking = thinkingSupported ? (thinkingWanted ?? config.thinking) : undefined;
       const budget = thinking && budgetSupported ? config.thinkingBudget : undefined;
-      const request: Body = {
+      const request: Body & Extra = {
         ...body,
         ...(body.tools && parallelToolCalls ? { parallel_tool_calls: true } : {}),
         ...(thinking !== undefined ? { enable_thinking: thinking } : {}),
         ...(budget !== undefined ? { thinking_budget: budget } : {}),
       };
       try {
-        return await client.chat.completions.create(request, { signal });
+        return await send(request);
       } catch (err) {
         if (attempt < 3 && err instanceof OpenAI.BadRequestError) {
           if (request.parallel_tool_calls && /parallel_tool_calls/i.test(err.message)) {
@@ -136,17 +143,24 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
 
   return {
     model: config.model,
-    async chat({ system, messages, tools, signal, thinking }) {
-      const body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
+    async chat({ system, messages, tools, signal, thinking, onDelta }) {
+      const body: Body = {
         model: config.model,
         messages: [{ role: "system", content: system }, ...messages.map(toOpenAIMessage)],
         ...(tools && tools.length > 0
           ? { tools: tools.map((tool) => ({ type: "function" as const, function: tool })) }
           : {}),
       };
-      let completion: OpenAI.Chat.ChatCompletion;
+      let raw: RawReply;
       try {
-        completion = await create(body, thinking, signal);
+        raw = onDelta
+          ? await readStream(
+              await create(body, thinking, (request) =>
+                client.chat.completions.create({ ...request, stream: true, stream_options: { include_usage: true } }, { signal }),
+              ),
+              onDelta,
+            )
+          : fromCompletion(await create(body, thinking, (request) => client.chat.completions.create(request, { signal })));
       } catch (err) {
         // 百炼对输入做内容审核，不通过时返回 400 data_inspection_failed
         if (err instanceof OpenAI.BadRequestError && err.code === "data_inspection_failed") {
@@ -155,21 +169,16 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
         throw toLlmError(err);
       }
 
-      const choice = completion.choices[0];
-      const text = stripThinkTags(choice?.message.content ?? "");
-      const usage = toUsage(completion.usage);
-      // reasoning_content 不是 OpenAI 的标准字段，百炼、DeepSeek 等开着思考时在这里返回思考内容
-      const thought = (choice?.message as { reasoning_content?: unknown } | undefined)?.reasoning_content;
-      const reasoning = typeof thought === "string" && thought.trim() ? thought.trim() : undefined;
+      const text = stripThinkTags(raw.content);
+      const usage = toUsage(raw.usage);
+      const reasoning = raw.reasoning.trim() || undefined;
       const withUsage = <T extends ChatResult>(result: T): T => ({ ...result, ...(usage ? { usage } : {}), ...(reasoning ? { reasoning } : {}) });
-      const toolCalls = (choice?.message.tool_calls ?? [])
-        .filter((call) => call.type === "function")
-        .map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments }));
+      const toolCalls = raw.toolCalls;
       // 有的模型带着工具调用返回时 finish_reason 仍是 stop，以是否真的有工具调用为准
       if (toolCalls.length > 0) {
         return withUsage({ text, finish: "tool_calls", toolCalls });
       }
-      switch (choice?.finish_reason) {
+      switch (raw.finishReason) {
         case "length":
           return withUsage({ text, finish: "length" });
         case "content_filter":
@@ -180,6 +189,69 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
       }
     },
   };
+}
+
+/** 一次调用拿到的原始结果，流式和非流式整理成一样的再往下处理 */
+interface RawReply {
+  content: string;
+  reasoning: string;
+  toolCalls: ToolCall[];
+  finishReason: string | null | undefined;
+  usage: OpenAI.CompletionUsage | undefined;
+}
+
+/** reasoning_content 不是 OpenAI 的标准字段，百炼、DeepSeek 等开着思考时在这里返回思考内容 */
+type WithReasoning = { reasoning_content?: unknown };
+
+function fromCompletion(completion: OpenAI.Chat.ChatCompletion): RawReply {
+  const choice = completion.choices[0];
+  const thought = (choice?.message as WithReasoning | undefined)?.reasoning_content;
+  return {
+    content: choice?.message.content ?? "",
+    reasoning: typeof thought === "string" ? thought : "",
+    toolCalls: (choice?.message.tool_calls ?? [])
+      .filter((call) => call.type === "function")
+      .map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments })),
+    finishReason: choice?.finish_reason,
+    usage: completion.usage,
+  };
+}
+
+/**
+ * 读流式结果：正文、思考按顺序拼起来，工具调用按 index 拼参数；每收到一段正文或思考就回调一次。
+ * 工具名有的服务只在第一段给，有的每段都给全名，有的拆开给：和已有的一样就不再拼
+ */
+async function readStream(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>, onDelta: NonNullable<ChatRequest["onDelta"]>): Promise<RawReply> {
+  const reply: RawReply = { content: "", reasoning: "", toolCalls: [], finishReason: undefined, usage: undefined };
+  const calls: ToolCall[] = [];
+  for await (const chunk of stream) {
+    if (chunk.usage) {
+      reply.usage = chunk.usage;
+    }
+    const choice = chunk.choices[0];
+    if (!choice) {
+      continue;
+    }
+    const delta = choice.delta as OpenAI.Chat.ChatCompletionChunk.Choice.Delta & WithReasoning;
+    const thought = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+    reply.reasoning += thought;
+    reply.content += delta.content ?? "";
+    for (const part of delta.tool_calls ?? []) {
+      const call = (calls[part.index ?? 0] ??= { id: "", name: "", arguments: "" });
+      call.id = part.id || call.id;
+      const name = part.function?.name;
+      if (name && name !== call.name) {
+        call.name += name;
+      }
+      call.arguments += part.function?.arguments ?? "";
+    }
+    reply.finishReason = choice.finish_reason ?? reply.finishReason;
+    if (thought || delta.content) {
+      onDelta({ reasoning: reply.reasoning, text: reply.content });
+    }
+  }
+  reply.toolCalls = calls.filter((call) => call && call.name);
+  return reply;
 }
 
 /** 看图片的模型：按要求把一张图片转成文字。主模型不一定能看图，所以单独配一个 */

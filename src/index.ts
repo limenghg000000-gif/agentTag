@@ -4,6 +4,7 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { MissedEventAlarm } from "./alarm.js";
 import { MemoryBackup } from "./backup.js";
 import { createCardActionHandler, createMessageHandler } from "./bot.js";
+import { CardAnswerStore } from "./card-answers.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { loadConfig } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
@@ -14,6 +15,7 @@ import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "
 import { McpHub } from "./mcp.js";
 import { MemoryStore } from "./memory.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
+import { createCardKitApi } from "./stream-card.js";
 import { TaskRegistry } from "./tasks.js";
 import { CODE_TOOL_NAMES, createCodeTools } from "./tools/code.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
@@ -56,6 +58,8 @@ const backup =
     : undefined;
 
 const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
+// 关掉 STREAM_CARD 以后，之前写在卡片里的回答照样能从这里读回话题历史
+const cardAnswers = new CardAnswerStore(config.cardAnswersDir);
 const docs = new FeishuDocs(createDocsApi(channel.rawClient), () => channel.botIdentity?.name ?? "机器人");
 const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefined;
 // MCP 服务在后台连接，连上之前（或连不上时）的提问没有它的工具，不耽误机器人启动
@@ -84,8 +88,9 @@ const handleMessage = createMessageHandler({
   ...(mcp ? { mcp } : {}),
   ...(images ? { images } : {}),
   showThinking: config.showThinking,
+  ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient), cardAnswers } : {}),
   botName: () => channel.botIdentity?.name,
-  context: new ThreadContextLoader(feishuApi),
+  context: new ThreadContextLoader(feishuApi, console, undefined, cardAnswers),
   memory,
   tasks,
   send: (to, input, opts) => channel.send(to, input, opts),
@@ -141,6 +146,11 @@ if (config.llm.thinking !== undefined) {
   const budget = config.llm.thinkingBudget ? `，打开时最多想 ${config.llm.thinkingBudget} token` : "";
   console.log(`思考模式：${config.llm.thinking ? "开（回答更慢）" : "关（MODEL_THINKING=on 可以打开）"}${budget}`);
 }
+console.log(
+  config.streamCard
+    ? "卡片即回答：思考和回答边生成边写进进度卡片（要开 cardkit:card:write 权限，建不了卡片时自动退回原来的方式），STREAM_CARD=off 可以关掉"
+    : "卡片即回答没开（STREAM_CARD=off）：进度卡片只显示进度，回答另外发",
+);
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();
   console.log(

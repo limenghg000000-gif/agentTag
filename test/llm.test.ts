@@ -6,16 +6,25 @@ import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel, LlmErro
 
 // 本地假 OpenAI 兼容接口：记录收到的请求，按队列返回预设的状态码和响应
 const requests: { url: string; headers: IncomingHttpHeaders; body: any }[] = [];
-const responses: { status: number; body: object }[] = [];
+// sse：流式响应，按 Server-Sent Events 逐条发出，最后发 [DONE]
+const responses: ({ status: number; body: object } | { status: number; sse: object[] })[] = [];
 const server = createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => (raw += chunk));
   req.on("end", () => {
     requests.push({ url: req.url!, headers: req.headers, body: JSON.parse(raw) });
-    const { status, body } = responses.shift()!;
-    res.statusCode = status;
+    const next = responses.shift()!;
+    res.statusCode = next.status;
+    if ("sse" in next) {
+      res.setHeader("content-type", "text/event-stream");
+      for (const event of next.sse) {
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
+      res.end("data: [DONE]\n\n");
+      return;
+    }
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify(body));
+    res.end(JSON.stringify(next.body));
   });
 });
 await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -333,4 +342,70 @@ test("看图关掉思考；模型不认 enable_thinking 时去掉重试，之后
   assert.equal(requests.at(-1)!.body.enable_thinking, undefined);
   assert.equal(await vision.describe(image, "原样抄文字"), "第三张");
   assert.equal(requests.at(-1)!.body.enable_thinking, undefined);
+});
+
+function chunk(delta: object, finish_reason: string | null = null, extra: object = {}) {
+  return { id: "chatcmpl-1", object: "chat.completion.chunk", created: 0, model: "qwen3.8-max", choices: [{ index: 0, delta, finish_reason }], ...extra };
+}
+
+test("传了 onDelta 时流式调用：边收边回调到目前为止的思考和正文，工具调用按 index 拼起来，用量从最后一段拿", async () => {
+  responses.push({
+    status: 200,
+    sse: [
+      chunk({ role: "assistant", reasoning_content: "先查" }),
+      chunk({ reasoning_content: "日志" }),
+      chunk({ content: "我查一下" }),
+      chunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "aiops_query_logs", arguments: '{"q":' } }] }),
+      chunk({ tool_calls: [{ index: 1, id: "call_2", type: "function", function: { name: "code_search", arguments: "{}" } }] }),
+      chunk({ tool_calls: [{ index: 0, function: { arguments: '"err"}' } }] }, "tool_calls"),
+      { id: "chatcmpl-1", object: "chat.completion.chunk", created: 0, model: "qwen3.8-max", choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
+    ],
+  });
+  const seen: { reasoning: string; text: string }[] = [];
+
+  const result = await model.chat({ system: "s", messages: [{ role: "user", content: "查" }], onDelta: (soFar) => seen.push(soFar) });
+
+  assert.deepEqual(result, {
+    text: "我查一下",
+    finish: "tool_calls",
+    toolCalls: [
+      { id: "call_1", name: "aiops_query_logs", arguments: '{"q":"err"}' },
+      { id: "call_2", name: "code_search", arguments: "{}" },
+    ],
+    usage: { input: 10, output: 5 },
+    reasoning: "先查日志",
+  });
+  assert.deepEqual(seen, [
+    { reasoning: "先查", text: "" },
+    { reasoning: "先查日志", text: "" },
+    { reasoning: "先查日志", text: "我查一下" },
+  ]);
+  const { body } = requests.at(-1)!;
+  assert.equal(body.stream, true);
+  assert.deepEqual(body.stream_options, { include_usage: true });
+});
+
+test("流式时每段都带完整工具名也只算一次；思考里的 <think> 标签照样去掉；不传 onDelta 时不流式", async () => {
+  responses.push({
+    status: 200,
+    sse: [
+      chunk({ content: "<think>想想</think>" }),
+      chunk({ content: "答案" }, "stop"),
+    ],
+  });
+  assert.deepEqual(await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), { text: "答案", finish: "stop" });
+
+  responses.push({
+    status: 200,
+    sse: [
+      chunk({ tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "echo", arguments: "{" } }] }),
+      chunk({ tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "echo", arguments: "}" } }] }, "tool_calls"),
+    ],
+  });
+  const repeated = await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} });
+  assert.deepEqual(repeated.toolCalls, [{ id: "c1", name: "echo", arguments: "{}" }]);
+
+  responses.push(completion("好"));
+  await ask();
+  assert.equal(requests.at(-1)!.body.stream, undefined);
 });

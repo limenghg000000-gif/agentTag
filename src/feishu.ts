@@ -78,6 +78,25 @@ export class FeishuApiError extends Error {
   }
 }
 
+/** 调飞书接口：接口直接返回 4xx 时 SDK 会抛 axios 的异常，统一换成带 code 和 msg 的 FeishuApiError */
+export async function callFeishu<T>(request: () => Promise<ApiResponse<T>>): Promise<T | undefined> {
+  let res: ApiResponse<T>;
+  try {
+    res = await request();
+  } catch (err) {
+    const response = (err as { response?: { status?: number; data?: { code?: number; msg?: string } } })?.response;
+    if (response?.data?.code !== undefined) {
+      throw new FeishuApiError(response.data.code, `飞书接口返回错误 ${response.data.code}：${response.data.msg ?? ""}`, response.status);
+    }
+    if (response?.status) {
+      throw new FeishuApiError(undefined, `飞书接口返回 HTTP ${response.status}`, response.status);
+    }
+    throw err;
+  }
+  check(res);
+  return res.data;
+}
+
 export function createFeishuApi(client: Client, appId: string, getBotIdentity: () => BotIdentity | undefined): FeishuApi {
   const toNormalized = (item: ApiItem & { message_id: string }): Promise<NormalizedMessage> => {
     const botIdentity = getBotIdentity() ?? { openId: "", name: "" };

@@ -32,6 +32,7 @@ import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, Ll
 import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
 import { STOP_ACTION, visibleThought } from "../src/progress.js";
+import type { CardKitApi } from "../src/stream-card.js";
 import { TaskRegistry } from "../src/tasks.js";
 import { type CodeLocation, type Tool, type ToolContext, ToolError, ToolOutputBuilder } from "../src/tools/tool.js";
 
@@ -2622,4 +2623,179 @@ test("用 aiops 按线上版本读了代码、回答提到仓库和行号：不�
   assert.equal(wrong.requests.length, 3);
   assert.deepEqual(wrong.requests[2].messages.at(-1), { role: "user", content: unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]) });
   assert.deepEqual(wrong.replies, [answer]);
+});
+
+/** 假的卡片实体接口：记下建的卡片和每次更新，create 可以换成会失败的 */
+function fakeCardKit(create: () => Promise<string> = async () => "card_1") {
+  const created: any[] = [];
+  const calls: { op: string; card?: any; element?: string; content?: string; settings?: any }[] = [];
+  const api: CardKitApi = {
+    async create(card) {
+      created.push(card);
+      return create();
+    },
+    async update(_id, card) {
+      calls.push({ op: "update", card });
+    },
+    async setContent(_id, element, content) {
+      calls.push({ op: "content", element, content });
+    },
+    async settings(_id, settings) {
+      calls.push({ op: "settings", settings });
+    },
+  };
+  /** 卡片上出现过的所有文字（全量更新的卡片和按组件更新的文字） */
+  const shown = () => calls.map((call) => (call.op === "update" ? cardText(call.card) : (call.content ?? ""))).join("\n");
+  const last = () => calls.filter((call) => call.op === "update").at(-1)?.card;
+  return { api, created, calls, shown, last };
+}
+
+/** 模型边生成边回调：按 deltas 依次报到目前为止的思考和正文，每报一次等卡片推一下 */
+function streamingModel(rounds: { deltas: { reasoning?: string; text?: string }[]; result: ChatResult }[]) {
+  const requests: ChatRequest[] = [];
+  const model: ChatModel = {
+    model: "fake",
+    async chat(req) {
+      requests.push(req);
+      const round = rounds.shift()!;
+      for (const delta of round.deltas) {
+        req.onDelta?.({ reasoning: delta.reasoning ?? "", text: delta.text ?? "" });
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      return round.result;
+    },
+  };
+  return { model, requests };
+}
+
+function answerStore() {
+  const saved: { chatId: string; messageId: string; answer: string }[] = [];
+  return { saved, store: { save: async (chatId: string, messageId: string, answer: string) => void saved.push({ chatId, messageId, answer }) } };
+}
+
+test("卡片即回答：建卡片实体按 card_id 发到话题里，思考和回答边生成边写进卡片，结束后卡片里是回答，不另外发，记下卡片里的回答", async () => {
+  const kit = fakeCardKit();
+  const answers = answerStore();
+  const { model, requests } = streamingModel([
+    {
+      deltas: [{ reasoning: "用户问周几" }, { reasoning: "用户问周几", text: "今天" }, { reasoning: "用户问周几", text: "今天**周一**" }],
+      result: { text: "今天**周一**", finish: "stop", reasoning: "用户问周几" },
+    },
+  ]);
+  const { sent, updates, handle } = setup({ model, cardKit: kit.api, cardAnswers: answers.store, streamIntervalMs: 0 });
+
+  await handle(message("今天周几？"));
+
+  assert.equal(typeof requests[0].onDelta, "function");
+  assert.equal(kit.created.length, 1);
+  assert.match(cardText(kit.created[0]), /思考中/);
+  assert.deepEqual(cards(sent), [{ type: "card", data: { card_id: "card_1" } }]);
+  assert.deepEqual(sent[0].opts, inThread);
+  assert.deepEqual(markdowns(sent), []);
+  assert.deepEqual(updates, []);
+  // 生成时打开流式模式，按组件写出思考和回答
+  assert.ok(kit.calls.some((call) => call.op === "settings" && call.settings.config.streaming_mode === true));
+  assert.match(kit.shown(), /正在想…/);
+  assert.match(kit.shown(), /今天\*\*周一\*\*/);
+  // 结束：关掉流式模式，卡片里是回答，思考折进面板
+  const final = kit.last();
+  assert.equal(final.config.streaming_mode, false);
+  assert.equal(final.body.elements.at(-1).content, "今天**周一**");
+  assert.equal(final.body.elements[0].tag, "collapsible_panel");
+  assert.equal(final.config.summary.content, "今天**周一**");
+  assert.deepEqual(answers.saved, [{ chatId: "oc_1", messageId: "om_reply_1", answer: "今天**周一**" }]);
+});
+
+test("卡片即回答：回答没通过检查时卡片里换成重做说明，重做的回答写出来以后替换它", async () => {
+  const kit = fakeCardKit();
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const unchecked = "product-service-api 最近 1 小时只有 2 条 warning";
+  const { model } = streamingModel([
+    { deltas: [{ text: unchecked }], result: { text: unchecked, finish: "stop" } },
+    { deltas: [], result: { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] } },
+    { deltas: [{ text: "最近 1 小时" }, { text: "最近 1 小时没有查到报错日志" }], result: { text: "最近 1 小时没有查到报错日志", finish: "stop" } },
+  ]);
+  const { sent, handle } = setup({
+    model,
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("查一下 product-service-api 最近一小时的报错日志"));
+
+  assert.match(kit.shown(), /2 条 warning/);
+  assert.match(kit.shown(), /这一版回答没通过检查，正在重做…/);
+  const final = kit.last();
+  assert.equal(final.body.elements.at(-1).content, "最近 1 小时没有查到报错日志");
+  assert.doesNotMatch(cardText(final), /warning|正在重做/);
+  assert.deepEqual(markdowns(sent), []);
+});
+
+test("卡片即回答：建不了卡片实体时退回原来的进度卡片、回答另外发，10 分钟内不再试", async () => {
+  let clock = 1_000_000;
+  const kit = fakeCardKit(async () => {
+    throw new Error("99991672 缺少 cardkit:card:write 权限");
+  });
+  const errors: string[] = [];
+  const { sent, updates, handle } = setup({
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    now: () => clock,
+    logger: { ...quiet, error: (text: string) => void errors.push(text) },
+  });
+
+  await handle(message("你好"));
+  await handle(message("再问一次", { messageId: "om_2" }));
+  assert.equal(kit.created.length, 1);
+  assert.match(errors[0], /发送流式卡片失败，10 分钟内先用原来的进度卡片/);
+  assert.deepEqual(markdowns(sent), ["**答案**", "**答案**"]);
+  assert.match(cardText(updates.at(-1)!.card), /已完成/);
+
+  clock += 11 * 60_000;
+  await handle(message("过了一会儿", { messageId: "om_3" }));
+  assert.equal(kit.created.length, 2);
+});
+
+test("卡片即回答：回答太长时卡片里只放开头，全文另外发，不记下", async () => {
+  const kit = fakeCardKit();
+  const answers = answerStore();
+  const long = Array.from({ length: 400 }, (_, i) => `第 ${i} 行：这是一段比较长的回答内容`).join("\n");
+  const { model } = fakeModel(() => ({ text: long, finish: "stop" }));
+  const { sent, handle } = setup({ model, cardKit: kit.api, cardAnswers: answers.store, streamIntervalMs: 0 });
+
+  await handle(message("写长一点"));
+
+  assert.match(kit.last().body.elements.at(-1).content, /回答较长，全文另外发在下面/);
+  assert.equal(markdowns(sent).join("\n"), long);
+  assert.deepEqual(answers.saved, []);
+});
+
+test("卡片即回答：停止时卡片标成已停止，不留草稿，不发回答", async () => {
+  const kit = fakeCardKit();
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  const model: ChatModel = {
+    model: "fake",
+    chat: ({ signal, onDelta }) =>
+      new Promise((_, reject) => {
+        onDelta?.({ reasoning: "", text: "写到一半的草稿" });
+        started();
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+  };
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0 });
+
+  const task = handle(message("写一篇长文"));
+  await running;
+  await handle(message("停止", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  await task;
+
+  assert.deepEqual(markdowns(sent), ["好的，已停止。"]);
+  assert.match(cardText(kit.last()), /已停止/);
+  assert.doesNotMatch(cardText(kit.last()), /草稿/);
 });
