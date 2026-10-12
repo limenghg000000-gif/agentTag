@@ -888,7 +888,8 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
     // 文件名里可以真有反斜杠（src/foo\bar.ts）：先按原样找，再把 \ 当成 / 找（Windows 的写法）
     return [...new Set([written, written.replace(/\\/g, "/")])].some((raw) => {
       // 绝对路径（/app/src/a.ts）：日志、堆栈里要整段对上，别的绝对路径（/build/app/src/a.ts）、相对路径（src/a.ts）不算；
-      // 代码工具查到的是仓库里的相对路径，按去掉前面几级目录以后的认（/app/src/a.ts 的 app/src/a.ts、src/a.ts，至少留一层目录）
+      // 代码工具查到的是仓库里的相对路径，按去掉前面几级目录以后的认（/app/src/a.ts 的 app/src/a.ts、src/a.ts，至少留一层目录）。
+      // 日志里的绝对路径不一定整理过（PHP 报错里的 /var/www/html/../vendor/autoload.php），回答照抄的也要认：按原样和整理后的都找
       const absolute = /^\s*\/(?!\/)/.test(raw) ? posix.normalize(raw.trim()) : undefined;
       const forms: Array<{ path: string; repos?: string[] }> = [];
       for (const text of absolute === undefined ? [repoPath(raw)] : innerPaths(absolute)) {
@@ -902,7 +903,7 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
           break;
         }
       }
-      return matchesFacts(facts, forms, line, branch, absolute === undefined ? undefined : [absolute]);
+      return matchesFacts(facts, forms, line, branch, absolute === undefined ? undefined : [...new Set([raw.trim(), absolute])]);
     });
   };
 }

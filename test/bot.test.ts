@@ -2078,12 +2078,16 @@ test("回答里的绝对路径也要查证：日志、堆栈里要整段对上�
       found("code_read_file", [{ path: "src/x.ts", lines: [1, 20] }]),
       { tool: "aiops_query_logs", output: "goroutine 1 [running]:\n/build/services/goods/tb.go:8220 +0x1d" },
       { tool: "aiops_query_logs", output: 'Traceback:\n  File "/app/src/a.py", line 3' },
+      { tool: "aiops_query_logs", output: "PHP Fatal error:  Uncaught Exception: boom in /var/www/html/../vendor/autoload.php:12" },
     ],
   );
   const unseen = (answer: string) => unseenCodeCitations(answer, seen).map((cite) => cite.text);
   // 堆栈里的绝对路径照样放行
   assert.deepEqual(unseen("根因在 /build/services/goods/tb.go:8220"), []);
   assert.deepEqual(unseen("见 `/app/src/a.py`"), []);
+  // 日志里没整理过的绝对路径（带 ..），回答照抄的放行；整理后的也认（/build/x/../services/goods/tb.go 就是堆栈里那个）
+  assert.deepEqual(unseen("报错在 /var/www/html/../vendor/autoload.php:12"), []);
+  assert.deepEqual(unseen("/build/x/../services/goods/tb.go:8220"), []);
   // 原先回答里的绝对路径一概不查：结果里没有的路径、行号现在打回
   assert.deepEqual(unseen("报错在 /app/src/user.ts:99，空指针"), ["/app/src/user.ts:99"]);
   assert.deepEqual(unseen("**/build/services/goods/tb.go**:8221"), ["/build/services/goods/tb.go:8221"]);
