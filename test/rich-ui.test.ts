@@ -511,3 +511,25 @@ test("Codex 第二轮：CPU 计数器一半套 rate、一半没套的认不出�
   assert.ok(!evidence.has(0.5, unitFactors("%")));
   assert.ok(evidence.has(1, unitFactors("个"))); // GPU 个数不知道单位，照旧
 });
+
+test("Codex 第三轮：resource 写死成 ephemeral_storage 也算字节；百分率、百分数是百分比；每个 Pod 的值一样被提到公共字段里也认得出单位", () => {
+  assert.equal(promqlUnit('sum by (pod) (kube_pod_container_resource_limits{resource="ephemeral_storage"})'), "bytes");
+  assert.equal(promqlUnit('sum by (pod) (kube_pod_container_resource_limits{resource="nvidia_com_gpu"})'), "resource");
+  for (const unit of ["百分率", "百分数", "百分比", "%"]) {
+    assert.deepEqual(unitFactors(unit)?.cores, [], unit);
+  }
+  assert.equal(unitFactors("P99 百分位"), undefined);
+
+  // 三个 Pod 的 CPU limit 都是 0.256：value 整个提到「result（每项都有的字段）」里，在第一条序列前面
+  const hoisted = compactText(
+    JSON.stringify({
+      query: 'sum by (pod) (kube_pod_container_resource_limits{namespace="prod", pod=~"union-.*", resource="cpu"})',
+      data: { resultType: "vector", result: ["a", "b", "c"].map((pod) => ({ metric: { pod }, value: [1760282600, "0.256"] })) },
+    }),
+  );
+  assert.ok(hoisted.indexOf(COMMON_SUFFIX) < hoisted.indexOf('"metric"'));
+  const evidence = new NumberEvidence([hoisted]);
+  assert.ok(!evidence.has(0.256, unitFactors("%")));
+  assert.ok(evidence.has(256, unitFactors("mCPU")));
+  assert.ok(evidence.has(1760282600)); // 时间戳照旧
+});

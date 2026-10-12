@@ -341,8 +341,8 @@ export function unitFactors(raw: string | undefined): UnitFactors | undefined {
     return undefined;
   }
   const text = halfWidth(raw);
-  // 「核心接口」「秒杀」「百分位」里的字不是单位
-  if (/%|百分比/.test(text)) {
+  // 「核心接口」「秒杀」「百分位」里的字不是单位；百分比、百分率、百分数是
+  if (/%|百分(?!位)/.test(text)) {
     return { any: [1, 100], cores: [], bytes: [] };
   }
   const bytes = /(?<![A-Za-z])(?:([KMGT])i?B?|([kmgt])B|bytes?)(?![A-Za-z])|字节/.exec(text);
@@ -422,15 +422,16 @@ export function promqlUnit(query: string): "cores" | "bytes" | "resource" | unde
       return matchers.length === 1 && matchers[0][1] === "=" ? matchers[0][2] : undefined;
     });
     const resource = selectors.every((value) => value === selectors[0]) ? selectors[0] : undefined;
-    return resource === "cpu" ? "cores" : resource === "memory" ? "bytes" : "resource";
+    return (resource ? resourceKind(resource) : undefined) ?? "resource";
   }
   return undefined;
 }
 
 const QUERY_FIELD = /"query"\s*:\s*("(?:[^"\\]|\\.)*")/g;
 const SERIES = /"metric"\s*:\s*\{/g;
-/** 结果整理时提出来的每条序列都一样的标签（核对前全角括号已经换成半角） */
-const COMMON_METRIC = new RegExp(`${halfWidth(COMMON_SUFFIX).replace(/[()]/g, "\\$&")}"\\s*:\\s*\\{\\s*"metric"\\s*:\\s*(\\{[^{}]*\\})`);
+/** 结果整理时提出来的每条序列都一样的字段、标签（核对前全角括号已经换成半角） */
+const COMMON_KEY = new RegExp(`${halfWidth(COMMON_SUFFIX).replace(/[()]/g, "\\$&")}"\\s*:`);
+const COMMON_METRIC = new RegExp(`${COMMON_KEY.source}\\s*\\{\\s*"metric"\\s*:\\s*(\\{[^{}]*\\})`);
 /** Prometheus 的一个样本：[时间戳, "值"] */
 const SAMPLE = /\[\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*,\s*"([^"\\]*)"\s*\]/gi;
 
@@ -444,7 +445,11 @@ function resourceUnit(labels: string): "cores" | "bytes" | undefined {
     return unit === "core" ? "cores" : "bytes";
   }
   const resource = /"resource"\s*:\s*"([^"]*)"/.exec(labels)?.[1];
-  return resource === "cpu" ? "cores" : resource && /^(?:memory|ephemeral[-_]storage|storage|hugepages[-_].+)$/.test(resource) ? "bytes" : undefined;
+  return resource ? resourceKind(resource) : undefined;
+}
+
+function resourceKind(resource: string): "cores" | "bytes" | undefined {
+  return resource === "cpu" ? "cores" : /^(?:memory|ephemeral[-_]storage|storage|hugepages[-_].+)$/.test(resource) ? "bytes" : undefined;
 }
 
 /**
@@ -468,9 +473,12 @@ function promqlSamples(output: string): { rest: string; samples: { unit: "cores"
   const samples: { unit: "cores" | "bytes"; value: number }[] = [];
   // 每条序列都一样的标签（三条以上都是 resource="cpu"）被提到「result（每项都有的字段）」里，序列自己的 metric 里就没有了
   const common = COMMON_METRIC.exec(output)?.[1] ?? "";
-  let rest = output.slice(0, starts[0]);
-  starts.forEach((start, i) => {
-    const series = output.slice(start, starts[i + 1] ?? output.length);
+  // 每条序列的 value(s) 都一样（几个 Pod 的 limit 相同）时也会被提到公共字段里，在第一条序列前面：从公共字段开始算一段
+  const commonAt = output.search(COMMON_KEY);
+  const regions = commonAt >= 0 && commonAt < starts[0] ? [commonAt, ...starts] : starts;
+  let rest = output.slice(0, regions[0]);
+  regions.forEach((start, i) => {
+    const series = output.slice(start, regions[i + 1] ?? output.length);
     const seriesUnit = unit === "resource" ? (resourceUnit(series.slice(0, series.indexOf("}") + 1)) ?? resourceUnit(common)) : unit;
     if (!seriesUnit) {
       rest += series;
