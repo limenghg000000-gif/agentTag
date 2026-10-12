@@ -1,8 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-
-/** 每个群最多记多少条，更早的删掉（读话题历史最多也只读最近 60 条消息） */
-const MAX_ANSWERS_PER_CHAT = 300;
+import { MAX_HISTORY_MESSAGES } from "./history.js";
 
 interface Entry {
   answer: string;
@@ -12,72 +10,73 @@ interface Entry {
 
 /**
  * 卡片即回答时，回答只在卡片里：读话题历史时，飞书接口读不出卡片实体里的文字，机器人自己的卡片还会被当成进度卡片去掉。
- * 这里按群把「卡片消息 id → 回答」记在本地文件（DATA_DIR/card-answers/<chat_id>.json），读话题历史时换回文字
+ * 这里按话题把「卡片消息 id → 回答」记在本地文件（DATA_DIR/card-answers/<chat_id>/<话题第一条消息 id>.json），读话题历史时换回文字。
+ * 按话题分文件：一个话题只留最近的若干条（读话题历史最多也只读最近 60 条消息），群里别的话题再多也挤不掉老话题的回答
  */
 export class CardAnswerStore {
-  private readonly loaded = new Map<string, Promise<Map<string, Entry>>>();
-  private readonly writing = new Map<string, Promise<void>>();
+  /** 同一个文件的读写排队，避免两次记录互相覆盖 */
+  private readonly queues = new Map<string, Promise<unknown>>();
 
   constructor(
     private readonly dir: string,
-    private readonly maxPerChat = MAX_ANSWERS_PER_CHAT,
+    private readonly maxPerThread = MAX_HISTORY_MESSAGES,
     private readonly now: () => number = Date.now,
   ) {}
 
-  async save(chatId: string, messageId: string, answer: string): Promise<void> {
-    const file = this.fileOf(chatId);
-    const entries = await this.load(chatId);
-    entries.delete(messageId);
-    entries.set(messageId, { answer, at: this.now() });
-    for (const oldest of entries.keys()) {
-      if (entries.size <= this.maxPerChat) {
-        break;
+  /** threadKey 是话题第一条消息的 id（见 threadKeyOf） */
+  async save(chatId: string, threadKey: string, messageId: string, answer: string): Promise<void> {
+    const file = this.fileOf(chatId, threadKey);
+    return this.queued(file, async () => {
+      const entries = await readEntries(file);
+      entries.delete(messageId);
+      entries.set(messageId, { answer, at: this.now() });
+      for (const oldest of entries.keys()) {
+        if (entries.size <= this.maxPerThread) {
+          break;
+        }
+        entries.delete(oldest);
       }
-      entries.delete(oldest);
-    }
-    // 同一个群的写入排队，后一次写的是最新的全部内容
-    const previous = this.writing.get(chatId) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(() => writeAtomically(file, JSON.stringify(Object.fromEntries(entries))));
-    this.writing.set(chatId, next);
-    try {
-      await next;
-    } finally {
-      if (this.writing.get(chatId) === next) {
-        this.writing.delete(chatId);
-      }
-    }
+      await writeAtomically(file, JSON.stringify(Object.fromEntries(entries)));
+    });
   }
 
-  /** 这些消息里记过回答的，返回消息 id → 回答 */
-  async get(chatId: string, messageIds: readonly string[]): Promise<Map<string, string>> {
-    const entries = await this.load(chatId);
-    const found = new Map<string, string>();
-    for (const id of messageIds) {
-      const entry = entries.get(id);
-      if (entry) {
-        found.set(id, entry.answer);
+  /** 这个话题里这些消息记过回答的，返回消息 id → 回答 */
+  async get(chatId: string, threadKey: string, messageIds: readonly string[]): Promise<Map<string, string>> {
+    const file = this.fileOf(chatId, threadKey);
+    return this.queued(file, async () => {
+      const entries = await readEntries(file);
+      const found = new Map<string, string>();
+      for (const id of messageIds) {
+        const entry = entries.get(id);
+        if (entry) {
+          found.set(id, entry.answer);
+        }
       }
-    }
-    return found;
+      return found;
+    });
   }
 
-  private load(chatId: string): Promise<Map<string, Entry>> {
-    let entries = this.loaded.get(chatId);
-    if (!entries) {
-      entries = readEntries(this.fileOf(chatId));
-      this.loaded.set(chatId, entries);
-      // 读失败（文件坏了、没权限）下次再读，不把失败记住
-      entries.catch(() => this.loaded.delete(chatId));
-    }
-    return entries;
+  private queued<T>(file: string, run: () => Promise<T>): Promise<T> {
+    const next = (this.queues.get(file) ?? Promise.resolve()).catch(() => {}).then(run);
+    this.queues.set(file, next);
+    const clear = () => {
+      if (this.queues.get(file) === next) {
+        this.queues.delete(file);
+      }
+    };
+    next.then(clear, clear);
+    return next;
   }
 
-  private fileOf(chatId: string): string {
-    // chat_id 拼进文件名，只允许字母数字、下划线和连字符（oc_xxx）
+  private fileOf(chatId: string, threadKey: string): string {
+    // id 拼进路径，只允许字母数字、下划线和连字符（oc_xxx、om_xxx）
     if (!/^[\w-]+$/.test(chatId)) {
       throw new Error(`chat_id 格式不对：${chatId}`);
     }
-    return path.join(this.dir, `${chatId}.json`);
+    if (!/^[\w-]+$/.test(threadKey)) {
+      throw new Error(`话题 id 格式不对：${threadKey}`);
+    }
+    return path.join(this.dir, chatId, `${threadKey}.json`);
   }
 }
 
@@ -95,7 +94,7 @@ async function readEntries(file: string): Promise<Map<string, Entry>> {
   try {
     data = JSON.parse(text);
   } catch {
-    // 文件坏了（比如手改坏了）：挪到一边留着排查，从空的重新记，不然这个群以后每次都记不下
+    // 文件坏了（比如手改坏了）：挪到一边留着排查，从空的重新记，不然这个话题以后每次都记不下
     await rename(file, `${file}.${Date.now()}.bad`);
     return new Map();
   }

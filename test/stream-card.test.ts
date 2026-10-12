@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { FeishuApiError } from "../src/feishu.js";
 import { type CardKitApi, StreamingCard } from "../src/stream-card.js";
 
 const quiet = { error() {} };
@@ -10,13 +11,14 @@ type Call =
   | { op: "content"; sequence: number; element: string; content: string }
   | { op: "settings"; sequence: number; streaming: boolean };
 
-/** 假的卡片实体接口：记下每次调用，fail 里返回 true 的调用抛错 */
-function fakeKit(fail: (call: Call) => boolean = () => false) {
+/** 假的卡片实体接口：记下每次调用，fail 里返回 true 的调用抛错，返回错误的抛这个错误 */
+function fakeKit(fail: (call: Call) => boolean | Error = () => false) {
   const calls: Call[] = [];
   const record = async (call: Call) => {
     calls.push(call);
-    if (fail(call)) {
-      throw new Error(`${call.op} failed`);
+    const failure = fail(call);
+    if (failure) {
+      throw failure instanceof Error ? failure : new Error(`${call.op} failed`);
     }
   };
   const api: CardKitApi = {
@@ -167,4 +169,34 @@ test("全量更新至少隔 fullIntervalMs：等的时候来了新的推最新�
   assert.equal(await streaming.finish(card(false, { status: "最终" })), true);
   assert.deepEqual(shown(), ["b", "d", "最终"]);
   assert.ok(Date.now() - startedAt < 200);
+});
+
+test("被飞书限流时等一会儿用新的 sequence 重试，不算失败；重试几次还被限流才当失败", async () => {
+  const limited = new FeishuApiError(99991400, "飞书接口返回错误 99991400：request trigger frequency limit", 400);
+  let limits = 1;
+  const { api, calls } = fakeKit((call) => (call.op === "content" && limits-- > 0 ? limited : false));
+  const errors: unknown[] = [];
+  const streaming = new StreamingCard(api, "card_1", card(false, { answer: "a" }), { error: (...args) => errors.push(args) }, 0, 0, [5, 5]);
+
+  streaming.update(card(true, { answer: "ab" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // 限流过去了，之后照样按组件更新
+  streaming.update(card(true, { answer: "abc" }));
+  await settle();
+
+  assert.deepEqual(
+    calls.map((call) => `${call.sequence}:${call.op}`),
+    ["1:settings", "2:content", "3:content", "4:content"],
+  );
+  assert.deepEqual(errors, []);
+
+  // 一直被限流：重试用完就当失败，改成全量更新
+  limits = 3;
+  streaming.update(card(true, { answer: "abcd" }));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(
+    calls.slice(4).map((call) => call.op),
+    ["content", "content", "content", "settings", "update"],
+  );
+  assert.equal(errors.length, 1);
 });

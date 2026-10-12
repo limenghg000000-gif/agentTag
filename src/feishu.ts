@@ -78,6 +78,11 @@ export class FeishuApiError extends Error {
   }
 }
 
+/** 飞书接口限流了（HTTP 429，或者错误码 99991400） */
+export function isRateLimited(err: unknown): boolean {
+  return err instanceof FeishuApiError && (err.status === 429 || err.code === 99991400);
+}
+
 /** 调飞书接口：接口直接返回 4xx 时 SDK 会抛 axios 的异常，统一换成带 code 和 msg 的 FeishuApiError */
 export async function callFeishu<T>(request: () => Promise<ApiResponse<T>>): Promise<T | undefined> {
   let res: ApiResponse<T>;

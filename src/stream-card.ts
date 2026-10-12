@@ -1,5 +1,5 @@
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { callFeishu } from "./feishu.js";
+import { callFeishu, isRateLimited } from "./feishu.js";
 import type { ProgressCard } from "./progress.js";
 
 /**
@@ -63,7 +63,8 @@ interface CardJson {
  * 卡片即回答用的进度卡片（卡片实体）。和 CardUpdater 一样合并短时间内的多次更新、同一时间只有一个请求在途，另外：
  * - 模型写回答时（卡片 config.streaming_mode 为 true）先打开卡片的流式模式，之后只是文字变了的组件按组件更新，有打字机效果；
  * - 别的时候（想、调工具、结束）关掉流式模式再全量更新：流式模式开着时卡片上的按钮可能点不了，飞书也会在 10 分钟后自动关掉它；
- * - 按组件更新失败一次（比如流式模式被飞书关了）就不再用，之后都全量更新。
+ * - 按组件更新失败一次（比如流式模式被飞书关了）就不再用，之后都全量更新；
+ * - 飞书限流（几个话题同时在写，加起来超过接口的频率上限）不算失败，等一会儿重试。
  * 更新失败只记日志，不影响任务本身
  */
 export class StreamingCard implements ProgressCard {
@@ -89,6 +90,8 @@ export class StreamingCard implements ProgressCard {
     private readonly minIntervalMs = 300,
     /** 两次全量更新的最小间隔 */
     private readonly fullIntervalMs = Math.max(minIntervalMs, 1000),
+    /** 被限流时，第几次重试前等多久；用完了还被限流就当失败 */
+    private readonly rateLimitRetryMs: readonly number[] = [1000, 3000],
   ) {
     this.layout = layoutOf(initial);
     this.texts = textsOf(initial);
@@ -214,14 +217,23 @@ export class StreamingCard implements ProgressCard {
   }
 
   private async call(what: string, request: (sequence: number) => Promise<void>): Promise<boolean> {
-    await this.wait();
-    this.lastAt = Date.now();
-    try {
-      await request(++this.sequence);
-      return true;
-    } catch (err) {
-      this.logger.error(`${what}失败 card=${this.cardId}`, err);
-      return false;
+    let until = 0;
+    for (let attempt = 0; ; attempt++) {
+      await this.wait(until);
+      this.lastAt = Date.now();
+      try {
+        // 重试也要用新的 sequence：飞书按 sequence 认更新，用过的会被拒
+        await request(++this.sequence);
+        return true;
+      } catch (err) {
+        const backoff = this.rateLimitRetryMs[attempt];
+        if (!isRateLimited(err) || backoff === undefined) {
+          this.logger.error(`${what}失败 card=${this.cardId}`, err);
+          return false;
+        }
+        // 几张卡片同时被限流时错开重试
+        until = Date.now() + backoff * (1 + Math.random() / 2);
+      }
     }
   }
 

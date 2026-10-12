@@ -62,7 +62,7 @@ export class ThreadContextLoader {
     private readonly logger: Logger = console,
     private readonly maxLocalThreads = 500,
     /** 卡片即回答时记下的卡片里的回答（见 CardAnswerStore）。读话题历史时，机器人的卡片换回这些文字 */
-    private readonly cardAnswers?: { get(chatId: string, messageIds: readonly string[]): Promise<ReadonlyMap<string, string>> },
+    private readonly cardAnswers?: { get(chatId: string, threadKey: string, messageIds: readonly string[]): Promise<ReadonlyMap<string, string>> },
   ) {}
 
   async load(msg: NormalizedMessage): Promise<ThreadContext> {
@@ -115,7 +115,7 @@ export class ThreadContextLoader {
   private async loadFromFeishu(msg: NormalizedMessage, threadId: string): Promise<ThreadContext> {
     const all = await this.api.listThreadMessages(threadId, MAX_HISTORY_MESSAGES);
     const askerName = all.find((m) => m.messageId === msg.messageId)?.senderName;
-    const answers = await this.cardAnswersOf(msg.chatId, all);
+    const answers = await this.cardAnswersOf(msg, all);
     const earlier = all.flatMap((m) => {
       if (m.messageId === msg.messageId || (m.createTime !== 0 && m.createTime > msg.createTime)) {
         return [];
@@ -145,15 +145,15 @@ export class ThreadContextLoader {
     };
   }
 
-  private async cardAnswersOf(chatId: string, messages: readonly ThreadMessage[]): Promise<ReadonlyMap<string, string>> {
+  private async cardAnswersOf(msg: NormalizedMessage, messages: readonly ThreadMessage[]): Promise<ReadonlyMap<string, string>> {
     const cards = messages.filter((m) => m.fromBot && m.msgType === "interactive").map((m) => m.messageId);
     if (cards.length === 0 || !this.cardAnswers) {
       return new Map();
     }
     try {
-      return await this.cardAnswers.get(chatId, cards);
+      return await this.cardAnswers.get(msg.chatId, threadKeyOf(msg), cards);
     } catch (err) {
-      this.logger.warn(`读取卡片里记下的回答失败 chat=${chatId}，这次话题历史里没有机器人在卡片里的回答`, err);
+      this.logger.warn(`读取卡片里记下的回答失败 chat=${msg.chatId} thread=${threadKeyOf(msg)}，这次话题历史里没有机器人在卡片里的回答`, err);
       return new Map();
     }
   }

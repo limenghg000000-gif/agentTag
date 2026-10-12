@@ -1,6 +1,6 @@
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { type DocBlock, kindOf, renderDocument } from "./doc-render.js";
-import { callFeishu as call, FeishuApiError } from "./feishu.js";
+import { callFeishu as call, FeishuApiError, isRateLimited } from "./feishu.js";
 
 /** 单次「创建嵌套块」最多插入的块数（飞书接口上限） */
 export const MAX_BLOCKS_PER_INSERT = 1000;
@@ -449,7 +449,7 @@ export class FeishuDocs {
     if (err.code === 1770002 || err.status === 404 || /not found/i.test(raw)) {
       return `找不到这篇文档，可能已被删除或链接不对（${raw}）`;
     }
-    if (err.status === 429 || err.code === 99991400) {
+    if (isRateLimited(err)) {
       return `飞书接口限流了，等几秒再试（${raw}）`;
     }
     return raw;

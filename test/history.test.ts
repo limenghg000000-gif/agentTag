@@ -170,17 +170,17 @@ test("卡片即回答：机器人的卡片记过回答的换成回答，没记�
     item("om_notice", { fromBot: true, msgType: "post", content: "处理完了，结果在上面的卡片里。" }),
     item("om_3", { createTime: 3000 }),
   ]);
-  const asked: { chatId: string; ids: readonly string[] }[] = [];
+  const asked: { chatId: string; threadKey: string; ids: readonly string[] }[] = [];
   const loader = new ThreadContextLoader(api, quiet, 500, {
-    async get(chatId, ids) {
-      asked.push({ chatId, ids });
+    async get(chatId, threadKey, ids) {
+      asked.push({ chatId, threadKey, ids });
       return new Map([["om_card_1", "卡片里的回答"]]);
     },
   });
 
   const context = await loader.load(message({ rootId: "om_1", threadId: "omt_1" }));
 
-  assert.deepEqual(asked, [{ chatId: "oc_1", ids: ["om_card_1", "om_card_old"] }]);
+  assert.deepEqual(asked, [{ chatId: "oc_1", threadKey: "om_1", ids: ["om_card_1", "om_card_old"] }]);
   assert.deepEqual(context.history, [
     { role: "user", content: "[张三] @机器人 查一下" },
     { role: "assistant", content: "卡片里的回答\n以前另外发的回答" },

@@ -2670,8 +2670,11 @@ function streamingModel(rounds: { deltas: { reasoning?: string; text?: string }[
 }
 
 function answerStore() {
-  const saved: { chatId: string; messageId: string; answer: string }[] = [];
-  return { saved, store: { save: async (chatId: string, messageId: string, answer: string) => void saved.push({ chatId, messageId, answer }) } };
+  const saved: { chatId: string; threadKey: string; messageId: string; answer: string }[] = [];
+  return {
+    saved,
+    store: { save: async (chatId: string, threadKey: string, messageId: string, answer: string) => void saved.push({ chatId, threadKey, messageId, answer }) },
+  };
 }
 
 test("卡片即回答：建卡片实体按 card_id 发到话题里，思考和回答边生成边写进卡片，结束后卡片里是回答，不另外发，记下卡片里的回答", async () => {
@@ -2704,7 +2707,7 @@ test("卡片即回答：建卡片实体按 card_id 发到话题里，思考和�
   assert.equal(final.body.elements.at(-1).content, "今天**周一**");
   assert.equal(final.body.elements[0].tag, "collapsible_panel");
   assert.equal(final.config.summary.content, "今天**周一**");
-  assert.deepEqual(answers.saved, [{ chatId: "oc_1", messageId: "om_reply_1", answer: "今天**周一**" }]);
+  assert.deepEqual(answers.saved, [{ chatId: "oc_1", threadKey: "om_1", messageId: "om_reply_1", answer: "今天**周一**" }]);
 });
 
 test("卡片即回答：回答没通过检查时卡片里换成重做说明，重做的回答写出来以后替换它", async () => {

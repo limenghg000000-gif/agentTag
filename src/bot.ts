@@ -114,7 +114,7 @@ export interface BotDeps {
    */
   cardKit?: CardKitApi;
   /** 卡片即回答时记下卡片里的回答，读话题历史时用（飞书读不出卡片里的文字） */
-  cardAnswers?: { save(chatId: string, messageId: string, answer: string): Promise<void> };
+  cardAnswers?: { save(chatId: string, threadKey: string, messageId: string, answer: string): Promise<void> };
   /** 流式卡片两次请求的最小间隔 */
   streamIntervalMs?: number;
   /** 配置的代码仓库（CODE_REPOS）。用来检查回答是不是没读代码就说了仓库里的内容 */
@@ -526,7 +526,7 @@ async function runTask(
 /** 记下卡片里的回答，之后读话题历史时用。记不下只是这个话题后面的提问看不到这条回答，不影响这次 */
 async function rememberCardAnswer(deps: BotDeps, msg: NormalizedMessage, cardMessageId: string, answer: string): Promise<void> {
   try {
-    await deps.cardAnswers?.save(msg.chatId, cardMessageId, answer);
+    await deps.cardAnswers?.save(msg.chatId, threadKeyOf(msg), cardMessageId, answer);
   } catch (err) {
     (deps.logger ?? console).error(`记下卡片里的回答失败 message=${msg.messageId} card=${cardMessageId}`, err);
   }
