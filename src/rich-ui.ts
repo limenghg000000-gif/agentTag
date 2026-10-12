@@ -299,11 +299,15 @@ function parseKpi(json: unknown): KpiBlock | undefined {
 }
 
 /**
- * 全角字符（数字、％、－、ＭｉＢ）和数学减号（−）换成半角，再拆数、认单位：「９９％」是 99%，「−5」是 -5。
+ * 全角字符（数字、％、－、ＭｉＢ、￥）和数学减号（−）换成半角，再拆数、认单位：「９９％」是 99%，「−5」是 -5。
  * 不用 NFKC：它会把「10²」变成 102
  */
 function halfWidth(text: string): string {
-  return text.replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0)).replace(/\u2212/g, "-");
+  return text
+    .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/\u2212/g, "-")
+    .replace(/\uFFE5/g, "¥")
+    .replace(/\uFFE1/g, "£");
 }
 
 /** 数字卡片里写的数、工具结果里的数：1,234 是一个数，.5 是 0.5；10-20 里的 - 不当负号 */
@@ -364,6 +368,10 @@ export class NumberEvidence {
    * 卡片里写成文字的数由 half 给出写出来的精度（0.000 是 ±0.0005，转成数就成了 0，按 0 算会放宽到 ±0.5）
    */
   has(v: number, factors: readonly number[] = [1], half = halfStep(v)): boolean {
+    // 1e309 这种转成数是 Infinity：区间算不出来，当查不到
+    if (!Number.isFinite(v) || !Number.isFinite(half)) {
+      return false;
+    }
     // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
     const slack = 8 * Number.EPSILON * Math.abs(v);
     return factors.some((factor) => this.within((v - half - slack) / factor, (v + half + slack) / factor));
@@ -389,14 +397,20 @@ export class NumberEvidence {
  * 用科学计数法数位数：很小的数 String() 出来是 1e-7 这样，按小数点数不出位数
  */
 function halfStep(v: number): number {
-  return writtenHalf(v.toExponential());
-}
-
-/** 写出来的数（41.20、0.000、1.5e-7）最后一位的半格：小数点后写了几位就按几位算，末尾的 0 也算 */
-function writtenHalf(token: string): number {
-  const [mantissa, exponent = "0"] = token.toLowerCase().split("e");
+  const [mantissa, exponent] = v.toExponential().split("e");
   const decimals = (mantissa.split(".")[1] ?? "").length;
   return 0.5 * 10 ** Math.min(0, Number(exponent) - decimals);
+}
+
+/**
+ * 写出来的数（41.20、0.000、1.5e-7）最后一位的半格：小数点后写了几位就按几位算，末尾的 0 也算。
+ * 科学计数法写了小数位的按写出来的那一位（1.50e3 写到十位 → ±5）；整数、1e9 这种按个位算
+ */
+function writtenHalf(token: string): number {
+  const [mantissa, exponent] = token.toLowerCase().split("e");
+  const decimals = (mantissa.split(".")[1] ?? "").length;
+  const place = Number(exponent ?? 0) - decimals;
+  return 0.5 * 10 ** (exponent !== undefined && decimals > 0 ? place : Math.min(0, place));
 }
 
 /**

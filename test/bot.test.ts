@@ -2994,7 +2994,7 @@ test("卡片即回答：回答太长另外发全文时，表格改成列表、�
   assert.match(kit.last().body.elements.at(-1).content, /<text_tag color='red'>高风险<\/text_tag>/);
 });
 
-test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时换成文字", async () => {
+test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时没教过这种写法，```chart 当代码示例原样发", async () => {
   const metrics: Tool = {
     spec: { name: "aiops_query_metrics_range", description: "查指标趋势", parameters: { type: "object", properties: {} } },
     describe: () => "aiops · 查指标趋势",
@@ -3047,7 +3047,8 @@ test("卡片即回答：回答里的图和关键数字按查到的数画出来�
   assert.match(made.warnings.join("\n"), /图「pod-a CPU」有 1 个数在查询结果里找不到（如 55）/);
 
   const plain = await run("41.2,39", false);
-  assert.deepEqual(markdowns(plain.sent), ["结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"]);
+  assert.deepEqual(markdowns(plain.sent), [answerWith("41.2,39")]);
+  assert.deepEqual(plain.warnings, []);
 });
 
 test("记忆工具结果里的数是模型自己写的，不算查到的数：先记「CPU 99%」再画 99% 的数字卡片不行", async () => {
@@ -3152,4 +3153,34 @@ test("卡片即回答：等了 1 分钟以上，写完后在话题里补一句�
   await assert.rejects(handle3(message("你好")), /network/);
   await assert.rejects(handle3(message("再问", { messageId: "om_2" })), /network/);
   assert.equal(kit3.created.length, 2);
+});
+
+test("代码工具读到的数（部署文件里的副本数、资源配置）也能拿来核对数字卡片", async () => {
+  const kit = fakeCardKit();
+  const warnings: string[] = [];
+  const codeRead: Tool = {
+    spec: { name: "code_read_file", description: "读代码", parameters: { type: "object", properties: {} } },
+    describe: () => "读代码",
+    run: async (_args, ctx) => codeResult(ctx, [["deploy/union.yaml（master 分支 @ 1a2b3c4）：", { commit: "1a2b3c4" }], ["replicas: 6", { path: "deploy/union.yaml", lines: [12, 12] }]]),
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_read_file", arguments: "{}" }] },
+    { text: '结论\n```kpi\n[{"label":"副本数","value":"6"},{"label":"上限","value":"9"}]\n```', finish: "stop" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    taskTools: () => [codeRead],
+    codeRepos: ["ai/aiops-mcp"],
+    logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+  });
+
+  await handle(message("union 部署了几个副本"));
+
+  const tiles = kit.last().body.elements.find((e: any) => e.tag === "column_set");
+  assert.equal(tiles?.columns.length, 1);
+  assert.match(JSON.stringify(tiles), /副本数/);
+  assert.match(warnings.join("\n"), /数字卡片「上限 9」在查询结果里找不到/);
 });

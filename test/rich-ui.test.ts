@@ -257,6 +257,10 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.ok(kpi("41.20%", "0.4120"));
   assert.ok(!kpi("41.20%", "0.4126"));
   assert.ok(kpi("1.50e-7", "1.5e-7"));
+  // 1.50e3 写到十位；1500、1e9 按个位；1e309 是 Infinity，当查不到
+  assert.ok(kpi("1.50e3", "1496"));
+  assert.ok(!kpi("1500", "1496"));
+  assert.ok(!kpi("1e309", "1 2 3"));
 
   const xs = (x: string, output: string) =>
     keepVerified([{ kind: "chart", type: "bar", title: "t", x: [x], series: [{ name: "a", data: [39] }] }], new NumberEvidence([output])).segments[0].kind;
@@ -265,6 +269,8 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.equal(xs("$1,000", "39"), "markdown");
   assert.equal(xs("$1,000", "1000 39"), "chart");
   assert.equal(xs("１,０００", "39"), "markdown");
+  assert.equal(xs("￥1,000", "39"), "markdown");
+  assert.equal(xs("￥1,000", "1000 39"), "chart");
 });
 
 test("「接着查」按钮：```actions 里的问题去掉尖括号、合成一行，太长的不要，最多 3 个，放在最后", () => {

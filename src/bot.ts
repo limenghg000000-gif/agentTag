@@ -335,7 +335,12 @@ async function runTask(
           const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
           evidence.push(
             code
-              ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
+              ? {
+                  tool: tool.spec.name,
+                  facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit),
+                  // 原文只拿来核对图和数字卡片里的数（读到的副本数、资源配置）；代码位置只认 facts
+                  output: seenByModel(output, limit),
+                }
               : {
                   tool: tool.spec.name,
                   output: seenByModel(output, limit),
@@ -510,7 +515,7 @@ async function runTask(
     }
     state.phase = "done";
     // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画；记下来的也是核对过的（对不上的数后面的提问不能再看到）
-    segments = verifiedSegments(answer, evidence, logger, msg.messageId);
+    segments = verifiedSegments(answer, evidence, logger, msg.messageId, streaming);
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified);
     // 被拦下、被审核拦下的回答里没有结论，不记
@@ -538,7 +543,7 @@ async function runTask(
   state.live = undefined;
   state.answerNote = undefined;
   state.answer = answer;
-  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId));
+  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId, streaming));
   state.answerSegments = displayed;
   const displayedText = segmentsAsText(displayed);
   try {
@@ -568,7 +573,11 @@ async function runTask(
 }
 
 /** 拆出回答里的图和数字卡片，数对不上查询结果的去掉；去掉了什么、哪些块格式不对写日志 */
-function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string): AnswerSegment[] {
+function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string, rich: boolean): AnswerSegment[] {
+  // 没教模型写图和数字卡片（不是流式卡片）时，回答里的 ```chart 是用户要的代码示例，原样留着
+  if (!rich) {
+    return answer.trim() ? [{ kind: "markdown", text: answer }] : [];
+  }
   const { segments, invalid } = splitAnswer(answer);
   if (invalid.length > 0) {
     logger.warn(`回答里的 ${invalid.join("、")} 块格式不对，没画 message=${messageId}`);
@@ -897,7 +906,7 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
  */
 const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
 
-/** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact），别的工具是模型看到的原文 */
+/** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact）和模型看到的原文（只核对数），别的工具是模型看到的原文 */
 export interface ToolEvidence {
   tool: string;
   output?: string;
