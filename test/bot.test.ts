@@ -31,6 +31,7 @@ import type { ImageRef, ThreadContext } from "../src/history.js";
 import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { compactText } from "../src/mcp-result.js";
+import { containsSecret } from "../src/knowledge.js";
 import { MemoryStore } from "../src/memory.js";
 import { ASK_ACTION, STOP_ACTION, visibleThought } from "../src/progress.js";
 import type { CardKitApi } from "../src/stream-card.js";
@@ -545,6 +546,27 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   assert.ok(query.length <= 800, `查的文字有 ${query.length} 字，aiops 只取前 800 字`);
   assert.match(query, /^日志如下：ERROR upstream timeout/);
   assert.match(query, /\n\[张三\] gateway-api 报 code=8，帮我看看$/, "第一个问题在两个库取的那一段里");
+
+  // 话题里有一轮写着密钥：整轮不截短，免得截掉 </password> 以后经验库认不出来、把前半截发给 aiops
+  const secret = ["Correct", "Horse", "Battery", "Staple9!"].join("");
+  const leaked: string[] = [];
+  const secretKnowledge = {
+    async lookup(query: string) {
+      leaked.push(query);
+      return { text: "", ids: [] };
+    },
+    tools: () => [],
+  };
+  const head = "[张三] gateway-api 报 code=8，配置文件是这样的 ";
+  const firstTurn = `${head}${"a".repeat(163 - head.length)}<password>${secret}</password>`;
+  await setup({ model, knowledge: secretKnowledge, context: fakeContext({ history: [{ role: "user", content: firstTurn }, { role: "assistant", content: "收到" }], source: "feishu" }).source }).handle(
+    message("怎么修？"),
+  );
+  // 截到 200 字时密码整个留着、</password> 截掉了：只看截短的认不出来
+  assert.equal(firstTurn.indexOf("</password>"), 200);
+  assert.ok(!containsSecret(firstTurn.slice(0, 200)));
+  assert.ok(leaked[0].includes(firstTurn), "整轮带上");
+  assert.ok(containsSecret(leaked[0]), "经验库认得出有密钥，不会查 aiops");
 
   // 这次的提问短：最近几轮都放得下
   queries.length = 0;

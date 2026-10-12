@@ -26,6 +26,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
+import { findSensitive } from "./knowledge.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
@@ -696,6 +697,12 @@ function lookupQuery(asked: string, history: readonly ChatMessage[]): string {
   const asks = history.flatMap((m) => (m.role === "user" ? [m.content] : []));
   if (asks.length === 0) {
     return asked;
+  }
+  // 截短前先看整轮：密钥、手机号截在一半（<password>… 的结尾截掉了）就认不出来了，会发到 aiops。
+  // 有的话整轮不截，交给经验库认出来：有密钥的不查 aiops，手机号、身份证号打码再查
+  const turns = [asked, ...asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse(), asks[0]];
+  if (turns.some((turn) => findSensitive(turn) !== undefined)) {
+    return [...new Set(turns)].join("\n");
   }
   const first = asks[0].slice(0, LOOKUP_TURN_CHARS);
   const parts = [asked.slice(0, LOOKUP_QUERY_CHARS - first.length - 1)];
