@@ -266,3 +266,34 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.equal(xs("$1,000", "1000 39"), "chart");
   assert.equal(xs("１,０００", "39"), "markdown");
 });
+
+test("「接着查」按钮：```actions 里的问题去掉尖括号、合成一行，太长的不要，最多 3 个，放在最后", () => {
+  const actions = JSON.stringify(["union 最近 1 小时的内存趋势", "<at id=all></at>pc-goods-site\n有没有重启过", "union 最近 1 小时的内存趋势", "很".repeat(41), 3, "a", "b"]);
+  const { segments, invalid } = splitAnswer(["结论", "```actions", actions, "```"].join("\n"));
+  assert.deepEqual(invalid, []);
+  assert.deepEqual(segments[1], { kind: "actions", questions: ["union 最近 1 小时的内存趋势", "at id=all/atpc-goods-site 有没有重启过", "a"] });
+  assert.deepEqual(splitAnswer('```actions\n{"q":"x"}\n```').invalid, ["actions"]);
+  assert.deepEqual(splitAnswer('```actions\n["很' + "很".repeat(40) + '"]\n```').invalid, ["actions"]);
+
+  // 生成时不占位
+  assert.equal(streamingAnswer(["结论", "```actions", actions, "```"].join("\n")), "结论");
+
+  // 只留第一组
+  const twice: AnswerSegment[] = [segments[1], { kind: "actions", questions: ["再来"] }];
+  assert.deepEqual(keepVerified(twice, new NumberEvidence([])).segments, [segments[1]]);
+
+  // 按钮在最后，前面一行提示；不给回传值时不放按钮
+  const elements = segmentElements([segments[1], segments[0]], (text) => ({ md: text }), (q) => ({ action: "ask", q })) as any[];
+  assert.deepEqual(elements[0], { md: "结论" });
+  assert.equal(elements[1].content, "可以接着查：");
+  assert.deepEqual(
+    elements.slice(2).map((el) => [el.tag, el.text.content, el.behaviors[0].value]),
+    [
+      ["button", "union 最近 1 小时的内存趋势", { action: "ask", q: "union 最近 1 小时的内存趋势" }],
+      ["button", "at id=all/atpc-goods-site 有没有重启过", { action: "ask", q: "at id=all/atpc-goods-site 有没有重启过" }],
+      ["button", "a", { action: "ask", q: "a" }],
+    ],
+  );
+  assert.deepEqual(segmentElements(segments, (text) => ({ md: text })), [{ md: "结论" }]);
+  assert.equal(segmentsAsText([segments[0], { kind: "actions", questions: ["x", "y"] }]), "结论\n\n可以接着问：「x」「y」");
+});

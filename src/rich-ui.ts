@@ -27,16 +27,25 @@ export interface KpiBlock {
   items: KpiItem[];
 }
 
-export type AnswerSegment = { kind: "markdown"; text: string } | ChartBlock | KpiBlock;
+/** 回答最后的「接着查」按钮：群成员接下来最可能问的几句话，点了就在话题里接着问 */
+export interface ActionsBlock {
+  kind: "actions";
+  questions: string[];
+}
+
+export type AnswerSegment = { kind: "markdown"; text: string } | ChartBlock | KpiBlock | ActionsBlock;
 
 /** 一次回答最多几张图、几个数字卡片，每张图最多几条线、几个点（卡片最大 30 KB，图的数据占地方） */
 export const MAX_CHARTS = 3;
 const MAX_SERIES = 8;
 const MAX_POINTS_PER_CHART = 200;
 const MAX_KPIS = 4;
+export const MAX_ACTIONS = 3;
+/** 按钮上的一句话最多几个字（飞书回调的 value 也有大小限制） */
+export const MAX_ACTION_CHARS = 40;
 const MAX_LABEL_CHARS = 40;
 
-const UI_LANGS = new Set(["chart", "kpi"]);
+const UI_LANGS = new Set(["chart", "kpi", "actions"]);
 
 /** 代码块开头那一行写的语言：```chart → chart */
 function langOf(line: string): string {
@@ -120,7 +129,7 @@ export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid:
  * 前几行能拼成完整的 JSON，块就到那里为止；拼不成（JSON 本身没写完、被截断）的，块到第一个空行为止。
  * used 是块用掉的行数，后面的行放回正文
  */
-function blockEnd(lang: string, body: string[]): { parsed?: ChartBlock | KpiBlock; used: number } {
+function blockEnd(lang: string, body: string[]): { parsed?: ReturnType<typeof parseBlock>; used: number } {
   for (let k = 1; k < body.length; k++) {
     const parsed = parseBlock(lang, body.slice(0, k).join("\n"));
     if (parsed) {
@@ -161,7 +170,10 @@ export function streamingAnswer(text: string): string {
     }
     const lang = !inCode && next.marker ? uiLang(line) : undefined;
     if (lang) {
-      out.push(lang === "chart" ? "📊 图表画好后显示在这里…" : "📌 关键数字整理好后显示在这里…");
+      // 按钮放在最后，生成时不用占位
+      if (lang !== "actions") {
+        out.push(lang === "chart" ? "📊 图表画好后显示在这里…" : "📌 关键数字整理好后显示在这里…");
+      }
       hidden = true;
       continue;
     }
@@ -170,14 +182,34 @@ export function streamingAnswer(text: string): string {
   return out.join("\n");
 }
 
-function parseBlock(lang: string, body: string): ChartBlock | KpiBlock | undefined {
+function parseBlock(lang: string, body: string): ChartBlock | KpiBlock | ActionsBlock | undefined {
   let json: unknown;
   try {
     json = JSON.parse(body);
   } catch {
     return undefined;
   }
-  return lang === "chart" ? parseChart(json) : parseKpi(json);
+  return lang === "chart" ? parseChart(json) : lang === "kpi" ? parseKpi(json) : parseActions(json);
+}
+
+function parseActions(json: unknown): ActionsBlock | undefined {
+  if (!Array.isArray(json)) {
+    return undefined;
+  }
+  const questions = [...new Set(json.map(actionQuestion))].filter((item): item is string => item !== undefined);
+  return questions.length === 0 ? undefined : { kind: "actions", questions: questions.slice(0, MAX_ACTIONS) };
+}
+
+/**
+ * 按钮上的一句话：去掉尖括号（点了以后这句话会发到话题里，不能变成 @所有人）、合成一行；
+ * 太长的不要（截断了的问题点了也问不清楚）
+ */
+export function actionQuestion(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const question = value.replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
+  return question && Array.from(question).length <= MAX_ACTION_CHARS ? question : undefined;
 }
 
 function text(value: unknown, max = MAX_LABEL_CHARS): string | undefined {
@@ -408,6 +440,11 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
         dropped.push(`图「${segment.title}」超过 ${MAX_CHARTS} 张`);
         continue;
       }
+    } else if (segment.kind === "actions") {
+      if (kept.some((item) => item.kind === "actions")) {
+        dropped.push("多写了一组按钮");
+        continue;
+      }
     } else if (segment.kind === "kpi") {
       const items = segment.items.filter((item) => {
         const factors = unitFactors(item.value) ?? unitFactors(item.label) ?? [1];
@@ -436,17 +473,39 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
 
 const LEVEL_COLOR: Record<NonNullable<KpiItem["level"]>, string> = { danger: "red", warn: "orange", ok: "green" };
 
-/** 卡片里的组件：markdown 段交给 renderMarkdown（转义、限长），图换成图表组件，数字卡片换成一排分栏 */
-export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text: string) => object): object[] {
-  return segments.map((segment) => {
+/**
+ * 卡片里的组件：markdown 段交给 renderMarkdown（转义、限长），图换成图表组件，数字卡片换成一排分栏，
+ * 「接着查」换成按钮放在最后（askValue 给出按钮回传的值；不给时不放按钮）
+ */
+export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text: string) => object, askValue?: (question: string) => object): object[] {
+  const elements: object[] = [];
+  const buttons: object[] = [];
+  for (const segment of segments) {
     if (segment.kind === "markdown") {
-      return renderMarkdown(segment.text);
+      elements.push(renderMarkdown(segment.text));
+    } else if (segment.kind === "kpi") {
+      elements.push(kpiElement(segment));
+    } else if (segment.kind === "chart") {
+      elements.push(chartElement(segment));
+    } else if (askValue) {
+      buttons.push(...segment.questions.map((question) => askButton(question, askValue(question))));
     }
-    if (segment.kind === "kpi") {
-      return kpiElement(segment);
-    }
-    return chartElement(segment);
-  });
+  }
+  if (buttons.length > 0) {
+    elements.push({ tag: "markdown", text_size: "notation", content: "可以接着查：" }, ...buttons);
+  }
+  return elements;
+}
+
+function askButton(question: string, value: object): object {
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: question },
+    type: "default",
+    size: "small",
+    width: "fill",
+    behaviors: [{ type: "callback", value }],
+  };
 }
 
 /** Markdown 符号换成长得像的全角字：直接去掉会把「10~20%」连成「1020%」 */
@@ -523,6 +582,9 @@ export function segmentsAsText(segments: AnswerSegment[]): string {
       }
       if (segment.kind === "kpi") {
         return segment.items.map((item) => `**${plain(item.label)}** ${plain(item.value)}`).join(" · ");
+      }
+      if (segment.kind === "actions") {
+        return `可以接着问：${segment.questions.map((question) => `「${plain(question)}」`).join("")}`;
       }
       return `📊 ${segment.title}（这里显示不了图）`;
     })

@@ -31,7 +31,7 @@ import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
-import { STOP_ACTION, visibleThought } from "../src/progress.js";
+import { ASK_ACTION, STOP_ACTION, visibleThought } from "../src/progress.js";
 import type { CardKitApi } from "../src/stream-card.js";
 import { TaskRegistry } from "../src/tasks.js";
 import { type CodeLocation, type Tool, type ToolContext, ToolError, ToolOutputBuilder } from "../src/tools/tool.js";
@@ -880,6 +880,60 @@ test("配了写权限名单：名单外的人只拿到读的工具，提示词�
   await setup({ model: open.model, taskTools }).handle(message("改一下", { senderId: "ou_guest" }));
   assert.equal(open.requests[0].tools?.length, 4);
   assert.doesNotMatch(open.requests[0].system, /WRITE_ALLOWED_USERS/);
+});
+
+test("点「接着查」按钮问的只给读的工具（写权限名单里的人也一样），提示词说明是按钮问的", async () => {
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_edit", true)];
+  const logs: string[] = [];
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, taskTools, writeAllowed: new Set(["ou_admin"]), logger: { ...quiet, info: (line: string) => logs.push(line) } });
+
+  await handle(message("union 有没有重启", { senderId: "ou_admin" }), { readOnly: true });
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read"]);
+  assert.match(requests[0].system, /点你上一条回答下面的「接着查」按钮问的/);
+  assert.doesNotMatch(requests[0].system, /WRITE_ALLOWED_USERS/);
+  assert.match(logs.join("\n"), /点按钮接着问的，这次只给读的工具 message=om_1 sender=ou_admin/);
+
+  // 名单外的人：还是按没权限说
+  await handle(message("union 有没有重启", { messageId: "om_2", senderId: "ou_guest" }), { readOnly: true });
+  assert.match(requests[1].system, /WRITE_ALLOWED_USERS/);
+  assert.doesNotMatch(requests[1].system, /「接着查」按钮问的/);
+
+  // 没有写的工具时不用提
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: plain.model }).handle(message("x"), { readOnly: true });
+  assert.doesNotMatch(plain.requests[0].system, /「接着查」按钮问的/);
+});
+
+test("点「接着查」按钮：交给 followUp，不等它跑完；白名单外的群、没配 followUp 时不处理", async () => {
+  const { deps } = setup();
+  const got: unknown[] = [];
+  let finish!: () => void;
+  const followUp = (evt: CardActionEvent, q: unknown) => {
+    got.push([evt.chatId, q]);
+    return new Promise<void>((resolve) => (finish = resolve));
+  };
+  const click = (chatId: string): CardActionEvent => ({
+    messageId: "om_card",
+    chatId,
+    operator: { openId: "ou_2" },
+    action: { tag: "button", value: { action: ASK_ACTION, q: "union 有没有重启" } },
+  });
+  const onCardAction = createCardActionHandler({ tasks: deps.tasks, allowedChatIds: deps.allowedChatIds, followUp, logger: quiet });
+
+  await onCardAction(click("oc_other"));
+  await onCardAction(click("oc_1"));
+  assert.deepEqual(got, [["oc_1", "union 有没有重启"]]);
+  finish();
+
+  await createCardActionHandler({ tasks: deps.tasks, allowedChatIds: deps.allowedChatIds, logger: quiet })(click("oc_1"));
+  assert.equal(got.length, 1);
 });
 
 test("提问里的截图先识别成文字再交给模型，进度卡片上多一步「识别图片」", async () => {

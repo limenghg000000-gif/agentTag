@@ -17,6 +17,7 @@ import {
   type ProgressStep,
   renderPlainProgressCard,
   renderProgressCard,
+  ASK_ACTION,
   STOP_ACTION,
   visibleThought,
 } from "./progress.js";
@@ -149,7 +150,7 @@ export function createMessageHandler(deps: BotDeps) {
   const duplicates = new DuplicateAsks(deps.now);
   const cardKit: CardKitHealth = { downUntil: 0 };
 
-  return async (msg: NormalizedMessage): Promise<void> => {
+  return async (msg: NormalizedMessage, options: TaskOptions = {}): Promise<void> => {
     if (!allowedChatIds.has(msg.chatId)) {
       // 机器人可能也在告警群等业务群里，没加进白名单的群一律不回应，只在日志里打出 chat_id 方便加白
       logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
@@ -186,8 +187,13 @@ export function createMessageHandler(deps: BotDeps) {
       return;
     }
 
-    await runTask(deps, msg, question, reply, cardKit);
+    await runTask(deps, msg, question, reply, cardKit, options);
   };
+}
+
+export interface TaskOptions {
+  /** 只给读的工具（点「接着查」按钮问的） */
+  readOnly?: boolean;
 }
 
 /** 流式卡片最近一次建不了以后，到什么时候之前先不用 */
@@ -201,6 +207,7 @@ async function runTask(
   question: string,
   reply: (markdown: string) => Promise<SendResult>,
   cardKit: CardKitHealth,
+  options: TaskOptions,
 ): Promise<void> {
   const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
   const task = tasks.create(msg.chatId, threadKeyOf(msg));
@@ -340,13 +347,19 @@ async function runTask(
         },
       }),
     );
+    const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
-    const readOnly = deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId) && allTools.some((tool) => tool.writes);
+    const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
+    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具
+    const followUp = hasWrites && !noPermission && options.readOnly === true;
+    const readOnly = noPermission || followUp;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter((tool) => !(readOnly && tool.writes) && (createDoc || tool.spec.name !== "feishu_doc_create"));
-    if (readOnly) {
+    if (noPermission) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (followUp) {
+      logger.info(`点按钮接着问的，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
@@ -392,7 +405,8 @@ async function runTask(
         now: new Date(now()),
         toolNames,
         memory: memory?.prompt,
-        readOnly,
+        readOnly: noPermission,
+        followUp,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
@@ -1582,14 +1596,24 @@ function applyEvent(state: ProgressState, event: Extract<AgentEvent, { type: "to
 export interface CardActionDeps {
   tasks: TaskRegistry;
   allowedChatIds: ReadonlySet<string>;
+  /** 回答下面的「接着查」按钮（见 createFollowUp）。不传时不处理 */
+  followUp?: (evt: CardActionEvent, question: unknown) => Promise<void>;
   logger?: Logger;
 }
 
-/** 处理进度卡片上的按钮。停止后卡片由任务自己更新成「已停止」。 */
-export function createCardActionHandler({ tasks, allowedChatIds, logger = console }: CardActionDeps) {
+/** 处理卡片上的按钮。停止后卡片由任务自己更新成「已停止」。 */
+export function createCardActionHandler({ tasks, allowedChatIds, followUp, logger = console }: CardActionDeps) {
   return async (evt: CardActionEvent): Promise<void> => {
-    const value = evt.action.value as { action?: unknown; task?: unknown } | undefined;
-    if (value?.action !== STOP_ACTION || typeof value.task !== "string" || !allowedChatIds.has(evt.chatId)) {
+    const value = evt.action.value as { action?: unknown; task?: unknown; q?: unknown } | undefined;
+    if (!allowedChatIds.has(evt.chatId)) {
+      return;
+    }
+    if (value?.action === ASK_ACTION && followUp) {
+      // 不等它跑完：SDK 按群排队处理按钮，等着的话这个群的停止按钮要等接着问的任务跑完才轮得到
+      followUp(evt, value.q).catch((err) => logger.error(`接着查按钮处理失败 card=${evt.messageId}`, err));
+      return;
+    }
+    if (value?.action !== STOP_ACTION || typeof value.task !== "string") {
       return;
     }
     const stopped = tasks.stop(value.task, evt.chatId);

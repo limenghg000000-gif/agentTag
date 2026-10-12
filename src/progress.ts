@@ -4,6 +4,8 @@ import { type AnswerSegment, hasUiBlocks, segmentElements, segmentsAsText, split
 
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
+/** 回答下面「接着查」按钮回传的值：{ action: ASK_ACTION, q: 要接着问的话 } */
+export const ASK_ACTION = "ask_followup";
 
 export interface ProgressStep {
   id: string;
@@ -142,7 +144,7 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
   if (streaming && finished && state.answer) {
     const segments = state.answerSegments;
     if (segments && hasUiBlocks(segments) && answerFitsCard(finalText(state))) {
-      elements.push(...segmentElements(segments, (text) => ({ tag: "markdown", content: escapeAnswer(text) })));
+      elements.push(...segmentElements(segments, (text) => ({ tag: "markdown", content: escapeAnswer(text) }), (q) => ({ action: ASK_ACTION, q })));
     } else {
       elements.push(answerElement(finalText(state)));
     }

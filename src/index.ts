@@ -9,6 +9,7 @@ import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { loadConfig } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { createFeishuApi } from "./feishu.js";
+import { createFollowUp } from "./follow-up.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
 import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "./llm.js";
@@ -127,7 +128,13 @@ channel.on("message", async (msg: NormalizedMessage) => {
   catchUp.watch(msg);
   await handleMessage(msg);
 });
-channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds }));
+// 回答下面的「接着查」按钮：机器人替点的人在话题里发一句，再当成他问的处理（只给读的工具）
+const followUp = createFollowUp({
+  api: feishuApi,
+  send: (to, input, opts) => channel.send(to, input, opts),
+  handle: (msg, options) => handleMessage(msg, options),
+});
+channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp }));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
 
 try {

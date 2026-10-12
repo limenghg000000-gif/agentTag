@@ -7,12 +7,17 @@ export interface ThreadMessage {
   fromBot: boolean;
   /** 发言人名字，拿不到时为空 */
   senderName?: string;
+  /** 发言人的 open_id，拿不到时（包括机器人发的）为空 */
+  senderId?: string;
   /** 飞书消息类型：text、post、interactive（卡片）等 */
   msgType: string;
   content: string;
   createTime: number;
   /** 消息里图片的 image_key，按出现的顺序。内容里对应的位置是 ![image](image_key) */
   images?: string[];
+  /** 在话题里时：话题 id（omt_ 开头）和话题第一条消息的 id */
+  threadId?: string;
+  rootId?: string;
 }
 
 /** 轮询读到的一条消息，已转成和事件一样的格式，可以直接交给消息处理函数 */
@@ -140,14 +145,18 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
     }
     const normalized = await toNormalized({ ...item, message_id: item.message_id });
     const images = imageKeysOf(normalized);
+    const senderId = asOpenId(item.sender?.id, item.sender?.id_type);
     return {
       messageId: item.message_id,
       fromBot: isFromBot(item),
       senderName: item.sender?.sender_name || undefined,
+      ...(senderId ? { senderId } : {}),
       msgType: item.msg_type ?? "unknown",
       content: normalized.content,
       createTime: Number(item.create_time) || 0,
       ...(images.length > 0 ? { images } : {}),
+      ...(item.thread_id ? { threadId: item.thread_id } : {}),
+      ...(item.root_id ? { rootId: item.root_id } : {}),
     };
   };
 

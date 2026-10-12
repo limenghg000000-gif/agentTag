@@ -197,3 +197,24 @@ test("卡片即回答：机器人的卡片记过回答的换成回答，没记�
     { role: "assistant", content: "以前另外发的回答" },
   ]);
 });
+
+test("点「接着查」按钮的问题：机器人替人发的那句算那个人问的；提问人名字用按钮那边拿到的", async () => {
+  const { api } = fakeApi([
+    item("om_root", { senderName: "张三", content: "union 内存", createTime: 1000 }),
+    item("om_card", { fromBot: true, msgType: "interactive", content: "进度", createTime: 1500 }),
+    item("om_ask1", { fromBot: true, senderName: "机器人", msgType: "post", content: "👉 李四 接着问：union 有没有重启", createTime: 2000 }),
+    item("om_ans", { fromBot: true, msgType: "post", content: "没有重启", createTime: 2500 }),
+    item("om_ask2", { fromBot: true, senderName: "机器人", msgType: "post", content: "👉 接着问：内存趋势", createTime: 3000 }),
+  ]);
+
+  const context = await new ThreadContextLoader(api, quiet).load(
+    message({ messageId: "om_ask2", senderName: "李四", content: "内存趋势", rootId: "om_root", threadId: "omt_1", createTime: 3000 }),
+  );
+
+  assert.equal(context.askerName, "李四");
+  assert.deepEqual(context.history, [
+    { role: "user", content: "[张三] union 内存" },
+    { role: "user", content: "[李四] union 有没有重启" },
+    { role: "assistant", content: "没有重启" },
+  ]);
+});
