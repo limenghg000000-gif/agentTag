@@ -229,7 +229,8 @@ export class McpHub {
     const lines = [
       `## ${name}（MCP 服务）`,
       `名字以 ${name}_ 开头的工具都来自 ${name}。${name} 的说明里写的工具名（如 ${example}）在你这里都带 ${name}_ 前缀（${toolName(name, example)}）。` +
-        `一次任务里 ${name} 的工具最多调 ${MAX_MCP_CALLS_PER_TASK} 次，同样的参数调第二次会直接拿到上次的结果。`,
+        `一次任务里 ${name} 的工具最多调 ${MAX_MCP_CALLS_PER_TASK} 次，同样的参数调第二次会直接拿到上次的结果。` +
+        `每次有人 @ 你都是一次新任务，次数重新算：话题里之前的回答说过「调用额度用完」「到上限了」，这次照样可以查。`,
     ];
     lines.push(
       `结果里「xx${COMMON_SUFFIX}」是机器人把列表 xx 里每一项都一样的字段提出来只写了一次，列表的每一项都有这些字段。`,

@@ -1,5 +1,6 @@
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { FeishuApi, ThreadMessage } from "./feishu.js";
+import { parseFollowUp } from "./follow-up.js";
 import type { ChatMessage } from "./llm.js";
 
 /**
@@ -90,7 +91,7 @@ export class ThreadContextLoader {
       }
     }
     // 不在话题里时拿不到话题列表里的发言人名字，单独读一下这条消息。名字只是锦上添花，读不到就算了
-    const askerName = (await this.api.getMessage(msg.messageId).catch(() => undefined))?.senderName;
+    const askerName = askerNameOf(msg, await this.api.getMessage(msg.messageId).catch(() => undefined));
     return {
       history,
       ...(askerName ? { askerName } : {}),
@@ -114,7 +115,7 @@ export class ThreadContextLoader {
 
   private async loadFromFeishu(msg: NormalizedMessage, threadId: string): Promise<ThreadContext> {
     const all = await this.api.listThreadMessages(threadId, MAX_HISTORY_MESSAGES);
-    const askerName = all.find((m) => m.messageId === msg.messageId)?.senderName;
+    const askerName = askerNameOf(msg, all.find((m) => m.messageId === msg.messageId));
     const answers = await this.cardAnswersOf(msg, all);
     const earlier = all.flatMap((m) => {
       if (m.messageId === msg.messageId || (m.createTime !== 0 && m.createTime > msg.createTime)) {
@@ -122,6 +123,12 @@ export class ThreadContextLoader {
       }
       if (m.fromBot && m.content.trim() === CARD_DONE_NOTICE) {
         return [];
+      }
+      // 点「接着查」按钮时机器人替人发的那句，算那个人问的
+      const followUp = m.fromBot ? parseFollowUp(m.content) : undefined;
+      if (followUp) {
+        const { senderName: _bot, ...rest } = m;
+        return [{ ...rest, fromBot: false, content: followUp.question, ...(followUp.name ? { senderName: followUp.name } : {}) }];
       }
       if (m.fromBot && m.msgType === "interactive") {
         // 机器人自己的进度卡片不算对话内容；卡片即回答时卡片里是回答，换成记下的文字
@@ -167,6 +174,14 @@ export class ThreadContextLoader {
       `读取话题历史失败，先只用机器人自己记下的问答作为上下文（通常是缺少 im:message.group_msg 权限）：${describeFeishuError(err)}`,
     );
   }
+}
+
+/**
+ * 提问人的名字：飞书读到的这条消息是本人发的就用它的名字；
+ * 点「接着查」按钮时这条消息是机器人替人发的，用按钮那边拿到的名字
+ */
+function askerNameOf(msg: NormalizedMessage, own: ThreadMessage | undefined): string | undefined {
+  return own && !own.fromBot ? own.senderName : msg.senderName;
 }
 
 /** 用户消息前标上发言人，方便模型分清话题里是谁说的 */

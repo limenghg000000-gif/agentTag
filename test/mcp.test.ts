@@ -123,6 +123,8 @@ test("开了 aiops 工具的任务，提示词里带上服务端的使用说明�
   assert.ok(prompt);
   assert.match(prompt, /## aiops（MCP 服务）/);
   assert.match(prompt, /在你这里都带 aiops_ 前缀（aiops_diagnose_service）/);
+  // 2026-10-12 测试群：上一次回答写了「已用完调用额度」，同一话题里接着问，模型两次都不调工具
+  assert.match(prompt, /每次有人 @ 你都是一次新任务，次数重新算/);
   assert.match(prompt, new RegExp(INSTRUCTIONS));
   assert.match(prompt, /群里回答要短/);
   assert.doesNotMatch(prompt, /给维护的人看的/);

@@ -77,9 +77,42 @@ test("查到的数：按写出来的精度四舍五入；按写出来的单位�
   assert.deepEqual(unitFactors("120ms"), [1, 1000]);
   assert.deepEqual(unitFactors("0.25 核"), [1, 1e-3]);
   assert.deepEqual(unitFactors("250 毫核"), [1, 1000]);
+  assert.deepEqual(unitFactors("0.06 mCPU"), [1, 1000]);
+  assert.deepEqual(unitFactors("62 mcpu"), [1, 1000]);
+  assert.ok(new NumberEvidence(['{"value":"0.0000623"}']).has(0.06, unitFactors("0.06 mCPU"))); // 核 → 毫核
   // 浮点误差的余量远小于半格：0 不能当 1e-12 的证据
   assert.ok(!new NumberEvidence(["0"]).has(1e-12));
   assert.ok(!new NumberEvidence(["0"]).has(1e-12, percent));
+});
+
+test("折线图、柱状图里对不上的点不超过一成：只空掉这几个点，图照画，图下说一句；饼图、横轴、点多了整张不画", () => {
+  const x = Array.from({ length: 20 }, (_, i) => `21:${String(i * 3).padStart(2, "0")}`);
+  const data = x.map((_, i) => 170 + i);
+  const evidence = new NumberEvidence([JSON.stringify(data.slice(0, 19))]);
+  const chart = (type: "line" | "bar" | "pie", values = [...data.slice(0, 19), 179.74], labels = x): AnswerSegment[] => [
+    { kind: "chart", type, title: "union 内存", unit: "MiB", x: labels, series: [{ name: "union", data: values }] },
+  ];
+
+  const line = keepVerified(chart("line"), evidence);
+  assert.equal(line.segments.length, 2);
+  const kept = line.segments[0] as ChartBlock;
+  assert.deepEqual(kept.series[0].data, [...data.slice(0, 19), null]);
+  assert.deepEqual(line.segments[1], { kind: "markdown", text: "📊 图「union 内存」里有 1 个点和这次查到的结果对不上，这几个点没画。" });
+  assert.match(line.dropped[0], /图「union 内存」有 1 个点在查询结果里找不到（如 179.74），只空掉这几个点/);
+  const [element] = segmentElements([kept], (text) => ({ md: text })) as any[];
+  assert.equal(element.chart_spec.invalidType, "break");
+  assert.deepEqual(element.chart_spec.data.values.at(-1), { x: "21:57", value: null, series: "union" });
+  // 没空掉点的折线图不加 invalidType
+  assert.equal((segmentElements(keepVerified(chart("line", data.slice(0, 19).concat(170)), evidence).segments, (text) => ({ md: text })) as any[])[0].chart_spec.invalidType, undefined);
+
+  assert.equal(keepVerified(chart("bar"), evidence).segments[0].kind, "chart");
+  // 饼图少一块，比例就变了
+  assert.equal(keepVerified(chart("pie"), evidence).segments[0].kind, "markdown");
+  // 对不上的点超过一成
+  assert.equal(keepVerified(chart("line", [...data.slice(0, 17), 1, 2, 3]), evidence).segments[0].kind, "markdown");
+  // 横轴上的数对不上
+  const numbered = x.map((_, i) => String(1000 + i));
+  assert.equal(keepVerified(chart("line", data.slice(0, 19).concat(170), numbered), evidence).segments[0].kind, "markdown");
 });
 
 test("只画数都查得到的图：对不上的图换成说明，数字卡片对不上的去掉", () => {
@@ -257,6 +290,10 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.ok(kpi("41.20%", "0.4120"));
   assert.ok(!kpi("41.20%", "0.4126"));
   assert.ok(kpi("1.50e-7", "1.5e-7"));
+  // 1.50e3 写到十位；1500、1e9 按个位；1e309 是 Infinity，当查不到
+  assert.ok(kpi("1.50e3", "1496"));
+  assert.ok(!kpi("1500", "1496"));
+  assert.ok(!kpi("1e309", "1 2 3"));
 
   const xs = (x: string, output: string) =>
     keepVerified([{ kind: "chart", type: "bar", title: "t", x: [x], series: [{ name: "a", data: [39] }] }], new NumberEvidence([output])).segments[0].kind;
@@ -265,4 +302,48 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.equal(xs("$1,000", "39"), "markdown");
   assert.equal(xs("$1,000", "1000 39"), "chart");
   assert.equal(xs("１,０００", "39"), "markdown");
+  assert.equal(xs("￥1,000", "39"), "markdown");
+  assert.equal(xs("￥1,000", "1000 39"), "chart");
+});
+
+test("「接着查」按钮：```actions 里的问题尖括号换成全角、合成一行，太长的不要，最多 3 个，放在最后", () => {
+  const actions = JSON.stringify(["union 最近 1 小时的内存趋势", "<at id=all></at>pc-goods-site\n有没有重启过", "union 最近 1 小时的内存趋势", "很".repeat(41), 3, "a", "b"]);
+  const { segments, invalid } = splitAnswer(["结论", "```actions", actions, "```"].join("\n"));
+  assert.deepEqual(invalid, []);
+  assert.deepEqual(segments[1], { kind: "actions", questions: ["union 最近 1 小时的内存趋势", "＜at id=all＞＜/at＞pc-goods-site 有没有重启过", "a"] });
+  // 比较符号留着：去掉的话问的就变了
+  assert.deepEqual(splitAnswer('```actions\n["查 CPU > 80% 的 Pod","延迟 < 500ms 的接口"]\n```').segments[0], {
+    kind: "actions",
+    questions: ["查 CPU ＞ 80% 的 Pod", "延迟 ＜ 500ms 的接口"],
+  });
+  assert.deepEqual(splitAnswer('```actions\n{"q":"x"}\n```').invalid, ["actions"]);
+  assert.deepEqual(splitAnswer('```actions\n["很' + "很".repeat(40) + '"]\n```').invalid, ["actions"]);
+
+  // 生成时不占位
+  assert.equal(streamingAnswer(["结论", "```actions", actions, "```"].join("\n")), "结论");
+
+  // 只留第一组
+  const twice: AnswerSegment[] = [segments[1], { kind: "actions", questions: ["再来"] }];
+  assert.deepEqual(keepVerified(twice, new NumberEvidence([])).segments, [segments[1]]);
+
+  // 按钮在最后，前面一行提示；不给回传值时不放按钮
+  const elements = segmentElements([segments[1], segments[0]], (text) => ({ md: text }), (q) => ({ action: "ask", q })) as any[];
+  assert.deepEqual(elements[0], { md: "结论" });
+  assert.equal(elements[1].content, "可以接着查：");
+  assert.deepEqual(
+    elements.slice(2).map((el) => [el.tag, el.text.content, el.behaviors[0].value]),
+    [
+      ["button", "union 最近 1 小时的内存趋势", { action: "ask", q: "union 最近 1 小时的内存趋势" }],
+      ["button", "＜at id=all＞＜/at＞pc-goods-site 有没有重启过", { action: "ask", q: "＜at id=all＞＜/at＞pc-goods-site 有没有重启过" }],
+      ["button", "a", { action: "ask", q: "a" }],
+    ],
+  );
+  assert.deepEqual(segmentElements(segments, (text) => ({ md: text })), [{ md: "结论" }]);
+  assert.equal(segmentsAsText([segments[0], { kind: "actions", questions: ["x", "y"] }]), "结论\n\n可以接着问：「x」「y」");
+});
+
+test("数字卡片：标签里带上服务名（30 来个字）不截断，值只写数和单位", () => {
+  const label = "CPU 占 limit 最高 · yuebai-user-rpc";
+  const kpi = splitAnswer("```kpi\n" + JSON.stringify([{ label, value: "50%", level: "ok" }]) + "\n```").segments[0];
+  assert.deepEqual(kpi, { kind: "kpi", items: [{ label, value: "50%", level: "ok" }] });
 });

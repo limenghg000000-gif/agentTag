@@ -10,6 +10,7 @@ import {
   blockedCodeAnswer,
   blockUnverifiedOps,
   type BotDeps,
+  codeContent,
   codeEvidence,
   createCardActionHandler,
   createMessageHandler,
@@ -31,7 +32,7 @@ import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
-import { STOP_ACTION, visibleThought } from "../src/progress.js";
+import { ASK_ACTION, STOP_ACTION, visibleThought } from "../src/progress.js";
 import type { CardKitApi } from "../src/stream-card.js";
 import { TaskRegistry } from "../src/tasks.js";
 import { type CodeLocation, type Tool, type ToolContext, ToolError, ToolOutputBuilder } from "../src/tools/tool.js";
@@ -375,6 +376,21 @@ test("在话题里 @ 机器人说「停止」会停掉这个话题的任务，�
 
   assert.deepEqual(markdowns(sent), ["好的，已停止。"]);
   assert.match(cardText(updates.at(-1)!.card), /已停止/);
+});
+
+test("点「接着查」按钮问的「停止」不当成停止指令：按钮上的话是模型写的，不能停掉话题里别的任务", async () => {
+  const { model, running } = blockingModel();
+  const { deps, sent, updates, handle } = setup({ model });
+
+  const task = handle(message("写一篇长文"));
+  await running;
+  // 按钮问的会跑成一次只读的提问；这里只看话题里写长文的任务没被停
+  const asked = handle(message("停止", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }), { readOnly: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(!markdowns(sent).includes("好的，已停止。"));
+  assert.ok(!updates.some((update) => /已停止/.test(cardText(update.card))));
+  deps.tasks.stopChat("oc_1");
+  await Promise.all([task, asked]);
 });
 
 test("没有进行中的任务时说「停止」如实告知", async () => {
@@ -880,6 +896,87 @@ test("配了写权限名单：名单外的人只拿到读的工具，提示词�
   await setup({ model: open.model, taskTools }).handle(message("改一下", { senderId: "ou_guest" }));
   assert.equal(open.requests[0].tools?.length, 4);
   assert.doesNotMatch(open.requests[0].system, /WRITE_ALLOWED_USERS/);
+});
+
+test("点「接着查」按钮问的只给读的工具（写权限名单里的人也一样），提示词说明是按钮问的", async () => {
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_edit", true)];
+  const logs: string[] = [];
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, taskTools, writeAllowed: new Set(["ou_admin"]), logger: { ...quiet, info: (line: string) => logs.push(line) } });
+
+  await handle(message("union 有没有重启", { senderId: "ou_admin" }), { readOnly: true });
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read"]);
+  assert.match(requests[0].system, /点你上一条回答下面的「接着查」按钮问的/);
+  assert.doesNotMatch(requests[0].system, /WRITE_ALLOWED_USERS/);
+  assert.match(logs.join("\n"), /点按钮接着问的，这次只给读的工具 message=om_1 sender=ou_admin/);
+
+  // 名单外的人：没权限、按钮问的两句都说
+  await handle(message("union 有没有重启", { messageId: "om_2", senderId: "ou_guest" }), { readOnly: true });
+  assert.match(requests[1].system, /WRITE_ALLOWED_USERS/);
+  assert.match(requests[1].system, /「接着查」按钮问的/);
+
+  // 没有写文档、改代码的工具时，也不给改群记忆的工具：按钮上的话是模型写的，可以写成「记住…」
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle: ask } = setup({ model: plain.model, memory: await memoryStore() });
+  await ask(message("x"), { readOnly: true });
+  assert.deepEqual(plain.requests[0].tools?.map((t) => t.name) ?? [], []);
+  assert.match(plain.requests[0].system, /「接着查」按钮问的/);
+  await ask(message("记住发版在周三", { messageId: "om_2" }));
+  assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), ["memory_save", "memory_update", "memory_delete"]);
+});
+
+test("点「接着查」按钮问的不能切分支：code_branches 只能列，switch_to 报错", async () => {
+  const runs: unknown[] = [];
+  const branches: Tool = {
+    spec: { name: "code_branches", description: "分支", parameters: { type: "object", properties: {} } },
+    describe: () => "分支",
+    run: async (args) => {
+      runs.push(args);
+      return "master";
+    },
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_branches", arguments: '{"switch_to":"dev"}' }] },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c2", name: "code_branches", arguments: "{}" }] },
+    { text: "好", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({ model, taskTools: () => [branches] });
+
+  await handle(message("dev 分支上 union 的配置"), { readOnly: true });
+  assert.deepEqual(runs, [{}]);
+  assert.match(JSON.stringify(requests[1].messages.at(-1)), /只能查，不能切换分支/);
+});
+
+test("点「接着查」按钮：交给 followUp，不等它跑完；白名单外的群、没配 followUp 时不处理", async () => {
+  const { deps } = setup();
+  const got: unknown[] = [];
+  let finish!: () => void;
+  const followUp = (evt: CardActionEvent, q: unknown) => {
+    got.push([evt.chatId, q]);
+    return new Promise<void>((resolve) => (finish = resolve));
+  };
+  const click = (chatId: string): CardActionEvent => ({
+    messageId: "om_card",
+    chatId,
+    operator: { openId: "ou_2" },
+    action: { tag: "button", value: { action: ASK_ACTION, q: "union 有没有重启" } },
+  });
+  const onCardAction = createCardActionHandler({ tasks: deps.tasks, allowedChatIds: deps.allowedChatIds, followUp, logger: quiet });
+
+  await onCardAction(click("oc_other"));
+  await onCardAction(click("oc_1"));
+  assert.deepEqual(got, [["oc_1", "union 有没有重启"]]);
+  finish();
+
+  await createCardActionHandler({ tasks: deps.tasks, allowedChatIds: deps.allowedChatIds, logger: quiet })(click("oc_1"));
+  assert.equal(got.length, 1);
 });
 
 test("提问里的截图先识别成文字再交给模型，进度卡片上多一步「识别图片」", async () => {
@@ -2986,7 +3083,7 @@ test("卡片即回答：回答太长另外发全文时，表格改成列表、�
   assert.match(kit.last().body.elements.at(-1).content, /<text_tag color='red'>高风险<\/text_tag>/);
 });
 
-test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时换成文字", async () => {
+test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时没教过这种写法，```chart 当代码示例原样发", async () => {
   const metrics: Tool = {
     spec: { name: "aiops_query_metrics_range", description: "查指标趋势", parameters: { type: "object", properties: {} } },
     describe: () => "aiops · 查指标趋势",
@@ -3039,7 +3136,8 @@ test("卡片即回答：回答里的图和关键数字按查到的数画出来�
   assert.match(made.warnings.join("\n"), /图「pod-a CPU」有 1 个数在查询结果里找不到（如 55）/);
 
   const plain = await run("41.2,39", false);
-  assert.deepEqual(markdowns(plain.sent), ["结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"]);
+  assert.deepEqual(markdowns(plain.sent), [answerWith("41.2,39")]);
+  assert.deepEqual(plain.warnings, []);
 });
 
 test("记忆工具结果里的数是模型自己写的，不算查到的数：先记「CPU 99%」再画 99% 的数字卡片不行", async () => {
@@ -3144,4 +3242,68 @@ test("卡片即回答：等了 1 分钟以上，写完后在话题里补一句�
   await assert.rejects(handle3(message("你好")), /network/);
   await assert.rejects(handle3(message("再问", { messageId: "om_2" })), /network/);
   assert.equal(kit3.created.length, 2);
+});
+
+test("代码工具读到的数（部署文件里的副本数、资源配置）也能拿来核对数字卡片", async () => {
+  const kit = fakeCardKit();
+  const warnings: string[] = [];
+  const codeRead: Tool = {
+    spec: { name: "code_read_file", description: "读代码", parameters: { type: "object", properties: {} } },
+    describe: () => "读代码",
+    run: async (_args, ctx) => {
+      // 和 numberedLines 一样：行号「12|」这一段记下这一行，后面是代码
+      const { text, facts } = new ToolOutputBuilder("ai/aiops-mcp")
+        .parts(["deploy/union.yaml", { path: "deploy/union.yaml" }], "（", ["master 分支 @ 1a2b3c4", { commit: "1a2b3c4" }], "，共 40 行，下面是第 11 到 12 行）")
+        .parts(["11|", { path: "deploy/union.yaml", lines: [11, 11] }], " spec:")
+        .parts(["12|", { path: "deploy/union.yaml", lines: [12, 12] }], "   replicas: 6")
+        .build();
+      ctx.onFacts?.(facts);
+      return text;
+    },
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_read_file", arguments: "{}" }] },
+    // 12 是行号、40 是文件行数、11 是起始行：都不是读到的数
+    { text: '结论\n```kpi\n[{"label":"副本数","value":"6"},{"label":"上限","value":"12"},{"label":"总数","value":"40"},{"label":"起","value":"11"}]\n```', finish: "stop" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    taskTools: () => [codeRead],
+    codeRepos: ["ai/aiops-mcp"],
+    logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+  });
+
+  await handle(message("union 部署了几个副本"));
+
+  const tiles = kit.last().body.elements.find((e: any) => e.tag === "column_set");
+  assert.equal(tiles?.columns.length, 1);
+  assert.match(JSON.stringify(tiles), /副本数/);
+  assert.match(warnings.join("\n"), /数字卡片「上限 12」在查询结果里找不到/);
+  assert.match(warnings.join("\n"), /数字卡片「总数 40」在查询结果里找不到/);
+  assert.match(warnings.join("\n"), /数字卡片「起 11」在查询结果里找不到/);
+});
+
+test("代码工具结果只留代码本身：只认工具记下的代码行，行号、文件名、提交号、写回来的搜索词不算", () => {
+  const read = new ToolOutputBuilder("ai/aiops-mcp")
+    .parts(["deploy/a.yaml", { path: "deploy/a.yaml" }], "（共 40 行，下面是第 11 到 13 行）")
+    .parts(["11|", { path: "deploy/a.yaml", lines: [11, 11] }], " spec:")
+    .parts(["12|", { path: "deploy/a.yaml", lines: [12, 12] }], "   replicas: 6")
+    .parts(["13|", { path: "deploy/a.yaml", lines: [13, 13] }], " ")
+    .build();
+  assert.equal(codeContent(read.text, read.facts), "spec:\n  replicas: 6\n");
+
+  const search = new ToolOutputBuilder("ai/aiops-mcp")
+    .line("在 1 个分支上共搜到 2 处：")
+    .parts("【", ["master", { branch: "master" }], "，2 处】")
+    .parts(["deploy/v2/a.yaml:12", { path: "deploy/v2/a.yaml", lines: [12, 12] }], ":  replicas: 6")
+    .parts(["src/x.go:7", { path: "src/x.go", lines: [7, 7] }], ":const limit = 9")
+    .build();
+  assert.equal(codeContent(search.text, search.facts), "  replicas: 6\nconst limit = 9");
+
+  // 没搜到时把搜的词原样写回来：长得像搜索结果，也不算
+  const miss = new ToolOutputBuilder("ai/aiops-mcp").parts("没有搜到「foo:12: limit 99」（", ["master", { branch: "master" }], "）。").build();
+  assert.equal(codeContent(miss.text, miss.facts), "");
 });
