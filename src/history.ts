@@ -2,6 +2,12 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { FeishuApi, ThreadMessage } from "./feishu.js";
 import type { ChatMessage } from "./llm.js";
 
+/**
+ * 卡片即回答时，任务跑得久，写完后在话题里补这一句，提问人才会收到通知（更新卡片不通知）。
+ * 读话题历史时去掉它：它不是回答，还会让「上一条回答在问话」认不出来
+ */
+export const CARD_DONE_NOTICE = "处理完了，结果在上面的卡片里。";
+
 /** 最多带上话题里最近多少条消息 */
 export const MAX_HISTORY_MESSAGES = 60;
 /** 话题上下文的总字数上限，超出时从较早的消息开始省略（话题第一条始终保留） */
@@ -55,6 +61,8 @@ export class ThreadContextLoader {
     private readonly api: Pick<FeishuApi, "listThreadMessages" | "getMessage">,
     private readonly logger: Logger = console,
     private readonly maxLocalThreads = 500,
+    /** 卡片即回答时记下的卡片里的回答（见 CardAnswerStore）。读话题历史时，机器人的卡片换回这些文字 */
+    private readonly cardAnswers?: { get(chatId: string, threadKey: string, messageIds: readonly string[]): Promise<ReadonlyMap<string, string>> },
   ) {}
 
   async load(msg: NormalizedMessage): Promise<ThreadContext> {
@@ -107,13 +115,21 @@ export class ThreadContextLoader {
   private async loadFromFeishu(msg: NormalizedMessage, threadId: string): Promise<ThreadContext> {
     const all = await this.api.listThreadMessages(threadId, MAX_HISTORY_MESSAGES);
     const askerName = all.find((m) => m.messageId === msg.messageId)?.senderName;
-    const earlier = all.filter(
-      (m) =>
-        m.messageId !== msg.messageId &&
-        (m.createTime === 0 || m.createTime <= msg.createTime) &&
-        // 机器人自己的进度卡片不算对话内容
-        !(m.fromBot && m.msgType === "interactive"),
-    );
+    const answers = await this.cardAnswersOf(msg, all);
+    const earlier = all.flatMap((m) => {
+      if (m.messageId === msg.messageId || (m.createTime !== 0 && m.createTime > msg.createTime)) {
+        return [];
+      }
+      if (m.fromBot && m.content.trim() === CARD_DONE_NOTICE) {
+        return [];
+      }
+      if (m.fromBot && m.msgType === "interactive") {
+        // 机器人自己的进度卡片不算对话内容；卡片即回答时卡片里是回答，换成记下的文字
+        const answer = answers.get(m.messageId);
+        return answer === undefined ? [] : [{ ...m, content: answer }];
+      }
+      return [m];
+    });
     if (msg.rootId && !earlier.some((m) => m.messageId === msg.rootId) && msg.rootId !== msg.messageId) {
       const root = await this.api.getMessage(msg.rootId).catch(() => undefined);
       if (root) {
@@ -127,6 +143,19 @@ export class ThreadContextLoader {
       source: earlier.length > 0 ? "feishu" : "none",
       ...(images.length > 0 ? { images } : {}),
     };
+  }
+
+  private async cardAnswersOf(msg: NormalizedMessage, messages: readonly ThreadMessage[]): Promise<ReadonlyMap<string, string>> {
+    const cards = messages.filter((m) => m.fromBot && m.msgType === "interactive").map((m) => m.messageId);
+    if (cards.length === 0 || !this.cardAnswers) {
+      return new Map();
+    }
+    try {
+      return await this.cardAnswers.get(msg.chatId, threadKeyOf(msg), cards);
+    } catch (err) {
+      this.logger.warn(`读取卡片里记下的回答失败 chat=${msg.chatId} thread=${threadKeyOf(msg)}，这次话题历史里没有机器人在卡片里的回答`, err);
+      return new Map();
+    }
   }
 
   private warnOnce(err: unknown): void {

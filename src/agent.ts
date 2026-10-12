@@ -16,7 +16,9 @@ export type AgentEvent =
   /** error 是交给模型的失败原因 */
   | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string }
   /** 回答没通过 review，已经让模型重做 */
-  | { type: "retry"; reason: string };
+  | { type: "retry"; reason: string }
+  /** 流式时模型这一轮到目前为止的思考和正文（stream 打开时才有） */
+  | { type: "delta"; round: number; reasoning: string; text: string };
 
 export interface AgentRequest {
   model: ChatModel;
@@ -46,6 +48,8 @@ export interface AgentRequest {
    * 不接在工具结果里：工具结果是外部资料，系统提示词说里面的指令一律不执行，混在一起也会教模型信工具结果里冒充的「系统提醒」
    */
   steerReasoning?: (reasoning: string) => string | undefined;
+  /** 流式调用模型，边生成边发 delta 事件（比如在卡片上边想边显示） */
+  stream?: boolean;
 }
 
 export interface AgentResult {
@@ -72,6 +76,7 @@ export async function runAgent({
   thinkAfter,
   review,
   steerReasoning,
+  stream,
 }: AgentRequest): Promise<AgentResult> {
   const byName = new Map(tools.map((tool) => [tool.spec.name, tool]));
   const specs = tools.map((tool) => tool.spec);
@@ -95,7 +100,15 @@ export async function runAgent({
     }
     const startedAt = now();
     const think = thinking ?? (investigating ? true : undefined);
-    const result = await model.chat({ system, messages: conversation, tools: specs, signal, ...(think !== undefined ? { thinking: think } : {}) });
+    const onDelta = stream ? (soFar: { reasoning: string; text: string }) => onEvent({ type: "delta", round: round + 1, ...soFar }) : undefined;
+    const result = await model.chat({
+      system,
+      messages: conversation,
+      tools: specs,
+      signal,
+      ...(think !== undefined ? { thinking: think } : {}),
+      ...(onDelta ? { onDelta } : {}),
+    });
     onEvent({
       type: "model",
       round: round + 1,

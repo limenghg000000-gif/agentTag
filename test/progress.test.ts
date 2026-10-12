@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  answerFitsCard,
   CardUpdater,
+  ELEMENT,
   formatDuration,
+  MAX_CARD_ANSWER_CHARS,
   MAX_CARD_BYTES,
   type ProgressState,
   renderPlainProgressCard,
@@ -174,4 +177,106 @@ test("CardUpdater 最终状态推送失败时改用简单版本", async () => {
   await updater.finish({ v: "fancy" }, { v: "plain" });
 
   assert.deepEqual(patched, ["fancy", "plain"]);
+});
+
+const streaming = { streaming: true };
+
+test("卡片即回答：进行中状态、思考、回答各是一个带 element_id 的组件，生成时要求打开流式模式", () => {
+  const card = renderProgressCard(
+    state({ live: { round: 2, reasoning: "先查 <日志>", text: "结论：服务正常" }, thoughts: [{ round: 1, ms: 1000, text: "第一轮", at: 0 }] }),
+    "t",
+    0,
+    streaming,
+  ) as any;
+
+  const [status, thought, answer, button] = card.body.elements;
+  assert.deepEqual(
+    card.body.elements.map((e: any) => e.element_id),
+    [ELEMENT.status, ELEMENT.thought, ELEMENT.answer, ELEMENT.stop],
+  );
+  assert.equal(status.content, "✍️ 正在写回答…");
+  assert.equal(thought.content, "**💭 第 2 轮，正在想…（草稿，结论以回答为准）**\n先查 &lt;日志&gt;");
+  assert.equal(answer.content, "结论：服务正常");
+  assert.equal(button.tag, "button");
+  assert.equal(card.config.streaming_mode, true);
+  assert.equal(card.config.streaming_config.print_strategy, "fast");
+  // 只在想、还没写回答时不开流式模式：开着时停止按钮可能点不了，深度思考能想好几分钟
+  const thinking = renderProgressCard(state({ live: { round: 1, reasoning: "想", text: "" } }), "t", 0, streaming) as any;
+  assert.equal(thinking.config.streaming_mode, false);
+  assert.match(text(thinking), /正在想/);
+
+  // 这一轮想完、去调工具：不要求流式，思考换成最新一段，回答位置空着
+  const between = renderProgressCard(state({ thoughts: [{ round: 1, ms: 1000, text: "第一轮", at: 0 }] }), "t", 0, streaming) as any;
+  assert.equal(between.config.streaming_mode, false);
+  assert.deepEqual(
+    between.body.elements.map((e: any) => e.element_id),
+    [ELEMENT.status, ELEMENT.thought, ELEMENT.stop],
+  );
+  // 不是卡片即回答时和以前一样，不带 element_id 和流式配置
+  assert.doesNotMatch(text(renderProgressCard(state({ live: { round: 1, reasoning: "", text: "答" } }), "t")), /element_id|streaming/);
+});
+
+test("卡片即回答：还在 <think> 里的正文不显示；没有正文时显示重做说明或上一版回答", () => {
+  const thinking = renderProgressCard(state({ live: { round: 1, reasoning: "", text: "<think>想一想" } }), "t", 0, streaming) as any;
+  assert.doesNotMatch(text(thinking), /想一想|正在写回答/);
+  const after = renderProgressCard(state({ live: { round: 1, reasoning: "", text: "<think>想</think>答案" } }), "t", 0, streaming) as any;
+  assert.equal(after.body.elements[1].content, "答案");
+
+  const redo = renderProgressCard(state({ answerNote: "这一版回答没通过检查，正在重做…" }), "t", 0, streaming) as any;
+  assert.equal(redo.body.elements[1].content, "这一版回答没通过检查，正在重做…");
+  const draft = renderProgressCard(state({ answer: "上一版" }), "t", 0, streaming) as any;
+  assert.equal(draft.body.elements[1].content, "上一版");
+});
+
+test("卡片即回答：结束后步骤和思考折进面板，下面是回答；预览是回答开头；代码块外的尖括号转义", () => {
+  const answer = `结论 <at id=all></at>\n\`\`\`go\nif a < b {}\n\`\`\`\n${"很长的说明".repeat(20)}`;
+  const card = renderProgressCard(
+    state({ phase: "done", endedAt: 3000, steps: [{ id: "1", label: "查日志", status: "ok" }], answer }),
+    "t",
+    0,
+    streaming,
+  ) as any;
+
+  const [panel, body] = card.body.elements;
+  assert.equal(panel.tag, "collapsible_panel");
+  assert.equal(body.element_id, ELEMENT.answer);
+  assert.match(body.content, /^结论 &lt;at id=all>&lt;\/at>\n```go\nif a < b \{\}\n```\n很长的说明/);
+  assert.equal(card.config.streaming_mode, false);
+  assert.match(card.config.summary.content, /^结论 <at id=all><\/at> ```go if a < b \{\} ``` 很长的说明.*…$/);
+  assert.equal(Array.from(card.config.summary.content).length, 50);
+  assert.doesNotMatch(text(card), /button/);
+
+  // 没有步骤时上面是一行结果
+  const quick = renderProgressCard(state({ phase: "done", endedAt: 1000, answer: "好的" }), "t", 0, streaming) as any;
+  assert.deepEqual(
+    quick.body.elements.map((e: any) => e.content),
+    ["✅ 已完成 · 用时 1 秒", "好的"],
+  );
+  // 停止了没有回答；简单版本也带回答
+  assert.equal((renderProgressCard(state({ phase: "stopped", endedAt: 0 }), "t", 0, streaming) as any).body.elements.length, 1);
+  const plain = renderPlainProgressCard(state({ phase: "done", endedAt: 0, answer: "好的" }), 0, streaming) as any;
+  assert.equal(plain.body.elements.at(-1).content, "好的");
+});
+
+test("卡片即回答：回答太长时卡片里只放开头（切在代码块里先合上），说明全文另外发", () => {
+  const long = `\`\`\`\n${"x".repeat(MAX_CARD_ANSWER_CHARS)}\n\`\`\``;
+  assert.equal(answerFitsCard(long), false);
+  assert.equal(answerFitsCard("短"), true);
+  const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer: long }), "t", 0, streaming) as any;
+  const content: string = card.body.elements.at(-1).content;
+  assert.ok(content.endsWith("x\n```\n\n…（回答较长，全文另外发在下面）"));
+  assert.ok(Buffer.byteLength(text(card)) <= MAX_CARD_BYTES);
+});
+
+test("卡片即回答：代码块按 CommonMark 认，```x``` 和缩进 4 格的不算开头；代码块里只转义 <at；> 开头的引用照常显示", () => {
+  const render = (answer: string) =>
+    (renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any).body.elements.at(-1).content as string;
+
+  assert.equal(render("```x```\n<at id=all></at>"), "```x```\n&lt;at id=all>&lt;/at>");
+  assert.equal(render("    ```\n<at id=all></at>"), "    ```\n&lt;at id=all>&lt;/at>");
+  assert.equal(
+    render("> 引用\n````go\nm := map[string]<-chan int{}\n<at id=all></at>\n```\n<font>\n````\n<b>"),
+    "> 引用\n````go\nm := map[string]<-chan int{}\n&lt;at id=all>&lt;/at>\n```\n<font>\n````\n&lt;b>",
+  );
+  assert.equal(render("~~~\na<b\n~~~\na<b"), "~~~\na<b\n~~~\na&lt;b");
 });
