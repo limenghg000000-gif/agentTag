@@ -16,9 +16,11 @@ export interface PromptContext {
   readOnly?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
   extra?: string;
+  /** 进度卡片上显示模型的思考（SHOW_THINKING 没关） */
+  showThinking?: boolean;
 }
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra }: PromptContext): string {
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, showThinking }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -28,6 +30,9 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
     "- 用提问者使用的语言回答，先给结论，需要时再展开。默认简洁：一般问题几句话到三五百字说清楚；总结长文、写方案这类任务按内容需要写，但不要铺垫、不要重复。大家读的是群消息，越长越没人看。",
     "- 可以用 Markdown：粗体、列表、链接、引用和代码块。飞书消息不渲染表格，需要对比时用列表。",
   ];
+  if (showThinking) {
+    lines.push("- 思考过程也用提问者使用的语言写，思考会显示在进度卡片上给群里的人看。工具返回的日志、代码、报错是英文时也一样，函数名、报错原文、命令照原样引用。");
+  }
   if (toolNames.length > 0) {
     lines.push(
       `- 你可以调用工具（${toolNames.join("、")}），复杂的事可以分几步完成：先想清楚需要哪些信息，拿到后再作答。常识性的问题能直接回答就不必调用工具；涉及代码仓库、飞书文档、网页和最新信息的，先用工具查。`,
