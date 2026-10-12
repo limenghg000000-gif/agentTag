@@ -280,3 +280,13 @@ test("卡片即回答：代码块按 CommonMark 认，```x``` 和缩进 4 格的
   );
   assert.equal(render("~~~\na<b\n~~~\na<b"), "~~~\na<b\n~~~\na&lt;b");
 });
+
+test("卡片即回答：回答里的表格、小标题、<font>、<text_tag> 照样显示，预览去掉标签和标题符号", () => {
+  const answer = "# 结论 <text_tag color='red'>高风险</text_tag>\n\n| 服务 | CPU |\n|---|---|\n| union | <font color='red'>92%</font> |\n<at id=all></at>";
+  const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any;
+  assert.equal(
+    card.body.elements.at(-1).content,
+    "#### 结论 <text_tag color='red'>高风险</text_tag>\n\n| 服务 | CPU |\n|---|---|\n| union | <font color='red'>92%</font> |\n&lt;at id=all>&lt;/at>",
+  );
+  assert.match(card.config.summary.content, /^结论 高风险 \| 服务 \| CPU \|/);
+});

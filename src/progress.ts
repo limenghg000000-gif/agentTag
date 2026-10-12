@@ -1,4 +1,5 @@
 import { stripThinkTags } from "./llm.js";
+import { nextFence, richCardLine, stripRichTags } from "./markdown.js";
 
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
@@ -152,7 +153,7 @@ function cardConfig(state: ProgressState, streaming: boolean | undefined): objec
 }
 
 function previewOf(answer: string): string {
-  const chars = Array.from(answer.replace(/\s+/g, " ").trim());
+  const chars = Array.from(stripRichTags(answer).replace(/^ {0,3}#+[ \t]+/gm, "").replace(/\s+/g, " ").trim());
   return chars.length <= SUMMARY_CHARS ? chars.join("") : `${chars.slice(0, SUMMARY_CHARS - 1).join("")}…`;
 }
 
@@ -189,27 +190,8 @@ function clipAnswer(answer: string): string {
 }
 
 /**
- * 代码块开头：3 个以上反引号或波浪号；反引号开头的后面不能再有反引号（```x``` 是行内代码）。
- * 前面的空白不限（列表里的代码块会缩进）：认错了也只是代码块里的 < 不转义，<at 在代码块里照样转义
- */
-const FENCE_OPEN = /^[ \t]*(`{3,}|~{3,})(.*?)\r?$/;
-const FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*\r?$/;
-
-/** 按 CommonMark 的规则走一行：返回这一行之后还在不在代码块里（fence 是开头那串符号），以及这一行是不是代码块的开头或结尾 */
-function nextFence(fence: string | undefined, line: string): { fence: string | undefined; marker: boolean } {
-  if (fence) {
-    const close = FENCE_CLOSE.exec(line)?.[1];
-    return close && close[0] === fence[0] && close.length >= fence.length ? { fence: undefined, marker: true } : { fence, marker: false };
-  }
-  const open = FENCE_OPEN.exec(line);
-  if (open && !(open[1][0] === "`" && open[2].includes("`"))) {
-    return { fence: open[1], marker: true };
-  }
-  return { fence: undefined, marker: false };
-}
-
-/**
  * 回答里的 < 转义：卡片会把 <at>、<font> 当成标签，工具结果里冒充的 <at id=all></at> 会变成 @所有人。
+ * 代码块外只放过模型用来标风险的 <font color>、<text_tag color>（见 richCardLine），标题降到 ####。
  * 代码块里照原样显示（代码里 < 很常见），只把 <at 转义，万一飞书在代码块里也认 @ 也不会变成 @。
  * > 不转义：只转 < 标签就不成立了，> 开头的引用照常显示
  */
@@ -221,7 +203,10 @@ function escapeAnswer(text: string): string {
       const inCode = fence !== undefined;
       const next = nextFence(fence, line);
       fence = next.fence;
-      return inCode && !next.marker ? line.replace(/<(\/?at\b)/gi, "&lt;$1") : line.replace(/</g, "&lt;");
+      if (inCode && !next.marker) {
+        return line.replace(/<(\/?at\b)/gi, "&lt;$1");
+      }
+      return next.marker ? line.replace(/</g, "&lt;") : richCardLine(line);
     })
     .join("\n");
 }

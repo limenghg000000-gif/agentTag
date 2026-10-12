@@ -1460,6 +1460,28 @@ test("引用了没查到的代码位置被拦下时，卡片上的思考也去�
   assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|user\.go/);
 });
 
+test("回答里用 <font>、<text_tag> 包着没查到的代码位置照样拦", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const tagged = "问题在 <text_tag color='red'>高风险</text_tag> <font color='red'>src/user.go</font>:99";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: tagged, finish: "stop" },
+    { text: tagged, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  // 打回时说的是去掉标签以后的 src/user.go:99
+  assert.match(JSON.stringify(requests.at(-1)!.messages), /src\/user\.go:99/);
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+});
+
 test("打回重做以后通过了：被打回的那一轮的思考不留在卡片上，前面几轮的照样留", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
@@ -2866,6 +2888,35 @@ test("卡片即回答：回答太长时卡片里只放开头，全文另外发�
   assert.match(kit.last().body.elements.at(-1).content, /回答较长，全文另外发在下面/);
   assert.equal(markdowns(sent).join("\n"), long);
   assert.deepEqual(answers.saved, []);
+});
+
+test("卡片即回答：提示词里允许表格、小标题和彩色标签；没用流式卡片时还是说不渲染表格", async () => {
+  const kit = fakeCardKit();
+  const rich = fakeModel(() => ({ text: "好的", finish: "stop" }));
+  await setup({ model: rich.model, cardKit: kit.api, streamIntervalMs: 0 }).handle(message("你好"));
+  assert.match(rich.requests[0].system, /表格/);
+  assert.match(rich.requests[0].system, /<text_tag color='red'>高风险<\/text_tag>/);
+  assert.doesNotMatch(rich.requests[0].system, /不渲染表格/);
+
+  const plain = fakeModel(() => ({ text: "好的", finish: "stop" }));
+  await setup({ model: plain.model }).handle(message("你好"));
+  assert.match(plain.requests[0].system, /飞书消息不渲染表格，需要对比时用列表/);
+  assert.doesNotMatch(plain.requests[0].system, /text_tag/);
+});
+
+test("卡片即回答：回答太长另外发全文时，表格改成列表、标签去掉", async () => {
+  const kit = fakeCardKit();
+  const rows = Array.from({ length: 200 }, (_, i) => `| pod-${i} | <font color='red'>${i}%</font> |`);
+  const long = ["<text_tag color='red'>高风险</text_tag> 结论", "| Pod | CPU |", "|---|---|", ...rows].join("\n");
+  const { model } = fakeModel(() => ({ text: long, finish: "stop" }));
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0 });
+
+  await handle(message("列一下所有 Pod 的 CPU"));
+
+  const posted = markdowns(sent).join("\n");
+  assert.match(posted, /^高风险 结论\n- \*\*pod-0\*\*：CPU 0%\n- \*\*pod-1\*\*：CPU 1%/);
+  assert.doesNotMatch(posted, /<font|text_tag|\|---/);
+  assert.match(kit.last().body.elements.at(-1).content, /<text_tag color='red'>高风险<\/text_tag>/);
 });
 
 test("卡片即回答：停止时卡片标成已停止，不留草稿，不发回答", async () => {

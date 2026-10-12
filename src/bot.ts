@@ -6,7 +6,7 @@ import { imageKeysOf } from "./feishu.js";
 import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
-import { splitMarkdown } from "./markdown.js";
+import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   answerFitsCard,
@@ -386,6 +386,7 @@ async function runTask(
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
+        richText: streaming,
       }),
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
@@ -394,9 +395,10 @@ async function runTask(
       ...(reviews.length > 0
         ? {
             // 几项检查都没过时一起告诉模型：重做只有一次，只说一项的话，另一项重做后就没人查了
+            // 按显示出来的文字检查：<font>、<text_tag> 标签去掉
             review: (answer: string, usedTools: ReadonlySet<string>) =>
               reviews
-                .map((review) => review(answer, usedTools))
+                .map((review) => review(stripRichTags(answer), usedTools))
                 .filter(Boolean)
                 .join("\n") || undefined,
           }
@@ -447,8 +449,10 @@ async function runTask(
       },
     });
     answer = toReply(result.text, result.finish);
+    // 最后一道检查也按显示出来的文字看：<font>、<text_tag> 标签去掉
+    const shown = stripRichTags(result.text);
     let blockedCode = false;
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
+    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
@@ -457,7 +461,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${result.text}`, repos);
+      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -468,7 +472,7 @@ async function runTask(
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
-      const unseen = unseenCodeCitations(result.text, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
+      const unseen = unseenCodeCitations(shown, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -518,7 +522,7 @@ async function runTask(
         }
       } else {
         // 没用流式卡片、卡片最后没更新上、或者回答太长卡片里只放了开头：和以前一样另外发全文
-        for (const chunk of splitMarkdown(answer, CHUNK_CHARS)) {
+        for (const chunk of splitMarkdown(toPostMarkdown(answer), CHUNK_CHARS)) {
           await reply(chunk);
         }
       }
