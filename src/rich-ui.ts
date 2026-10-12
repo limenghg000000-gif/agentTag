@@ -328,10 +328,10 @@ export class NumberEvidence {
 
   /**
    * v 是不是哪个查到的数（按 factors 里的一个倍数换算以后）按 v 写出来的精度四舍五入的结果：
-   * v 写成 41.2、单位是 % 时，看有没有 41.15 到 41.25 之间的数，或者 0.4115 到 0.4125 之间的数
+   * v 写成 41.2、单位是 % 时，看有没有 41.15 到 41.25 之间的数，或者 0.4115 到 0.4125 之间的数。
+   * 卡片里写成文字的数由 half 给出写出来的精度（0.000 是 ±0.0005，转成数就成了 0，按 0 算会放宽到 ±0.5）
    */
-  has(v: number, factors: readonly number[] = [1]): boolean {
-    const half = halfStep(v);
+  has(v: number, factors: readonly number[] = [1], half = halfStep(v)): boolean {
     // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
     const slack = 8 * Number.EPSILON * Math.abs(v);
     return factors.some((factor) => this.within((v - half - slack) / factor, (v + half + slack) / factor));
@@ -357,14 +357,24 @@ export class NumberEvidence {
  * 用科学计数法数位数：很小的数 String() 出来是 1e-7 这样，按小数点数不出位数
  */
 function halfStep(v: number): number {
-  const [mantissa, exponent] = v.toExponential().split("e");
+  return writtenHalf(v.toExponential());
+}
+
+/** 写出来的数（41.20、0.000、1.5e-7）最后一位的半格：小数点后写了几位就按几位算，末尾的 0 也算 */
+function writtenHalf(token: string): number {
+  const [mantissa, exponent = "0"] = token.toLowerCase().split("e");
   const decimals = (mantissa.split(".")[1] ?? "").length;
   return 0.5 * 10 ** Math.min(0, Number(exponent) - decimals);
 }
 
-/** 数字卡片的值里写的数：「41%」「1.2 GiB」「1,234」「1e9」「.5」各是一个数；「10~20%」「10-20」是 10 和 20 */
-function numbersIn(value: string): number[] {
-  return [...halfWidth(value).matchAll(NUMBER)].map((match) => Number(match[0].replace(/,/g, "")));
+/**
+ * 数字卡片的值里写的数和写出来的精度：「41%」「1.2 GiB」「1,234」「1e9」「.5」各是一个数；「10~20%」「10-20」是 10 和 20
+ */
+function numbersIn(value: string): { n: number; half: number }[] {
+  return [...halfWidth(value).matchAll(NUMBER)].map((match) => {
+    const token = match[0].replace(/,/g, "");
+    return { n: Number(token), half: writtenHalf(token) };
+  });
 }
 
 /**
@@ -386,7 +396,7 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
     if (segment.kind === "chart") {
       const factors = unitFactors(segment.unit) ?? [1];
       const missing = [
-        ...segment.x.filter((value) => NUMERIC_LABEL.test(halfWidth(value))).flatMap((value) => numbersIn(value).filter((n) => !evidence.has(n, unitFactors(value) ?? [1]))),
+        ...segment.x.filter((value) => NUMERIC_LABEL.test(halfWidth(value))).flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? [1], half)).map(({ n }) => n)),
         ...segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n, factors)),
       ];
       if (missing.length > 0) {
@@ -401,7 +411,7 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
     } else if (segment.kind === "kpi") {
       const items = segment.items.filter((item) => {
         const factors = unitFactors(item.value) ?? unitFactors(item.label) ?? [1];
-        const ok = numbersIn(item.value).every((n) => evidence.has(n, factors));
+        const ok = numbersIn(item.value).every(({ n, half }) => evidence.has(n, factors, half));
         if (!ok) {
           dropped.push(`数字卡片「${item.label} ${item.value}」在查询结果里找不到`);
         }

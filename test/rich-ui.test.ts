@@ -251,6 +251,12 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.ok(kpi("−99%", "delta -0.99"));
   assert.ok(kpi("1.2 ＧｉＢ", String(1.2 * 1024 ** 3)));
   assert.ok(!kpi("102", "10²"));
+  // 写出来的精度：末尾的 0 也算
+  assert.ok(!kpi("0.000%", "error_percent 0.4"));
+  assert.ok(kpi("0.000%", "error_ratio 0.0000041"));
+  assert.ok(kpi("41.20%", "0.4120"));
+  assert.ok(!kpi("41.20%", "0.4126"));
+  assert.ok(kpi("1.50e-7", "1.5e-7"));
 
   const xs = (x: string, output: string) =>
     keepVerified([{ kind: "chart", type: "bar", title: "t", x: [x], series: [{ name: "a", data: [39] }] }], new NumberEvidence([output])).segments[0].kind;
