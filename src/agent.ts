@@ -1,10 +1,20 @@
-import type { ChatMessage, ChatModel, ChatResult, TokenUsage, ToolCall } from "./llm.js";
+import { type ChatMessage, type ChatModel, type ChatResult, LlmError, type TokenUsage, type ToolCall } from "./llm.js";
 import type { Tool } from "./tools/tool.js";
 
 /** 单次任务最多几轮工具调用。到了上限就让模型用已有信息直接作答。排查线上问题时一次诊断加几次补查，8 轮不太够 */
 export const MAX_TOOL_ROUNDS = 12;
 /** 单个工具结果交给模型前默认的字数上限，防止一个大网页挤掉上下文。工具可以用 maxOutputChars 另定 */
 export const MAX_TOOL_OUTPUT_CHARS = 16000;
+
+/**
+ * 模型服务说输入太长时，按顺序试这几档：先把最近 2 轮以前的工具结果压到只留开头，还不行就连最近的也压，最后只留很短的开头。
+ * 不预先估 token：各家模型的上下文窗口和分词都不一样，以服务的报错为准，换模型也不用另配窗口大小
+ */
+const COMPACT_LEVELS = [
+  { keepRounds: 2, headChars: 2000 },
+  { keepRounds: 0, headChars: 2000 },
+  { keepRounds: 0, headChars: 300 },
+] as const;
 
 const LAST_ROUND_NOTE = "工具调用次数已经用完了。请根据上面已经拿到的信息直接给出最终回答，不要再调用工具；没查到的部分如实说明。";
 const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限（${MAX_TOOL_ROUNDS} 轮工具调用），我先停在这里。可以把任务拆小一点再交给我。`;
@@ -17,6 +27,8 @@ export type AgentEvent =
   | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string }
   /** 回答没通过 review，已经让模型重做 */
   | { type: "retry"; reason: string }
+  /** 模型服务说输入太长，压短了 results 个工具结果（一共省掉 chars 字）后重试这一轮 */
+  | { type: "compacted"; round: number; results: number; chars: number }
   /** 流式时模型这一轮到目前为止的思考和正文（stream 打开时才有） */
   | { type: "delta"; round: number; reasoning: string; text: string };
 
@@ -82,6 +94,8 @@ export async function runAgent({
   const specs = tools.map((tool) => tool.spec);
   const conversation = [...messages];
   const usedTools = new Set<string>();
+  /** 压短过的工具结果的原文（按在 conversation 里的位置），再压时从原文取开头 */
+  const originals = new Map<number, string>();
   let toolCalls = 0;
   let reviewed = false;
   let investigating = false;
@@ -101,14 +115,34 @@ export async function runAgent({
     const startedAt = now();
     const think = thinking ?? (investigating ? true : undefined);
     const onDelta = stream ? (soFar: { reasoning: string; text: string }) => onEvent({ type: "delta", round: round + 1, ...soFar }) : undefined;
-    const result = await model.chat({
-      system,
-      messages: conversation,
-      tools: specs,
-      signal,
-      ...(think !== undefined ? { thinking: think } : {}),
-      ...(onDelta ? { onDelta } : {}),
-    });
+    let result: ChatResult;
+    for (let level = 0; ; ) {
+      try {
+        result = await model.chat({
+          system,
+          messages: conversation,
+          tools: specs,
+          signal,
+          ...(think !== undefined ? { thinking: think } : {}),
+          ...(onDelta ? { onDelta } : {}),
+        });
+        break;
+      } catch (err) {
+        if (!(err instanceof LlmError && err.kind === "too_long")) {
+          throw err;
+        }
+        // 找下一档真能压掉东西的；都压不动（比如第一轮还没有工具结果）就照原样报错，由调用方告诉用户
+        let saved = { results: 0, chars: 0 };
+        while (saved.results === 0 && level < COMPACT_LEVELS.length) {
+          saved = compactToolResults(conversation, originals, COMPACT_LEVELS[level++]);
+        }
+        if (saved.results === 0) {
+          throw err;
+        }
+        signal.throwIfAborted();
+        onEvent({ type: "compacted", round: round + 1, ...saved });
+      }
+    }
     onEvent({
       type: "model",
       round: round + 1,
@@ -150,6 +184,46 @@ export async function runAgent({
       conversation.push({ role: "user", content: steer });
     }
   }
+}
+
+/**
+ * 把较早的工具结果压到只留开头：最近 keepRounds 轮调了工具的结果原样留着，更早的只留 headChars 字，后面写明省略了多少、需要就重新查。
+ * 只会越压越短，不会把压过的再放长。返回这次压短了几个结果、一共省掉多少字
+ */
+export function compactToolResults(
+  conversation: ChatMessage[],
+  originals: Map<number, string>,
+  { keepRounds, headChars }: { keepRounds: number; headChars: number },
+): { results: number; chars: number } {
+  let cutoff = conversation.length;
+  for (let kept = 0; kept < keepRounds && cutoff > 0; ) {
+    cutoff--;
+    const message = conversation[cutoff];
+    if (message.role === "assistant" && message.toolCalls?.length) {
+      kept++;
+    }
+  }
+  let results = 0;
+  let chars = 0;
+  for (let i = 0; i < cutoff; i++) {
+    const message = conversation[i];
+    if (message.role !== "tool") {
+      continue;
+    }
+    const original = originals.get(i) ?? message.content;
+    if (original.length <= headChars) {
+      continue;
+    }
+    const content = `${original.slice(0, headChars)}\n\n（上下文快放不下了，这个结果只留了开头 ${headChars} 字，后面 ${original.length - headChars} 字已省略；要用后面的内容请重新查）`;
+    if (content.length >= message.content.length) {
+      continue;
+    }
+    originals.set(i, original);
+    chars += message.content.length - content.length;
+    results++;
+    conversation[i] = { ...message, content };
+  }
+  return { results, chars };
 }
 
 async function runTool(

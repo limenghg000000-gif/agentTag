@@ -496,3 +496,40 @@ test("服务支持流式但不认 stream_options 时去掉它照样流式，之�
   );
   assert.match(warnings.join("\n"), /不认 stream_options/);
 });
+
+test("输入超出上下文窗口时抛出 too_long；报错里提到思考也不当成不认 enable_thinking", async () => {
+  const warnings: string[] = [];
+  const thinking = createOpenAICompatibleModel(
+    {
+      baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+      apiKey: "sk-test",
+      model: "qwen3.8-max",
+      thinking: true,
+    },
+    (message) => warnings.push(message),
+  );
+  const askThinking = () => thinking.chat({ system: "s", messages: [{ role: "user", content: "很长的问题" }] });
+  responses.push(
+    // 百炼
+    { status: 400, body: { error: { code: "invalid_parameter_error", message: "Range of input length should be [1, 983616] in thinking mode", type: "invalid_request_error" } } },
+    // OpenAI、DeepSeek、vLLM
+    { status: 400, body: { error: { code: "context_length_exceeded", message: "This model's maximum context length is 131072 tokens." } } },
+    // Kimi
+    { status: 400, body: { error: { message: "Invalid request: Your request exceeded model token limit: 262144", type: "invalid_request_error" } } },
+    // 只有错误码认得出来、说法里提到思考的
+    { status: 400, body: { error: { code: "context_length_exceeded", message: "Request rejected in thinking mode" } } },
+    completion("好"),
+  );
+
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(askThinking, (err) => err instanceof LlmError && err.kind === "too_long");
+  }
+  await askThinking();
+  assert.equal(requests.at(-1)!.body.enable_thinking, true);
+  assert.deepEqual(warnings, []);
+});
+
+test("别的 400 还是 api 类错误", async () => {
+  responses.push({ status: 400, body: { error: { code: "invalid_parameter_error", message: "Range of max_tokens should be [1, 65536]" } } });
+  await assert.rejects(ask, (err) => err instanceof LlmError && err.kind === "api");
+});

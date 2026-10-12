@@ -246,6 +246,19 @@ test("模型调用失败时卡片标成出错，并在话题里说明原因", as
   assert.match(cardText(updates.at(-1)!.card), /出错了/);
 });
 
+test("输入超出模型一次能读的长度时，说清楚原因和怎么问", async () => {
+  const { model } = fakeModel(() => {
+    throw new LlmError("too_long", "400 Range of input length should be [1, 991808]");
+  });
+  const { sent, handle } = setup({ model });
+
+  await handle(message("把这半年的日志都看一遍"));
+
+  assert.deepEqual(markdowns(sent), [
+    "抱歉，这次没能完成：要看的内容超出了模型一次能读的长度，可以把问题拆小一点，或者说清楚服务、时间范围再问。",
+  ]);
+});
+
 test("进度卡片发不出去时照样回答", async () => {
   const sent: Sent[] = [];
   const { handle } = setup({

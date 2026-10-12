@@ -602,6 +602,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
     logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${think}${usage} → ${next}`);
   } else if (event.type === "retry") {
     logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);
+  } else if (event.type === "compacted") {
+    logger.warn(`模型说输入太长，第${event.round}轮把 ${event.results} 个工具结果压短（省掉 ${event.chars} 字）后重试 message=${messageId}`);
   } else if (event.type === "tool_end") {
     if (event.ok) {
       logger.info(`工具 ${event.name} message=${messageId} 用时=${event.ms}ms`);
@@ -1557,5 +1559,7 @@ function describeError(err: unknown): string {
       return "连不上模型服务，请检查网络或 MODEL_BASE_URL";
     case "api":
       return "模型服务返回错误";
+    case "too_long":
+      return "要看的内容超出了模型一次能读的长度，可以把问题拆小一点，或者说清楚服务、时间范围再问";
   }
 }
