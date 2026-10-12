@@ -137,6 +137,11 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     ["xapp", "-1-A0123456789-0123456789-abcdef"].join(""),
     ["https://open.feishu.cn/open-apis/bot/v2/hook/", "3fa85f64-5717-4562-b3fc-2c963f66afa6"].join(""),
     ["https://hooks.slack.com/services/", "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"].join(""),
+    ["https://discord.com/api/webhooks/", "123456789012345678/", "AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789-abcdef"].join(""),
+    ["https://ptb.discordapp.com/api/v10/webhooks/", "123456789012345678/", "AbCdEfGhIjKlMnOpQrStUvWxYz"].join(""),
+    ["https://qyapi.weixin.qq.com/cgi-bin/webhook/send?", "key=693a91f6-7b2c-4bc4-97a0-0ec2a1fa5aaa"].join(""),
+    ["https://contoso.webhook.office.com/webhookb2/", "11111111-2222-3333-4444-555555555555@66666666-7777-8888-9999-000000000000/IncomingWebhook/0123456789abcdef"].join(""),
+    ["https://outlook.office.com/webhook/", "11111111-2222-3333-4444-555555555555@66666666-7777-8888-9999-000000000000/IncomingWebhook/0123456789abcdef"].join(""),
     ["AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"].join(""),
     ["sk", "_live_", "abcdefghijklmnop0123"].join(""),
     ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "abcdefghijklmnopqrstuv"].join("."),
@@ -418,6 +423,12 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
   assert.ok(normalizeDraft({ ...code8, basis: "用 sk-learn-preprocessing-pipeline 处理的数据" }));
   assert.ok(normalizeDraft({ ...code8, basis: "这次调用 total_tokens: 123456789" }));
   assert.ok(normalizeDraft({ ...code8, basis: "群机器人的 Webhook 地址在飞书群设置里，xoxo 不是令牌" }));
+  assert.ok(
+    normalizeDraft({
+      ...code8,
+      basis: "Discord 的地址是 discord.com/api/webhooks/{id}/{token}，企业微信是 qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<key>，Teams 的在 webhook.office.com 里配",
+    }),
+  );
   for (const prose of [
     "日志里是 token=invalid_signature，换新令牌后好了",
     "MCP_AIOPS_TOKEN=${MCP_AIOPS_TOKEN}，从 .env 读",
@@ -1380,6 +1391,23 @@ test("取代旧的排查经验：再试一次前有人在表格里改了旧的�
   assert.deepEqual(setup.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
   assert.equal(setup.lastCard().header.title.content, "已存进经验库");
   assert.match((setup.sent.at(-1)!.input as { markdown: string }).markdown, /aiops 经验库里同步的经验 #31 也已归档/);
+});
+
+test("取代表格里手动加的旧经验（没有草稿编号）：卡片发出后有人改了它的编号，存新的时按内容认出它，后面照样归档它，不当成删了", async () => {
+  const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 32 }) });
+  await setup.base.save(normalizeDraft(code8));
+  await setup.base.linkAiops({ id: "K1" }, 31);
+  delete setup.backend.entries[0].requestId;
+  await setup.tool("knowledge_propose").run({ ...code8, title: "gateway-api 报 code=8（已修复）", replaces: "K1" }, { signal });
+  setup.backend.entries[0].id = "K9";
+  await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+  await setup.desk.idle();
+  const old = setup.backend.entries.find((e) => e.id === "K9")!;
+  assert.equal(old.status, "archived", "旧的那一行归档了，不和新的同时有效");
+  assert.equal(setup.lastCard().header.title.content, "已存进经验库");
+  assert.match(cardText(setup.lastCard()), /旧的经验 K9「[^」]+」已归档/);
+  assert.doesNotMatch(cardText(setup.lastCard()), /已经从表格里删掉了/);
+  assert.deepEqual(setup.calls.filter((call) => call.tool === "archive_lesson").map((call) => call.args), [{ id: 31 }]);
 });
 
 test("取代旧的排查经验：aiops 不认 force、强制保存还说重复时不算进了 aiops，旧的在 aiops 里那条留着，卡片可以再试一次", async () => {
@@ -3019,6 +3047,9 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(`gateway-api 报 code=8，请求头 Authorization: Signature keyId="rsa-key-1",algorithm="rsa-sha256",signature="${base64(Buffer.alloc(32, 9))}"`, task);
   await desk.lookup(`gateway-api 报 code=8，sops 用的 age 私钥是 ${["AGE", "SECRET", "KEY", `1${bech32(Buffer.alloc(32, 8)).toUpperCase()}`].join("-")}`, task);
   await desk.lookup(`gateway-api 报 code=8，terraform 里写的是 password = <<EOT\n${["Correct", "Horse", "Battery", "Staple9!"].join("-")}\nEOT`, task);
+  // 群机器人的 Webhook 地址：拿到就能往群里发消息
+  await desk.lookup(["gateway-api 报 code=8，告警发到 https://discord.com/api/webhooks/", "123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789"].join(""), task);
+  await desk.lookup(["gateway-api 报 code=8，告警发到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?", "key=693a91f6-7b2c-4bc4-97a0-0ec2a1fa5aaa"].join(""), task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);

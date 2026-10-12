@@ -299,6 +299,14 @@ export class KnowledgeBase {
     return byRequestOrId(await this.entries(true), requestId, id);
   }
 
+  /**
+   * 卡片上那一条现在是表格里的哪一行（重新读表格），和保存、归档时认的一样（见 cardTarget）：
+   * 有草稿编号的按草稿编号认，没有的（表格里手动加的、导入的）改了编号按内容认
+   */
+  async current(seen: KnowledgeEntry): Promise<KnowledgeEntry | undefined> {
+    return cardTarget(await this.entries(true), seen.id, seen);
+  }
+
   /** 按提问找相近的经验，默认只看有效的，按相近程度排序 */
   async search(query: string, { limit = 3, category, includeArchived = false, signal, semanticDeadline }: SearchOptions = {}): Promise<KnowledgeHit[]> {
     const text = query.trim().slice(0, QUERY_CHARS);
@@ -691,8 +699,11 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b(?:AKIA|LTAI)[A-Za-z0-9]{12,}/, "云服务的 AccessKey"],
   // Slack 的 xoxb-、xoxp-、xoxe.xoxp-、xapp- 令牌
   [/\bxox(?:e\.xox)?[a-z]-[A-Za-z0-9-]{10,}|\bxapp-\d+-[A-Za-z0-9-]{10,}/, "Slack 令牌"],
-  // 拿到地址就能往群里发消息：飞书、Lark、Slack 的群机器人 Webhook
-  [/\/open-apis\/bot\/v2\/hook\/[\w-]{8,}|hooks\.slack\.com\/services\/[\w/]{10,}/, "群机器人 Webhook 地址"],
+  // 拿到地址就能往群里发消息：飞书、Lark、Slack、Discord、企业微信、Teams 的群机器人 Webhook（钉钉的 access_token= 按令牌算）
+  [
+    /\/open-apis\/bot\/v2\/hook\/[\w-]{8,}|hooks\.slack\.com\/services\/[\w/]{10,}|discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d{5,}\/[\w-]{20,}|qyapi\.weixin\.qq\.com\/cgi-bin\/webhook\/send\?(?:[^\s#&]*&)*key=[\w-]{16,}|(?:\.webhook\.office\.com\/webhookb2|outlook\.office(?:365)?\.com\/webhook)\/[\w@.-]{20,}/i,
+    "群机器人 Webhook 地址",
+  ],
   [/\bAIza[\w-]{35}/, "Google API 密钥"],
   [/\b[rs]k_live_[A-Za-z0-9]{16,}/, "Stripe 密钥"],
   [/\beyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}/, "JWT 令牌"],

@@ -647,10 +647,8 @@ export class KnowledgeDesk {
     let replacedGone = false;
     if (proposal.replaces) {
       try {
-        // 按草稿编号找：表格里改了编号也认得出
-        replaced = proposal.replaces.requestId
-          ? await base.saved(proposal.replaces.requestId, proposal.replaces.id)
-          : await base.get(proposal.replaces.id, { fresh: true });
+        // 和保存时一样认：表格里改了编号也认得出（没有草稿编号的按内容认），不把改了编号的当成删了
+        replaced = await base.current(proposal.replaces);
       } catch (err) {
         if (!proposal.replacedArchived) {
           out.unfinished.push(`没能重新读取要取代的旧经验 ${proposal.replaces.id}：${describe(err)}。同步 aiops、归档旧经验这几步先没做`);
