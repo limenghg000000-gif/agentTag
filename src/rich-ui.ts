@@ -287,7 +287,8 @@ function parseKpi(json: unknown): KpiBlock | undefined {
       return undefined;
     }
     const raw = item as Record<string, unknown>;
-    const label = text(raw.label, 20);
+    // 标签里会带上服务、Pod 名（「CPU 占 limit 最高 · user-rpc」），字号小，可以长一点
+    const label = text(raw.label, 32);
     const value = text(raw.value, 16);
     if (!label || !value) {
       return undefined;

@@ -303,3 +303,9 @@ test("「接着查」按钮：```actions 里的问题去掉尖括号、合成一
   assert.deepEqual(segmentElements(segments, (text) => ({ md: text })), [{ md: "结论" }]);
   assert.equal(segmentsAsText([segments[0], { kind: "actions", questions: ["x", "y"] }]), "结论\n\n可以接着问：「x」「y」");
 });
+
+test("数字卡片：标签里带上服务名（30 来个字）不截断，值只写数和单位", () => {
+  const label = "CPU 占 limit 最高 · yuebai-user-rpc";
+  const kpi = splitAnswer("```kpi\n" + JSON.stringify([{ label, value: "50%", level: "ok" }]) + "\n```").segments[0];
+  assert.deepEqual(kpi, { kind: "kpi", items: [{ label, value: "50%", level: "ok" }] });
+});
