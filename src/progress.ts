@@ -1,4 +1,6 @@
 import { stripThinkTags } from "./llm.js";
+import { nextFence, richCardLine, stripRichTags } from "./markdown.js";
+import { type AnswerSegment, hasUiBlocks, segmentElements, segmentsAsText, splitAnswer, streamingAnswer } from "./rich-ui.js";
 
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
@@ -35,6 +37,8 @@ export interface ProgressState {
   answer?: string;
   /** 卡片即回答：还没有回答可显示时，回答位置上的说明（比如上一版没通过检查、正在重做） */
   answerNote?: string;
+  /** 卡片即回答：结束后的回答拆成的几段（图和数字卡片已经核对过查询结果），有图或数字卡片时按段显示 */
+  answerSegments?: AnswerSegment[];
 }
 
 export interface CardOptions {
@@ -79,7 +83,15 @@ export function renderProgressCard(state: ProgressState, taskId: string, now = D
     card = buildProgressCard(state, taskId, now, ++omitted, options);
   }
   // 正文全去掉还放不下（步骤太多、步骤名很长）：不显示思考，和以前一样只列最近的步骤
-  return total > 0 && !fits(card) ? buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options) : card;
+  if (total > 0 && !fits(card)) {
+    card = buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options);
+  }
+  // 还放不下就是图的数据太多：图换成文字说明（用核对过的那几段，不再从原文拆：对不上被去掉的数字卡片不能回来）
+  if (!fits(card) && state.answerSegments && hasUiBlocks(state.answerSegments)) {
+    const asText: AnswerSegment[] = [{ kind: "markdown", text: segmentsAsText(state.answerSegments) }];
+    card = buildProgressCard({ ...state, thoughts: undefined, answerSegments: asText }, taskId, now, 0, options);
+  }
+  return card;
 }
 
 /** omitted：最早的几段思考只显示标题、不显示正文 */
@@ -101,7 +113,8 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
     }
     const answer = streaming ? (liveText(state) || state.answerNote || state.answer) : undefined;
     if (answer) {
-      elements.push(answerElement(answer));
+      // 图和数字卡片的代码块不把 JSON 显示出来，写完回答以后再画
+      elements.push(answerElement(streamingAnswer(answer)));
     }
     elements.push({
       tag: "button",
@@ -127,9 +140,22 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
     });
   }
   if (streaming && finished && state.answer) {
-    elements.push(answerElement(state.answer));
+    const segments = state.answerSegments;
+    if (segments && hasUiBlocks(segments) && answerFitsCard(finalText(state))) {
+      elements.push(...segmentElements(segments, (text) => ({ tag: "markdown", content: escapeAnswer(text) })));
+    } else {
+      elements.push(answerElement(finalText(state)));
+    }
   }
   return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
+}
+
+/**
+ * 结束后只能放文字时的回答：图换成一句说明，数字卡片换成一行。完整显示得下（answerFitsCard）也按这段文字算，和发全文时判断的一样。
+ * 没核对过（answerSegments 没给）时数字卡片不显示，图只有标题
+ */
+function finalText(state: ProgressState): string {
+  return segmentsAsText(state.answerSegments ?? splitAnswer(state.answer ?? "").segments.filter((segment) => segment.kind !== "kpi"));
 }
 
 function isFinished(state: ProgressState): boolean {
@@ -143,7 +169,7 @@ function isFinished(state: ProgressState): boolean {
  */
 function cardConfig(state: ProgressState, streaming: boolean | undefined): object {
   const finished = isFinished(state);
-  const preview = streaming && finished && state.answer ? previewOf(state.answer) : undefined;
+  const preview = streaming && finished && state.answer ? previewOf(finalText(state)) : undefined;
   return {
     update_multi: true,
     ...(streaming ? { streaming_mode: !finished && liveText(state) !== "", streaming_config: STREAMING_CONFIG } : {}),
@@ -152,7 +178,7 @@ function cardConfig(state: ProgressState, streaming: boolean | undefined): objec
 }
 
 function previewOf(answer: string): string {
-  const chars = Array.from(answer.replace(/\s+/g, " ").trim());
+  const chars = Array.from(stripRichTags(answer).replace(/^ {0,3}#+[ \t]+/gm, "").replace(/\s+/g, " ").trim());
   return chars.length <= SUMMARY_CHARS ? chars.join("") : `${chars.slice(0, SUMMARY_CHARS - 1).join("")}…`;
 }
 
@@ -170,9 +196,9 @@ function answerElement(answer: string): object {
   return { tag: "markdown", element_id: ELEMENT.answer, content: escapeAnswer(clipAnswer(answer)) };
 }
 
-/** 回答能不能完整放进卡片。放不下时卡片里只有开头，要另外发全文 */
+/** 回答能不能完整放进卡片（图和数字卡片的代码块不算字数，卡片放不下图时另有处理）。放不下时卡片里只有开头，要另外发全文 */
 export function answerFitsCard(answer: string): boolean {
-  return Array.from(answer).length <= MAX_CARD_ANSWER_CHARS;
+  return Array.from(streamingAnswer(answer)).length <= MAX_CARD_ANSWER_CHARS;
 }
 
 function clipAnswer(answer: string): string {
@@ -189,27 +215,8 @@ function clipAnswer(answer: string): string {
 }
 
 /**
- * 代码块开头：3 个以上反引号或波浪号；反引号开头的后面不能再有反引号（```x``` 是行内代码）。
- * 前面的空白不限（列表里的代码块会缩进）：认错了也只是代码块里的 < 不转义，<at 在代码块里照样转义
- */
-const FENCE_OPEN = /^[ \t]*(`{3,}|~{3,})(.*?)\r?$/;
-const FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*\r?$/;
-
-/** 按 CommonMark 的规则走一行：返回这一行之后还在不在代码块里（fence 是开头那串符号），以及这一行是不是代码块的开头或结尾 */
-function nextFence(fence: string | undefined, line: string): { fence: string | undefined; marker: boolean } {
-  if (fence) {
-    const close = FENCE_CLOSE.exec(line)?.[1];
-    return close && close[0] === fence[0] && close.length >= fence.length ? { fence: undefined, marker: true } : { fence, marker: false };
-  }
-  const open = FENCE_OPEN.exec(line);
-  if (open && !(open[1][0] === "`" && open[2].includes("`"))) {
-    return { fence: open[1], marker: true };
-  }
-  return { fence: undefined, marker: false };
-}
-
-/**
  * 回答里的 < 转义：卡片会把 <at>、<font> 当成标签，工具结果里冒充的 <at id=all></at> 会变成 @所有人。
+ * 代码块外只放过模型用来标风险的 <font color>、<text_tag color>（见 richCardLine），标题降到 ####。
  * 代码块里照原样显示（代码里 < 很常见），只把 <at 转义，万一飞书在代码块里也认 @ 也不会变成 @。
  * > 不转义：只转 < 标签就不成立了，> 开头的引用照常显示
  */
@@ -221,7 +228,10 @@ function escapeAnswer(text: string): string {
       const inCode = fence !== undefined;
       const next = nextFence(fence, line);
       fence = next.fence;
-      return inCode && !next.marker ? line.replace(/<(\/?at\b)/gi, "&lt;$1") : line.replace(/</g, "&lt;");
+      if (inCode && !next.marker) {
+        return line.replace(/<(\/?at\b)/gi, "&lt;$1");
+      }
+      return next.marker ? line.replace(/</g, "&lt;") : richCardLine(line);
     })
     .join("\n");
 }
@@ -278,7 +288,7 @@ export function visibleThought(text: string): string {
 export function renderPlainProgressCard(state: ProgressState, now = Date.now(), { streaming }: CardOptions = {}): object {
   const elements: object[] = [{ tag: "markdown", content: [summaryLine(state, now), ...stepLines(state.steps)].join("\n") }];
   if (streaming && state.answer) {
-    elements.push(answerElement(state.answer));
+    elements.push(answerElement(finalText(state)));
   }
   return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
 }

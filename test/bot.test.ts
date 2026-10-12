@@ -1460,6 +1460,49 @@ test("引用了没查到的代码位置被拦下时，卡片上的思考也去�
   assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|user\.go/);
 });
 
+test("回答里用 <font>、<text_tag> 包着没查到的代码位置照样拦", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const tagged = "问题在 <text_tag color='red'>高风险</text_tag> <font color='red'>src/user.go</font>:99";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: tagged, finish: "stop" },
+    { text: tagged, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  // 打回时说的是去掉标签以后的 src/user.go:99
+  assert.match(JSON.stringify(requests.at(-1)!.messages), /src\/user\.go:99/);
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+});
+
+test("写歪的标签卡片照原文显示，里面夹的没查到的代码位置也要拦", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const tagged = "问题在 <font data-x='src/user.go:99'>这里</font>";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: tagged, finish: "stop" },
+    { text: tagged, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  assert.match(JSON.stringify(requests.at(-1)!.messages), /src\/user\.go:99/);
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+});
+
 test("打回重做以后通过了：被打回的那一轮的思考不留在卡片上，前面几轮的照样留", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
@@ -2866,6 +2909,122 @@ test("卡片即回答：回答太长时卡片里只放开头，全文另外发�
   assert.match(kit.last().body.elements.at(-1).content, /回答较长，全文另外发在下面/);
   assert.equal(markdowns(sent).join("\n"), long);
   assert.deepEqual(answers.saved, []);
+});
+
+test("卡片即回答：提示词里允许表格、小标题和彩色标签；没用流式卡片时还是说不渲染表格", async () => {
+  const kit = fakeCardKit();
+  const rich = fakeModel(() => ({ text: "好的", finish: "stop" }));
+  await setup({ model: rich.model, cardKit: kit.api, streamIntervalMs: 0 }).handle(message("你好"));
+  assert.match(rich.requests[0].system, /表格/);
+  assert.match(rich.requests[0].system, /<text_tag color='red'>高风险<\/text_tag>/);
+  assert.doesNotMatch(rich.requests[0].system, /不渲染表格/);
+
+  const plain = fakeModel(() => ({ text: "好的", finish: "stop" }));
+  await setup({ model: plain.model }).handle(message("你好"));
+  assert.match(plain.requests[0].system, /飞书消息不渲染表格，需要对比时用列表/);
+  assert.doesNotMatch(plain.requests[0].system, /text_tag/);
+});
+
+test("卡片即回答：回答太长另外发全文时，表格改成列表、标签去掉", async () => {
+  const kit = fakeCardKit();
+  const rows = Array.from({ length: 200 }, (_, i) => `| pod-${i} | <font color='red'>${i}%</font> |`);
+  const long = ["<text_tag color='red'>高风险</text_tag> 结论", "| Pod | CPU |", "|---|---|", ...rows].join("\n");
+  const { model } = fakeModel(() => ({ text: long, finish: "stop" }));
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0 });
+
+  await handle(message("列一下所有 Pod 的 CPU"));
+
+  const posted = markdowns(sent).join("\n");
+  assert.match(posted, /^高风险 结论\n- \*\*pod-0\*\*：CPU 0%\n- \*\*pod-1\*\*：CPU 1%/);
+  assert.doesNotMatch(posted, /<font|text_tag|\|---/);
+  assert.match(kit.last().body.elements.at(-1).content, /<text_tag color='red'>高风险<\/text_tag>/);
+});
+
+test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时换成文字", async () => {
+  const metrics: Tool = {
+    spec: { name: "aiops_query_metrics_range", description: "查指标趋势", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查指标趋势",
+    run: async () => '{"series":[{"pod":"pod-a","values":[["19:00","0.412"],["19:05","0.39"]]}]}',
+  };
+  const chart = (data: string) =>
+    `\`\`\`chart\n{"type":"line","title":"pod-a CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[${data}]}]}\n\`\`\``;
+  const answerWith = (data: string) => `结论：CPU 正常\n\`\`\`kpi\n[{"label":"CPU 最高","value":"41%","level":"ok"},{"label":"内存","value":"88%"}]\n\`\`\`\n${chart(data)}`;
+  const run = async (data: string, withCard: boolean) => {
+    const kit = fakeCardKit();
+    const warnings: string[] = [];
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_metrics_range", arguments: "{}" }] },
+      { text: answerWith(data), finish: "stop" },
+    ];
+    const { model } = fakeModel(() => results.shift()!);
+    const context = fakeContext();
+    const saved: string[] = [];
+    const recorded: string[] = [];
+    const { sent, handle } = setup({
+      model,
+      ...(withCard ? { cardKit: kit.api } : {}),
+      streamIntervalMs: 0,
+      mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined },
+      logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+      context: context.source,
+      cardAnswers: { save: async (_chat, _thread, _card, answer) => void saved.push(answer) },
+      recentThreads: { record: async (_chat, _thread, turn) => void recorded.push(turn.answer), list: async () => [] },
+    });
+    await handle(message("看看 pod-a 最近的 CPU"));
+    return { kit, sent, warnings, remembered: [...context.remembered.map((turn) => turn.answer), ...saved, ...recorded] };
+  };
+
+  const ok = await run("41.2,39", true);
+  const elements = ok.kit.last().body.elements;
+  assert.deepEqual(
+    elements.slice(1).map((e: any) => e.tag),
+    ["markdown", "column_set", "chart"],
+  );
+  // 内存 88% 查不到：这个数字卡片不放
+  assert.equal(elements[2].columns.length, 1);
+  assert.match(ok.warnings.join("\n"), /数字卡片「内存 88%」在查询结果里找不到/);
+  assert.deepEqual(markdowns(ok.sent), []);
+  // 记下来的回答（话题上下文、卡片里的回答、最近话题）也是核对过的：对不上的 88% 后面的提问看不到
+  assert.deepEqual(ok.remembered, Array(3).fill("结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"));
+
+  const made = await run("41.2,55", true);
+  assert.doesNotMatch(JSON.stringify(made.kit.last()), /"tag":"chart"/);
+  assert.match(JSON.stringify(made.kit.last()), /图「pod-a CPU」里有数和这次查到的结果对不上，没画出来/);
+  assert.match(made.warnings.join("\n"), /图「pod-a CPU」有 1 个数在查询结果里找不到（如 55）/);
+
+  const plain = await run("41.2,39", false);
+  assert.deepEqual(markdowns(plain.sent), ["结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"]);
+});
+
+test("记忆工具结果里的数是模型自己写的，不算查到的数：先记「CPU 99%」再画 99% 的数字卡片不行", async () => {
+  const kit = fakeCardKit();
+  const warnings: string[] = [];
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: "c1", name: "memory_save", arguments: JSON.stringify({ content: "union CPU 最高 99%", kind: "background" }) }],
+    },
+    { text: '结论\n```kpi\n[{"label":"CPU 最高","value":"99%"}]\n```', finish: "stop" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    memory: await memoryStore(),
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+  });
+
+  await handle(message("union 的 CPU 怎么样"));
+
+  const elements = kit.last().body.elements;
+  // 记忆这一步本身成功了（卡片上有这一步），但它写进去的数不能拿来证明卡片
+  assert.match(JSON.stringify(elements[0]), /记住：union CPU 最高 99%/);
+  assert.doesNotMatch(JSON.stringify(elements[0]), /❌/);
+  assert.deepEqual(elements.slice(1).map((e: any) => e.tag), ["markdown"]);
+  assert.doesNotMatch(JSON.stringify(elements.slice(1)), /99%/);
+  assert.match(warnings.join("\n"), /数字卡片「CPU 最高 99%」在查询结果里找不到/);
 });
 
 test("卡片即回答：停止时卡片标成已停止，不留草稿，不发回答", async () => {

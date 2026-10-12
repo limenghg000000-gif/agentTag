@@ -6,7 +6,8 @@ import { imageKeysOf } from "./feishu.js";
 import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
-import { splitMarkdown } from "./markdown.js";
+import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
+import { type AnswerSegment, hasUiBlocks, keepVerified, NumberEvidence, segmentsAsText, splitAnswer } from "./rich-ui.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   answerFitsCard,
@@ -24,7 +25,7 @@ import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { createMemoryTools } from "./tools/memory.js";
-import { createRecentThreadsTool } from "./tools/recent-threads.js";
+import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
@@ -260,6 +261,10 @@ async function runTask(
   let result: AgentResult | undefined;
   let source = "none";
   let memoryCount: number | undefined;
+  // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
+  const evidence: ToolEvidence[] = [];
+  // 核对过的回答（拆成段）：回答定下来时就核对，记下来的、显示的都用它
+  let segments: AnswerSegment[] | undefined;
   try {
     if (!(await task.waitTurn())) {
       throw new Error("stopped while queued");
@@ -291,7 +296,6 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
-    const evidence: ToolEvidence[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
     const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
@@ -325,7 +329,12 @@ async function runTask(
           evidence.push(
             code
               ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
-              : { tool: tool.spec.name, output: seenByModel(output, limit), ...(mcpNames.has(tool.spec.name) ? { links: true } : {}) },
+              : {
+                  tool: tool.spec.name,
+                  output: seenByModel(output, limit),
+                  ...(mcpNames.has(tool.spec.name) ? { links: true } : {}),
+                  ...(tool.writes || MODEL_ECHO_TOOLS.has(tool.spec.name) ? { echo: true } : {}),
+                },
           );
           return output;
         },
@@ -386,6 +395,7 @@ async function runTask(
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
+        richText: streaming,
       }),
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
@@ -394,9 +404,10 @@ async function runTask(
       ...(reviews.length > 0
         ? {
             // 几项检查都没过时一起告诉模型：重做只有一次，只说一项的话，另一项重做后就没人查了
+            // 按显示出来的文字检查：<font>、<text_tag> 标签去掉
             review: (answer: string, usedTools: ReadonlySet<string>) =>
               reviews
-                .map((review) => review(answer, usedTools))
+                .map((review) => review(stripRichTags(answer), usedTools))
                 .filter(Boolean)
                 .join("\n") || undefined,
           }
@@ -447,8 +458,10 @@ async function runTask(
       },
     });
     answer = toReply(result.text, result.finish);
+    // 最后一道检查也按显示出来的文字看：<font>、<text_tag> 标签去掉
+    const shown = stripRichTags(result.text);
     let blockedCode = false;
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
+    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
@@ -457,7 +470,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${result.text}`, repos);
+      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -468,7 +481,7 @@ async function runTask(
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
-      const unseen = unseenCodeCitations(result.text, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
+      const unseen = unseenCodeCitations(shown, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
@@ -482,12 +495,16 @@ async function runTask(
       state.thoughts = undefined;
     }
     state.phase = "done";
-    deps.context.remember(msg, prompt, answer);
+    // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画；记下来的也是核对过的（对不上的数后面的提问不能再看到）
+    segments = verifiedSegments(answer, evidence, logger, msg.messageId);
+    const verified = segmentsAsText(segments);
+    deps.context.remember(msg, prompt, verified);
     // 被拦下、被审核拦下的回答里没有结论，不记
     if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
-      await rememberThread(deps, msg, asked, answer, context.askerName);
+      await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
+    segments = undefined;
     if (task.signal.aborted) {
       state.phase = "stopped";
     } else {
@@ -507,18 +524,21 @@ async function runTask(
   state.live = undefined;
   state.answerNote = undefined;
   state.answer = answer;
+  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId));
+  state.answerSegments = displayed;
+  const displayedText = segmentsAsText(displayed);
   try {
     const landed = await card?.finish(render(), renderPlainProgressCard(state, now(), { streaming }));
     if (answer !== undefined) {
-      if (streaming && landed && cardMessageId && answerFitsCard(answer)) {
-        await rememberCardAnswer(deps, msg, cardMessageId, answer);
+      if (streaming && landed && cardMessageId && answerFitsCard(displayedText)) {
+        await rememberCardAnswer(deps, msg, cardMessageId, displayedText);
         // 更新卡片不发通知：等得久的（排队加处理）补一句，提问人才知道处理完了
         if (state.endedAt - askedAt >= NOTIFY_AFTER_MS) {
           await reply(CARD_DONE_NOTICE);
         }
       } else {
         // 没用流式卡片、卡片最后没更新上、或者回答太长卡片里只放了开头：和以前一样另外发全文
-        for (const chunk of splitMarkdown(answer, CHUNK_CHARS)) {
+        for (const chunk of splitMarkdown(toPostMarkdown(displayedText), CHUNK_CHARS)) {
           await reply(chunk);
         }
       }
@@ -531,6 +551,22 @@ async function runTask(
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
+}
+
+/** 拆出回答里的图和数字卡片，数对不上查询结果的去掉；去掉了什么、哪些块格式不对写日志 */
+function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string): AnswerSegment[] {
+  const { segments, invalid } = splitAnswer(answer);
+  if (invalid.length > 0) {
+    logger.warn(`回答里的 ${invalid.join("、")} 块格式不对，没画 message=${messageId}`);
+  }
+  if (!hasUiBlocks(segments)) {
+    return segments;
+  }
+  const checked = keepVerified(segments, new NumberEvidence(evidence.flatMap((item) => (item.output === undefined || item.echo ? [] : [item.output]))));
+  if (checked.dropped.length > 0) {
+    logger.warn(`回答里的图、数字卡片对不上查询结果，没画 message=${messageId}：${checked.dropped.join("；")}`);
+  }
+  return checked.segments;
 }
 
 /** 记下这个话题的问答，之后别的话题用 chat_recent_threads 查。记不下只是别的话题查不到这次，不影响这次回答 */
@@ -841,11 +877,19 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
   return [...cites.values()];
 }
 
+/**
+ * 结果里的内容是模型自己写进去的工具：记忆（记的、查的都是之前模型写的）、最近话题（之前的回答）。
+ * 它们结果里的数不算查到的数：模型先记一句「CPU 99%」，不能再拿回执里的 99 去画图
+ */
+const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
+
 /** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact），别的工具是模型看到的原文 */
 export interface ToolEvidence {
   tool: string;
   output?: string;
   facts?: readonly CodeFact[];
+  /** 结果里的内容是模型自己写进去的（写操作的回执、记忆、之前的回答）：里面的数不能当图和数字卡片的依据 */
+  echo?: boolean;
   /** output 里的代码永久链接（见 codeLinks）算查到的代码：MCP 服务的结果是，网页、搜索结果不是 */
   links?: boolean;
 }

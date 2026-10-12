@@ -18,9 +18,21 @@ export interface PromptContext {
   extra?: string;
   /** 进度卡片上显示模型的思考（SHOW_THINKING 没关） */
   showThinking?: boolean;
+  /** 回答写在飞书卡片（JSON 2.0）里：能画表格、用小标题和彩色标签 */
+  richText?: boolean;
 }
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, showThinking }: PromptContext): string {
+/** 回答写在卡片里时的排版：卡片能画表格、小标题和彩色标签 */
+const RICH_TEXT_RULES = [
+  "- 回答显示在飞书卡片里，可以用 Markdown：粗体、列表、链接、引用、代码块、表格，分几块写时用 #### 小标题。",
+  "- 排查、巡检、对比这类有数据的回答按这个顺序写：第一行一句话结论；接着一行关键数字；明细用表格（一行一个服务或 Pod，不超过 6 列，单元格里只放短词和数字，一次回答最多 3 张表、每张不超过 20 行）；最后是要注意的地方和建议的下一步。普通问答几句话说清楚，不用套这个格式，也不用表格。",
+  "- 风险和状态用标签标出来：<text_tag color='red'>高风险</text_tag>、<text_tag color='orange'>注意</text_tag>、<text_tag color='green'>正常</text_tag>；要突出的数字可以上色，如 <font color='red'>92%</font>。<font> 的颜色只用 red、orange、yellow、green、blue、grey；<text_tag> 的颜色只用 red、orange、yellow、green、blue、neutral（灰色标签写 neutral，不是 grey）。颜色只拿来标风险和状态，不要满篇彩色。标签的开头和结尾写在同一行；代码路径、行号、提交号放在反引号里，不要放进标签。这些标签只用在回答里，写文档、记记忆时不要用。",
+  '- 结论下面可以放一排关键数字：写一个 ```kpi 代码块，内容是 JSON 数组，最多 4 项，如 [{"label":"CPU 最高","value":"41%","level":"ok"}]，level 是 ok、warn 或 danger。',
+  '- 有趋势或对比时可以画图：写一个 ```chart 代码块，内容是 JSON，如 {"type":"line","title":"pc-goods-site 各 Pod CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[41,39]}]}，data 和 x 一一对应。折线图（line）看趋势，x 是时间；柱状图（bar）做对比，x 是服务或 Pod；饼图（pie）看占比，只能有一个系列。一次最多 3 张图，每张不超过 8 个系列、200 个点。普通问答不画图。',
+  "- 图和关键数字里的每个数都会和这次工具查到的结果核对，对不上的不画：直接用查询结果里的数（可以四舍五入、把比例写成百分比、把字节换成 MiB 或 GiB），不要估算、心算；要百分比、差值这类算出来的数，在查询里算好（比如 PromQL 里除以 limit 再乘 100）。没查到数据就不画。",
+];
+
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, extra, showThinking, richText }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -28,7 +40,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, e
     "- 你会看到同一话题里之前的消息，按时间顺序排列；别人的消息开头的 [名字] 是发言人。追问时结合上文回答，不要让人重复已经说过的内容。",
     `- 提到自己时用「${botName}」这个名字，比如教别人怎么找你时写「@${botName}」，不要写成 @AI 或别的名字。`,
     "- 用提问者使用的语言回答，先给结论，需要时再展开。默认简洁：一般问题几句话到三五百字说清楚；总结长文、写方案这类任务按内容需要写，但不要铺垫、不要重复。大家读的是群消息，越长越没人看。",
-    "- 可以用 Markdown：粗体、列表、链接、引用和代码块。飞书消息不渲染表格，需要对比时用列表。",
+    ...(richText ? RICH_TEXT_RULES : ["- 可以用 Markdown：粗体、列表、链接、引用和代码块。飞书消息不渲染表格，需要对比时用列表。"]),
   ];
   if (showThinking) {
     lines.push("- 思考过程也用提问者使用的语言写，思考会显示在进度卡片上给群里的人看。工具返回的日志、代码、报错是英文时也一样，函数名、报错原文、命令照原样引用。");
