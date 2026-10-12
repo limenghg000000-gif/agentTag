@@ -188,9 +188,12 @@ function clipAnswer(answer: string): string {
   return `${head}${open ? `\n${open}` : ""}\n\n${ANSWER_CONTINUED}`;
 }
 
-/** 代码块开头：行首最多 3 个空格，3 个以上反引号或波浪号；反引号开头的后面不能再有反引号（```x``` 是行内代码） */
-const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+/**
+ * 代码块开头：3 个以上反引号或波浪号；反引号开头的后面不能再有反引号（```x``` 是行内代码）。
+ * 前面的空白不限（列表里的代码块会缩进）：认错了也只是代码块里的 < 不转义，<at 在代码块里照样转义
+ */
+const FENCE_OPEN = /^[ \t]*(`{3,}|~{3,})(.*?)\r?$/;
+const FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*\r?$/;
 
 /** 按 CommonMark 的规则走一行：返回这一行之后还在不在代码块里（fence 是开头那串符号），以及这一行是不是代码块的开头或结尾 */
 function nextFence(fence: string | undefined, line: string): { fence: string | undefined; marker: boolean } {

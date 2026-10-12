@@ -53,6 +53,7 @@ test("文件坏了时挪到 .bad 留着，从空的重新记", async () => {
 
   assert.deepEqual([...(await store.get("oc_2", ["om_1"]))], []);
   await store.save("oc_2", "om_2", "新的");
-  assert.equal(await readFile(path.join(dir, "oc_2.json.bad"), "utf8"), "{坏了");
+  const [bad] = (await readdir(dir)).filter((name) => /^oc_2\.json\.\d+\.bad$/.test(name));
+  assert.equal(await readFile(path.join(dir, bad), "utf8"), "{坏了");
   assert.deepEqual([...(await new CardAnswerStore(dir).get("oc_2", ["om_2"]))], [["om_2", "新的"]]);
 });

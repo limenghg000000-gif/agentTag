@@ -431,7 +431,7 @@ test("流式读到一半被停止时报中止，不把写了一半的内容当�
 
   responses.push({ status: 200, sse: [chunk({ content: "写到一半" })], done: false });
   await assert.rejects(model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), (err: Error) => {
-    return err instanceof LlmError && err.kind === "api" && /没有正常结束/.test(err.message);
+    return err instanceof LlmError && err.kind === "connection" && /没有正常结束/.test(err.message);
   });
 });
 

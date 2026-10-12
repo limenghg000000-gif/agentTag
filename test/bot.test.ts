@@ -2650,7 +2650,7 @@ function fakeCardKit(create: () => Promise<string> = async () => "card_1") {
   return { api, created, calls, shown, last };
 }
 
-/** 模型边生成边回调：按 deltas 依次报到目前为止的思考和正文，每报一次等卡片推一下 */
+/** 模型边生成边回调：按 deltas 依次报到目前为止的思考和正文。每轮开头和每报一次都等卡片推一下 */
 function streamingModel(rounds: { deltas: { reasoning?: string; text?: string }[]; result: ChatResult }[]) {
   const requests: ChatRequest[] = [];
   const model: ChatModel = {
@@ -2658,6 +2658,7 @@ function streamingModel(rounds: { deltas: { reasoning?: string; text?: string }[
     async chat(req) {
       requests.push(req);
       const round = rounds.shift()!;
+      await new Promise((resolve) => setTimeout(resolve, 5));
       for (const delta of round.deltas) {
         req.onDelta?.({ reasoning: delta.reasoning ?? "", text: delta.text ?? "" });
         await new Promise((resolve) => setTimeout(resolve, 2));
@@ -2800,7 +2801,7 @@ test("卡片即回答：停止时卡片标成已停止，不留草稿，不发�
   assert.doesNotMatch(cardText(kit.last()), /草稿/);
 });
 
-test("卡片即回答：任务跑了 1 分钟以上，回答写完后在话题里补一句提醒；卡片建好了只是发不出去时下次照样试", async () => {
+test("卡片即回答：等了 1 分钟以上，写完后在话题里补一句提醒；流式卡片发不出去、原来的卡片发得出去时先停用流式卡片", async () => {
   let clock = 0;
   const kit = fakeCardKit();
   const { model } = fakeModel(() => {
@@ -2809,10 +2810,10 @@ test("卡片即回答：任务跑了 1 分钟以上，回答写完后在话题�
   });
   const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0, now: () => clock });
   await handle(message("查一下"));
-  assert.deepEqual(markdowns(sent), ["回答好了，在上面的卡片里。"]);
+  assert.deepEqual(markdowns(sent), ["处理完了，结果在上面的卡片里。"]);
   assert.equal(kit.last().body.elements.at(-1).content, "查完了");
 
-  // 发消息失败：这次用原来的进度卡片、另外发回答，下次照样建流式卡片
+  // 只有流式卡片发不出去：这次用原来的进度卡片、另外发回答，之后 10 分钟不建流式卡片
   let failSend = true;
   const kit2 = fakeCardKit();
   const sent2: Sent[] = [];
@@ -2830,6 +2831,20 @@ test("卡片即回答：任务跑了 1 分钟以上，回答写完后在话题�
   });
   await handle2(message("你好"));
   await handle2(message("再问", { messageId: "om_2" }));
-  assert.equal(kit2.created.length, 2);
-  assert.deepEqual(markdowns(sent2), ["**答案**"]);
+  assert.equal(kit2.created.length, 1);
+  assert.deepEqual(markdowns(sent2), ["**答案**", "**答案**"]);
+
+  // 消息全都发不出去（和卡片无关）：不停用流式卡片
+  const kit3 = fakeCardKit();
+  const { handle: handle3 } = setup({
+    cardKit: kit3.api,
+    streamIntervalMs: 0,
+    send: async () => {
+      throw new Error("network");
+    },
+  });
+  // 回答也发不出去，处理函数照旧报错
+  await assert.rejects(handle3(message("你好")), /network/);
+  await assert.rejects(handle3(message("再问", { messageId: "om_2" })), /network/);
+  assert.equal(kit3.created.length, 2);
 });

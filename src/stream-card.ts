@@ -113,7 +113,7 @@ export class StreamingCard implements ProgressCard {
       await this.setStreaming(false);
     }
     for (const candidate of fallback ? [card, fallback] : [card]) {
-      if (await this.replace(candidate)) {
+      if (await this.replace(candidate, true)) {
         return true;
       }
     }
@@ -142,7 +142,7 @@ export class StreamingCard implements ProgressCard {
   }
 
   private async apply(card: object): Promise<void> {
-    const wanted = (card as CardJson).config?.streaming_mode === true && !this.elementsBroken;
+    const wanted = this.wantsStreaming(card);
     if (wanted && layoutOf(card) === this.layout) {
       if (!this.streaming && !(await this.setStreaming(true))) {
         this.elementsBroken = true;
@@ -168,23 +168,40 @@ export class StreamingCard implements ProgressCard {
     if (this.streaming) {
       await this.setStreaming(false);
     }
-    if ((await this.replace(card)) && wanted && !(await this.setStreaming(true))) {
+    const pushed = await this.replace(card);
+    if (pushed && this.wantsStreaming(pushed) && !(await this.setStreaming(true))) {
       this.elementsBroken = true;
     }
   }
 
-  /** 全量更新。卡片里的 streaming_mode 换成卡片现在实际的状态，开关只通过 settings 改 */
-  private async replace(card: object): Promise<boolean> {
+  private wantsStreaming(card: object): boolean {
+    return (card as CardJson).config?.streaming_mode === true && !this.elementsBroken;
+  }
+
+  /**
+   * 全量更新，返回推上去的卡片（失败、不推时为空）。卡片里的 streaming_mode 换成卡片现在实际的状态，开关只通过 settings 改。
+   * 等间隔的时候来了更新的，推最新的那张；等完已经结束了就不推，马上要推最终的卡片（final 是最终卡片）
+   */
+  private async replace(card: object, final = false): Promise<object | undefined> {
+    await this.wait(this.lastFullAt + this.fullIntervalMs);
+    if (!final) {
+      if (this.closed) {
+        return undefined;
+      }
+      if (this.pending) {
+        card = this.pending;
+        this.pending = undefined;
+      }
+    }
     const json = card as CardJson;
     const body = { ...json, config: { ...json.config, streaming_mode: this.streaming } };
-    await this.wait(this.lastFullAt + this.fullIntervalMs);
     this.lastFullAt = Date.now();
-    const ok = await this.call("更新卡片", (sequence) => this.api.update(this.cardId, body, sequence));
-    if (ok) {
-      this.layout = layoutOf(card);
-      this.texts = textsOf(card);
+    if (!(await this.call("更新卡片", (sequence) => this.api.update(this.cardId, body, sequence)))) {
+      return undefined;
     }
-    return ok;
+    this.layout = layoutOf(card);
+    this.texts = textsOf(card);
+    return card;
   }
 
   private async setStreaming(on: boolean): Promise<boolean> {

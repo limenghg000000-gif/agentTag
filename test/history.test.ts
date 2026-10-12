@@ -167,7 +167,7 @@ test("卡片即回答：机器人的卡片记过回答的换成回答，没记�
     item("om_card_1", { fromBot: true, msgType: "interactive", content: "请升级至最新版本客户端" }),
     item("om_card_old", { fromBot: true, msgType: "interactive", content: "✅ 已完成" }),
     item("om_answer_old", { fromBot: true, content: "以前另外发的回答" }),
-    item("om_notice", { fromBot: true, msgType: "post", content: "回答好了，在上面的卡片里。" }),
+    item("om_notice", { fromBot: true, msgType: "post", content: "处理完了，结果在上面的卡片里。" }),
     item("om_3", { createTime: 3000 }),
   ]);
   const asked: { chatId: string; ids: readonly string[] }[] = [];

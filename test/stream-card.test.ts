@@ -147,3 +147,24 @@ test("全量更新失败时下一次照样全量推最新的；结束时最终�
   const { api: api2 } = fakeKit((call) => call.op === "update" && call.texts.answer === "最终");
   assert.equal(await new StreamingCard(api2, "card_2", card(false, {}), quiet, 0, 0).finish(card(false, { answer: "最终" }), card(false, { answer: "简单" })), true);
 });
+
+test("全量更新至少隔 fullIntervalMs：等的时候来了新的推最新的；等的时候结束了就不推旧的，直接推最终卡片", async () => {
+  const { api, calls } = fakeKit();
+  const streaming = new StreamingCard(api, "card_1", card(false, { status: "a" }), quiet, 0, 50);
+  const shown = () => calls.map((call) => (call.op === "update" ? call.texts.status : call.op));
+
+  streaming.update(card(false, { status: "b" }));
+  await settle();
+  streaming.update(card(false, { status: "c" }));
+  await settle();
+  streaming.update(card(false, { status: "d" }));
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(shown(), ["b", "d"]);
+
+  streaming.update(card(false, { status: "e" }));
+  await settle();
+  const startedAt = Date.now();
+  assert.equal(await streaming.finish(card(false, { status: "最终" })), true);
+  assert.deepEqual(shown(), ["b", "d", "最终"]);
+  assert.ok(Date.now() - startedAt < 200);
+});

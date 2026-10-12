@@ -3,10 +3,10 @@ import type { FeishuApi, ThreadMessage } from "./feishu.js";
 import type { ChatMessage } from "./llm.js";
 
 /**
- * 卡片即回答时，任务跑得久，回答写完后在话题里补这一句，提问人才会收到通知（更新卡片不通知）。
+ * 卡片即回答时，任务跑得久，写完后在话题里补这一句，提问人才会收到通知（更新卡片不通知）。
  * 读话题历史时去掉它：它不是回答，还会让「上一条回答在问话」认不出来
  */
-export const CARD_DONE_NOTICE = "回答好了，在上面的卡片里。";
+export const CARD_DONE_NOTICE = "处理完了，结果在上面的卡片里。";
 
 /** 最多带上话题里最近多少条消息 */
 export const MAX_HISTORY_MESSAGES = 60;

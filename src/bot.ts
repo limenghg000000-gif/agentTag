@@ -199,7 +199,9 @@ async function runTask(
 ): Promise<void> {
   const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
   const task = tasks.create(msg.chatId, threadKeyOf(msg));
-  const state: ProgressState = { phase: task.queued ? "queued" : "thinking", steps: [], startedAt: now() };
+  // 提问的时间：排队的时间也算进「等了多久」
+  const askedAt = now();
+  const state: ProgressState = { phase: task.queued ? "queued" : "thinking", steps: [], startedAt: askedAt };
   // 卡片即回答：回答边生成边写进卡片
   let streaming = false;
   const render = () => renderProgressCard(state, task.id, now(), { streaming });
@@ -207,6 +209,8 @@ async function runTask(
   // 进度卡片发不出去（比如卡片格式被拒）不影响回答，只是看不到进度、不能点停止
   let card: ProgressCard | undefined;
   let cardMessageId: string | undefined;
+  // 流式卡片建好了、消息却发不出去：原来的卡片能发出去的话，问题出在流式卡片上，先停用一阵
+  let streamCardRejected = false;
   if (deps.cardKit && now() >= cardKit.downUntil) {
     const initial = renderProgressCard(state, task.id, now(), { streaming: true });
     let cardId: string | undefined;
@@ -230,8 +234,8 @@ async function runTask(
         cardMessageId = messageId;
         streaming = true;
       } catch (err) {
-        // 卡片建好了只是发消息失败（多半和卡片无关）：这次用原来的进度卡片，下次照样试流式卡片
         logger.error(`发送流式卡片失败，这次用原来的进度卡片 message=${msg.messageId}`, err);
+        streamCardRejected = true;
       }
     }
   }
@@ -239,6 +243,10 @@ async function runTask(
     try {
       const { messageId } = await send(msg.chatId, { card: render() }, { replyTo: msg.messageId, replyInThread: true });
       card = new CardUpdater((next) => updateCard(messageId, next), logger, cardIntervalMs);
+      if (streamCardRejected) {
+        cardKit.downUntil = now() + CARDKIT_RETRY_MS;
+        logger.error(`原来的进度卡片发得出去、流式卡片发不出去，${CARDKIT_RETRY_MS / 60_000} 分钟内先不用流式卡片 message=${msg.messageId}`);
+      }
     } catch (err) {
       logger.error(`发送进度卡片失败 message=${msg.messageId}`, err);
     }
@@ -494,8 +502,8 @@ async function runTask(
     if (answer !== undefined) {
       if (streaming && landed && cardMessageId && answerFitsCard(answer)) {
         await rememberCardAnswer(deps, msg, cardMessageId, answer);
-        // 更新卡片不发通知：跑得久的任务补一句，提问人才知道回答好了
-        if (state.endedAt - state.startedAt >= NOTIFY_AFTER_MS) {
+        // 更新卡片不发通知：等得久的（排队加处理）补一句，提问人才知道处理完了
+        if (state.endedAt - askedAt >= NOTIFY_AFTER_MS) {
           await reply(CARD_DONE_NOTICE);
         }
       } else {

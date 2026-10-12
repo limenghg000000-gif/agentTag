@@ -96,7 +96,7 @@ async function readEntries(file: string): Promise<Map<string, Entry>> {
     data = JSON.parse(text);
   } catch {
     // 文件坏了（比如手改坏了）：挪到一边留着排查，从空的重新记，不然这个群以后每次都记不下
-    await rename(file, `${file}.bad`);
+    await rename(file, `${file}.${Date.now()}.bad`);
     return new Map();
   }
   const entries = new Map<string, Entry>();

@@ -104,7 +104,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   let parallelToolCalls = true;
   let thinkingSupported = true;
   let budgetSupported = true;
-  // 服务不支持流式（stream、stream_options 报 400）时退回非流式，之后都不再流式调用
+  // 服务不支持流式（stream、stream_options 报 400）、改成非流式又成功了，之后都不再流式调用
   let streamSupported = true;
   type Extra = { enable_thinking?: boolean; thinking_budget?: number };
   type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
@@ -154,8 +154,10 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
           : {}),
       };
       let raw: RawReply;
+      // 流式请求被说不支持流式（400）时，这次改成非流式再试
+      let fallback = false;
       for (;;) {
-        const streamed = onDelta !== undefined && streamSupported;
+        const streamed = onDelta !== undefined && streamSupported && !fallback;
         try {
           raw = streamed
             ? await readStream(
@@ -166,11 +168,14 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
                 signal,
               )
             : fromCompletion(await create(body, thinking, (request) => client.chat.completions.create(request, { signal })));
+          if (fallback) {
+            warn(`模型服务不支持流式输出，改成非流式成功了，之后不再流式调用，卡片上等整轮生成完再显示`);
+            streamSupported = false;
+          }
           break;
         } catch (err) {
-          if (streamed && err instanceof OpenAI.BadRequestError && /\bstream/i.test(err.message)) {
-            warn(`模型服务不支持流式输出（${err.message}），之后不再流式调用，卡片上等整轮生成完再显示`);
-            streamSupported = false;
+          if (streamed && err instanceof OpenAI.BadRequestError && STREAM_UNSUPPORTED.test(err.message)) {
+            fallback = true;
             continue;
           }
           // 百炼对输入输出做内容审核，不通过时返回 data_inspection_failed：输入在请求时就是 400，流式输出到一半被拦时是流里的一条错误
@@ -202,6 +207,10 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
     },
   };
 }
+
+/** 服务说不认流式参数的 400：stream_options，或者 stream 和「不支持」「不认识」这类词在同一句里 */
+const STREAM_UNSUPPORTED =
+  /stream_options|\bstream\b[^.\n]*\b(?:not supported|unsupported|unrecognized|unknown|invalid|not allowed)\b|\b(?:not supported|unsupported|unrecognized|unknown|invalid|not allowed)\b[^.\n]*\bstream\b/i;
 
 /** 一次调用拿到的原始结果，流式和非流式整理成一样的再往下处理 */
 interface RawReply {
@@ -269,7 +278,7 @@ async function readStream(
   // 读到一半被停止时，SDK 不报错、直接结束循环：不能把写了一半的内容当成回答
   signal?.throwIfAborted();
   if (!reply.finishReason) {
-    throw new LlmError("api", "模型服务的流式输出没有正常结束（没有 finish_reason），可能中途断开了");
+    throw new LlmError("connection", "模型服务的流式输出没有正常结束（没有 finish_reason），可能中途断开了");
   }
   reply.toolCalls = calls.filter((call) => call && call.name);
   return reply;
