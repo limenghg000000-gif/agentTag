@@ -202,14 +202,15 @@ function parseActions(json: unknown): ActionsBlock | undefined {
 }
 
 /**
- * 按钮上的一句话：去掉尖括号（点了以后这句话会发到话题里，不能变成 @所有人）、合成一行；
+ * 按钮上的一句话：尖括号换成全角（点了以后这句话会发到话题里，不能变成 @所有人）、合成一行；
  * 太长的不要（截断了的问题点了也问不清楚）
  */
 export function actionQuestion(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
-  const question = value.replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
+  // 尖括号换成全角：去掉的话「CPU > 80% 的 Pod」就成了「CPU 80% 的 Pod」；全角的也不会变成 <at> 这类标签
+  const question = value.replace(/</g, "＜").replace(/>/g, "＞").replace(/\s+/g, " ").trim();
   return question && Array.from(question).length <= MAX_ACTION_CHARS ? question : undefined;
 }
 

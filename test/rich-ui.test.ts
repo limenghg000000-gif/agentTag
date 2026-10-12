@@ -306,11 +306,16 @@ test("全角数字、全角 ％、数学减号先换成半角再核对；横轴�
   assert.equal(xs("￥1,000", "1000 39"), "chart");
 });
 
-test("「接着查」按钮：```actions 里的问题去掉尖括号、合成一行，太长的不要，最多 3 个，放在最后", () => {
+test("「接着查」按钮：```actions 里的问题尖括号换成全角、合成一行，太长的不要，最多 3 个，放在最后", () => {
   const actions = JSON.stringify(["union 最近 1 小时的内存趋势", "<at id=all></at>pc-goods-site\n有没有重启过", "union 最近 1 小时的内存趋势", "很".repeat(41), 3, "a", "b"]);
   const { segments, invalid } = splitAnswer(["结论", "```actions", actions, "```"].join("\n"));
   assert.deepEqual(invalid, []);
-  assert.deepEqual(segments[1], { kind: "actions", questions: ["union 最近 1 小时的内存趋势", "at id=all/atpc-goods-site 有没有重启过", "a"] });
+  assert.deepEqual(segments[1], { kind: "actions", questions: ["union 最近 1 小时的内存趋势", "＜at id=all＞＜/at＞pc-goods-site 有没有重启过", "a"] });
+  // 比较符号留着：去掉的话问的就变了
+  assert.deepEqual(splitAnswer('```actions\n["查 CPU > 80% 的 Pod","延迟 < 500ms 的接口"]\n```').segments[0], {
+    kind: "actions",
+    questions: ["查 CPU ＞ 80% 的 Pod", "延迟 ＜ 500ms 的接口"],
+  });
   assert.deepEqual(splitAnswer('```actions\n{"q":"x"}\n```').invalid, ["actions"]);
   assert.deepEqual(splitAnswer('```actions\n["很' + "很".repeat(40) + '"]\n```').invalid, ["actions"]);
 
@@ -329,7 +334,7 @@ test("「接着查」按钮：```actions 里的问题去掉尖括号、合成一
     elements.slice(2).map((el) => [el.tag, el.text.content, el.behaviors[0].value]),
     [
       ["button", "union 最近 1 小时的内存趋势", { action: "ask", q: "union 最近 1 小时的内存趋势" }],
-      ["button", "at id=all/atpc-goods-site 有没有重启过", { action: "ask", q: "at id=all/atpc-goods-site 有没有重启过" }],
+      ["button", "＜at id=all＞＜/at＞pc-goods-site 有没有重启过", { action: "ask", q: "＜at id=all＞＜/at＞pc-goods-site 有没有重启过" }],
       ["button", "a", { action: "ask", q: "a" }],
     ],
   );

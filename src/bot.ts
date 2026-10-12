@@ -312,10 +312,16 @@ async function runTask(
     const recentThreadTools = deps.recentThreads
       ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
       : [];
+    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
+    const followUp = options.readOnly === true;
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
+          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支
+          if (followUp && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+            throw new Error("这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数");
+          }
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
           if (tool.instructionsOnly) {
             return tool.run(args, ctx);
@@ -360,8 +366,6 @@ async function runTask(
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
-    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮）
-    const followUp = options.readOnly === true;
     const readOnly = noPermission || followUp;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
@@ -937,6 +941,9 @@ export function codeContent(output: string, facts: readonly CodeFact[]): string 
     })
     .join("\n");
 }
+
+/** 列分支、切分支的代码工具：点按钮问的不让切（见 runTask 里的 followUp） */
+const BRANCHES_TOOL = "code_branches";
 
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);

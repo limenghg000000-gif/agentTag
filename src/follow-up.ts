@@ -16,7 +16,7 @@ export function followUpText(name: string | undefined, question: string): string
 
 /**
  * 机器人发的一条消息是不是替人接着问的那句：是的话返回谁问的、问了什么。
- * 问题要是按钮上放得下的那种（一行、40 字以内、没有尖括号）：普通回答碰巧以「👉 」开头、写到「接着问：」的，不当成群成员问的
+ * 问题要是按钮上放得下的那种（一行、40 字以内、尖括号是全角的）：普通回答碰巧以「👉 」开头、写到「接着问：」的，不当成群成员问的
  */
 export function parseFollowUp(content: string): { name?: string; question: string } | undefined {
   const match = FOLLOW_UP.exec(content.trim());
@@ -88,7 +88,11 @@ export function createFollowUp({ api, send, handle, logger = console, now = Date
       replyToMessageId: evt.messageId,
       createTime: now(),
     };
-    await handle(msg, { readOnly: true });
+    // 处理出错（回答发不出去）时也不算点过：再点会再发一句「接着问」，总比点了没反应好
+    await handle(msg, { readOnly: true }).catch((err: unknown) => {
+      clicked.delete(key);
+      throw err;
+    });
   };
 
   /** 读出按钮所在的卡片，在它的话题里发「👉 某某 接着问：…」。读不到卡片时返回 undefined */

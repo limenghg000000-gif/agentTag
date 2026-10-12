@@ -92,9 +92,9 @@ test("点「接着查」：同一个按钮 1 分钟内再点（别人点也算�
     await followUp(click(bad), bad);
   }
   assert.equal(sent.length, 3);
-  // 尖括号去掉，不会变成 @所有人
+  // 尖括号换成全角，不会变成 @所有人
   await followUp(click("<at id=all></at>看看"), "<at id=all></at>看看");
-  assert.equal((sent[3].input as { markdown: string }).markdown, "👉 接着问：at id=all/at看看");
+  assert.equal((sent[3].input as { markdown: string }).markdown, "👉 接着问：＜at id=all＞＜/at＞看看");
 });
 
 test("点「接着查」：读卡片、发那句失败了不算点过，再点还能问", async () => {
@@ -136,6 +136,35 @@ test("点「接着查」：读卡片、发那句失败了不算点过，再点�
   // 发出去了才算点过
   await followUp(click("q1"), "q1");
   assert.equal(sent.length, 1);
+});
+
+test("点「接着查」：处理出错（回答发不出去）也不算点过，再点还能问", async () => {
+  let fail = true;
+  const handled: string[] = [];
+  const followUp = createFollowUp({
+    api: {
+      async getMessage(messageId) {
+        return { messageId, fromBot: true, msgType: "interactive", content: "", createTime: 1 };
+      },
+      async listThreadMessages() {
+        return [];
+      },
+    },
+    send: async () => ({ messageId: "om_ask" }) as never,
+    handle: async (msg) => {
+      if (fail) {
+        throw new Error("回答发不出去");
+      }
+      handled.push(msg.content);
+    },
+    logger: quiet,
+    now: () => 10_000,
+  });
+
+  await assert.rejects(followUp(click("q1"), "q1"), /回答发不出去/);
+  fail = false;
+  await followUp(click("q1"), "q1");
+  assert.deepEqual(handled, ["q1"]);
 });
 
 test("替人接着问的那句：写出来、认回去；名字里的 Markdown 符号和尖括号去掉", () => {

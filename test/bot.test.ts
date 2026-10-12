@@ -931,6 +931,29 @@ test("点「接着查」按钮问的只给读的工具（写权限名单里的�
   assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), ["memory_save", "memory_update", "memory_delete"]);
 });
 
+test("点「接着查」按钮问的不能切分支：code_branches 只能列，switch_to 报错", async () => {
+  const runs: unknown[] = [];
+  const branches: Tool = {
+    spec: { name: "code_branches", description: "分支", parameters: { type: "object", properties: {} } },
+    describe: () => "分支",
+    run: async (args) => {
+      runs.push(args);
+      return "master";
+    },
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_branches", arguments: '{"switch_to":"dev"}' }] },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c2", name: "code_branches", arguments: "{}" }] },
+    { text: "好", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({ model, taskTools: () => [branches] });
+
+  await handle(message("dev 分支上 union 的配置"), { readOnly: true });
+  assert.deepEqual(runs, [{}]);
+  assert.match(JSON.stringify(requests[1].messages.at(-1)), /只能查，不能切换分支/);
+});
+
 test("点「接着查」按钮：交给 followUp，不等它跑完；白名单外的群、没配 followUp 时不处理", async () => {
   const { deps } = setup();
   const got: unknown[] = [];

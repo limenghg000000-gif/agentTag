@@ -132,7 +132,11 @@ channel.on("message", async (msg: NormalizedMessage) => {
 const followUp = createFollowUp({
   api: feishuApi,
   send: (to, input, opts) => channel.send(to, input, opts),
-  handle: (msg, options) => handleMessage(msg, options),
+  handle: (msg, options) => {
+    // 和收到的消息一样记进补漏轮询：点按钮可能让一个已经不再跟踪的话题又活了，后面的 @ 漏了事件还能补上
+    catchUp.watch(msg);
+    return handleMessage(msg, options);
+  },
 });
 channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp }));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
