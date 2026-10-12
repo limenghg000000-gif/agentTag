@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type AgentEvent, MAX_TOOL_OUTPUT_CHARS, runAgent } from "../src/agent.js";
-import type { ChatMessage, ChatModel, ChatRequest, ChatResult } from "../src/llm.js";
+import { type AgentEvent, compactToolResults, MAX_TOOL_OUTPUT_CHARS, runAgent } from "../src/agent.js";
+import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import type { Tool } from "../src/tools/tool.js";
 
 function scriptedModel(script: ChatResult[]) {
@@ -190,6 +190,24 @@ test("每轮模型调用和每次工具调用都报告用时，带上模型用�
   }
 });
 
+test("模型返回了思考内容时，这一轮的事件带上它", async () => {
+  const { model } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "先查日志" },
+    { text: "好了", finish: "stop" },
+  ]);
+  const events: AgentEvent[] = [];
+
+  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, now: () => 0, onEvent: (e) => events.push(e) });
+
+  assert.deepEqual(
+    events.filter((e) => e.type === "model"),
+    [
+      { type: "model", round: 1, ms: 0, toolNames: ["echo"], reasoning: "先查日志" },
+      { type: "model", round: 2, ms: 0, toolNames: [] },
+    ],
+  );
+});
+
 test("回答没通过 review 时交回模型重做一次，第二次不再检查", async () => {
   const { model, requests } = scriptedModel([
     { text: "瞎编的答案", finish: "stop" },
@@ -271,4 +289,236 @@ test("调过 thinkAfter 认的工具以后，后面每一轮都打开思考；�
     forced.requests.map((req) => req.thinking),
     [false, false, false, false],
   );
+});
+
+test("steer 返回一段话时，在这一轮工具结果后面加一条用户消息；拿到这一轮的思考和下一轮开不开思考，给出回答的那轮不看", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" }), call("c2", "echo", { text: "b" })], reasoning: "check the logs" },
+    { text: "", finish: "tool_calls", toolCalls: [call("c3", "echo", { text: "c" })] },
+    { text: "好了", finish: "stop", reasoning: "done" },
+  ]);
+  const seen: { reasoning?: string; thinkingNext: boolean }[] = [];
+
+  await runAgent({
+    model,
+    system: "s",
+    messages: user,
+    tools: [echoTool()],
+    signal,
+    steer: (round) => {
+      seen.push(round);
+      return round.reasoning ? "用中文想" : undefined;
+    },
+  });
+
+  // 没指定思考：这一轮返回了思考，下一轮就当开着
+  assert.deepEqual(seen, [{ reasoning: "check the logs", thinkingNext: true }, { thinkingNext: false }]);
+  assert.deepEqual(requests[1].messages.slice(-3), [
+    { role: "tool", toolCallId: "c1", content: "回声：a" },
+    { role: "tool", toolCallId: "c2", content: "回声：b" },
+    { role: "user", content: "用中文想" },
+  ]);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "tool", toolCallId: "c3", content: "回声：c" });
+});
+
+test("steer 的 thinkingNext 跟着这次任务的思考设置走：显式开关照它，调过 thinkAfter 认的工具以后开着", async () => {
+  const script = (): ChatResult[] => [
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c2", "probe", { text: "b" })], reasoning: "想一下" },
+    { text: "好了", finish: "stop" },
+  ];
+  const run = async (extra: { thinking?: boolean; thinkAfter?: (name: string) => boolean }) => {
+    const { model } = scriptedModel(script());
+    const seen: boolean[] = [];
+    await runAgent({
+      model,
+      system: "s",
+      messages: user,
+      tools: [echoTool(), echoTool("probe")],
+      signal,
+      steer: ({ thinkingNext }) => {
+        seen.push(thinkingNext);
+        return undefined;
+      },
+      ...extra,
+    });
+    return seen;
+  };
+
+  assert.deepEqual(await run({}), [false, true]);
+  assert.deepEqual(await run({ thinking: true }), [true, true]);
+  assert.deepEqual(await run({ thinking: false }), [false, false]);
+  assert.deepEqual(await run({ thinkAfter: (name) => name === "echo" }), [true, true]);
+});
+
+test("轮数用完时上一条已经是用户消息（思考提醒）就把收尾提醒并进去，不连着两条用户消息", async () => {
+  const { model, requests } = scriptedModel([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })], reasoning: "check the logs" },
+    { text: "只能先这样答", finish: "stop" },
+  ]);
+
+  await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, maxToolRounds: 1, steer: () => "用中文想" });
+
+  const last = requests[1].messages.slice(-2);
+  assert.deepEqual(
+    last.map((m) => m.role),
+    ["tool", "user"],
+  );
+  assert.match(last[1].content, /^用中文想\n\n工具调用次数已经用完/);
+  // 调用方传进来的消息没被改
+  assert.deepEqual(user, [{ role: "user", content: "帮我做事" }]);
+});
+
+test("stream 打开时把模型的 onDelta 转成这一轮的 delta 事件；不打开时不传 onDelta", async () => {
+  const requests: ChatRequest[] = [];
+  const model: ChatModel = {
+    model: "fake",
+    async chat(req) {
+      requests.push(req);
+      req.onDelta?.({ reasoning: "想", text: "" });
+      req.onDelta?.({ reasoning: "想", text: "答" });
+      return { text: "答", finish: "stop" };
+    },
+  };
+  const events: AgentEvent[] = [];
+
+  await runAgent({ model, system: "s", messages: user, tools: [], signal, stream: true, onEvent: (e) => events.push(e) });
+  await runAgent({ model, system: "s", messages: user, tools: [], signal });
+
+  assert.deepEqual(
+    events.filter((e) => e.type === "delta"),
+    [
+      { type: "delta", round: 1, reasoning: "想", text: "" },
+      { type: "delta", round: 1, reasoning: "想", text: "答" },
+    ],
+  );
+  assert.equal(typeof requests[0].onDelta, "function");
+  assert.equal(requests[1].onDelta, undefined);
+});
+
+/** 按顺序答：Error 就抛出（比如模型服务说输入太长），否则当作这次的结果 */
+function scriptedModelWithErrors(script: (ChatResult | Error)[]) {
+  const requests: ChatRequest[] = [];
+  const model: ChatModel = {
+    model: "fake",
+    async chat(req) {
+      requests.push({ ...req, messages: [...req.messages] });
+      const next = script.shift();
+      assert.ok(next, "模型被多调用了一次");
+      if (next instanceof Error) {
+        throw next;
+      }
+      return next;
+    },
+  };
+  return { model, requests };
+}
+
+const tooLong = () => new LlmError("too_long", "400 Range of input length should be [1, 991808]");
+const big = (n: number) => echoTool(`big${n}`, async () => `${n}`.repeat(5000));
+const toolContents = (req: ChatRequest) => req.messages.filter((m) => m.role === "tool").map((m) => m.content);
+
+test("模型服务说输入太长时，最近 2 轮以前的工具结果压到只留开头再试，最近 2 轮原样留着", async () => {
+  const { model, requests } = scriptedModelWithErrors([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "big1", {})] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c2", "big2", {})] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c3", "big3", {})] },
+    tooLong(),
+    { text: "查完了", finish: "stop" },
+  ]);
+  const events: AgentEvent[] = [];
+
+  const result = await runAgent({ model, system: "s", messages: user, tools: [big(1), big(2), big(3)], signal, onEvent: (e) => events.push(e) });
+
+  assert.equal(result.text, "查完了");
+  assert.equal(requests.length, 5);
+  const [first, second, third] = toolContents(requests[4]);
+  assert.equal(first.slice(0, 2000), "1".repeat(2000));
+  assert.match(first, /只留了开头 2000 字，后面 3000 字已省略；要用后面的内容请重新查/);
+  assert.equal(second, "2".repeat(5000));
+  assert.equal(third, "3".repeat(5000));
+  const compacted = events.filter((e) => e.type === "compacted");
+  assert.deepEqual(compacted, [{ type: "compacted", round: 4, results: 1, chars: 5000 - first.length }]);
+  // 压短只改交给模型的那份，第一次失败的请求里还是原文
+  assert.equal(toolContents(requests[3])[0], "1".repeat(5000));
+});
+
+test("压了较早的还放不下就连最近的也压，再不行只留很短的开头；都压过了还放不下就照原样报错", async () => {
+  const { model, requests } = scriptedModelWithErrors([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "big1", {})] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c2", "big2", {})] },
+    { text: "", finish: "tool_calls", toolCalls: [call("c3", "big3", {})] },
+    tooLong(),
+    tooLong(),
+    tooLong(),
+    tooLong(),
+  ]);
+  const events: AgentEvent[] = [];
+
+  await assert.rejects(
+    runAgent({ model, system: "s", messages: user, tools: [big(1), big(2), big(3)], signal, onEvent: (e) => events.push(e) }),
+    (err) => err instanceof LlmError && err.kind === "too_long",
+  );
+
+  assert.equal(requests.length, 7);
+  assert.deepEqual(
+    toolContents(requests[5]).map((content) => content.match(/只留了开头 (\d+) 字/)?.[1]),
+    ["2000", "2000", "2000"],
+  );
+  assert.deepEqual(
+    toolContents(requests[6]).map((content) => content.match(/只留了开头 (\d+) 字/)?.[1]),
+    ["300", "300", "300"],
+  );
+  assert.deepEqual(
+    events.filter((e) => e.type === "compacted").map((e) => (e as { results: number }).results),
+    [1, 2, 3],
+  );
+});
+
+test("第一轮就说输入太长（还没有工具结果可压）时直接报错，不重试", async () => {
+  const { model, requests } = scriptedModelWithErrors([tooLong()]);
+
+  await assert.rejects(
+    runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal }),
+    (err) => err instanceof LlmError && err.kind === "too_long",
+  );
+  assert.equal(requests.length, 1);
+});
+
+test("别的模型错误照原样抛出，不压缩、不重试", async () => {
+  const { model, requests } = scriptedModelWithErrors([
+    { text: "", finish: "tool_calls", toolCalls: [call("c1", "big1", {})] },
+    new LlmError("api", "500 boom"),
+  ]);
+
+  await assert.rejects(
+    runAgent({ model, system: "s", messages: user, tools: [big(1)], signal }),
+    (err) => err instanceof LlmError && err.kind === "api",
+  );
+  assert.equal(requests.length, 2);
+});
+
+test("压过的结果只会越压越短：下一轮按较松的一档压时，不会把压到 300 字的又放回 2000 字", () => {
+  const conversation: ChatMessage[] = [
+    { role: "user", content: "问" },
+    { role: "assistant", content: "", toolCalls: [call("c1", "a", {})] },
+    { role: "tool", toolCallId: "c1", content: "x".repeat(5000) },
+    { role: "assistant", content: "", toolCalls: [call("c2", "a", {})] },
+    { role: "tool", toolCallId: "c2", content: "y".repeat(5000) },
+    { role: "assistant", content: "", toolCalls: [call("c3", "a", {})] },
+    { role: "tool", toolCallId: "c3", content: "短" },
+  ];
+  const originals = new Map<number, string>();
+  const firstResult = conversation[2];
+
+  assert.equal(compactToolResults(conversation, originals, { keepRounds: 0, headChars: 300 }).results, 2);
+  const tight = conversation[2].content;
+  assert.match(tight, /只留了开头 300 字，后面 4700 字已省略/);
+
+  assert.deepEqual(compactToolResults(conversation, originals, { keepRounds: 2, headChars: 2000 }), { results: 0, chars: 0 });
+  assert.equal(conversation[2].content, tight);
+  assert.equal(conversation[6].content, "短");
+  // 换成新的消息对象，原来那条不改（调用方传进来的消息也可能被别处用着）
+  assert.equal(firstResult.content, "x".repeat(5000));
+  assert.equal(originals.get(2), "x".repeat(5000));
 });

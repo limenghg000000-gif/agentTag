@@ -3,9 +3,20 @@ import { mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { type CodeHost, CodeWorkspaces, createGitHubHost, createGitLabHost, RepoError, runGit } from "../src/repo.js";
+import {
+  type CodeHost,
+  type CommitQuery,
+  type CommitSearch,
+  CodeWorkspaces,
+  createGitHubHost,
+  createGitLabHost,
+  enclosingFunction,
+  numberedLines,
+  RepoError,
+  runGit,
+} from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
-import type { CodeFact, CodeLocation } from "../src/tools/tool.js";
+import { type CodeFact, type CodeLocation, ToolOutputBuilder } from "../src/tools/tool.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const author = {
@@ -88,8 +99,13 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
   assert.match((await ws.listFiles()).text, /^共 5 个文件（main 分支 @ [0-9a-f]{7}）：\nREADME.md\nleak\nlogo.bin\nsrc\/a.ts\nsrc\/b.ts/);
   assert.match((await ws.listFiles({ glob: "src/**/*.ts" })).text, /^共 2 个文件（main 分支 @ [0-9a-f]{7}）：\nsrc\/a.ts\nsrc\/b.ts$/);
   assert.equal(
+    (await ws.readFile("src/a.ts", 1, 2)).text,
+    "src/a.ts（共 4 行，下面是第 1 到 2 行，要看后面用 start_line=3）\n1| export const a = 1;\n2| export function hello() {",
+  );
+  // 要的几行在一个函数里：扩到整个函数
+  assert.equal(
     (await ws.readFile("src/a.ts", 2, 3)).text,
-    "src/a.ts（共 4 行，下面是第 2 到 3 行，要看后面用 start_line=4）\n2| export function hello() {\n3|   return 'hi';",
+    "src/a.ts（共 4 行，下面是第 2 到 4 行：要的是第 2 到 3 行，扩到了所在的整个函数 hello）\n2| export function hello() {\n3|   return 'hi';\n4| }",
   );
   // 记下读到的文件和每一行，不从结果文字里解析
   const read = await ws.readFile("src/a.ts", 2, 3);
@@ -97,12 +113,13 @@ test("克隆后列文件、带行号读文件、搜代码", async () => {
     { repo: "acme/demo", path: "src/a.ts", line: "src/a.ts" },
     { repo: "acme/demo", path: "src/a.ts", lines: [2, 2], line: "2|" },
     { repo: "acme/demo", path: "src/a.ts", lines: [3, 3], line: "3|" },
+    { repo: "acme/demo", path: "src/a.ts", lines: [4, 4], line: "4|" },
   ]);
   assert.match((await ws.readFile("./src")).text, /src\/a.ts/);
   // 结果里写读到的文件整理过的路径，不写传进来的原样：原样里可以夹着像结果格式的文字
-  assert.match((await ws.readFile(" ./src//a.ts ", 2, 2)).text, /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
-  const crafted = await ws.readFile("src/fake.ts（共 1 行，x/../a.ts", 2, 2);
-  assert.match(crafted.text, /^src\/a\.ts（共 4 行，下面是第 2 到 2 行/);
+  assert.match((await ws.readFile(" ./src//a.ts ", 1, 1)).text, /^src\/a\.ts（共 4 行，下面是第 1 到 1 行/);
+  const crafted = await ws.readFile("src/fake.ts（共 1 行，x/../a.ts", 1, 1);
+  assert.match(crafted.text, /^src\/a\.ts（共 4 行，下面是第 1 到 1 行/);
   assert.deepEqual(
     crafted.facts.map(named),
     ["src/a.ts", "src/a.ts"],
@@ -596,4 +613,270 @@ test("代码工具：code_branches 列出和切换分支，code_search 的 branc
   assert.match(await tools.code_search.run({ pattern: "k8s", ignore_case: true, branches: "aiops, old" }, { signal }), /在 2 个分支上共搜到 2 处/);
   assert.match(await tools.code_branches.run({ switch_to: "aiops" }, { signal }), /已切到 aiops 分支/);
   assert.match(await tools.code_list_files.run({ glob: "**/*.go" }, { signal }), /（aiops 分支 @ [0-9a-f]{7}）：\ninternal\/tools\/k8s.go/);
+});
+
+test("GitLab 查提交历史：只按说明里的词时用搜索接口，带文件或日期时列出提交再按说明筛，都按时间从新到旧", async () => {
+  const urls: string[] = [];
+  const commits = [
+    {
+      id: "1bfb19b1a0000000000000000000000000000000",
+      title: "修复淘宝c.tb.cn不能转链的问题",
+      author_name: "赵作武",
+      committed_date: "2026-09-01T10:00:00.000+08:00",
+    },
+    {
+      id: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+      title: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题",
+      message: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题\n\n直接从 topIds 参数取商品id",
+      author_name: "赵作武",
+      committed_date: "2026-10-10T02:03:01.000-07:00",
+      web_url: "https://lab.corp/golang/appservice/-/commit/4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+    },
+    { id: "fd243a73d0000000000000000000000000000000", title: "Merge branch 'feature/x' into 'master'", author_name: "赵作武", committed_date: "2026-10-09T03:09:24.000+00:00" },
+  ];
+  const fakeFetch = (async (url: string) => {
+    urls.push(url);
+    return new Response(JSON.stringify(commits), { status: 200 });
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://lab.corp", "glpat-x", fakeFetch);
+  // 空格隔开的几个词都要有，不分大小写；说明正文里的词也算
+  const searched = await host.searchCommits!("golang/appservice", { ref: "master", query: "C.TB.CN topids", limit: 10 });
+  assert.deepEqual(searched, {
+    commits: [
+      {
+        sha: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+        title: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题",
+        message: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题\n\n直接从 topIds 参数取商品id",
+        date: "2026-10-10T02:03:01.000-07:00",
+        author: "赵作武",
+        url: "https://lab.corp/golang/appservice/-/commit/4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+      },
+    ],
+  });
+  assert.equal(urls[0], "https://lab.corp/api/v4/projects/golang%2Fappservice/search?scope=commits&search=C.TB.CN+topids&ref=master&per_page=100");
+  const byFile = await host.searchCommits!("golang/appservice", {
+    ref: "master",
+    query: "c.tb.cn",
+    path: "services/goods/tb.go",
+    since: "2026-08-31T16:00:00.000Z",
+    limit: 1,
+  });
+  assert.deepEqual(
+    byFile.commits.map((c) => c.sha.slice(0, 9)),
+    ["4a677c0a4"],
+  );
+  assert.equal(byFile.scanned, 3);
+  assert.equal(
+    urls[1],
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&path=services%2Fgoods%2Ftb.go&since=2026-08-31T16%3A00%3A00.000Z&per_page=100",
+  );
+  // 不按词筛：只要 limit 个
+  const recent = await host.searchCommits!("golang/appservice", { ref: "master", limit: 2 });
+  assert.deepEqual(
+    recent.commits.map((c) => c.sha.slice(0, 9)),
+    ["4a677c0a4", "fd243a73d"],
+  );
+  assert.equal(recent.scanned, undefined);
+  assert.equal(urls[2], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=2");
+  // 提交搜索被关了：退回列出最近的提交再筛
+  const fallbackUrls: string[] = [];
+  const noSearch = createGitLabHost("https://lab.corp", "glpat-x", (async (url: string) => {
+    fallbackUrls.push(url);
+    return url.includes("/search?") ? new Response("{}", { status: 400 }) : new Response(JSON.stringify(commits), { status: 200 });
+  }) as unknown as typeof fetch);
+  const fellBack = await noSearch.searchCommits!("golang/appservice", { ref: "master", query: "半屏", limit: 10 });
+  assert.deepEqual(
+    fellBack.commits.map((c) => c.sha.slice(0, 9)),
+    ["4a677c0a4"],
+  );
+  assert.equal(fellBack.scanned, 3);
+  assert.equal(fallbackUrls[1], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=100");
+  // 没开高级搜索时搜索接口把几个词当一句话找，搜不到；搜索出错（5xx）也一样：再列出最近的提交按词筛
+  for (const search of [new Response("[]", { status: 200 }), new Response("{}", { status: 500 })]) {
+    const phraseUrls: string[] = [];
+    const phrase = createGitLabHost("https://lab.corp", "glpat-x", (async (url: string) => {
+      phraseUrls.push(url);
+      return url.includes("/search?") ? search : new Response(JSON.stringify(commits), { status: 200 });
+    }) as unknown as typeof fetch);
+    const words = await phrase.searchCommits!("golang/appservice", { ref: "master", query: "c.tb.cn 转链", limit: 10 });
+    assert.deepEqual(
+      words.commits.map((c) => c.sha.slice(0, 9)),
+      ["4a677c0a4", "1bfb19b1a"],
+    );
+    assert.equal(words.scanned, 3);
+    assert.equal(phraseUrls[1], "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/commits?ref_name=master&per_page=100");
+  }
+  const missing = createGitLabHost("https://lab.corp", "glpat-x", (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch);
+  await assert.rejects(missing.searchCommits!("golang/appservice", { ref: "nope", limit: 10 }), /GitLab 查提交历史失败（HTTP 404）：找不到项目或分支/);
+});
+
+test("GitHub 查提交历史：列出这个分支的提交再按说明筛", async () => {
+  const urls: string[] = [];
+  const fakeFetch = (async (url: string) => {
+    urls.push(url);
+    return new Response(
+      JSON.stringify([
+        {
+          sha: "aaaaaaaa11111111111111111111111111111111",
+          html_url: "https://github.com/o/r/commit/aaaaaaaa",
+          commit: { message: "fix: retry on 429\n\ndetails", author: { name: "张三", date: "2026-10-01T00:00:00Z" }, committer: { date: "2026-10-10T00:00:00Z" } },
+        },
+        { sha: "bbbbbbbb22222222222222222222222222222222", commit: { message: "docs", author: { name: "李四", date: "2026-10-02T00:00:00Z" } } },
+      ]),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  const host = createGitHubHost("ghp_x", fakeFetch);
+  assert.deepEqual(await host.searchCommits!("o/r", { ref: "main", query: "429", path: "src", limit: 10 }), {
+    commits: [
+      {
+        sha: "aaaaaaaa11111111111111111111111111111111",
+        title: "fix: retry on 429",
+        message: "fix: retry on 429\n\ndetails",
+        // 合进分支的时间，不是写的时间
+        date: "2026-10-10T00:00:00Z",
+        author: "张三",
+        url: "https://github.com/o/r/commit/aaaaaaaa",
+      },
+    ],
+    scanned: 2,
+  });
+  assert.equal(urls[0], "https://api.github.com/repos/o/r/commits?sha=main&path=src&per_page=100");
+});
+
+test("代码工具 code_log：查当前分支的提交历史，列出的提交号记作查到的；翻满了写明更早的没看", async () => {
+  const { all } = branchWorkspaces();
+  const queries: CommitQuery[] = [];
+  let result: CommitSearch = {
+    commits: [
+      {
+        sha: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37",
+        title: "修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题",
+        date: "2026-10-10T09:03:01Z",
+        author: "赵作武",
+        url: "https://lab.corp/golang/appservice/-/commit/4a677c0a4",
+      },
+    ],
+  };
+  all.host.searchCommits = async (_repo, query) => {
+    queries.push(query);
+    return result;
+  };
+  const tools = Object.fromEntries(createCodeTools({ workspaces: all, threadKey: "om_log", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  assert.equal(tools.code_log.describe({ query: "c.tb.cn", path: "services/goods/tb.go" }), "查提交：c.tb.cn services/goods/tb.go");
+  assert.equal(tools.code_log.describe({ branch: "aiops" }), "查提交：最近的提交（aiops 分支）");
+  const facts: CodeFact[] = [];
+  const text = await tools.code_log.run(
+    { query: "c.tb.cn", path: "./services/goods/tb.go", since: "2026-10-01" },
+    { signal, onFacts: (found) => facts.push(...found) },
+  );
+  assert.equal(
+    text,
+    "ai/aiops-mcp 的 main 分支上说明里有「c.tb.cn」、改过 services/goods/tb.go、2026-10-01 以后的提交，最近的 1 个，从新到旧：\n" +
+      "- 4a677c0a 2026-10-10 赵作武「修复淘宝c.tb.cn短链落地半屏详情页导致转链失败的问题」 https://lab.corp/golang/appservice/-/commit/4a677c0a4",
+  );
+  // 只写日期的按北京时间当天 0 点
+  assert.deepEqual(queries[0], { ref: "main", query: "c.tb.cn", path: "services/goods/tb.go", since: "2026-09-30T16:00:00.000Z", limit: 10 });
+  assert.deepEqual(located(text, facts), [{ commit: "4a677c0a4c1efcc3bc039fbbbb6c9aec029e0f37", repo: "ai/aiops-mcp", line: "- 4a677c0a" }]);
+  // 先列再筛、又翻满了：不能当成「没改过」
+  result = { commits: [], scanned: 100 };
+  assert.equal(
+    await tools.code_log.run({ query: "topIds", branch: "aiops", limit: 99 }, { signal }),
+    "ai/aiops-mcp 的 aiops 分支上说明里有「topIds」的提交一个都没找到（只翻了最近 100 个提交，更早的没看，可以加 since 或换个词再查）。",
+  );
+  assert.deepEqual(queries[1], { ref: "aiops", query: "topIds", path: undefined, since: undefined, limit: 30 });
+  // 分支名和别的代码工具一样整理；没写时区的时间按北京时间
+  await tools.code_log.run({ branch: "origin/aiops", since: "2026-10-10 09:00" }, { signal });
+  assert.equal(queries[2].ref, "aiops");
+  assert.equal(queries[2].since, "2026-10-10T01:00:00.000Z");
+  await tools.code_log.run({ since: "2026-10-1" }, { signal });
+  assert.equal(queries[3].since, "2026-09-30T16:00:00.000Z");
+  await tools.code_log.run({ since: "2026-10-10T09:00:00Z" }, { signal });
+  assert.equal(queries[4].since, "2026-10-10T09:00:00.000Z");
+  await tools.code_log.run({ since: "2026/10/10" }, { signal });
+  assert.equal(queries[5].since, "2026-10-09T16:00:00.000Z");
+  await tools.code_log.run({ since: "2026-10-10T09:00:00.000" }, { signal });
+  assert.equal(queries[6].since, "2026-10-10T01:00:00.000Z");
+  // 提交时间按北京时间写日期：UTC 前一天 23 点是北京当天 7 点
+  result = { commits: [{ sha: "aaaaaaaa11111111111111111111111111111111", title: "fix", date: "2026-10-09T23:00:00Z" }] };
+  assert.match(await tools.code_log.run({ since: "2026-10-10" }, { signal }), /- aaaaaaaa 2026-10-10「fix」/);
+  await assert.rejects(tools.code_log.run({ since: "上周" }, { signal }), /since 要写成 2026-10-01 这样的日期/);
+  await assert.rejects(tools.code_log.run({ path: "../etc/passwd" }, { signal }), /路径要在仓库里面/);
+  // 平台没有查提交的接口时直说
+  const plain = Object.fromEntries(
+    createCodeTools({ workspaces: branchWorkspaces().all, threadKey: "om_log2", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]),
+  );
+  await assert.rejects(plain.code_log.run({}, { signal }), /Fake 还不支持查提交历史/);
+});
+
+test("读代码只要了一小段：扩到所在的整个函数，同一个函数里后面的分支也给出来", () => {
+  // 2026-10-10 转链排查：只读了重定向失败就 return 的那几行，修复在同一个函数往下几行
+  const go = [
+    "package goods", // 1
+    "", // 2
+    "func (t *TaoBao) Other() {", // 3
+    "}", // 4
+    "", // 5
+    "func (t *TaoBao) GetGoodIdAndOriginUrl(c *gin.Context) (goodsId string, err error) {", // 6
+    "\tstr, err = common.GetGetContentUrlByCache(request.Content)", // 7
+    "\tif err != nil {", // 8
+    "\t\treturn", // 9
+    "\t}", // 10
+    "\tif id := common.ParseTbHalfDetailItemId(str); id != \"\" {", // 11
+    "\t\treturn id, nil", // 12
+    "\t}", // 13
+    "\treturn", // 14
+    "}", // 15
+    "", // 16
+    "type X struct {", // 17
+    "\tA int", // 18
+    "}", // 19
+  ];
+  assert.deepEqual(enclosingFunction(go, 7, 9, "services/goods/tb.go"), { start: 6, end: 15, name: "GetGoodIdAndOriginUrl" });
+  // 跨了两个函数、不在函数里、函数太长：照要的给
+  assert.equal(enclosingFunction(go, 4, 7, "services/goods/tb.go"), undefined);
+  assert.equal(enclosingFunction(go, 18, 18, "services/goods/tb.go"), undefined);
+  // 一行写完的函数下面的几行（var 块）不在它里面
+  const oneLine = ["package x", "func (x X) Len() int { return len(x) }", "", "var m = map[string]int{", '\t"a": 1,', "}"];
+  assert.equal(enclosingFunction(oneLine, 5, 5, "x.go"), undefined);
+  // 行尾注释里的大括号不算一行写完
+  const routed = ["func Handle(w http.ResponseWriter, r *http.Request) { // GET /items/{id}", "\tid := r.PathValue(\"id\")", "\t_ = id", "}"];
+  assert.deepEqual(enclosingFunction(routed, 2, 2, "x.go"), { start: 1, end: 4, name: "Handle" });
+  const long = ["func Long() {", ...Array.from({ length: 300 }, () => "\tx++"), "}"];
+  assert.equal(enclosingFunction(long, 10, 12, "a.go"), undefined);
+  // PHP：认 function 关键字，往下数大括号，字符串里的括号不算
+  const php = [
+    "<?php", // 1
+    "class Order {", // 2
+    "    public static function convert($url) {", // 3
+    "        $a = \"{\";", // 4
+    "        if ($url) {", // 5
+    "            return 1;", // 6
+    "        }", // 7
+    "        return 0;", // 8
+    "    }", // 9
+    "}", // 10
+  ];
+  assert.deepEqual(enclosingFunction(php, 5, 6, "app/Order.php"), { start: 3, end: 9, name: "convert" });
+  assert.equal(enclosingFunction(php, 5, 6, "notes.md"), undefined);
+  // 没闭合的字符串里一长串反斜杠：去引号的正则不能回溯到卡死
+  const slashes = ["function f() {", `  $s = "${"\\".repeat(5000)}`, "}"];
+  const started = Date.now();
+  assert.deepEqual(enclosingFunction(slashes, 2, 2, "a.php"), { start: 1, end: 3, name: "f" });
+  assert.ok(Date.now() - started < 1000);
+
+  const out = numberedLines(new ToolOutputBuilder("golang/appservice"), "services/goods/tb.go", go.join("\n"), 7, 9);
+  assert.match(out.text, /^services\/goods\/tb\.go（共 19 行，下面是第 6 到 15 行：要的是第 7 到 9 行，扩到了所在的整个函数 GetGoodIdAndOriginUrl，要看后面用 start_line=16）\n6\| func/);
+  assert.match(out.text, /\n11\| \tif id := common\.ParseTbHalfDetailItemId/);
+  // 没给止行（从某行往后读）：照旧
+  assert.match(numberedLines(new ToolOutputBuilder("golang/appservice"), "services/goods/tb.go", go.join("\n"), 7, undefined).text, /下面是第 7 到 19 行）/);
+  // 函数不到 250 行但一次给不完（行很长）：不扩，照要的给，不能从函数头开始给到一半就截断、要的几行反而没给
+  const wide = ["func Wide() {", ...Array.from({ length: 100 }, (_, i) => `\tx${i} := "${"y".repeat(300)}"`), "}"];
+  assert.deepEqual(enclosingFunction(wide, 90, 92, "a.go"), { start: 1, end: 102, name: "Wide" });
+  const narrow = numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", wide.join("\n"), 90, 92);
+  assert.match(narrow.text, /^a\.go（共 102 行，下面是第 90 到 92 行，要看后面用 start_line=93）\n90\| \tx88 /);
+  // 超过一次能读的 1.5 万字（工具结果交给模型前截到 1.6 万字）：也不扩，扩了后半段会被截掉
+  const mid = ["func Mid() {", ...Array.from({ length: 100 }, (_, i) => `\tx${i} := "${"y".repeat(150)}"`), "}"];
+  assert.ok(mid.join("\n").length > 15_000 && mid.join("\n").length < 20_000);
+  assert.match(numberedLines(new ToolOutputBuilder("acme/demo"), "a.go", mid.join("\n"), 90, 92).text, /下面是第 90 到 92 行，/);
 });

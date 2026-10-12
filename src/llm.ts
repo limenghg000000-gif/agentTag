@@ -28,6 +28,11 @@ export interface ChatRequest {
   signal?: AbortSignal;
   /** 这次单独打开或关掉思考；不传用配置里的 */
   thinking?: boolean;
+  /**
+   * 传了就流式调用：边生成边回调，给的是到目前为止的全部思考和正文（不是增量），用来在进度卡片上边想边显示。
+   * 最终结果和不传时一样由 chat() 返回
+   */
+  onDelta?: (soFar: { reasoning: string; text: string }) => void;
 }
 
 /** 一次模型调用用掉的 token，用来看时间花在哪 */
@@ -48,6 +53,8 @@ export interface ChatResult {
   toolCalls?: ToolCall[];
   /** 模型服务返回了用量时才有 */
   usage?: TokenUsage;
+  /** 模型这一轮的思考内容（百炼放在 reasoning_content 里）。开着思考、模型服务返回了才有 */
+  reasoning?: string;
 }
 
 /** 模型调用层。业务代码只依赖这个接口，换模型服务只需换实现或改环境变量。 */
@@ -72,7 +79,8 @@ export interface LlmConfig {
   thinkingBudget?: number;
 }
 
-export type LlmErrorKind = "auth" | "rate_limit" | "connection" | "api";
+/** too_long：输入超出了模型一次能读的长度（上下文窗口） */
+export type LlmErrorKind = "auth" | "rate_limit" | "connection" | "api" | "too_long";
 
 /** 各家 SDK 的异常统一翻译成这个类型，上层不必认识具体 SDK。 */
 export class LlmError extends Error {
@@ -97,21 +105,28 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   let parallelToolCalls = true;
   let thinkingSupported = true;
   let budgetSupported = true;
-  type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & { enable_thinking?: boolean; thinking_budget?: number };
-  const create = async (body: Body, thinkingWanted: boolean | undefined, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> => {
+  // 服务不支持流式（stream 报 400）、改成非流式又成功了，之后都不再流式调用
+  let streamSupported = true;
+  // 流式时要用量的 stream_options 是可选参数：服务不认它、去掉后流式成功了，之后都不再带（流式时就没有用量统计）
+  let streamOptionsSupported = true;
+  type Extra = { enable_thinking?: boolean; thinking_budget?: number };
+  type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
+  /** 发请求，参数不认（400）时去掉重试。send 发出最终的请求体，流式和非流式各自用 */
+  const create = async <T>(body: Body, thinkingWanted: boolean | undefined, send: (request: Body & Extra) => Promise<T>): Promise<T> => {
     for (let attempt = 0; ; attempt++) {
       const thinking = thinkingSupported ? (thinkingWanted ?? config.thinking) : undefined;
       const budget = thinking && budgetSupported ? config.thinkingBudget : undefined;
-      const request: Body = {
+      const request: Body & Extra = {
         ...body,
         ...(body.tools && parallelToolCalls ? { parallel_tool_calls: true } : {}),
         ...(thinking !== undefined ? { enable_thinking: thinking } : {}),
         ...(budget !== undefined ? { thinking_budget: budget } : {}),
       };
       try {
-        return await client.chat.completions.create(request, { signal });
+        return await send(request);
       } catch (err) {
-        if (attempt < 3 && err instanceof OpenAI.BadRequestError) {
+        // 输入太长的报错里可能也提到思考（「思考模式下最大输入…」），不能因此当成不认 enable_thinking
+        if (attempt < 3 && err instanceof OpenAI.BadRequestError && !isTooLong(err)) {
           if (request.parallel_tool_calls && /parallel_tool_calls/i.test(err.message)) {
             parallelToolCalls = false;
             continue;
@@ -134,46 +149,170 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
 
   return {
     model: config.model,
-    async chat({ system, messages, tools, signal, thinking }) {
-      const body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
+    async chat({ system, messages, tools, signal, thinking, onDelta }) {
+      const body: Body = {
         model: config.model,
         messages: [{ role: "system", content: system }, ...messages.map(toOpenAIMessage)],
         ...(tools && tools.length > 0
           ? { tools: tools.map((tool) => ({ type: "function" as const, function: tool })) }
           : {}),
       };
-      let completion: OpenAI.Chat.ChatCompletion;
-      try {
-        completion = await create(body, thinking, signal);
-      } catch (err) {
-        // 百炼对输入做内容审核，不通过时返回 400 data_inspection_failed
-        if (err instanceof OpenAI.BadRequestError && err.code === "data_inspection_failed") {
-          return { text: "", finish: "filtered" };
+      let raw: RawReply;
+      // 流式请求被说不认 stream_options（400）时先去掉它再流式试；还说不支持流式时，这次改成非流式再试
+      let streamOptions = streamOptionsSupported;
+      let fallback = false;
+      for (;;) {
+        const streamed = onDelta !== undefined && streamSupported && !fallback;
+        try {
+          raw = streamed
+            ? await readStream(
+                await create(body, thinking, (request) =>
+                  client.chat.completions.create(
+                    { ...request, stream: true, ...(streamOptions ? { stream_options: { include_usage: true } } : {}) },
+                    { signal },
+                  ),
+                ),
+                onDelta,
+                signal,
+              )
+            : fromCompletion(await create(body, thinking, (request) => client.chat.completions.create(request, { signal })));
+          if (fallback) {
+            warn(`模型服务不支持流式输出，改成非流式成功了，之后不再流式调用，卡片上等整轮生成完再显示`);
+            streamSupported = false;
+          } else if (streamed && !streamOptions && streamOptionsSupported) {
+            warn(`模型服务不认 stream_options，去掉后流式成功了，之后流式调用不再带它（没有用量统计）`);
+            streamOptionsSupported = false;
+          }
+          break;
+        } catch (err) {
+          if (streamed && err instanceof OpenAI.BadRequestError && STREAM_UNSUPPORTED.test(err.message)) {
+            if (streamOptions && /stream_options/i.test(err.message)) {
+              streamOptions = false;
+            } else {
+              fallback = true;
+            }
+            continue;
+          }
+          // 百炼对输入输出做内容审核，不通过时返回 data_inspection_failed：输入在请求时就是 400，流式输出到一半被拦时是流里的一条错误
+          if (err instanceof OpenAI.APIError && err.code === "data_inspection_failed") {
+            return { text: "", finish: "filtered" };
+          }
+          throw toLlmError(err);
         }
-        throw toLlmError(err);
       }
 
-      const choice = completion.choices[0];
-      const text = stripThinkTags(choice?.message.content ?? "");
-      const usage = toUsage(completion.usage);
-      const withUsage = <T extends ChatResult>(result: T): T => (usage ? { ...result, usage } : result);
-      const toolCalls = (choice?.message.tool_calls ?? [])
-        .filter((call) => call.type === "function")
-        .map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments }));
+      const text = stripThinkTags(raw.content);
+      const usage = toUsage(raw.usage);
+      const reasoning = raw.reasoning.trim() || undefined;
+      const withUsage = <T extends ChatResult>(result: T): T => ({ ...result, ...(usage ? { usage } : {}), ...(reasoning ? { reasoning } : {}) });
+      const toolCalls = raw.toolCalls;
       // 有的模型带着工具调用返回时 finish_reason 仍是 stop，以是否真的有工具调用为准
       if (toolCalls.length > 0) {
         return withUsage({ text, finish: "tool_calls", toolCalls });
       }
-      switch (choice?.finish_reason) {
+      switch (raw.finishReason) {
         case "length":
           return withUsage({ text, finish: "length" });
         case "content_filter":
-          return withUsage({ text, finish: "filtered" });
+          // 回答被审核拦下时思考也不带出去
+          return usage ? { text, finish: "filtered", usage } : { text, finish: "filtered" };
         default:
           return withUsage({ text, finish: "stop" });
       }
     },
   };
+}
+
+/** 服务说不认流式参数的 400：stream_options，或者 stream 和「不支持」「不认识」这类词在同一句里 */
+const STREAM_UNSUPPORTED =
+  /stream_options|\bstream\b[^.\n]*\b(?:not supported|unsupported|unrecognized|unknown|invalid|not allowed)\b|\b(?:not supported|unsupported|unrecognized|unknown|invalid|not allowed)\b[^.\n]*\bstream\b/i;
+
+/**
+ * 输入超出上下文窗口的 400。各家的说法：百炼「Range of input length should be [1, 991808]」，
+ * OpenAI、DeepSeek、vLLM「maximum context length is N tokens」，Kimi「exceeded model token limit」，智谱「Prompt exceeds max length」
+ */
+const TOO_LONG =
+  /range of input length|context[_ ]length|maximum context|(?:model|context) token limit|(?:prompt|input) (?:is )?too long|exceeds? (?:the )?max(?:imum)? (?:input |context )?length|输入[^。\n]{0,10}(?:过长|超长|长度超过)|上下文[^。\n]{0,10}(?:过长|超长|超过)/i;
+
+/** 输入超出上下文窗口：认错误码，或者认各家的说法（TOO_LONG） */
+function isTooLong(err: unknown): boolean {
+  return (
+    err instanceof OpenAI.APIError &&
+    (err.status === 400 || err.status === 413) &&
+    (err.code === "context_length_exceeded" || TOO_LONG.test(err.message))
+  );
+}
+
+/** 一次调用拿到的原始结果，流式和非流式整理成一样的再往下处理 */
+interface RawReply {
+  content: string;
+  reasoning: string;
+  toolCalls: ToolCall[];
+  finishReason: string | null | undefined;
+  usage: OpenAI.CompletionUsage | undefined;
+}
+
+/** reasoning_content 不是 OpenAI 的标准字段，百炼、DeepSeek 等开着思考时在这里返回思考内容 */
+type WithReasoning = { reasoning_content?: unknown };
+
+function fromCompletion(completion: OpenAI.Chat.ChatCompletion): RawReply {
+  const choice = completion.choices[0];
+  const thought = (choice?.message as WithReasoning | undefined)?.reasoning_content;
+  return {
+    content: choice?.message.content ?? "",
+    reasoning: typeof thought === "string" ? thought : "",
+    toolCalls: (choice?.message.tool_calls ?? [])
+      .filter((call) => call.type === "function")
+      .map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments })),
+    finishReason: choice?.finish_reason,
+    usage: completion.usage,
+  };
+}
+
+/**
+ * 读流式结果：正文、思考按顺序拼起来，工具调用按 index 拼参数；每收到一段正文或思考就回调一次。
+ * 工具名有的服务只在第一段给，有的每段都给全名，有的拆开给：和已有的一样就不再拼
+ */
+async function readStream(
+  stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
+  onDelta: NonNullable<ChatRequest["onDelta"]>,
+  signal: AbortSignal | undefined,
+): Promise<RawReply> {
+  const reply: RawReply = { content: "", reasoning: "", toolCalls: [], finishReason: undefined, usage: undefined };
+  const calls: ToolCall[] = [];
+  for await (const chunk of stream) {
+    if (chunk.usage) {
+      reply.usage = chunk.usage;
+    }
+    const choice = chunk.choices[0];
+    if (!choice) {
+      continue;
+    }
+    const delta = choice.delta as OpenAI.Chat.ChatCompletionChunk.Choice.Delta & WithReasoning;
+    const thought = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+    reply.reasoning += thought;
+    reply.content += delta.content ?? "";
+    for (const part of delta.tool_calls ?? []) {
+      const call = (calls[part.index ?? 0] ??= { id: "", name: "", arguments: "" });
+      call.id = part.id || call.id;
+      const name = part.function?.name;
+      if (name && name !== call.name) {
+        call.name += name;
+      }
+      call.arguments += part.function?.arguments ?? "";
+    }
+    reply.finishReason = choice.finish_reason ?? reply.finishReason;
+    if (thought || delta.content) {
+      onDelta({ reasoning: reply.reasoning, text: reply.content });
+    }
+  }
+  // 读到一半被停止时，SDK 不报错、直接结束循环：不能把写了一半的内容当成回答
+  signal?.throwIfAborted();
+  if (!reply.finishReason) {
+    throw new LlmError("connection", "模型服务的流式输出没有正常结束（没有 finish_reason），可能中途断开了");
+  }
+  reply.toolCalls = calls.filter((call) => call && call.name);
+  return reply;
 }
 
 /** 看图片的模型：按要求把一张图片转成文字。主模型不一定能看图，所以单独配一个 */
@@ -310,6 +449,9 @@ function toLlmError(err: unknown): unknown {
   }
   if (err instanceof OpenAI.APIConnectionError) {
     return new LlmError("connection", err.message, { cause: err });
+  }
+  if (err instanceof OpenAI.APIError && isTooLong(err)) {
+    return new LlmError("too_long", `${err.status} ${err.message}`, { cause: err });
   }
   if (err instanceof OpenAI.APIError) {
     return new LlmError("api", `${err.status ?? ""} ${err.message}`.trim(), { cause: err });

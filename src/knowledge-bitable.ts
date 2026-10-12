@@ -1,8 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { call } from "./docs.js";
-import { FeishuApiError } from "./feishu.js";
+import { callFeishu as call, FeishuApiError } from "./feishu.js";
 import type { Logger } from "./history.js";
 import {
   findSensitive,

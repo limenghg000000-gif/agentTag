@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
+  askedInChinese,
   BLOCKED_OPS_ANSWER,
   blockedCodeAnswer,
   blockUnverifiedOps,
@@ -12,19 +13,26 @@ import {
   codeEvidence,
   createCardActionHandler,
   createMessageHandler,
+  DEFLECTED_ANSWER,
   reviewCodeAnswer,
+  reviewDeflectedAnswer,
   reviewOpsAnswer,
+  THINK_IN_CHINESE,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
   unseenCodeAnswer,
+  unverifiedCodeAnswer,
   unseenCodeCitations,
   unverifiedOpsAnswer,
+  writtenInEnglish,
 } from "../src/bot.js";
 import type { ImageRef, ThreadContext } from "../src/history.js";
 import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
+import { compactText } from "../src/mcp-result.js";
 import { MemoryStore } from "../src/memory.js";
-import { STOP_ACTION } from "../src/progress.js";
+import { STOP_ACTION, visibleThought } from "../src/progress.js";
+import type { CardKitApi } from "../src/stream-card.js";
 import { TaskRegistry } from "../src/tasks.js";
 import { type CodeLocation, type Tool, type ToolContext, ToolError, ToolOutputBuilder } from "../src/tools/tool.js";
 
@@ -226,6 +234,66 @@ test("回答被截断或被内容审核拦下时如实说明", async () => {
   assert.match(markdowns(sent)[1], /内容审核/);
 });
 
+test("答完以后记下这个话题的问答；模型能用 chat_recent_threads 看本群别的话题", async () => {
+  const recorded: { chatId: string; threadKey: string; turn: { question: string; answer: string; askerName?: string } }[] = [];
+  const listed: { chatId: string; exclude?: string }[] = [];
+  const recentThreads: BotDeps["recentThreads"] = {
+    async record(chatId, threadKey, turn) {
+      recorded.push({ chatId, threadKey, turn });
+    },
+    async list(chatId, exclude) {
+      listed.push({ chatId, exclude });
+      return [{ threadKey: "om_old", topic: "礼金链接为什么转不了", question: "礼金链接为什么转不了", answer: "礼金链接不走取券逻辑", turns: 1, at: 0 }];
+    },
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "上面那个说的是礼金链接", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "chat_recent_threads", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, recentThreads, context: fakeContext({ askerName: "ML" }).source });
+
+  await handle(message("给产品解释一下上面那个", { messageId: "om_now", rootId: "om_root" }));
+
+  assert.ok(requests[0].tools?.some((tool) => tool.name === "chat_recent_threads"));
+  assert.match(requests[0].system, /chat_recent_threads/);
+  assert.deepEqual(listed, [{ chatId: "oc_1", exclude: "om_root" }]);
+  assert.match(requests[1].messages.at(-1)!.content, /礼金链接不走取券逻辑/);
+  assert.deepEqual(markdowns(sent), ["上面那个说的是礼金链接"]);
+  assert.deepEqual(recorded, [
+    { chatId: "oc_1", threadKey: "om_root", turn: { question: "给产品解释一下上面那个", answer: "上面那个说的是礼金链接", askerName: "ML" } },
+  ]);
+});
+
+test("被内容审核拦下、出错的不记话题问答；记不下也照常回答", async () => {
+  const recorded: string[] = [];
+  const recentThreads: BotDeps["recentThreads"] = {
+    async record(_chatId, _threadKey, turn) {
+      recorded.push(turn.answer);
+      throw new Error("磁盘满了");
+    },
+    async list() {
+      return [];
+    },
+  };
+  const results: (ChatResult | Error)[] = [{ text: "", finish: "filtered" }, new LlmError("connection", "boom"), { text: "正常回答", finish: "stop" }];
+  const { model } = fakeModel(() => {
+    const next = results.shift()!;
+    if (next instanceof Error) {
+      throw next;
+    }
+    return next;
+  });
+  const { sent, handle } = setup({ model, recentThreads });
+
+  await handle(message("敏感问题", { messageId: "om_a" }));
+  await handle(message("你好", { messageId: "om_b" }));
+  await handle(message("正常问题", { messageId: "om_c" }));
+
+  assert.deepEqual(recorded, ["正常回答"]);
+  assert.equal(markdowns(sent).at(-1), "正常回答");
+});
+
 test("模型调用失败时卡片标成出错，并在话题里说明原因", async () => {
   const { model } = fakeModel(() => {
     throw new LlmError("connection", "boom");
@@ -236,6 +304,19 @@ test("模型调用失败时卡片标成出错，并在话题里说明原因", as
 
   assert.deepEqual(markdowns(sent), ["抱歉，这次没能完成：连不上模型服务，请检查网络或 MODEL_BASE_URL。"]);
   assert.match(cardText(updates.at(-1)!.card), /出错了/);
+});
+
+test("输入超出模型一次能读的长度时，说清楚原因和怎么问", async () => {
+  const { model } = fakeModel(() => {
+    throw new LlmError("too_long", "400 Range of input length should be [1, 991808]");
+  });
+  const { sent, handle } = setup({ model });
+
+  await handle(message("把这半年的日志都看一遍"));
+
+  assert.deepEqual(markdowns(sent), [
+    "抱歉，这次没能完成：要看的内容超出了模型一次能读的长度，可以把问题拆小一点，或者说清楚服务、时间范围再问。",
+  ]);
 });
 
 test("进度卡片发不出去时照样回答", async () => {
@@ -738,6 +819,162 @@ test("日志里记下每轮模型调用和每次工具调用的用时", async ()
   assert.match(text, /模型第2轮 message=om_1 用时=\d+ms 输入=1600 输出=300 → 给出回答/);
 });
 
+test("模型返回了思考内容时，进度卡片上显示最新一段，结束后和步骤一起折叠；SHOW_THINKING=off 时不显示", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const script = (): ChatResult[] => [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }], reasoning: "先查资料 A" },
+    { text: "总结", finish: "stop", reasoning: "资料够了，可以总结" },
+  ];
+
+  let results = script();
+  const shown = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool] });
+  await shown.handle(message("查一下"));
+  assert.ok(shown.updates.some((u) => /最新的思考（第 1 轮.*先查资料 A/.test(cardText(u.card))));
+  const final = shown.updates.at(-1)!.card;
+  assert.deepEqual(
+    final.body.elements[0].elements.map((e: any) => e.content.split("\n").at(-1)),
+    ["💭 是模型的思考草稿，里面的猜测没有核实，结论以回答为准", "先查资料 A", "✔️ 查资料 A", "资料够了，可以总结"],
+  );
+  assert.deepEqual(markdowns(shown.sent), ["总结"]);
+
+  results = script();
+  const hidden = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool], showThinking: false });
+  await hidden.handle(message("查一下"));
+  assert.ok(hidden.updates.length > 0);
+  assert.ok(hidden.updates.every((u) => !/💭|先查资料/.test(cardText(u.card))));
+});
+
+test("中文提问、卡片显示思考时，每次查完、下一轮要思考之前都在工具结果后面提醒用中文想", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料",
+    run: async () => "ERROR parse failed: invalid control character in URL",
+  };
+  const rounds = (reasoning: string, n: number): ChatResult[] => [
+    ...Array.from({ length: n }, (_, i): ChatResult => ({
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: `c${i}`, name: "lookup", arguments: "{}" }],
+      reasoning,
+    })),
+    { text: "查完了", finish: "stop" },
+  ];
+  const nudges = (requests: ChatRequest[]) => requests.map((req) => req.messages.at(-1)?.content === THINK_IN_CHINESE);
+
+  const logged: string[] = [];
+  const logger = { ...quiet, info: (line: string) => logged.push(line) };
+  let results = rounds("The log shows a parse error, let me read GetGoodIdAndOriginUrl next.", 5);
+  const english = fakeModel(() => results.shift()!);
+  await setup({ model: english.model, tools: [tool], logger }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(english.requests), [false, true, true, true, true, true]);
+  // 提醒过还是想成英文的，日志里记一行
+  assert.equal(logged.filter((line) => line.startsWith("思考是英文，提醒模型接着用中文想")).length, 5);
+
+  // 思考是中文也提前提醒，不等想成英文；日志里不记
+  logged.length = 0;
+  results = rounds("日志里是 parse error，下一步读 GetGoodIdAndOriginUrl 看 c.tb.cn 怎么处理", 2);
+  const chinese = fakeModel(() => results.shift()!);
+  await setup({ model: chinese.model, tools: [tool], logger }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(chinese.requests), [false, true, true]);
+  assert.equal(logged.filter((line) => line.startsWith("思考是英文")).length, 0);
+
+  // 没开思考（这一轮没返回思考）时不提醒
+  results = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c0", name: "lookup", arguments: "{}" }] },
+    { text: "查完了", finish: "stop" },
+  ];
+  const noThinking = fakeModel(() => results.shift()!);
+  await setup({ model: noThinking.model, tools: [tool] }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(noThinking.requests), [false, false]);
+
+  results = rounds("The log shows a parse error.", 2);
+  const asked = fakeModel(() => results.shift()!);
+  await setup({ model: asked.model, tools: [tool] }).handle(message("why did the link conversion fail?"));
+  assert.deepEqual(nudges(asked.requests), [false, false, false]);
+
+  results = rounds("The log shows a parse error.", 2);
+  const hidden = fakeModel(() => results.shift()!);
+  await setup({ model: hidden.model, tools: [tool], showThinking: false }).handle(message("转链为什么失败了"));
+  assert.deepEqual(nudges(hidden.requests), [false, false, false]);
+  // 系统提示词里思考语言那条也只在卡片显示思考时才写
+  assert.match(english.requests[0].system, /思考过程也用提问者使用的语言写/);
+  assert.doesNotMatch(hidden.requests[0].system, /思考过程/);
+});
+
+test("writtenInEnglish：认英文行文里的虚词，中文思考里夹着日志、路径、代码、网址不算英文", () => {
+  const english = [
+    "No results with the token. Let me try searching with the short link URL instead.",
+    "Okay, the logs show the conversion failed at 13:12. I need to check whether the fix was deployed.",
+    "The log shows `URL 解析失败`, so read the caller next.",
+    "The user asks '转链为什么失败了'. Let me check the logs next.",
+    "The user asked why 转链 failed; the logs show a parse error in the share text, so the caller is next.",
+    // 开头一大段中文、后面写成英文：调用方只拿卡片上显示的最后一段来判断
+    "Wait, the log shows the request went through. Let me look at the caller, then I should check the fix.",
+  ];
+  for (const text of english) {
+    assert.equal(writtenInEnglish(text), true, text);
+  }
+  const chinese = [
+    "先查一下日志",
+    "12:00 → 500",
+    "Checking logs.",
+    "日志里是 invalid control character in URL，下一步读 GetGoodIdAndOriginUrl",
+    "报错是 ERROR parse failed: invalid control character in URL at position 12，说明分享文本整段被当成了链接",
+    "看 app/appservice/internal/service/tb/convert_link.go:98 和 app/appservice/internal/handler/link.go:40",
+    "日志：2026-10-10 12:00:01 ERROR [convert_link.go:98] parse share text failed: invalid control character in URL request_id=abc user_id=123",
+    "报错原文：\n```\nERROR the request was rejected because the token is invalid\n```\n所以要看 token 是怎么取的",
+    "读了 https://lab.yuebai.site/golang/appservice/-/blob/master/tb.go#L2431，这里先用正则匹配短链再请求解析，失败时就返回 the error",
+    "先打开 `https://c.tb.cn/h.8AYbSqZ7` 看看跳到哪，日志里报错是 `the request was rejected because the token is invalid, so we need a new one`，说明要先查 token 是怎么取的",
+    "看下 for i := 0; i < n; i++ 这段",
+    "读 handler：let ok = await fetch(url).then(r => r.json())，所以 then 之后没处理异常",
+    "调用 time.Now() 再 wg.Wait()，然后 libssl.so 报错",
+    "代码是这样的：\n```\nconst s = 'a`b';\n```\n然后看日志 `the token is invalid so we need to refresh it, then retry` 说明 token 过期",
+  ];
+  for (const text of chinese) {
+    assert.equal(writtenInEnglish(text), false, text);
+  }
+});
+
+test("writtenInEnglish 配 visibleThought：只看卡片上显示的开头和结尾，先去掉代码块再截，长消息也不卡", () => {
+  const chineseOpening = "先看日志里这次转链请求的完整过程，确认主链路在哪一步失败，再看同款推荐兜底。".repeat(20);
+  const englishTail = " Wait, the log shows the request went through. Let me look at the caller, then I should check the fix.".repeat(5);
+  assert.equal(writtenInEnglish(chineseOpening + englishTail), false);
+  assert.equal(writtenInEnglish(chineseOpening + englishTail, visibleThought), true);
+
+  const comment = "  // we need to check the token, then retry so the caller should not see it\n";
+  const quotedCode = `调用方是这样写的：\n\`\`\`go\n${comment.repeat(30)}\`\`\`\n${"所以先看 token 是怎么取的，再看重试逻辑有没有吞掉报错。".repeat(4)}`;
+  assert.equal(writtenInEnglish(quotedCode, visibleThought), false);
+
+  const started = Date.now();
+  askedInChinese("6".repeat(150_000));
+  writtenInEnglish("a".repeat(150_000));
+  assert.ok(Date.now() - started < 500, `用时 ${Date.now() - started}ms`);
+});
+
+test("askedInChinese：有汉字，或者没有英文提问的常用词就按中文；@ 的名字、链接、告警里的 key=value 不看；日文、韩文不算", () => {
+  for (const question of [
+    "转链为什么失败了",
+    "",
+    "@飞书 CLI",
+    "@Li Ming Hao",
+    "c.tb.cn/h.xxx",
+    "[FIRING:1] HighErrorRate service=appservice",
+    "HighErrorRate appservice",
+    "看下 [FIRING] HighErrorRate service=appservice error_rate=5.2% threshold=1%",
+    "https://c.tb.cn/h.8AYbSqZ7SeriAVy?tk=lSzFTJwYSlv 转不了",
+    "![image](img_v3_02ab_1234abcd)",
+  ]) {
+    assert.equal(askedInChinese(question), true, question);
+  }
+  for (const question of ["what failed?", "@张三 why did the link conversion fail?", "日本語で答えてください", "이거 왜 실패했어?"]) {
+    assert.equal(askedInChinese(question), false, question);
+  }
+});
+
 test("提问里说「深度思考」时这次任务打开思考，平时不指定", async () => {
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const { handle } = setup({ model });
@@ -963,7 +1200,7 @@ test("有代码工具时，没读代码就说仓库内容的回答被打回去�
   await handle(message("在 ai/aiops-mcp 里搜一下 k8s 相关的 tool 在哪里定义？"));
 
   assert.equal(requests.length, 3);
-  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["src/index.ts:30"]) });
   assert.deepEqual(markdowns(sent), ["定义在 `internal/k8s/tools.go:12`"]);
   assert.match(warnings.join("\n"), /回答没通过检查，已让模型重做 message=om_1/);
 });
@@ -1046,7 +1283,7 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
 
   const guessed = await ask(["panic 在 `internal/logic/order.go:88`，是 `internal/svc/context.go` 里没初始化", "panic 在 `internal/logic/order.go:88`"]);
   assert.equal(guessed.requests.length, 3);
-  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: UNVERIFIED_CODE_ANSWER });
+  assert.deepEqual(guessed.requests[2].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["internal/svc/context.go"]) });
   assert.deepEqual(guessed.replies, ["panic 在 `internal/logic/order.go:88`"]);
 
   // 截断以前的部分照样算，截断处被切开的「user.go:12」不算（其实是 123 行）
@@ -1074,6 +1311,60 @@ test("回答里的文件路径出现在 MCP 工具结果里（比如报错堆栈
   const beforeAnchor = await ask(["报错在 `src/index.ts` 里"], "aiops_get_anchor");
   assert.equal(beforeAnchor.requests.length, 2);
   assert.deepEqual(beforeAnchor.replies, ["报错在 `src/index.ts` 里"]);
+});
+
+test("aiops 结果里转义过的报错堆栈（\\n\\t/build/...）照样算查到：2026-10-10 转链排查的回答就是因为认不出被拦下的", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  // Go 的报错堆栈：日志行里的换行、缩进是 JSON 转义（\n\t），整理 aiops 结果时又 JSON.stringify 一次，路径前面紧挨着 \t 的 t
+  const stack =
+    "get similar goods by channel fail\nyuebai-api-app/services/goods.(*TaoBao).similarGoods\n\t/build/services/goods/tb.go:8220 +0x5c4\n" +
+    "yuebai-api-app/controller/convert.ConvertLink\n\t/build/controller/convert/convert_link.go:98 +0x1b4";
+  const once = compactText(JSON.stringify({ logs: [{ msg: stack }] }));
+  // 日志行本身是 JSON 字符串、aiops 原样返回时转义两层
+  const twice = compactText(JSON.stringify({ logs: [{ line: JSON.stringify({ level: "error", content: stack }) }] }));
+  assert.match(once, /\\n\\t\/build\/services\/goods\/tb\.go:8220/);
+  assert.match(twice, /\\\\n\\\\t\/build\/services\/goods\/tb\.go:8220/);
+  const ask = async (output: string, answers: string[]) => {
+    const queryLogs: Tool = {
+      spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+      describe: () => "aiops · 查日志",
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["ai/aiops-mcp"],
+      mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+    });
+    await handle(message("用户反馈转链失败，排查一下"));
+    return { requests, replies: markdowns(sent) };
+  };
+
+  const answer = "同款推荐失败，报在 `services/goods/tb.go:8220`，是从 `controller/convert/convert_link.go:98` 调进来的";
+  for (const output of [once, twice]) {
+    const cited = await ask(output, [answer]);
+    assert.equal(cited.requests.length, 2);
+    assert.deepEqual(cited.replies, [answer]);
+  }
+  // 还原转义只是认出分界：行号对不上、堆栈里没有的文件照样打回
+  for (const output of [once, twice]) {
+    const wrong = await ask(output, ["报在 `services/goods/tb.go:8221`，`services/goods/jd.go` 也有", "报在 `services/goods/tb.go:8220`"]);
+    assert.equal(wrong.requests.length, 3);
+    assert.deepEqual(wrong.requests[2].messages.at(-1), {
+      role: "user",
+      content: unverifiedCodeAnswer(["services/goods/tb.go:8221", "services/goods/jd.go"]),
+    });
+    assert.deepEqual(wrong.replies, ["报在 `services/goods/tb.go:8220`"]);
+  }
 });
 
 test("有 aiops 工具时，一个工具都没调就给出线上数据的回答被打回去，查过之后才发出", async () => {
@@ -1223,6 +1514,165 @@ test("打回重做以后还是没查证就给出线上数据：不发出去，�
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
   assert.deepEqual(context.remembered, [{ question: "[群成员] prod", answer: BLOCKED_OPS_ANSWER }]);
+});
+
+test("回答照抄了剧本里的核对记录（提交号）：打回时点名是哪处，去掉以后照常发出", async () => {
+  // 2026-10-10 复测转链：剧本开头写着「按 golang/appservice 的 master，提交 fa02ac8 核对」，模型抄进了回答，整条被拦
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":["淘口令生成：链接不符合规范"]}',
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "淘宝返回「淘口令生成：链接不符合规范」（错误码表按 appservice 提交 fa02ac8 核对）", finish: "stop" },
+    { text: "淘宝返回「淘口令生成：链接不符合规范」", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [{ ...queryLogs, spec: { ...queryLogs.spec, name: "code_search" } }],
+    codeRepos: ["ai/aiops-mcp"],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("转链失败了，排查一下"));
+
+  assert.equal(requests.length, 3);
+  assert.match(requests[2].messages.at(-1)!.content, /引用了这些代码位置：fa02ac8.*去掉这几处，其余查到的结论照常写/);
+  assert.deepEqual(markdowns(sent), ["淘宝返回「淘口令生成：链接不符合规范」"]);
+});
+
+test("回答被模型服务的内容审核拦下时，卡片上前面几轮的思考也去掉", async () => {
+  const tool: Tool = {
+    spec: { name: "lookup", description: "查资料", parameters: { type: "object", properties: {} } },
+    describe: () => "查资料 A",
+    run: async () => "资料内容",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "lookup", arguments: "{}" }], reasoning: "先查资料 A" },
+    { text: "", finish: "filtered" },
+  ];
+  const { sent, updates, handle } = setup({ model: fakeModel(() => results.shift()!).model, tools: [tool] });
+
+  await handle(message("查一下"));
+
+  assert.match(markdowns(sent)[0], /内容审核拦下/);
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|先查资料 A/);
+});
+
+test("回答因为没查证被拦下时，卡片上的思考也去掉", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const results: ChatResult[] = [
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop", reasoning: "不用查，直接说没有报错" },
+    { text: "结论：gateway-api（prod）最近 1 小时没有 error 级别日志（把握：中）", finish: "stop", reasoning: "还是不查了" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { sent, updates, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("prod"));
+
+  assert.deepEqual(markdowns(sent), [BLOCKED_OPS_ANSWER]);
+  // 被打回的那一轮的思考：打回紧跟在这一轮后面，卡片还没推出去就去掉了，过程中也不显示
+  assert.ok(!updates.some((u) => /不用查/.test(cardText(u.card))));
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|不用查|还是不查了/);
+});
+
+test("引用了没查到的代码位置被拦下时，卡片上的思考也去掉", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }], reasoning: "搜一下 user.go" },
+    { text: "问题在 src/user.go:99", finish: "stop", reasoning: "多半是 src/user.go:99" },
+    { text: "问题在 src/user.go:99", finish: "stop", reasoning: "就是 src/user.go:99" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { sent, updates, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+  assert.doesNotMatch(cardText(updates.at(-1)!.card), /💭|user\.go/);
+});
+
+test("回答里用 <font>、<text_tag> 包着没查到的代码位置照样拦", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const tagged = "问题在 <text_tag color='red'>高风险</text_tag> <font color='red'>src/user.go</font>:99";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: tagged, finish: "stop" },
+    { text: tagged, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  // 打回时说的是去掉标签以后的 src/user.go:99
+  assert.match(JSON.stringify(requests.at(-1)!.messages), /src\/user\.go:99/);
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+});
+
+test("写歪的标签卡片照原文显示，里面夹的没查到的代码位置也要拦", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const tagged = "问题在 <font data-x='src/user.go:99'>这里</font>";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }] },
+    { text: tagged, finish: "stop" },
+    { text: tagged, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+
+  await handle(message("user 服务为什么报错"));
+
+  assert.match(JSON.stringify(requests.at(-1)!.messages), /src\/user\.go:99/);
+  assert.deepEqual(markdowns(sent), [blockedCodeAnswer(["ai/aiops-mcp"])]);
+});
+
+test("打回重做以后通过了：被打回的那一轮的思考不留在卡片上，前面几轮的照样留", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "没有结果",
+  };
+  const ask = async (rejected: ChatResult) => {
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: "{}" }], reasoning: "搜一下用户服务" },
+      rejected,
+      { text: "代码里没搜到相关的位置", finish: "stop", reasoning: "查不到就直说" },
+    ];
+    const { model } = fakeModel(() => results.shift()!);
+    const { sent, updates, handle } = setup({ model, tools: [codeSearch], codeRepos: ["ai/aiops-mcp"] });
+    await handle(message("user 服务为什么报错"));
+    return { replies: markdowns(sent), updates };
+  };
+
+  const { replies, updates } = await ask({ text: "问题在 src/user.go:99", finish: "stop", reasoning: "多半是 src/user.go:99" });
+  assert.deepEqual(replies, ["代码里没搜到相关的位置"]);
+  const final = cardText(updates.at(-1)!.card);
+  assert.match(final, /搜一下用户服务/);
+  assert.match(final, /查不到就直说/);
+  assert.doesNotMatch(final, /多半是/);
+  // 被打回的那一轮没有思考时，不去动前面几轮的
+  const quiet = await ask({ text: "问题在 src/user.go:99", finish: "stop" });
+  assert.deepEqual(quiet.replies, ["代码里没搜到相关的位置"]);
+  assert.match(cardText(quiet.updates.at(-1)!.card), /搜一下用户服务[\s\S]*查不到就直说/);
 });
 
 test("打回重做以后没再给线上数据、查过工具、或者是整理之前内容的请求时，照常发出", async () => {
@@ -1427,6 +1877,138 @@ test("aiops 连不上、这次没有它的工具时，照搬话题里之前的�
   assert.deepEqual(markdowns(sent), ["aiops 现在连不上，暂时查不了，请稍后再试"]);
 });
 
+test("排查过以后把问题推到服务之外的结论，打回一次让模型先拿代码核对", () => {
+  const review = (...names: string[]) => reviewDeflectedAnswer(["aiops"], new Set(names));
+  const deflecting = [
+    "淘宝拒绝了这个链接，不是服务故障，建议用户在商品详情页重新分享",
+    "结论：并非服务端问题（把握：中）",
+    "这不是我们的 bug，是淘宝平台限制",
+    "服务本身没有问题",
+    "属于淘宝平台的限制",
+    "淘宝拒绝了这个链接，不过建议用户重新分享",
+    "淘宝无法识别，建议用户换个链接再试",
+    "属于用户侧问题",
+    "这个无需修复",
+    "服务端没有问题，是淘宝拒绝了链接",
+    "是淘宝那边拒绝的，跟我们无关",
+    "这个问题没法修复，建议用户重新分享",
+    "线上部署的还是旧版本，建议用户重新分享",
+    "修复后仍然失败，建议用户重新分享",
+    "淘宝侧限制导致失败，不是服务故障导致",
+    "这次失败不是系统故障导致的",
+    "是上游服务的问题",
+    "原因在淘宝平台限制",
+    // 同一句里有举例的分句，说结论的分句照样算
+    "示例链接被淘宝拒绝，不是服务故障",
+    // 「是否已部署」「不确定是否已修复」「已修复，待确认上线」不是修好了
+    "淘宝返回链接不符合规范，线上是否已部署未确认，建议让用户重新分享。",
+    "不确定是否已修复，建议让用户重新分享。",
+    "参数、域名等线上是否已部署还不确定，建议让用户重新分享。",
+    "等待确认是否已上线，建议让用户重新分享。",
+    "无法确认是否均已修复，建议让用户重新分享。",
+    "未确认已部署，建议让用户重新分享。",
+    "代码已修复，待确认上线，建议让用户重新分享。",
+  ];
+  for (const answer of deflecting) {
+    assert.equal(review("aiops_query_logs")(answer), DEFLECTED_ANSWER, answer);
+    // 没查线上（没调工具、只调了群记忆、只问代码）的不管
+    assert.equal(review()(answer), undefined, answer);
+    assert.equal(review("memory_search")(answer), undefined, answer);
+    assert.equal(review("code_search")(answer), undefined, answer);
+  }
+  const fine = [
+    // 看状态、没说到服务、说某条线索不是根因
+    "gateway-api 现在没有异常，最近 1 小时错误率 0.1%",
+    "这次 Pod 重启不是故障，是正常的滚动发布",
+    "URL 解析失败那条 warn 不是故障原因，是同款推荐支路的连带报错",
+    "这条报错不是服务问题所在，真正的原因在主流程",
+    // 排除外部原因、说是我们自己的问题
+    "这不是淘宝平台限制，是我们解析 pages-fast 的 bug，要修代码",
+    "不是用户侧的问题，是转链服务没处理这种链接",
+    "不是代码问题，是配置里的超时设成了 1s，改配置就行",
+    "无需修改代码，把超时配置改成 5s 即可",
+    "前端不需要修改，只改后端 order.go 就行",
+    "用户端操作后接口没校验，这是我们的 bug",
+    "根因是淘宝风控返回的 code 我们没处理",
+    "问题在转链服务没处理 pages-fast 这种落地页，要修代码",
+    // 否定、假设、修好以后让用户重试
+    "修好以后不需要用户重新分享",
+    "不建议让用户重新分享，应该在解析阶段识别",
+    "不应该让用户重新分享，要在解析阶段处理",
+    "等修复上线后通知用户重试",
+    "应该在解析阶段兼容这种链接，而不是让用户重新分享",
+    "不要再让用户重新分享，要在代码里处理",
+    "需要通知用户手动处理已经生成的订单",
+    "可以引导用户在页面上手动刷新查看最新状态",
+    // 问句、假设、拿不准
+    "要先确认是不是服务故障，再决定怎么处理",
+    "如果不是服务故障，就要看淘宝那边",
+    "无法确定是不是我们的问题",
+    "不排除是淘宝平台限制",
+    "系统本身没有问题吗？需要再查",
+    "除非服务故障，这个接口不会返回 code=8",
+    "已修复并部署，通知用户重试即可",
+    // 举例的分句
+    "比如回答「不是服务故障」之前，要先搜代码",
+  ];
+  for (const answer of fine) {
+    assert.equal(review("aiops_query_logs")(answer), undefined, answer);
+  }
+});
+
+test("2026-10-10 转链排查那种回答：只看日志就说不是服务故障，和「没调代码工具」一起打回，重做后照常发", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => JSON.stringify({ logs: [{ msg: "TaoBao CreatePassWord code params sub_code=26 链接不符合规范" }] }),
+  };
+  const first = "淘宝返回 sub_code 26，链接不符合规范。这不是服务故障，建议用户在商品详情页重新分享。";
+  const second = "当时失败是淘宝拒绝了 pages-fast 半屏详情页链接；现在 master 的 tb.go 已经从 topIds 取商品 id，要看线上是否部署了这一版。";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: first, finish: "stop" },
+    { text: second, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["golang/appservice"],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("用户反馈 appservice 转链失败，排查一下"));
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${DEFLECTED_ANSWER}` });
+  assert.deepEqual(markdowns(sent), [second]);
+});
+
+test("没有代码工具时不查推出去的结论：要模型去搜代码，它也搜不了", async () => {
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => JSON.stringify({ logs: [{ msg: "sub_code=26 链接不符合规范" }] }),
+  };
+  const answer = "淘宝返回 sub_code 26，不是服务故障";
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: answer, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } });
+
+  await handle(message("用户反馈转链失败，排查一下"));
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [answer]);
+});
+
 test("代码和线上数据两项检查都没过时，重做时一起告诉模型", async () => {
   const codeSearch: Tool = {
     spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
@@ -1447,7 +2029,7 @@ test("代码和线上数据两项检查都没过时，重做时一起告诉模�
 
   await handle(message("order-api 为什么重启"));
 
-  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${UNVERIFIED_CODE_ANSWER}\n${unverifiedOpsAnswer(["aiops"])}` });
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: `${unverifiedCodeAnswer(["internal/logic/order.go:88"])}\n${unverifiedOpsAnswer(["aiops"])}` });
 });
 
 test("代码回答检查：调过代码工具、或者和仓库无关时放行", () => {
@@ -1459,7 +2041,7 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   assert.equal(byShortName("Go", new Set()), UNVERIFIED_CODE_ANSWER);
   // 没提仓库，但回答里写了代码文件路径
   const general = reviewCodeAnswer("这个服务怎么启动", ["ai/aiops-mcp"]);
-  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(general("入口在 cmd/server/main.go", new Set(["web_search"])), unverifiedCodeAnswer(["cmd/server/main.go"]));
   // 和仓库无关的一般问题不管
   assert.equal(general("用 systemctl 重启，配置写在 tsconfig.json", new Set()), undefined);
   assert.equal(reviewCodeAnswer("今天周几", ["ai/api"])("周一，api 文档见 https://x.com/a/b.js", new Set()), undefined);
@@ -1468,9 +2050,9 @@ test("代码回答检查：调过代码工具、或者和仓库无关时放行",
   const seen = (path: string) => logs.some((output) => output.includes(path));
   const crash = reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"], seen);
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["aiops_get_pod_logs"])), undefined);
-  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), UNVERIFIED_CODE_ANSWER);
+  assert.equal(crash("panic 在 internal/logic/order.go:88，入口在 cmd/server/main.go", new Set(["aiops_get_pod_logs"])), unverifiedCodeAnswer(["cmd/server/main.go"]));
   assert.equal(crash("panic 在 internal/logic/order.go:88", new Set(["web_search"])), undefined);
-  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), UNVERIFIED_CODE_ANSWER);
+  assert.equal(reviewCodeAnswer("order-api 的 Pod 为什么重启", ["ai/aiops-mcp"])("panic 在 internal/logic/order.go:88", new Set()), unverifiedCodeAnswer(["internal/logic/order.go:88"]));
   // 问的是配置的仓库，结果里出现过路径也不算读过代码
   const repoQuestion = reviewCodeAnswer("aiops-mcp 里 k8s 工具在哪定义", ["ai/aiops-mcp"], () => true);
   assert.equal(repoQuestion("在 internal/tools/k8s.go", new Set(["aiops_list_namespaces"])), UNVERIFIED_CODE_ANSWER);
@@ -1567,8 +2149,11 @@ test("代码回答检查：调过代码工具也要核对，回答里的文件�
     unseenCodeAnswer(["yuebai-user/rpc/internal/logic/common/userlogic.go:35", "2c6a7d9"], ["ai/aiops-mcp", "ai/agent-tag"]),
   );
   assert.match(unseenCodeAnswer(["a/b.go"], ["ai/aiops-mcp"]), /工具结果里都没有出现：a\/b\.go.*直说读不到这部分代码/);
+  // 没调代码工具时也点名是哪几处，模型才知道去掉什么；只是提到了仓库、没写具体位置时还是原来那段
+  assert.match(unverifiedCodeAnswer(["fa02ac8", "a/b.go:3"]), /引用了这些代码位置：fa02ac8、a\/b\.go:3.*剧本和使用说明里写的文件路径、提交号.*去掉这几处，其余查到的结论照常写/);
+  assert.equal(unverifiedCodeAnswer([]), UNVERIFIED_CODE_ANSWER);
   // 群成员在提问里写的路径不算查证：没读代码就照着提问讲，照样要先读
-  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), UNVERIFIED_CODE_ANSWER);
+  assert.equal(reviewCodeAnswer("src/foo.ts:10 是干嘛的", ["ai/aiops-mcp"], seen)("src/foo.ts:10 是初始化配置", new Set()), unverifiedCodeAnswer(["src/foo.ts:10"]));
 });
 
 test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号」，读文件时读到的那一行", () => {
@@ -1718,6 +2303,52 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   const slashes = codeEvidence([], [found("code_list_files", [{ path: "src/foo\\bar.ts" }, { path: "internal/k8s/client.go" }])]);
   assert.deepEqual(unseenCodeCitations("见 `src/foo\\bar.ts` 和 internal/k8s\\client.go", slashes), []);
   assert.deepEqual(unseenCodeCitations("见 src/foo/bar.ts", slashes), [{ text: "src/foo/bar.ts", located: false }]);
+});
+
+test("回答里的绝对路径也要查证：日志、堆栈里要整段对上，代码工具查到的按仓库里的相对路径认", () => {
+  const seen = codeEvidence(
+    ["ai/agent-tag", "ai/aiops-mcp"],
+    [
+      found("code_read_file", [{ path: "internal/logic/user.go", lines: [1, 80] }], "ai/agent-tag"),
+      found("code_read_file", [{ path: "src/x.ts", lines: [1, 20] }]),
+      { tool: "aiops_query_logs", output: "goroutine 1 [running]:\n/build/services/goods/tb.go:8220 +0x1d" },
+      { tool: "aiops_query_logs", output: 'Traceback:\n  File "/app/src/a.py", line 3' },
+      { tool: "aiops_query_logs", output: "PHP Fatal error:  Uncaught Exception: boom in /var/www/html/../vendor/autoload.php:12" },
+    ],
+  );
+  const unseen = (answer: string) => unseenCodeCitations(answer, seen).map((cite) => cite.text);
+  // 堆栈里的绝对路径照样放行
+  assert.deepEqual(unseen("根因在 /build/services/goods/tb.go:8220"), []);
+  assert.deepEqual(unseen("见 `/app/src/a.py`"), []);
+  // 日志里没整理过的绝对路径（带 ..），回答照抄的放行；整理后的也认（/build/x/../services/goods/tb.go 就是堆栈里那个）
+  assert.deepEqual(unseen("报错在 /var/www/html/../vendor/autoload.php:12"), []);
+  assert.deepEqual(unseen("/build/x/../services/goods/tb.go:8220"), []);
+  // 原先回答里的绝对路径一概不查：结果里没有的路径、行号现在打回
+  assert.deepEqual(unseen("报错在 /app/src/user.ts:99，空指针"), ["/app/src/user.ts:99"]);
+  assert.deepEqual(unseen("**/build/services/goods/tb.go**:8221"), ["/build/services/goods/tb.go:8221"]);
+  // 别的绝对路径不能拿来充数：前面少几级、多几级的都不是堆栈里那个文件
+  assert.deepEqual(unseen("/services/goods/tb.go:8220"), ["/services/goods/tb.go:8220"]);
+  assert.deepEqual(unseen("/x/build/services/goods/tb.go:8220"), ["/x/build/services/goods/tb.go:8220"]);
+  // 代码工具读到的按仓库里的相对路径认：容器里的 /app/internal/logic/user.go:35 就是 internal/logic/user.go 第 35 行，读到的行以外的不算
+  assert.deepEqual(unseen("/app/internal/logic/user.go:35"), []);
+  assert.deepEqual(unseen("/app/internal/logic/user.go:99"), ["/app/internal/logic/user.go:99"]);
+  // 开头的 / 当仓库根，和读文件时一样
+  assert.deepEqual(unseen("/internal/logic/user.go:35"), []);
+  // 绝对路径里有仓库名的，只认这个仓库里查到的：src/x.ts 读的是 ai/aiops-mcp 的
+  assert.deepEqual(unseen("/ai/aiops-mcp/src/x.ts:3"), []);
+  assert.deepEqual(unseen("/ai/agent-tag/src/x.ts:3"), ["/ai/agent-tag/src/x.ts:3"]);
+  // 开头最多去掉 32 级目录：再深的不是容器里的前缀，不一段段拼（几万级的路径查一次要几秒）
+  assert.deepEqual(unseen(`/${"d/".repeat(32)}src/x.ts:3`), []);
+  assert.deepEqual(unseen(`/${"d/".repeat(33)}src/x.ts:3`), [`/${"d/".repeat(33)}src/x.ts:3`]);
+  // 不是绝对路径的开头：~ 家目录下的文件、网址里的路径
+  assert.deepEqual(unseen("配置在 ~/.config/app.yaml"), []);
+  assert.deepEqual(unseen("见 https://lab.yuebai.site/ai/agent-tag/-/blob/master/src/zz.ts"), []);
+  // 删除线包着的、反引号里带空格的绝对路径按整段认
+  assert.deepEqual(unseen("~~/app/src/old.ts~~"), ["/app/src/old.ts"]);
+  assert.deepEqual(unseen("`/app/my dir/a.ts:3`"), ["/app/my dir/a.ts:3"]);
+  // 读起来是命令的，里面的绝对路径一个个认
+  assert.deepEqual(unseen("`go run /app/cmd/main.go`"), ["/app/cmd/main.go"]);
+  assert.deepEqual(unseen("~~/app/src/one.ts or src/two.ts~~"), ["src/two.ts", "/app/src/one.ts"]);
 });
 
 test("代码引用：反引号里带空格的路径按整段认，读起来是命令的里面的路径一个个认", () => {
@@ -2203,4 +2834,506 @@ test("没读代码、也没问仓库时，重做后还写着举例的路径照�
   await handle(message("K8s 里环境变量一般怎么配"));
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent), ["比如写在 k8s/deployment.yaml 里，用 envFrom 引用 ConfigMap"]);
+});
+
+test("aiops 按线上版本读的代码：结果里的永久链接写明了仓库、提交、文件和行，引用对得上就算查证过", () => {
+  // aiops get_repo_file 的返回：行号写在代码前面（2468| ...），回答里的 tb.go:2468 在原文里找不到，只能按链接认
+  const repoFile = JSON.stringify({
+    project: "golang/appservice",
+    commit_id: "da67e31c495ec498e41bb42e6296a9d688995d6a",
+    path: "services/goods/tb.go",
+    start_line: 2440,
+    end_line: 2480,
+    permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c495ec498e41bb42e6296a9d688995d6a/services/goods/tb.go#L2440-2480",
+    content: '2466| //淘宝分享落地的半屏详情页\n2468| if halfDetailGoodsId := common.ParseTbHalfDetailItemId(str); halfDetailGoodsId != "" {',
+  });
+  const seen = codeEvidence(["golang/appservice"], [{ tool: "aiops_get_repo_file", output: compactText(repoFile), links: true }]);
+  assert.equal(seen("services/goods/tb.go", 2468), true);
+  assert.equal(seen("golang/appservice/services/goods/tb.go", 2468), true);
+  assert.equal(seen("da67e31c4"), true);
+  // 链接没标的行、别的文件照样不算
+  assert.equal(seen("services/goods/tb.go", 2500), false);
+  assert.equal(seen("services/goods/jd.go"), false);
+  // 网页、搜索结果里的链接是别人的仓库，不算
+  assert.equal(codeEvidence([], [{ tool: "fetch_url", output: repoFile }])("services/goods/tb.go", 2468), false);
+  // 结果太长、链接被截在行号里：只认文件，不认行
+  const cut = codeEvidence([], [
+    { tool: "aiops_get_repo_file", output: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go#L2440-24…（省略 2 字）", links: true },
+  ]);
+  assert.equal(cut("services/goods/tb.go"), true);
+  assert.equal(cut("services/goods/tb.go", 100), false);
+  assert.equal(cut("services/goods/tb.go", 2440), false);
+  // 内容被截短、链接还在：链接标了一段的，只认结果里真有「行号|」的那几行
+  const shortened = codeEvidence([], [
+    {
+      tool: "aiops_get_repo_file",
+      output: compactText(JSON.stringify({ permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go#L2000-2600", content: "2000| func a() {\n2001| \tb()…（省略 30000 字）" })),
+      links: true,
+    },
+  ]);
+  assert.equal(shortened("services/goods/tb.go", 2001), true);
+  assert.equal(shortened("services/goods/tb.go", 2550), false);
+  assert.equal(shortened("services/goods/tb.go"), true);
+  // 日志里别的网址路径里有 blob 的不是代码；链接后面紧跟着中文标点、英文句号的，标点不算进路径
+  const other = codeEvidence([], [
+    {
+      tool: "aiops_query_logs",
+      output: "GET https://oss.example.com/img/blob/abc1234/avatar/user.php 200；修复见 https://lab.yuebai.site/golang/appservice/-/blob/da67e31c4/services/goods/tb.go，见上；另见 https://lab.yuebai.site/golang/appservice/-/blob/master/README.md.",
+      links: true,
+    },
+  ]);
+  assert.equal(other("avatar/user.php"), false);
+  assert.equal(other("services/goods/tb.go"), true);
+  assert.equal(other("README.md"), true);
+  assert.equal(other("da67e31c4"), true);
+  // 结果里一个「行号|」都没有（aiops 改了写法）：照链接标的整段算；主机名大小写不论
+  const plain = codeEvidence([], [
+    { tool: "aiops_get_repo_file", output: JSON.stringify({ permalink: "https://GitHub.com/o/r/blob/abc1234/x.go#L10-20", content: "func a() {\n\tb()\n}" }), links: true },
+  ]);
+  assert.equal(plain("x.go", 11), true);
+  assert.equal(plain("x.go", 21), false);
+
+  // GitHub 的写法（#L10-L20）、路径里转义过的字、结果又被 JSON 转义了一层
+  const hits = JSON.stringify({
+    line: JSON.stringify({
+      hits: [
+        { path: "src/a.ts", permalink: "https://github.com/o/r/blob/0123abcd/src/a.ts#L10-L20", snippet: "14| a();\n15| b();" },
+        { path: "src/中.ts", permalink: "https://github.com/o/r/blob/main/src/%E4%B8%AD.ts#L3" },
+      ],
+    }),
+  });
+  const github = codeEvidence([], [{ tool: "aiops_search_code", output: hits, links: true }]);
+  assert.equal(github("src/a.ts", 15), true);
+  assert.equal(github("src/a.ts", 16), false);
+  assert.equal(github("src/a.ts", 21), false);
+  assert.equal(github("src/中.ts", 3), true);
+  assert.equal(github("0123abcd"), true);
+
+  // 通过 aiops 读过代码，和调过代码工具一样只核对引用；没读过的照旧要先读代码
+  const review = reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen, () => true);
+  assert.equal(review("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])), undefined);
+  assert.equal(
+    review("在 `services/goods/tb.go:2500`", new Set(["aiops_get_repo_file"])),
+    unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]),
+  );
+  assert.equal(
+    reviewCodeAnswer("golang/appservice 的转链为什么失败", ["golang/appservice"], seen)("修复已在 golang/appservice 的 `services/goods/tb.go:2468`", new Set(["aiops_get_repo_file"])),
+    UNVERIFIED_CODE_ANSWER,
+  );
+});
+
+test("日志里别的网址路径里有 blob 的不算读过代码：提到仓库的回答照样要先读代码", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const logs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => "2026-10-10 10:00:00 GET https://oss.example.com/img/blob/abc1234/avatar/user.php 500",
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "golang/appservice 的 avatar/user.php 处理头像时出错", finish: "stop" },
+    { text: "日志里 10:00 有 500，还没读代码，确认不了是哪一行", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    taskTools: () => [codeSearch],
+    codeRepos: ["golang/appservice"],
+    mcp: { names: ["aiops"], tools: () => [logs], prompt: () => undefined },
+  });
+  await handle(message("golang/appservice 的头像接口为什么报 500"));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].messages.at(-1), { role: "user", content: unverifiedCodeAnswer(["avatar/user.php"]) });
+});
+
+test("用 aiops 按线上版本读了代码、回答提到仓库和行号：不再打回让模型用代码工具重读一遍", async () => {
+  const codeSearch: Tool = {
+    spec: { name: "code_search", description: "搜代码", parameters: { type: "object", properties: {} } },
+    describe: () => "搜代码",
+    run: async () => "",
+  };
+  const output = compactText(
+    JSON.stringify({
+      project: "golang/appservice",
+      path: "services/goods/tb.go",
+      permalink: "https://lab.yuebai.site/golang/appservice/-/blob/da67e31c495ec498e41bb42e6296a9d688995d6a/services/goods/tb.go#L2460-2475",
+      content: "2468| if halfDetailGoodsId := common.ParseTbHalfDetailItemId(str); halfDetailGoodsId != \"\" {",
+    }),
+  );
+  const ask = async (answers: string[]) => {
+    const repoFile: Tool = {
+      spec: { name: "aiops_get_repo_file", description: "读代码", parameters: { type: "object", properties: {} } },
+      describe: () => "aiops · 读代码",
+      run: async () => output,
+    };
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_get_repo_file", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      taskTools: () => [codeSearch],
+      codeRepos: ["golang/appservice"],
+      mcp: { names: ["aiops"], tools: () => [repoFile], prompt: () => undefined },
+    });
+    await handle(message("golang/appservice 现在能处理 c.tb.cn 的半屏详情页吗"));
+    return { requests, replies: markdowns(sent) };
+  };
+  const answer = "能处理：golang/appservice 线上版本的 `services/goods/tb.go:2468` 从 topIds 取商品 ID（da67e31c）";
+  const ok = await ask([answer]);
+  assert.equal(ok.requests.length, 2);
+  assert.deepEqual(ok.replies, [answer]);
+  // 链接没覆盖的行照样打回
+  const wrong = await ask(["在 `services/goods/tb.go:2500`", answer]);
+  assert.equal(wrong.requests.length, 3);
+  assert.deepEqual(wrong.requests[2].messages.at(-1), { role: "user", content: unseenCodeAnswer(["services/goods/tb.go:2500"], ["golang/appservice"]) });
+  assert.deepEqual(wrong.replies, [answer]);
+});
+
+/** 假的卡片实体接口：记下建的卡片和每次更新，create 可以换成会失败的 */
+function fakeCardKit(create: () => Promise<string> = async () => "card_1") {
+  const created: any[] = [];
+  const calls: { op: string; card?: any; element?: string; content?: string; settings?: any }[] = [];
+  const api: CardKitApi = {
+    async create(card) {
+      created.push(card);
+      return create();
+    },
+    async update(_id, card) {
+      calls.push({ op: "update", card });
+    },
+    async setContent(_id, element, content) {
+      calls.push({ op: "content", element, content });
+    },
+    async settings(_id, settings) {
+      calls.push({ op: "settings", settings });
+    },
+  };
+  /** 卡片上出现过的所有文字（全量更新的卡片和按组件更新的文字） */
+  const shown = () => calls.map((call) => (call.op === "update" ? cardText(call.card) : (call.content ?? ""))).join("\n");
+  const last = () => calls.filter((call) => call.op === "update").at(-1)?.card;
+  return { api, created, calls, shown, last };
+}
+
+/** 模型边生成边回调：按 deltas 依次报到目前为止的思考和正文。每轮开头和每报一次都等卡片推一下 */
+function streamingModel(rounds: { deltas: { reasoning?: string; text?: string }[]; result: ChatResult }[]) {
+  const requests: ChatRequest[] = [];
+  const model: ChatModel = {
+    model: "fake",
+    async chat(req) {
+      requests.push(req);
+      const round = rounds.shift()!;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      for (const delta of round.deltas) {
+        req.onDelta?.({ reasoning: delta.reasoning ?? "", text: delta.text ?? "" });
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      return round.result;
+    },
+  };
+  return { model, requests };
+}
+
+function answerStore() {
+  const saved: { chatId: string; threadKey: string; messageId: string; answer: string }[] = [];
+  return {
+    saved,
+    store: { save: async (chatId: string, threadKey: string, messageId: string, answer: string) => void saved.push({ chatId, threadKey, messageId, answer }) },
+  };
+}
+
+test("卡片即回答：建卡片实体按 card_id 发到话题里，思考和回答边生成边写进卡片，结束后卡片里是回答，不另外发，记下卡片里的回答", async () => {
+  const kit = fakeCardKit();
+  const answers = answerStore();
+  const { model, requests } = streamingModel([
+    {
+      deltas: [{ reasoning: "用户问周几" }, { reasoning: "用户问周几", text: "今天" }, { reasoning: "用户问周几", text: "今天**周一**" }],
+      result: { text: "今天**周一**", finish: "stop", reasoning: "用户问周几" },
+    },
+  ]);
+  const { sent, updates, handle } = setup({ model, cardKit: kit.api, cardAnswers: answers.store, streamIntervalMs: 0 });
+
+  await handle(message("今天周几？"));
+
+  assert.equal(typeof requests[0].onDelta, "function");
+  assert.equal(kit.created.length, 1);
+  assert.match(cardText(kit.created[0]), /思考中/);
+  assert.deepEqual(cards(sent), [{ type: "card", data: { card_id: "card_1" } }]);
+  assert.deepEqual(sent[0].opts, inThread);
+  assert.deepEqual(markdowns(sent), []);
+  assert.deepEqual(updates, []);
+  // 生成时打开流式模式，按组件写出思考和回答
+  assert.ok(kit.calls.some((call) => call.op === "settings" && call.settings.config.streaming_mode === true));
+  assert.match(kit.shown(), /正在想…/);
+  assert.match(kit.shown(), /今天\*\*周一\*\*/);
+  // 结束：关掉流式模式，卡片里是回答，思考折进面板
+  const final = kit.last();
+  assert.equal(final.config.streaming_mode, false);
+  assert.equal(final.body.elements.at(-1).content, "今天**周一**");
+  assert.equal(final.body.elements[0].tag, "collapsible_panel");
+  assert.equal(final.config.summary.content, "今天**周一**");
+  assert.deepEqual(answers.saved, [{ chatId: "oc_1", threadKey: "om_1", messageId: "om_reply_1", answer: "今天**周一**" }]);
+});
+
+test("卡片即回答：回答没通过检查时卡片里换成重做说明，重做的回答写出来以后替换它", async () => {
+  const kit = fakeCardKit();
+  const queryLogs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[]}',
+  };
+  const unchecked = "product-service-api 最近 1 小时只有 2 条 warning";
+  const { model } = streamingModel([
+    { deltas: [{ text: unchecked }], result: { text: unchecked, finish: "stop" } },
+    { deltas: [], result: { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] } },
+    { deltas: [{ text: "最近 1 小时" }, { text: "最近 1 小时没有查到报错日志" }], result: { text: "最近 1 小时没有查到报错日志", finish: "stop" } },
+  ]);
+  const { sent, handle } = setup({
+    model,
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+  });
+
+  await handle(message("查一下 product-service-api 最近一小时的报错日志"));
+
+  assert.match(kit.shown(), /2 条 warning/);
+  assert.match(kit.shown(), /这一版回答没通过检查，正在重做…/);
+  const final = kit.last();
+  assert.equal(final.body.elements.at(-1).content, "最近 1 小时没有查到报错日志");
+  assert.doesNotMatch(cardText(final), /warning|正在重做/);
+  assert.deepEqual(markdowns(sent), []);
+});
+
+test("卡片即回答：建不了卡片实体时退回原来的进度卡片、回答另外发，10 分钟内不再试", async () => {
+  let clock = 1_000_000;
+  const kit = fakeCardKit(async () => {
+    throw new Error("99991672 缺少 cardkit:card:write 权限");
+  });
+  const errors: string[] = [];
+  const { sent, updates, handle } = setup({
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    now: () => clock,
+    logger: { ...quiet, error: (text: string) => void errors.push(text) },
+  });
+
+  await handle(message("你好"));
+  await handle(message("再问一次", { messageId: "om_2" }));
+  assert.equal(kit.created.length, 1);
+  assert.match(errors[0], /建流式卡片失败，10 分钟内先用原来的进度卡片/);
+  assert.deepEqual(markdowns(sent), ["**答案**", "**答案**"]);
+  assert.match(cardText(updates.at(-1)!.card), /已完成/);
+
+  clock += 11 * 60_000;
+  await handle(message("过了一会儿", { messageId: "om_3" }));
+  assert.equal(kit.created.length, 2);
+});
+
+test("卡片即回答：回答太长时卡片里只放开头，全文另外发，不记下", async () => {
+  const kit = fakeCardKit();
+  const answers = answerStore();
+  const long = Array.from({ length: 400 }, (_, i) => `第 ${i} 行：这是一段比较长的回答内容`).join("\n");
+  const { model } = fakeModel(() => ({ text: long, finish: "stop" }));
+  const { sent, handle } = setup({ model, cardKit: kit.api, cardAnswers: answers.store, streamIntervalMs: 0 });
+
+  await handle(message("写长一点"));
+
+  assert.match(kit.last().body.elements.at(-1).content, /回答较长，全文另外发在下面/);
+  assert.equal(markdowns(sent).join("\n"), long);
+  assert.deepEqual(answers.saved, []);
+});
+
+test("卡片即回答：提示词里允许表格、小标题和彩色标签；没用流式卡片时还是说不渲染表格", async () => {
+  const kit = fakeCardKit();
+  const rich = fakeModel(() => ({ text: "好的", finish: "stop" }));
+  await setup({ model: rich.model, cardKit: kit.api, streamIntervalMs: 0 }).handle(message("你好"));
+  assert.match(rich.requests[0].system, /表格/);
+  assert.match(rich.requests[0].system, /<text_tag color='red'>高风险<\/text_tag>/);
+  assert.doesNotMatch(rich.requests[0].system, /不渲染表格/);
+
+  const plain = fakeModel(() => ({ text: "好的", finish: "stop" }));
+  await setup({ model: plain.model }).handle(message("你好"));
+  assert.match(plain.requests[0].system, /飞书消息不渲染表格，需要对比时用列表/);
+  assert.doesNotMatch(plain.requests[0].system, /text_tag/);
+});
+
+test("卡片即回答：回答太长另外发全文时，表格改成列表、标签去掉", async () => {
+  const kit = fakeCardKit();
+  const rows = Array.from({ length: 200 }, (_, i) => `| pod-${i} | <font color='red'>${i}%</font> |`);
+  const long = ["<text_tag color='red'>高风险</text_tag> 结论", "| Pod | CPU |", "|---|---|", ...rows].join("\n");
+  const { model } = fakeModel(() => ({ text: long, finish: "stop" }));
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0 });
+
+  await handle(message("列一下所有 Pod 的 CPU"));
+
+  const posted = markdowns(sent).join("\n");
+  assert.match(posted, /^高风险 结论\n- \*\*pod-0\*\*：CPU 0%\n- \*\*pod-1\*\*：CPU 1%/);
+  assert.doesNotMatch(posted, /<font|text_tag|\|---/);
+  assert.match(kit.last().body.elements.at(-1).content, /<text_tag color='red'>高风险<\/text_tag>/);
+});
+
+test("卡片即回答：回答里的图和关键数字按查到的数画出来，对不上的不画；没用流式卡片时换成文字", async () => {
+  const metrics: Tool = {
+    spec: { name: "aiops_query_metrics_range", description: "查指标趋势", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查指标趋势",
+    run: async () => '{"series":[{"pod":"pod-a","values":[["19:00","0.412"],["19:05","0.39"]]}]}',
+  };
+  const chart = (data: string) =>
+    `\`\`\`chart\n{"type":"line","title":"pod-a CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[${data}]}]}\n\`\`\``;
+  const answerWith = (data: string) => `结论：CPU 正常\n\`\`\`kpi\n[{"label":"CPU 最高","value":"41%","level":"ok"},{"label":"内存","value":"88%"}]\n\`\`\`\n${chart(data)}`;
+  const run = async (data: string, withCard: boolean) => {
+    const kit = fakeCardKit();
+    const warnings: string[] = [];
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_metrics_range", arguments: "{}" }] },
+      { text: answerWith(data), finish: "stop" },
+    ];
+    const { model } = fakeModel(() => results.shift()!);
+    const context = fakeContext();
+    const saved: string[] = [];
+    const recorded: string[] = [];
+    const { sent, handle } = setup({
+      model,
+      ...(withCard ? { cardKit: kit.api } : {}),
+      streamIntervalMs: 0,
+      mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined },
+      logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+      context: context.source,
+      cardAnswers: { save: async (_chat, _thread, _card, answer) => void saved.push(answer) },
+      recentThreads: { record: async (_chat, _thread, turn) => void recorded.push(turn.answer), list: async () => [] },
+    });
+    await handle(message("看看 pod-a 最近的 CPU"));
+    return { kit, sent, warnings, remembered: [...context.remembered.map((turn) => turn.answer), ...saved, ...recorded] };
+  };
+
+  const ok = await run("41.2,39", true);
+  const elements = ok.kit.last().body.elements;
+  assert.deepEqual(
+    elements.slice(1).map((e: any) => e.tag),
+    ["markdown", "column_set", "chart"],
+  );
+  // 内存 88% 查不到：这个数字卡片不放
+  assert.equal(elements[2].columns.length, 1);
+  assert.match(ok.warnings.join("\n"), /数字卡片「内存 88%」在查询结果里找不到/);
+  assert.deepEqual(markdowns(ok.sent), []);
+  // 记下来的回答（话题上下文、卡片里的回答、最近话题）也是核对过的：对不上的 88% 后面的提问看不到
+  assert.deepEqual(ok.remembered, Array(3).fill("结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"));
+
+  const made = await run("41.2,55", true);
+  assert.doesNotMatch(JSON.stringify(made.kit.last()), /"tag":"chart"/);
+  assert.match(JSON.stringify(made.kit.last()), /图「pod-a CPU」里有数和这次查到的结果对不上，没画出来/);
+  assert.match(made.warnings.join("\n"), /图「pod-a CPU」有 1 个数在查询结果里找不到（如 55）/);
+
+  const plain = await run("41.2,39", false);
+  assert.deepEqual(markdowns(plain.sent), ["结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"]);
+});
+
+test("记忆工具结果里的数是模型自己写的，不算查到的数：先记「CPU 99%」再画 99% 的数字卡片不行", async () => {
+  const kit = fakeCardKit();
+  const warnings: string[] = [];
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: "c1", name: "memory_save", arguments: JSON.stringify({ content: "union CPU 最高 99%", kind: "background" }) }],
+    },
+    { text: '结论\n```kpi\n[{"label":"CPU 最高","value":"99%"}]\n```', finish: "stop" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    memory: await memoryStore(),
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+  });
+
+  await handle(message("union 的 CPU 怎么样"));
+
+  const elements = kit.last().body.elements;
+  // 记忆这一步本身成功了（卡片上有这一步），但它写进去的数不能拿来证明卡片
+  assert.match(JSON.stringify(elements[0]), /记住：union CPU 最高 99%/);
+  assert.doesNotMatch(JSON.stringify(elements[0]), /❌/);
+  assert.deepEqual(elements.slice(1).map((e: any) => e.tag), ["markdown"]);
+  assert.doesNotMatch(JSON.stringify(elements.slice(1)), /99%/);
+  assert.match(warnings.join("\n"), /数字卡片「CPU 最高 99%」在查询结果里找不到/);
+});
+
+test("卡片即回答：停止时卡片标成已停止，不留草稿，不发回答", async () => {
+  const kit = fakeCardKit();
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  const model: ChatModel = {
+    model: "fake",
+    chat: ({ signal, onDelta }) =>
+      new Promise((_, reject) => {
+        onDelta?.({ reasoning: "", text: "写到一半的草稿" });
+        started();
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+  };
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0 });
+
+  const task = handle(message("写一篇长文"));
+  await running;
+  await handle(message("停止", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  await task;
+
+  assert.deepEqual(markdowns(sent), ["好的，已停止。"]);
+  assert.match(cardText(kit.last()), /已停止/);
+  assert.doesNotMatch(cardText(kit.last()), /草稿/);
+});
+
+test("卡片即回答：等了 1 分钟以上，写完后在话题里补一句提醒；流式卡片发不出去、原来的卡片发得出去时先停用流式卡片", async () => {
+  let clock = 0;
+  const kit = fakeCardKit();
+  const { model } = fakeModel(() => {
+    clock += 61_000;
+    return { text: "查完了", finish: "stop" };
+  });
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0, now: () => clock });
+  await handle(message("查一下"));
+  assert.deepEqual(markdowns(sent), ["处理完了，结果在上面的卡片里。"]);
+  assert.equal(kit.last().body.elements.at(-1).content, "查完了");
+
+  // 只有流式卡片发不出去：这次用原来的进度卡片、另外发回答，之后 10 分钟不建流式卡片
+  let failSend = true;
+  const kit2 = fakeCardKit();
+  const sent2: Sent[] = [];
+  const { handle: handle2 } = setup({
+    cardKit: kit2.api,
+    streamIntervalMs: 0,
+    send: async (to, input, opts) => {
+      if (failSend && "card" in input && (input.card as any).type === "card") {
+        failSend = false;
+        throw new Error("network");
+      }
+      sent2.push({ to, input, opts });
+      return { messageId: `om_reply_${sent2.length}` };
+    },
+  });
+  await handle2(message("你好"));
+  await handle2(message("再问", { messageId: "om_2" }));
+  assert.equal(kit2.created.length, 1);
+  assert.deepEqual(markdowns(sent2), ["**答案**", "**答案**"]);
+
+  // 消息全都发不出去（和卡片无关）：不停用流式卡片
+  const kit3 = fakeCardKit();
+  const { handle: handle3 } = setup({
+    cardKit: kit3.api,
+    streamIntervalMs: 0,
+    send: async () => {
+      throw new Error("network");
+    },
+  });
+  // 回答也发不出去，处理函数照旧报错
+  await assert.rejects(handle3(message("你好")), /network/);
+  await assert.rejects(handle3(message("再问", { messageId: "om_2" })), /network/);
+  assert.equal(kit3.created.length, 2);
 });

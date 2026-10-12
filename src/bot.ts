@@ -4,23 +4,30 @@ import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { imageKeysOf } from "./feishu.js";
-import { type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
+import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
-import { type ChatMessage, type ChatModel, LlmError } from "./llm.js";
-import { splitMarkdown } from "./markdown.js";
+import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
+import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
+import { type AnswerSegment, hasUiBlocks, keepVerified, NumberEvidence, segmentsAsText, splitAnswer } from "./rich-ui.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
+  answerFitsCard,
   CardUpdater,
+  type ProgressCard,
   type ProgressState,
   type ProgressStep,
   renderPlainProgressCard,
   renderProgressCard,
   STOP_ACTION,
+  visibleThought,
 } from "./progress.js";
 import { buildSystemPrompt } from "./prompt.js";
+import type { RecentThreadStore } from "./recent-threads.js";
+import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
+import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
@@ -28,6 +35,10 @@ import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
  * 所以这里先切好，每片都回复到原消息的话题。
  */
 const CHUNK_CHARS = 3000;
+/** 流式卡片建不了（比如没开 cardkit:card:write 权限）以后，这么久之内先用原来的进度卡片，不每次都试 */
+const CARDKIT_RETRY_MS = 10 * 60_000;
+/** 卡片即回答时，任务跑了这么久以上，回答写完后在话题里补一句提醒（提问人多半已经去忙别的了） */
+const NOTIFY_AFTER_MS = 60_000;
 /** 连长连接之前还不知道机器人名字时用这个 */
 const FALLBACK_BOT_NAME = "AI 助手";
 /** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
@@ -95,6 +106,8 @@ export interface BotDeps {
   context: ThreadContextSource;
   /** 按群保存的长期记忆。不传时不带记忆，也没有记忆工具 */
   memory?: MemoryStore;
+  /** 按群记下最近几个话题的问答。不传时不记，也没有 chat_recent_threads 工具 */
+  recentThreads?: Pick<RecentThreadStore, "record" | "list">;
   tasks: TaskRegistry;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   updateCard: (messageId: string, card: object) => Promise<void>;
@@ -102,6 +115,17 @@ export interface BotDeps {
   now?: () => number;
   /** 同一张进度卡片两次更新的最小间隔 */
   cardIntervalMs?: number;
+  /** 进度卡片上显示模型每轮的思考（SHOW_THINKING）。不传时显示 */
+  showThinking?: boolean;
+  /**
+   * 卡片即回答（STREAM_CARD）：进度卡片用飞书卡片实体，思考和回答边生成边写进卡片，回答不再另外发。
+   * 不传、或者卡片实体建不了时，和以前一样：进度卡片只显示进度，回答另外发
+   */
+  cardKit?: CardKitApi;
+  /** 卡片即回答时记下卡片里的回答，读话题历史时用（飞书读不出卡片里的文字） */
+  cardAnswers?: { save(chatId: string, threadKey: string, messageId: string, answer: string): Promise<void> };
+  /** 流式卡片两次请求的最小间隔 */
+  streamIntervalMs?: number;
   /** 配置的代码仓库（CODE_REPOS）。用来检查回答是不是没读代码就说了仓库里的内容 */
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
@@ -131,6 +155,7 @@ export interface BotDeps {
 export function createMessageHandler(deps: BotDeps) {
   const { allowedChatIds, tasks, send, logger = console } = deps;
   const duplicates = new DuplicateAsks(deps.now);
+  const cardKit: CardKitHealth = { downUntil: 0 };
 
   return async (msg: NormalizedMessage): Promise<void> => {
     if (!allowedChatIds.has(msg.chatId)) {
@@ -169,8 +194,13 @@ export function createMessageHandler(deps: BotDeps) {
       return;
     }
 
-    await runTask(deps, msg, question, reply);
+    await runTask(deps, msg, question, reply, cardKit);
   };
+}
+
+/** 流式卡片最近一次建不了以后，到什么时候之前先不用 */
+interface CardKitHealth {
+  downUntil: number;
 }
 
 async function runTask(
@@ -178,25 +208,71 @@ async function runTask(
   msg: NormalizedMessage,
   question: string,
   reply: (markdown: string) => Promise<SendResult>,
+  cardKit: CardKitHealth,
 ): Promise<void> {
   const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
   const task = tasks.create(msg.chatId, threadKeyOf(msg));
-  const state: ProgressState = { phase: task.queued ? "queued" : "thinking", steps: [], startedAt: now() };
-  const render = () => renderProgressCard(state, task.id, now());
+  // 提问的时间：排队的时间也算进「等了多久」
+  const askedAt = now();
+  const state: ProgressState = { phase: task.queued ? "queued" : "thinking", steps: [], startedAt: askedAt };
+  // 卡片即回答：回答边生成边写进卡片
+  let streaming = false;
+  const render = () => renderProgressCard(state, task.id, now(), { streaming });
 
   // 进度卡片发不出去（比如卡片格式被拒）不影响回答，只是看不到进度、不能点停止
-  let card: CardUpdater | undefined;
-  try {
-    const { messageId } = await send(msg.chatId, { card: render() }, { replyTo: msg.messageId, replyInThread: true });
-    card = new CardUpdater((next) => updateCard(messageId, next), logger, cardIntervalMs);
-  } catch (err) {
-    logger.error(`发送进度卡片失败 message=${msg.messageId}`, err);
+  let card: ProgressCard | undefined;
+  let cardMessageId: string | undefined;
+  // 流式卡片建好了、消息却发不出去：原来的卡片能发出去的话，问题出在流式卡片上，先停用一阵
+  let streamCardRejected = false;
+  if (deps.cardKit && now() >= cardKit.downUntil) {
+    const initial = renderProgressCard(state, task.id, now(), { streaming: true });
+    let cardId: string | undefined;
+    try {
+      cardId = await deps.cardKit.create(initial);
+    } catch (err) {
+      cardKit.downUntil = now() + CARDKIT_RETRY_MS;
+      logger.error(
+        `建流式卡片失败，${CARDKIT_RETRY_MS / 60_000} 分钟内先用原来的进度卡片、回答另外发（看看有没有开 cardkit:card:write 权限） message=${msg.messageId}`,
+        err,
+      );
+    }
+    if (cardId) {
+      try {
+        const { messageId } = await send(
+          msg.chatId,
+          { card: { type: "card", data: { card_id: cardId } } },
+          { replyTo: msg.messageId, replyInThread: true },
+        );
+        card = new StreamingCard(deps.cardKit, cardId, initial, logger, deps.streamIntervalMs, cardIntervalMs);
+        cardMessageId = messageId;
+        streaming = true;
+      } catch (err) {
+        logger.error(`发送流式卡片失败，这次用原来的进度卡片 message=${msg.messageId}`, err);
+        streamCardRejected = true;
+      }
+    }
+  }
+  if (!card) {
+    try {
+      const { messageId } = await send(msg.chatId, { card: render() }, { replyTo: msg.messageId, replyInThread: true });
+      card = new CardUpdater((next) => updateCard(messageId, next), logger, cardIntervalMs);
+      if (streamCardRejected) {
+        cardKit.downUntil = now() + CARDKIT_RETRY_MS;
+        logger.error(`原来的进度卡片发得出去、流式卡片发不出去，${CARDKIT_RETRY_MS / 60_000} 分钟内先不用流式卡片 message=${msg.messageId}`);
+      }
+    } catch (err) {
+      logger.error(`发送进度卡片失败 message=${msg.messageId}`, err);
+    }
   }
 
   let answer: string | undefined;
   let result: AgentResult | undefined;
   let source = "none";
   let memoryCount: number | undefined;
+  // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
+  const evidence: ToolEvidence[] = [];
+  // 核对过的回答（拆成段）：回答定下来时就核对，记下来的、显示的都用它
+  let segments: AnswerSegment[] | undefined;
   try {
     if (!(await task.waitTurn())) {
       throw new Error("stopped while queued");
@@ -229,10 +305,14 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
-    const evidence: ToolEvidence[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
+    // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
+    const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
+    const recentThreadTools = deps.recentThreads
+      ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
+      : [];
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
@@ -259,7 +339,12 @@ async function runTask(
           evidence.push(
             code
               ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
-              : { tool: tool.spec.name, output: seenByModel(output, limit) },
+              : {
+                  tool: tool.spec.name,
+                  output: seenByModel(output, limit),
+                  ...(mcpNames.has(tool.spec.name) ? { links: true } : {}),
+                  ...(tool.writes || MODEL_ECHO_TOOLS.has(tool.spec.name) ? { echo: true } : {}),
+                },
           );
           return output;
         },
@@ -285,16 +370,37 @@ async function runTask(
     const toolNames = taskTools.map((tool) => tool.spec.name);
     const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
+    // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
+    const readCode = () => evidence.some(linksCode);
     const reviews = [
-      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen)] : []),
+      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
+      ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
+    // 卡片上显示思考、不是用英文问的（群里一般说中文）：每次查完、下一轮要思考之前，提醒模型用中文想。
+    // 系统提示词开头虽然写了，隔着几万字英文的日志、代码，模型常常就用英文想了（2026-10-12 转链排查的第 3 轮）；
+    // 等它想成英文再提醒，卡片上已经有一轮英文
+    const steer =
+      deps.showThinking !== false && card && askedInChinese(question)
+        ? ({ reasoning, thinkingNext }: { reasoning?: string; thinkingNext: boolean }) => {
+            // 提醒过还是想成了英文的记一行，看提醒管不管用。只看卡片上显示的那部分：思考很长时卡片只显示开头和结尾
+            if (reasoning !== undefined && writtenInEnglish(reasoning, visibleThought)) {
+              logger.info(`思考是英文${thinkingNext ? "，提醒模型接着用中文想" : ""} message=${msg.messageId}`);
+            }
+            return thinkingNext ? THINK_IN_CHINESE : undefined;
+          }
+        : undefined;
+    // 最近一次模型调用是第几轮：打回重做（retry）紧跟在给出那版回答的这一轮后面
+    let lastRound = 0;
+    // 流式时这一轮到目前为止的正文：这一轮没调工具的话，就是给出的回答
+    let liveText = "";
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
       ...(thinksAfter ? { thinkAfter: thinksAfter } : {}),
+      ...(steer ? { steer } : {}),
       system: buildSystemPrompt({
         botName: deps.botName() || FALLBACK_BOT_NAME,
         now: new Date(now()),
@@ -302,6 +408,8 @@ async function runTask(
         memory: memory?.prompt,
         readOnly,
         extra: deps.mcp?.prompt(toolNames),
+        showThinking: deps.showThinking !== false,
+        richText: streaming,
         ...(deps.knowledge
           ? {
               knowledge: knowledge
@@ -318,26 +426,68 @@ async function runTask(
       messages: [...history, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
+      ...(streaming ? { stream: true } : {}),
       ...(reviews.length > 0
         ? {
             // 几项检查都没过时一起告诉模型：重做只有一次，只说一项的话，另一项重做后就没人查了
+            // 按显示出来的文字检查：<font>、<text_tag> 标签去掉
             review: (answer: string, usedTools: ReadonlySet<string>) =>
               reviews
-                .map((review) => review(answer, usedTools))
+                .map((review) => review(stripRichTags(answer), usedTools))
                 .filter(Boolean)
                 .join("\n") || undefined,
           }
         : {}),
       onEvent: (event) => {
+        if (event.type === "delta") {
+          liveText = event.text;
+          const reasoning = deps.showThinking !== false ? event.reasoning : "";
+          if (reasoning || event.text) {
+            state.live = { round: event.round, reasoning, text: event.text };
+            card?.update(render());
+          }
+          return;
+        }
         logEvent(logger, msg.messageId, event);
+        if (event.type === "model") {
+          lastRound = event.round;
+          if (streaming) {
+            // 这一轮想完了：思考收进 thoughts（下面），没调工具的话正文就是这一版回答（还没检查完）
+            state.live = undefined;
+            state.answer = event.toolNames.length === 0 ? stripThinkTags(liveText) || undefined : undefined;
+            if (state.answer) {
+              state.answerNote = undefined;
+            }
+            liveText = "";
+            if (!event.reasoning || deps.showThinking === false) {
+              card?.update(render());
+            }
+          }
+        }
+        if (event.type === "retry" && streaming) {
+          // 卡片里那一版回答没通过检查：换成说明，重做的回答写出来以后替换它
+          state.answer = undefined;
+          state.answerNote = "这一版回答没通过检查，正在重做…";
+          card?.update(render());
+        }
         if (event.type === "tool_start" || event.type === "tool_end") {
           applyEvent(state, event);
+          card?.update(render());
+        } else if (event.type === "model" && event.reasoning && deps.showThinking !== false) {
+          (state.thoughts ??= []).push({ round: event.round, ms: event.ms, text: event.reasoning, at: state.steps.length });
+          card?.update(render());
+        } else if (event.type === "retry" && state.thoughts?.some((thought) => thought.round === lastRound)) {
+          // 被打回的那版回答是紧挨着的上一轮想出来的，多半就是没查证的说法：重做通过以后卡片上也不留这一轮的思考
+          state.thoughts = state.thoughts.filter((thought) => thought.round !== lastRound);
           card?.update(render());
         }
       },
     });
     answer = toReply(result.text, result.finish);
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, result.text, result.toolCalls > 0)) {
+    // 最后一道检查也按显示出来的文字看：<font>、<text_tag> 标签去掉
+    const shown = stripRichTags(result.text);
+    let blockedCode = false;
+    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
@@ -346,7 +496,7 @@ async function runTask(
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
       const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = [...attempted].some(isCodeTool) || mentionsRepo(`${asked}\n${result.text}`, repos);
+      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -357,17 +507,30 @@ async function runTask(
       // 带行号的要群成员写的也是这一行（问的是 src/foo.ts，回答写 src/foo.ts:99 不算照着复述）
       const inQuestion = (text: string, line?: number) =>
         [userText, unprefixed].some((said) => (line === undefined ? mentions(said, text) : mentionsLine(said, text, line)));
-      const unseen = unseenCodeCitations(result.text, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
+      const unseen = unseenCodeCitations(shown, (text, line, branch, sentence) => seen(text, line, branch, sentence) || inQuestion(text, line)).filter(
         (cite) => cite.located || investigating,
       );
       if (unseen.length > 0) {
         logger.warn(`回答打回重做以后还是引用了没查到的代码位置，没有发出 message=${msg.messageId}：${unseen.map((cite) => cite.text).join("、")}`);
         answer = blockedCodeAnswer(deps.codeRepos ?? []);
+        blockedCode = true;
       }
     }
+    // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
+    if (answer === BLOCKED_OPS_ANSWER || blockedCode || result.finish === "filtered") {
+      state.thoughts = undefined;
+    }
     state.phase = "done";
-    deps.context.remember(msg, prompt, answer);
+    // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画；记下来的也是核对过的（对不上的数后面的提问不能再看到）
+    segments = verifiedSegments(answer, evidence, logger, msg.messageId);
+    const verified = segmentsAsText(segments);
+    deps.context.remember(msg, prompt, verified);
+    // 被拦下、被审核拦下的回答里没有结论，不记
+    if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
+      await rememberThread(deps, msg, asked, verified, context.askerName);
+    }
   } catch (err) {
+    segments = undefined;
     if (task.signal.aborted) {
       state.phase = "stopped";
     } else {
@@ -383,11 +546,27 @@ async function runTask(
       step.status = "error";
     }
   }
+  // 卡片即回答：卡片里换成最终的回答（被拦下、出错时是对应的说明；停止了就不留草稿）
+  state.live = undefined;
+  state.answerNote = undefined;
+  state.answer = answer;
+  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId));
+  state.answerSegments = displayed;
+  const displayedText = segmentsAsText(displayed);
   try {
-    await card?.finish(render(), renderPlainProgressCard(state, now()));
+    const landed = await card?.finish(render(), renderPlainProgressCard(state, now(), { streaming }));
     if (answer !== undefined) {
-      for (const chunk of splitMarkdown(answer, CHUNK_CHARS)) {
-        await reply(chunk);
+      if (streaming && landed && cardMessageId && answerFitsCard(displayedText)) {
+        await rememberCardAnswer(deps, msg, cardMessageId, displayedText);
+        // 更新卡片不发通知：等得久的（排队加处理）补一句，提问人才知道处理完了
+        if (state.endedAt - askedAt >= NOTIFY_AFTER_MS) {
+          await reply(CARD_DONE_NOTICE);
+        }
+      } else {
+        // 没用流式卡片、卡片最后没更新上、或者回答太长卡片里只放了开头：和以前一样另外发全文
+        for (const chunk of splitMarkdown(toPostMarkdown(displayedText), CHUNK_CHARS)) {
+          await reply(chunk);
+        }
       }
     }
   } finally {
@@ -398,6 +577,40 @@ async function runTask(
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
+}
+
+/** 拆出回答里的图和数字卡片，数对不上查询结果的去掉；去掉了什么、哪些块格式不对写日志 */
+function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string): AnswerSegment[] {
+  const { segments, invalid } = splitAnswer(answer);
+  if (invalid.length > 0) {
+    logger.warn(`回答里的 ${invalid.join("、")} 块格式不对，没画 message=${messageId}`);
+  }
+  if (!hasUiBlocks(segments)) {
+    return segments;
+  }
+  const checked = keepVerified(segments, new NumberEvidence(evidence.flatMap((item) => (item.output === undefined || item.echo ? [] : [item.output]))));
+  if (checked.dropped.length > 0) {
+    logger.warn(`回答里的图、数字卡片对不上查询结果，没画 message=${messageId}：${checked.dropped.join("；")}`);
+  }
+  return checked.segments;
+}
+
+/** 记下这个话题的问答，之后别的话题用 chat_recent_threads 查。记不下只是别的话题查不到这次，不影响这次回答 */
+async function rememberThread(deps: BotDeps, msg: NormalizedMessage, question: string, answer: string, askerName: string | undefined): Promise<void> {
+  try {
+    await deps.recentThreads?.record(msg.chatId, threadKeyOf(msg), { question, answer, ...(askerName ? { askerName } : {}) });
+  } catch (err) {
+    (deps.logger ?? console).error(`记下话题问答失败 message=${msg.messageId}`, err);
+  }
+}
+
+/** 记下卡片里的回答，之后读话题历史时用。记不下只是这个话题后面的提问看不到这条回答，不影响这次 */
+async function rememberCardAnswer(deps: BotDeps, msg: NormalizedMessage, cardMessageId: string, answer: string): Promise<void> {
+  try {
+    await deps.cardAnswers?.save(msg.chatId, threadKeyOf(msg), cardMessageId, answer);
+  } catch (err) {
+    (deps.logger ?? console).error(`记下卡片里的回答失败 message=${msg.messageId} card=${cardMessageId}`, err);
+  }
 }
 
 /**
@@ -523,6 +736,8 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
     logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${think}${usage} → ${next}`);
   } else if (event.type === "retry") {
     logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);
+  } else if (event.type === "compacted") {
+    logger.warn(`模型说输入太长，第${event.round}轮把 ${event.results} 个工具结果压短（省掉 ${event.chars} 字）后重试 message=${messageId}`);
   } else if (event.type === "tool_end") {
     if (event.ok) {
       logger.info(`工具 ${event.name} message=${messageId} 用时=${event.ms}ms`);
@@ -575,12 +790,18 @@ const PATH_END = `(?=$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}]))(?![${SOFT_DE
 const CODE_EXT = "(?:ts|tsx|js|jsx|mjs|go|py|java|kt|rs|rb|php|c|cc|cpp|h|hpp|cs|swift|vue|sql|sh|ya?ml|toml|proto)";
 const CODE_PATHS = new RegExp(`${NOT_GLUED}(?!~)((?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
 /**
+ * 回答里的绝对路径（报错堆栈里的 /app/internal/logic/user.go:35、Go 模块缓存 /go/pkg/mod/…/x.go）：CODE_PATHS 只认相对路径，
+ * 绝对路径整段都认不出来，原先回答里写 /app/src/user.ts:99 一概不查。和 CODE_PATHS 一样至少一层目录、按整段认；
+ * 前面要是分界：x(/app/…、~/.config/x.yaml、./src/a.ts 里的 / 前面紧挨着路径字符，不是绝对路径的开头
+ */
+const ABS_CODE_PATHS = new RegExp(`${NOT_GLUED}(\\/(?:${NAME_CHAR}+\\/)+${NAME_CHAR}+\\.${CODE_EXT})${PATH_END}`, "g");
+/**
  * 反引号、加粗、引号里带空格的路径（`src/my files/app.ts:12`、**src/my files/app.ts**:12、"src/my files/app.ts":12）：
  * CODE_PATHS 只认得出空格后面那段，这种先按整段认（见 unseenCodeCitations）。目录和文件名里能有的字符和 CODE_PATHS 一样，
  * 词之间可以是连着几个空格、制表符、全角空格；后面是收尾的符号，或者 LINE_AFTER_PATH 认的行号写法（:12、：12、#L12、 第 12 行）
  */
 const SPACED_CODE_PATHS = new RegExp(
-  `(?<=[\`*"“「『])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})(?=[\`*"”」』:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
+  `(?<=[\`*"“「『])(\\/?(?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})(?=[\`*"”」』:：#]|\\s*(?:的)?\\s*第\\s*\\d)`,
   "g",
 );
 /**
@@ -588,7 +809,7 @@ const SPACED_CODE_PATHS = new RegExp(
  * CODE_PATHS 会把两头的符号算进路径里、认不出来。前面是分界、两头是一样的一对符号时，中间按一整段路径认（见 unseenCodeCitations）
  */
 const WRAPPED_CODE_PATHS = new RegExp(
-  `(?<=(?:^|[${PATH_DELIM}])([_~]{1,2}))(?![_~])((?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})` +
+  `(?<=(?:^|[${PATH_DELIM}])([_~]{1,2}))(?![_~])(\\/?(?:${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\/)+${NAME_CHAR}+(?:[^\\S\\r\\n]+${NAME_CHAR}+)*\\.${CODE_EXT})` +
     `(?=\\1(?:$|[${PATH_DELIM}]|[.!?]+(?:$|[${PATH_DELIM}])))`,
   "g",
 );
@@ -632,6 +853,22 @@ export const UNVERIFIED_CODE_ANSWER =
   "（系统检查）你的回答涉及代码仓库的内容，但这次一次代码工具都没调用，这些内容没有经过查证。" +
   "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
   "如果和仓库无关，去掉没查证的文件路径后重新回答。不要提这段检查。";
+
+/**
+ * 没调代码工具，回答里却有没查证的文件、提交号时，点名是哪几处让模型重做。2026-10-10 复测转链：模型把剧本里的核对记录
+ * （「提交 fa02ac8」）抄进了回答，打回时只说「去掉没查证的文件路径」，它不知道是哪处，重做后照样带着，整条回答被拦
+ */
+export function unverifiedCodeAnswer(cites: readonly string[]): string {
+  if (cites.length === 0) {
+    return UNVERIFIED_CODE_ANSWER;
+  }
+  return (
+    `（系统检查）你的回答引用了这些代码位置：${cites.join("、")}，但这次一次代码工具都没调用，它们没有经过查证；` +
+    "排查剧本和使用说明里写的文件路径、提交号是写说明的人核对时用的，也不算这次查到过。" +
+    "如果问题和配置的仓库有关，先用 code_list_files、code_search、code_read_file 查清楚，再只按查到的内容重新回答，写明文件和行号，查不到就直说；" +
+    "如果和仓库无关，去掉这几处，其余查到的结论照常写，重新回答。不要提这段检查。"
+  );
+}
 
 /** 调过代码工具，回答里却引用了工具结果里没有的文件、提交号时，让模型重做 */
 export function unseenCodeAnswer(cites: readonly string[], repos: readonly string[]): string {
@@ -705,15 +942,19 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
     if (!/\s/.test(path) || line !== undefined || seen(path, line) || !looksLikeCommand(path)) {
       check(path, line, match.index);
     } else {
-      for (const piece of path.matchAll(CODE_PATHS)) {
-        const at = match.index + piece.index;
-        check(piece[1], lineAfter(at + piece[1].length), at);
+      for (const pieces of [CODE_PATHS, ABS_CODE_PATHS]) {
+        for (const piece of path.matchAll(pieces)) {
+          const at = match.index + piece.index;
+          check(piece[1], lineAfter(at + piece[1].length), at);
+        }
       }
     }
   }
-  for (const match of answer.matchAll(CODE_PATHS)) {
-    if (!spans.some(([from, to]) => match.index >= from && match.index < to)) {
-      check(match[1], lineAfter(match.index + match[1].length), match.index);
+  for (const paths of [CODE_PATHS, ABS_CODE_PATHS]) {
+    for (const match of answer.matchAll(paths)) {
+      if (!spans.some(([from, to]) => match.index >= from && match.index < to)) {
+        check(match[1], lineAfter(match.index + match[1].length), match.index);
+      }
     }
   }
   // 提交号所在的这句话：写着仓库名的，只认这个仓库里查到的提交（见 codeEvidence）
@@ -732,11 +973,21 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
   return [...cites.values()];
 }
 
+/**
+ * 结果里的内容是模型自己写进去的工具：记忆（记的、查的都是之前模型写的）、最近话题（之前的回答）。
+ * 它们结果里的数不算查到的数：模型先记一句「CPU 99%」，不能再拿回执里的 99 去画图
+ */
+const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
+
 /** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact），别的工具是模型看到的原文 */
 export interface ToolEvidence {
   tool: string;
   output?: string;
   facts?: readonly CodeFact[];
+  /** 结果里的内容是模型自己写进去的（写操作的回执、记忆、之前的回答）：里面的数不能当图和数字卡片的依据 */
+  echo?: boolean;
+  /** output 里的代码永久链接（见 codeLinks）算查到的代码：MCP 服务的结果是，网页、搜索结果不是 */
+  links?: boolean;
 }
 
 /**
@@ -746,6 +997,8 @@ export interface ToolEvidence {
  * 读到、搜到的代码正文里写的路径、行号、提交号也就不算：仓库里的测试和文档常常写着别的路径，机器人自己的仓库 ai/agent-tag 的测试里
  * 就有 2026-10-09 编出来的那几个引用。
  * 别的工具（aiops 查到的日志、报错堆栈）没有固定格式，按原文找：路径要整段对上，前面是绝对路径的也算（/app/src/a.ts:12）。
+ * 回答里写的就是绝对路径时，日志、堆栈里要有这整个绝对路径；代码工具查到的是仓库里的相对路径，去掉前面几级目录以后对得上就算
+ * （容器里的 /app/src/a.ts:12 就是读到的 src/a.ts 第 12 行）。
  * 没查到的（「没有这个文件：src/foo.ts」、没搜到、没有匹配的文件）不算：从回答的字面上分不清是在说「它不存在」，
  * 还是没查到以后照样讲它写了什么。照实说找不到的回答，打回重做时会被告知别写这个路径；路径是群成员自己问的，重做以后照着复述也不拦（见 runTask）。
  * 回答里写成「./路径」时去掉前缀再找，路径和读文件时一样整理（src/./a.ts 就是 src/a.ts）；
@@ -763,22 +1016,52 @@ export function codeEvidence(repos: readonly string[], results: readonly ToolEvi
     const named = sentence !== undefined && COMMIT_ID.test(cite) ? commitRepo(sentence, repos) : undefined;
     const written = named === undefined ? cite : `${named}/${cite}`;
     // 文件名里可以真有反斜杠（src/foo\bar.ts）：先按原样找，再把 \ 当成 / 找（Windows 的写法）
-    return [...new Set([repoPath(written), repoPath(written.replace(/\\/g, "/"))])].some((text) => {
-      // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算。
-      // 仓库名互相包含时（team/backend、team/backend/api）只按最长的那个算：team/backend/api/src/x.ts 说的是 team/backend/api 里的
-      const prefix = longestRepoPrefix(text, repos);
-      const forms: Array<{ path: string; repos?: string[] }> = [
-        { path: text, repos: prefix === undefined ? undefined : [prefix] },
-        ...(prefix === undefined ? [] : [{ path: text.slice(prefix.length + 1), repos: [prefix] }]),
-      ];
-      return matchesFacts(facts, forms, line, branch);
+    return [...new Set([written, written.replace(/\\/g, "/")])].some((raw) => {
+      // 绝对路径（/app/src/a.ts）：日志、堆栈里要整段对上，别的绝对路径（/build/app/src/a.ts）、相对路径（src/a.ts）不算；
+      // 代码工具查到的是仓库里的相对路径，按去掉前面几级目录以后的认（/app/src/a.ts 的 app/src/a.ts、src/a.ts，至少留一层目录）。
+      // 日志里的绝对路径不一定整理过（PHP 报错里的 /var/www/html/../vendor/autoload.php），回答照抄的也要认：按原样和整理后的都找
+      const absolute = /^\s*\/(?!\/)/.test(raw) ? posix.normalize(raw.trim()) : undefined;
+      const forms: Array<{ path: string; repos?: string[] }> = [];
+      for (const text of absolute === undefined ? [repoPath(raw)] : innerPaths(absolute)) {
+        // 开头是仓库名的，整段当路径找时也只认这个仓库里查到的：别的仓库里恰好有个叫 ai/aiops-mcp/src/foo.ts 的文件不算。
+        // 仓库名互相包含时（team/backend、team/backend/api）只按最长的那个算：team/backend/api/src/x.ts 说的是 team/backend/api 里的。
+        // 绝对路径里有仓库名的（/ai/agent-tag/src/x.ts），更短的那几段（src/x.ts）不再拿去别的仓库里找
+        const prefix = longestRepoPrefix(text, repos);
+        forms.push({ path: text, repos: prefix === undefined ? undefined : [prefix] });
+        if (prefix !== undefined) {
+          forms.push({ path: text.slice(prefix.length + 1), repos: [prefix] });
+          break;
+        }
+      }
+      return matchesFacts(facts, forms, line, branch, absolute === undefined ? undefined : [...new Set([raw.trim(), absolute])]);
     });
   };
 }
 
-/** 按 forms 里的几种写法（整段、去掉仓库名的）在查到的里找 */
-function matchesFacts(facts: CodeFacts, forms: Array<{ path: string; repos?: string[] }>, line?: number, branch?: boolean): boolean {
-  return forms.some(({ path, repos: scope }) => {
+/**
+ * 绝对路径最多去掉开头这么多级目录。容器、构建机、模块缓存的前缀（/app、/var/www/html、/home/runner/work/x/x、/go/pkg/mod/…@v1.2.3）没有这么深；
+ * 不设上限时每一段都拼一遍，回答里写一个几万字、几万级的路径，查一次就要几秒、几百 MB
+ */
+const MAX_DROPPED_DIRS = 32;
+
+/** 绝对路径去掉开头几级目录以后的各段，从长到短，至少留一层目录：/app/src/a.ts → app/src/a.ts、src/a.ts */
+function innerPaths(absolute: string): string[] {
+  const parts = absolute.split("/").filter(Boolean);
+  return parts.slice(0, Math.min(parts.length - 1, MAX_DROPPED_DIRS + 1)).map((_, i) => parts.slice(i).join("/"));
+}
+
+/**
+ * 按 forms 里的几种写法（整段、去掉仓库名的）在查到的里找。texts 是在没有固定格式的结果（日志、堆栈）里找的写法，
+ * 不传就是 forms 里的这几种；绝对路径只按它整段找
+ */
+function matchesFacts(
+  facts: CodeFacts,
+  forms: Array<{ path: string; repos?: string[] }>,
+  line?: number,
+  branch?: boolean,
+  texts: readonly string[] = forms.map((form) => form.path),
+): boolean {
+  const known = forms.some(({ path, repos: scope }) => {
     const inRepo = (found: { repo: string }) => scope === undefined || scope.includes(found.repo);
     let found: boolean;
     if (COMMIT_ID.test(path)) {
@@ -794,8 +1077,9 @@ function matchesFacts(facts: CodeFacts, forms: Array<{ path: string; repos?: str
         ) ||
         (branch === true && line === undefined && facts.branches.some((seen) => inRepo(seen) && seen.name === path));
     }
-    return found || facts.text.some((output) => (line === undefined ? mentions(output, path) : hasLine(output, path, line)));
+    return found;
   });
+  return known || facts.text.some((output) => texts.some((path) => (line === undefined ? mentions(output, path) : hasLine(output, path, line))));
 }
 
 /**
@@ -863,11 +1147,22 @@ interface CodeFacts {
 
 function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
   const facts: CodeFacts = { files: new Map(), commits: [], branches: [], text: [] };
-  for (const { tool, output, facts: found } of results) {
+  for (const { tool, output, facts: found, links } of results) {
     // 代码工具的结果文字一概不认，只认它记下的代码位置
     if (!isCodeTool(tool)) {
       if (output !== undefined) {
-        facts.text.push(output);
+        const forms = unescapedForms(output);
+        facts.text.push(...forms);
+        const found = links ? [...new Map(forms.flatMap(codeLinks).map((link) => [JSON.stringify(link), link])).values()] : [];
+        // 只有标了一段行的链接才要看「行号|」
+        const marked = found.some((link) => link.lines && link.lines[0] !== link.lines[1]) ? markedLines(forms) : undefined;
+        for (const link of found) {
+          const shown = shownLines(link.lines, marked).map((lines) => ({ repo: link.repo, lines }));
+          facts.files.set(link.path, [...(facts.files.get(link.path) ?? []), { repo: link.repo }, ...shown]);
+          if (COMMIT_ID.test(link.ref)) {
+            facts.commits.push({ repo: link.repo, sha: link.ref.toLowerCase() });
+          }
+        }
       }
       continue;
     }
@@ -883,6 +1178,117 @@ function codeFacts(results: readonly ToolEvidence[]): CodeFacts {
     }
   }
   return facts;
+}
+
+const JSON_ESCAPE = /\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g;
+const JSON_ESCAPED: Record<string, string> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+
+/**
+ * aiops 结果里的报错堆栈常常是转义过的：日志行里的换行、缩进写成 \n\t，整理结果时又 JSON.stringify 一次，
+ * 路径前面紧挨着的是 \t 里的 t（\n\t/build/services/goods/tb.go:8220），就认不出是绝对路径；日志行本身是 JSON 字符串时还会转义两层（\\n\\t）。
+ * 2026-10-10 转链排查时回答引用的堆栈位置就是因为这个被当成没查证、整段拦下。
+ * 按 JSON 的转义还原一层、两层，和原文一起拿来找：还原只是把转义符变回空白、引号这些分界，不会多出原文里没有的路径
+ */
+function unescapedForms(output: string): string[] {
+  const forms = [output];
+  for (let i = 0; i < 2 && forms[i].includes("\\"); i++) {
+    const next = forms[i].replace(JSON_ESCAPE, (_, hex: string | undefined, char: string) =>
+      hex !== undefined ? String.fromCharCode(parseInt(hex, 16)) : (JSON_ESCAPED[char] ?? char),
+    );
+    if (next === forms[i]) {
+      break;
+    }
+    forms.push(next);
+  }
+  return forms;
+}
+
+/**
+ * 代码平台上文件的永久链接：GitLab 的 https://主机/组/项目/-/blob/<提交或分支>/<路径>#L12-20，GitHub 的 https://github.com/owner/repo/blob/<提交>/<路径>#L12-L20。
+ * aiops 的代码工具（get_repo_file、search_code）按线上版本读到代码时都附这样的链接，写明了读的是哪个仓库、哪个提交、哪个文件的哪几行；
+ * 结果里的行号写在代码前面（「2468| ...」），回答里的「tb.go:2468」在原文里找不到，只能按链接认。
+ * 认链接不认字段名：aiops 的代码工具还在开发，字段可能改，链接是代码平台自己的格式。
+ * 结果太长被截短时，链接可能断在中间（…#L2440-24…（省略 2 字））：后面紧跟着省略号、字母数字的不认，断在行号里的只认文件。
+ * 只认 GitLab 的 /-/blob/ 和 github.com 的 /blob/：日志里别的网址（对象存储 https://oss…/img/blob/abc1234/a.php、用户分享的链接）路径里也可能有 blob，不是代码。
+ * 路径里不收中文标点和 , ; { }：链接后面紧跟着「，见上」时不能把标点算进路径
+ */
+const CODE_LINK =
+  /https?:\/\/(?:github\.com\/([^\s/"'`<>()（）…\\#?]+\/[^\s/"'`<>()（）…\\#?]+)\/blob|[^\s/"'`<>()（）…\\]+\/([^\s"'`<>()（）…\\#?]+?)\/-\/blob)\/([^\s/"'`<>()（）…\\#?]+)\/([^\s"'`<>()（）…\\#?，。；：、！？「」『』【】,;{}]+)(?:\?[^\s"'`<>()（）…\\#]*)?(?:#L(\d+)(?:-L?(\d+))?)?(?![\w\-…])/gi;
+
+interface CodeLink {
+  /** 仓库（小写） */
+  repo: string;
+  /** 链接里的提交号或分支 */
+  ref: string;
+  path: string;
+  /** 链接标了行（#L12、#L12-20）时，起止行 */
+  lines?: [number, number];
+}
+
+function codeLinks(text: string): CodeLink[] {
+  const links: CodeLink[] = [];
+  for (const match of text.matchAll(CODE_LINK)) {
+    const [, github, gitlab, ref, file, from, to] = match;
+    const repo = github ?? gitlab;
+    let decoded: string;
+    try {
+      // 链接写在句末时，后面的英文句号、冒号不是路径的一部分（中文标点本来就不收进路径）
+      decoded = decodeURIComponent(from === undefined ? file.replace(/[.:!]+$/, "") : file);
+    } catch {
+      continue;
+    }
+    const start = from === undefined ? undefined : Number(from);
+    // 止行比起行小的不是正常的范围，只认起行
+    const end = to === undefined || start === undefined || Number(to) < start ? start : Number(to);
+    links.push({
+      repo: repo.toLowerCase(),
+      ref,
+      path: repoPath(decoded),
+      ...(start !== undefined && end !== undefined ? { lines: [start, end] as [number, number] } : {}),
+    });
+  }
+  return links;
+}
+
+/** 结果里带行号的代码行（aiops 读代码、搜代码的结果写成「2468| ...」）的行号。转义过的结果（\n2468|）在还原过的那份里认 */
+function markedLines(forms: readonly string[]): Set<number> {
+  const marked = new Set<number>();
+  for (const form of forms) {
+    for (const match of form.matchAll(/(?<![\w.])(\d{1,7})\|/g)) {
+      marked.add(Number(match[1]));
+    }
+  }
+  return marked;
+}
+
+/**
+ * 链接标的行里，哪些算查到了：只标一行的（搜代码命中的那一行）算；标了一段的（读文件），只算结果里真有「行号|」的那几行，连着的并成一段。
+ * 结果太长时长字段会被截短（见 compactText），链接还在、后面的代码已经没了：那些行模型没看到。
+ * 结果里一个「行号|」都没有时（aiops 改了代码的写法），没法按行核对，照链接标的整段算，不因为格式变了就把引用全打回。
+ * 「行号|」不分是哪个文件的：一次结果里有几段代码时，别的文件的行号也会算上，这一点放宽
+ */
+function shownLines(lines: [number, number] | undefined, marked: ReadonlySet<number> | undefined): Array<[number, number]> {
+  if (lines === undefined) {
+    return [];
+  }
+  if (lines[0] === lines[1] || marked === undefined || marked.size === 0) {
+    return [lines];
+  }
+  const runs: Array<[number, number]> = [];
+  for (const line of [...marked].filter((n) => n >= lines[0] && n <= lines[1]).sort((a, b) => a - b)) {
+    const last = runs.at(-1);
+    if (last && last[1] === line - 1) {
+      last[1] = line;
+    } else {
+      runs.push([line, line]);
+    }
+  }
+  return runs;
+}
+
+/** 这次结果里有 MCP 服务读代码给的永久链接：算读过代码 */
+function linksCode(item: ToolEvidence): boolean {
+  return item.links === true && item.output !== undefined && unescapedForms(item.output).some((form) => codeLinks(form).length > 0);
 }
 
 /** text 里有没有这个路径或提交号：提交号可以只写前几位，按前缀认；路径要整段对上 */
@@ -981,15 +1387,16 @@ function mentionsRepo(text: string, repos: readonly string[]): boolean {
  * - 一次代码工具都没调，问题或回答却提到了配置的仓库、或者回答里写了没查证的文件路径：让它先查再答。模型关着思考时容易照着常见的项目结构编出文件和行号。
  * - 调过代码工具，回答里还是写了工具结果里没有的文件、行号、提交号：让它只按查到的重写。只看「调没调过」不够，调一次什么都没查到照样能编。
  * seen 认的不算没查证：排查线上问题时文件和行号来自 aiops 查到的报错日志和堆栈，代码工具读到的也在里面；
- * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码
+ * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码。
+ * readCode：通过 aiops 这类 MCP 服务读过代码（结果里有代码永久链接），和调过代码工具一样只核对引用
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false) {
+export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false, readCode: () => boolean = () => false) {
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     const unseen = unseenCodeCitations(answer, seen);
-    if ([...usedTools].some(isCodeTool)) {
+    if ([...usedTools].some(isCodeTool) || readCode()) {
       return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
     }
-    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? UNVERIFIED_CODE_ANSWER : undefined;
+    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;
   };
 }
 
@@ -1077,6 +1484,131 @@ export function reviewOpsAnswer(question: string, servers: readonly string[], su
       return undefined;
     }
     return OPS_QUESTION.test(question) || hasUnverified(OPS_DATA, question, answer) ? unverifiedOpsAnswer(servers) : undefined;
+  };
+}
+
+/** 「不是服务故障的原因」「不是服务问题所在」说的是某条线索不是根因，不是把问题推出去（「不是服务故障导致的」是） */
+const NOT_CAUSE = String.raw`(?!\s*(?:的|原因|根因|根源|源头|点|所在))`;
+/** 否定、拿不准的前面：「不是淘宝平台限制」「不属于用户侧问题」说的是排除了外部原因，「不排除是」「可能是」还没下结论 */
+const NOT_BEFORE = String.raw`(?<!(?:不|非|并非|并不|排除|可能|也许|或许|怀疑|是否)(?:是|属于|在)?)`;
+/** 我们这边的主语。「代码」「接口」不算：「不是代码问题，是配置里的超时设成了 1s」说的还是服务自己的问题 */
+const OUR_SIDE = String.raw`(?:我们|我方)?的?(?:服务端?|系统|后端|我们|我方)`;
+
+/** 外部：平台、第三方、上游 */
+const OUTSIDE = String.raw`(?:淘宝|天猫|京东|拼多多|抖音|微信|支付宝|第三方|上游|对方|外部)(?:平台|服务)?(?:侧|方|端|那边)?`;
+
+/**
+ * 把问题推到服务之外的结论：「不是服务故障」「服务本身没有问题」「跟我们无关」「属于淘宝平台限制」「用户侧问题」「无需修复」。
+ * 要说到是谁的问题：「服务没有异常」这类看状态的、「这次重启不是故障，是正常发版」这类没说到服务的都不算；
+ * 只提到外部原因、同一句里说是我们没处理的（「根因是淘宝风控返回的 code 我们没处理」）也不算
+ */
+const DEFLECTING = new RegExp(
+  [
+    // 「是不是服务故障」「如果不是服务故障」「是否」是在问、在假设
+    String.raw`(?:(?<![是果否])不是|并非|并不是|不属于|(?<![除是])非)${OUR_SIDE}(?:本身)?的?\s*(?:故障|问题|bug|缺陷)${NOT_CAUSE}`,
+    String.raw`(?:(?:服务端?|系统|后端)本身|(?:我们|我方)(?:这边|这里|侧))(?:没有|没|无|不存在|并无)\s*(?:问题|故障|bug)`,
+    String.raw`(?:跟|和|与)(?:我们|我方|服务端?|系统|后端)(?:这边|本身)?(?:无关|没关系|没有关系)`,
+    String.raw`(?:没有|没|无)\s*(?:问题|故障|bug)[，,]?\s*是${OUTSIDE}`,
+    String.raw`${NOT_BEFORE}用户(?:侧|端|自己|自身)的?(?:问题|原因)|用户操作(?:不当|失误|有误|错误)`,
+    String.raw`${NOT_BEFORE}属于${OUTSIDE}的?(?:限制|问题|原因|规则|策略|风控)`,
+    String.raw`${NOT_BEFORE}(?:是|在)${OUTSIDE}的?(?:限制|问题)`,
+    String.raw`(?:无需|无须|不用|不需要|没必要)(?:我们|开发)?修复`,
+  ].join("|"),
+  "i",
+);
+/**
+ * 让用户自己重来：「建议用户在商品详情页重新分享」「让用户换个链接再试」。否定的（「不建议让用户重新分享」「不应该让用户重新分享」）不算；
+ * 同一句里说了已经修了、等修好上线（「已修复并部署，通知用户重试即可」「等修复上线后通知用户重试」）也不算；「而不是让用户重新分享」「避免让用户…」是反过来说的
+ */
+const USER_REDO = new RegExp(
+  String.raw`(?<!(?:不|(?<![特识区个类级])别|勿|无需|无须|没必要)(?:应该?|能|可以?|该|要|用|必|需|建议)?|而不是|不要再|别再|不再|避免)(?:建议|请|让|需要|可以|引导|提示|告诉|通知)用户[^。；;！!？?\n]{0,20}?(?:重新|再次|重试|再试|换个|换一个|换成|改用)`,
+);
+const FIXED = /已经?(?:修复|修好|改好|部署|上线|发版)|等[^，,。；;]{0,8}(?:修复|修好|改好|部署|上线|发版)/;
+/** 这句话里修没修好、上没上线还没确定（「是否已部署未确认」「不确定是否已修复」「已修复，待确认上线」）：这时让用户重试还是推出去 */
+const UNSURE = /是否|是不是|有没有|有无|不确定|不能确定|无法确定|没法确定|无法确认|没法确认|未确认|待确认|还没确认|尚未确认|不清楚/;
+
+/** 回答里有没有把问题推出去的结论。问句（「系统本身没有问题吗？」）、举例的分句（「比如回答『不是服务故障』之前…」）不算 */
+function deflects(answer: string): boolean {
+  return answer.split(/(?<=[。；;！!？?\n])/).some((sentence) => {
+    if (/(?:[？?]|[吗呢][。！!]?)\s*$/.test(sentence)) {
+      return false;
+    }
+    const stated = sentence
+      .split(/(?<=[，,])/)
+      .filter((clause) => !EXAMPLE.test(clause))
+      .join("");
+    return DEFLECTING.test(stated) || (USER_REDO.test(stated) && !(FIXED.test(sentence) && !UNSURE.test(sentence)));
+  });
+}
+
+/**
+ * 每次查完、下一轮要思考之前加在工具结果后面的提醒。2026-10-10 转链排查：第 2 轮还是中文，第 3 轮读完一大段英文日志就一直用英文想，
+ * 进度卡片上整段英文，群里看着费劲。系统提示词里也写了，但模型想用什么语言跟着最近读到的内容走，离得近的提醒更管用。
+ * 原来等想成英文了才提醒，2026-10-12 那次第 3 轮还是先出了一轮英文，所以改成每轮都提前提醒
+ */
+export const THINK_IN_CHINESE = "（系统提醒，不用回复这句）接下来的思考请用中文写：思考会显示在进度卡片上给群里的人看。代码、日志、报错原文、函数名、命令照原样引用，不用翻译。";
+
+/** 代码块整块去掉：里面的反引号不成对也不会错开后面的配对 */
+const FENCED_CODE = /```[\s\S]*?(?:```|$)/g;
+/** 引号、反引号、书名号里引用的原文：英文思考里引用的中文报错、商品名，中文思考里引用的英文日志 */
+const QUOTED_TEXT = /`[^`\n]*`|「[^」]*」|“[^”]*”|【[^】]*】|"[^"\n]*"/g;
+/** 连着的一串可见 ASCII 字符。只吃 ASCII，网址后面直接跟着的汉字、全角标点不受影响 */
+const ASCII_RUN = /[\x21-\x7e]+/g;
+/** 代码标点：带它的 ASCII 串是网址、路径、函数调用（time.Now()）、key=value、日志时间、图片和文件占位符 */
+const CODE_PUNCT = /[._/\\()[\]{}=;:<>|]/;
+/** 英文行文才有的虚词，大小写照行文的写法（单独的小写 i 多半是循环变量）。带代码标点的词先去掉了，wg.Wait()、time.Now() 不算 */
+const ENGLISH_PROSE = /\b(?:[Tt]he|I|[Ll]et|[Mm]e|[Ww]e|[Nn]eed|[Ss]hould|[Nn]ow|[Ss]o|[Oo]kay|[Ww]ait|[Mm]aybe|[Bb]ut|[Ww]hich|[Tt]here|[Tt]hen|[Ss]eems|[Ll]ooks)\b/g;
+/** 英文提问里几乎总有的词 */
+const ENGLISH_QUESTION = /\b(?:what|why|how|when|where|who|which|is|are|was|were|does|do|did|can|could|would|should|please|I|my|we|our|you|your|it|this|that|the|a|an)\b/i;
+
+/** 去掉带代码标点的 ASCII 串。先整串匹配再判断，不用一个正则回溯着找，几十 KB 的长串也是线性的 */
+function dropCodeTokens(text: string): string {
+  return text.replace(ASCII_RUN, (run) => (CODE_PUNCT.test(run) ? " " : run));
+}
+
+/**
+ * 思考是不是用英文写的：去掉代码块、引用的原文和带代码标点的词以后，英文虚词至少 3 个，而且汉字数不到虚词数的 8 倍。
+ * 中文思考里引用的英文日志、路径、函数名不带这些虚词；英文思考里没加引号提到的商品名、中文报错也压不过虚词。
+ * visible 取实际显示的那部分：先在整段上去掉代码块再取，截断不会把代码块切成两半
+ */
+export function writtenInEnglish(text: string, visible: (text: string) => string = (all) => all): boolean {
+  const plain = dropCodeTokens(visible(text.replace(FENCED_CODE, " ")).replace(QUOTED_TEXT, " "));
+  const han = plain.match(/\p{Script=Han}/gu)?.length ?? 0;
+  const prose = plain.match(ENGLISH_PROSE)?.length ?? 0;
+  return prose >= 3 && han < prose * 8;
+}
+
+/**
+ * 提问是不是该按中文算：有汉字，或者没有英文提问的常用词（只 @ 了一下、只贴了告警名、链接）；
+ * 有日文假名、韩文的不算。@ 的名字、网址、带代码标点的词不看。群里一般说中文，拿不准时按中文
+ */
+export function askedInChinese(question: string): boolean {
+  if (/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(question)) {
+    return false;
+  }
+  const plain = dropCodeTokens(question.replace(/@\S+/g, " "));
+  return /\p{Script=Han}/u.test(plain) || !ENGLISH_QUESTION.test(plain);
+}
+
+export const DEFLECTED_ANSWER =
+  "（系统检查）你的回答把问题归到了服务之外（比如「不是服务故障」「建议用户重新操作」「属于平台限制」）。这类结论会让大家不再往下查，下之前要拿代码核对清楚：\n" +
+  "1. 拿失败请求的特征（链接的域名和关键参数、报错原文、错误码）搜代码，从入口沿主流程看这种输入在哪一步被处理或拒绝，不要只看报错附近的几行；\n" +
+  "2. 日志是当时线上那一版打的，代码可能已经改过：用 code_log 按同样的特征查最近的提交，看是不是已经修过，能查线上版本就查，查不了就在结论里写明看的是哪个分支的代码；\n" +
+  "3. 结论分开写：当时为什么失败（带日志时间）、现在的代码处不处理、线上部署了没有。\n" +
+  "核对完还是服务之外的问题，就照常这么写，并写明核对了哪些代码（只写这次实际读到、搜到的文件和行号）；读不到相关代码就直说没法确认是不是服务的问题。不要提这段检查。";
+
+/**
+ * 排查线上问题（调过 aiops 这类 MCP 服务的工具，成没成功都算）以后，回答把问题推到服务之外时，打回一次，让模型先拿代码核对。
+ * 2026-10-10 转链排查：模型只看日志就定了「淘宝拒绝、不是服务故障，让用户重新分享」，被打回补查代码时 5 次搜索都在同款推荐那条支路上，
+ * 没拿链接里的 pages-fast、topIds 搜一下，漏掉了当天已经合进 master 的修复。这类结论会让用户和开发都不再往下查。
+ * 只问代码、没查线上的（「前端不需要修改」）不管。只在有代码工具时装（要模型去搜代码）；核对完还是这个结论就照常发。
+ * 重做只有一次：这一项用掉以后，重做的回答里再有没查证的引用就直接拦下，所以提示里要模型只写这次实际读到、搜到的文件和行号
+ */
+export function reviewDeflectedAnswer(servers: readonly string[], attempted: ReadonlySet<string>) {
+  const prefixes = servers.map((name) => `${name}_`);
+  return (answer: string): string | undefined => {
+    const investigated = [...attempted].some((name) => prefixes.some((prefix) => name.startsWith(prefix)));
+    return investigated && deflects(answer) ? DEFLECTED_ANSWER : undefined;
   };
 }
 
@@ -1223,5 +1755,7 @@ function describeError(err: unknown): string {
       return "连不上模型服务，请检查网络或 MODEL_BASE_URL";
     case "api":
       return "模型服务返回错误";
+    case "too_long":
+      return "要看的内容超出了模型一次能读的长度，可以把问题拆小一点，或者说清楚服务、时间范围再问";
   }
 }

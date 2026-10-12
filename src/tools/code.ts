@@ -1,4 +1,4 @@
-import { addChanges, type CodeWorkspaces, RECENT_BRANCHES, type Workspace } from "../repo.js";
+import { addChanges, type CodeWorkspaces, DEFAULT_LOG_COMMITS, MAX_LOG_COMMITS, RECENT_BRANCHES, type Workspace } from "../repo.js";
 import { type Tool, type ToolContext, type ToolOutput, ToolOutputBuilder } from "./tool.js";
 
 export const CODE_TOOL_NAMES = [
@@ -6,6 +6,7 @@ export const CODE_TOOL_NAMES = [
   "code_list_files",
   "code_read_file",
   "code_search",
+  "code_log",
   "code_edit_file",
   "code_diff",
   "code_open_pr",
@@ -162,6 +163,43 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
   };
 
+  // 2026-10-10 转链排查：修复「c.tb.cn 短链落地半屏详情页」已经合进 master，提交说明写得清清楚楚，
+  // 机器人看不到提交历史，读了 master 的代码还是下了「不是服务故障、让用户重新分享」的结论
+  const log: Tool = {
+    spec: {
+      name: "code_log",
+      description:
+        "查代码仓库一个分支的提交历史（提交号、时间、作者、说明），从新到旧，可以按提交说明里的词、改过的文件或目录、起始日期筛。" +
+        "用来确认一个问题有没有人改过、改在哪个提交、什么时候合进来的：排查追到某段代码或某个报错，" +
+        "要下「代码没处理」「不是服务的问题」「让用户换个方式」这类结论前，先按报错文案、关键参数或文件查一下最近的提交。" +
+        "只看一个分支（默认当前分支）；要知道修复合没合进别的分支，用 branch 再查一次。",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: repoParam,
+          query: { type: "string", description: "提交说明里要有的词，几个词用空格隔开（都要有），不分大小写，如「c.tb.cn 转链」" },
+          path: { type: "string", description: "只看改过这个文件或目录的提交，相对仓库根目录" },
+          since: { type: "string", description: "只看这天以后的提交，如 2026-10-01" },
+          limit: { type: "integer", description: `最多列几个，默认 ${DEFAULT_LOG_COMMITS}，最多 ${MAX_LOG_COMMITS}` },
+          branch: branchParam,
+        },
+        required: required(),
+      },
+    },
+    describe: (args) => `查提交：${[optional(args.query) ? preview(args.query) : "", optional(args.path) ?? ""].filter(Boolean).join(" ") || "最近的提交"}${onBranch(args.branch)}`,
+    async run(args, ctx) {
+      const ws = await workspace(args, ctx);
+      const options = {
+        query: optional(args.query),
+        path: optional(args.path),
+        since: optional(args.since),
+        branch: optional(args.branch),
+        limit: typeof args.limit === "number" ? args.limit : undefined,
+      };
+      return report(ctx, await ws.log(options, ctx.signal));
+    },
+  };
+
   const edit: Tool = {
     writes: true,
     spec: {
@@ -242,7 +280,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
   };
 
-  return [branches, listFiles, read, search, edit, diff, openPr];
+  return [branches, listFiles, read, search, log, edit, diff, openPr];
 }
 
 /** 把结果里查到的代码位置交给机器人的回答检查，文字交给模型 */

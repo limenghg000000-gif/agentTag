@@ -6,16 +6,33 @@ import { createOpenAICompatibleEmbedder, createOpenAICompatibleModel, createOpen
 
 // 本地假 OpenAI 兼容接口：记录收到的请求，按队列返回预设的状态码和响应
 const requests: { url: string; headers: IncomingHttpHeaders; body: any }[] = [];
-const responses: { status: number; body: object }[] = [];
+// sse：流式响应，按 Server-Sent Events 逐条发出（每条之间等 delayMs），最后发 [DONE]；done 为 false 时不发 [DONE]
+const responses: ({ status: number; body: object } | { status: number; sse: object[]; delayMs?: number; done?: boolean })[] = [];
 const server = createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => (raw += chunk));
   req.on("end", () => {
     requests.push({ url: req.url!, headers: req.headers, body: JSON.parse(raw) });
-    const { status, body } = responses.shift()!;
-    res.statusCode = status;
+    const next = responses.shift()!;
+    res.statusCode = next.status;
+    if ("sse" in next) {
+      res.setHeader("content-type", "text/event-stream");
+      void (async () => {
+        for (const event of next.sse) {
+          if (res.destroyed) {
+            return;
+          }
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+          if (next.delayMs) {
+            await new Promise((resolve) => setTimeout(resolve, next.delayMs));
+          }
+        }
+        res.end(next.done === false ? "" : "data: [DONE]\n\n");
+      })();
+      return;
+    }
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify(body));
+    res.end(JSON.stringify(next.body));
   });
 });
 await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -106,6 +123,26 @@ test("带上工具说明，解析模型返回的工具调用", async () => {
   assert.deepEqual(requests.at(-1)!.body.tools, [{ type: "function", function: tool }]);
   // 允许一轮调多个工具，少等几轮
   assert.equal(requests.at(-1)!.body.parallel_tool_calls, true);
+});
+
+test("带回模型返回的思考内容（reasoning_content）；没有或只有空白时不带", async () => {
+  const withThought = (reasoning_content: unknown) => {
+    const reply = completion("结论：链接不规范");
+    const [choice] = reply.body.choices;
+    return { ...reply, body: { ...reply.body, choices: [{ ...choice, message: { ...choice.message, reasoning_content } }] } };
+  };
+  responses.push(withThought("\n先按链接 ID 搜 req_id，再查全链路。\n"), withThought("  \n"), withThought(null));
+  assert.deepEqual(await ask(), { text: "结论：链接不规范", finish: "stop", reasoning: "先按链接 ID 搜 req_id，再查全链路。" });
+  assert.deepEqual(await ask(), { text: "结论：链接不规范", finish: "stop" });
+  assert.deepEqual(await ask(), { text: "结论：链接不规范", finish: "stop" });
+
+  // 回答被审核拦下时思考也不带出去
+  const filtered = withThought("被拦下的思考");
+  filtered.body.choices[0].finish_reason = "content_filter";
+  responses.push(filtered);
+  const result = await ask();
+  assert.equal(result.finish, "filtered");
+  assert.equal(result.reasoning, undefined);
 });
 
 test("带回模型服务返回的用量，包括思考用掉的 token", async () => {
@@ -343,4 +380,186 @@ test("向量模型：按 OpenAI 兼容的 /embeddings 调，结果按 index 排�
 
   responses.push({ status: 401, body: { error: { message: "Incorrect API key", type: "invalid_request_error" } } });
   await assert.rejects(embedder.embed(["x"]), (err: unknown) => err instanceof LlmError && err.kind === "auth");
+});
+
+function chunk(delta: object, finish_reason: string | null = null, extra: object = {}) {
+  return { id: "chatcmpl-1", object: "chat.completion.chunk", created: 0, model: "qwen3.8-max", choices: [{ index: 0, delta, finish_reason }], ...extra };
+}
+
+test("传了 onDelta 时流式调用：边收边回调到目前为止的思考和正文，工具调用按 index 拼起来，用量从最后一段拿", async () => {
+  responses.push({
+    status: 200,
+    sse: [
+      chunk({ role: "assistant", reasoning_content: "先查" }),
+      chunk({ reasoning_content: "日志" }),
+      chunk({ content: "我查一下" }),
+      chunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "aiops_query_logs", arguments: '{"q":' } }] }),
+      chunk({ tool_calls: [{ index: 1, id: "call_2", type: "function", function: { name: "code_search", arguments: "{}" } }] }),
+      chunk({ tool_calls: [{ index: 0, function: { arguments: '"err"}' } }] }, "tool_calls"),
+      { id: "chatcmpl-1", object: "chat.completion.chunk", created: 0, model: "qwen3.8-max", choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
+    ],
+  });
+  const seen: { reasoning: string; text: string }[] = [];
+
+  const result = await model.chat({ system: "s", messages: [{ role: "user", content: "查" }], onDelta: (soFar) => seen.push(soFar) });
+
+  assert.deepEqual(result, {
+    text: "我查一下",
+    finish: "tool_calls",
+    toolCalls: [
+      { id: "call_1", name: "aiops_query_logs", arguments: '{"q":"err"}' },
+      { id: "call_2", name: "code_search", arguments: "{}" },
+    ],
+    usage: { input: 10, output: 5 },
+    reasoning: "先查日志",
+  });
+  assert.deepEqual(seen, [
+    { reasoning: "先查", text: "" },
+    { reasoning: "先查日志", text: "" },
+    { reasoning: "先查日志", text: "我查一下" },
+  ]);
+  const { body } = requests.at(-1)!;
+  assert.equal(body.stream, true);
+  assert.deepEqual(body.stream_options, { include_usage: true });
+});
+
+test("流式时每段都带完整工具名也只算一次；思考里的 <think> 标签照样去掉；不传 onDelta 时不流式", async () => {
+  responses.push({
+    status: 200,
+    sse: [
+      chunk({ content: "<think>想想</think>" }),
+      chunk({ content: "答案" }, "stop"),
+    ],
+  });
+  assert.deepEqual(await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), { text: "答案", finish: "stop" });
+
+  responses.push({
+    status: 200,
+    sse: [
+      chunk({ tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "echo", arguments: "{" } }] }),
+      chunk({ tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "echo", arguments: "}" } }] }, "tool_calls"),
+    ],
+  });
+  const repeated = await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} });
+  assert.deepEqual(repeated.toolCalls, [{ id: "c1", name: "echo", arguments: "{}" }]);
+
+  responses.push(completion("好"));
+  await ask();
+  assert.equal(requests.at(-1)!.body.stream, undefined);
+});
+
+test("流式读到一半被停止时报中止，不把写了一半的内容当成回答；流没正常结束（没有 finish_reason）时报错", async () => {
+  responses.push({ status: 200, sse: Array.from({ length: 20 }, (_, i) => chunk({ content: `第${i}段` })), delayMs: 20 });
+  const controller = new AbortController();
+  const asking = model.chat({
+    system: "s",
+    messages: [{ role: "user", content: "写长文" }],
+    signal: controller.signal,
+    onDelta: () => controller.abort(),
+  });
+  await assert.rejects(asking, (err: Error) => controller.signal.aborted && !(err instanceof LlmError));
+
+  responses.push({ status: 200, sse: [chunk({ content: "写到一半" })], done: false });
+  await assert.rejects(model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), (err: Error) => {
+    return err instanceof LlmError && err.kind === "connection" && /没有正常结束/.test(err.message);
+  });
+});
+
+test("流式输出到一半被内容审核拦下（流里的 data_inspection_failed）视为被拦截", async () => {
+  responses.push({
+    status: 200,
+    sse: [chunk({ content: "前半段" }), { error: { code: "data_inspection_failed", message: "Output data may contain inappropriate content." } }],
+  });
+  assert.deepEqual(await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), { text: "", finish: "filtered" });
+});
+
+test("服务不支持流式时退回非流式，之后都不再流式调用", async () => {
+  const warnings: string[] = [];
+  const plain = createOpenAICompatibleModel(
+    { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, apiKey: "sk-test", model: "other" },
+    (message) => warnings.push(message),
+  );
+  responses.push(
+    { status: 400, body: { error: { message: "Unrecognized request argument supplied: stream_options" } } },
+    { status: 400, body: { error: { message: "stream is not supported for this model" } } },
+    completion("好"),
+    completion("还好"),
+  );
+  const ask = () => plain.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} });
+
+  assert.deepEqual(await ask(), { text: "好", finish: "stop" });
+  // 先去掉 stream_options 再流式试了一次，还不行才改成非流式
+  assert.deepEqual(
+    requests.slice(-3).map(({ body }) => [body.stream, body.stream_options]),
+    [
+      [true, { include_usage: true }],
+      [true, undefined],
+      [undefined, undefined],
+    ],
+  );
+  assert.deepEqual(await ask(), { text: "还好", finish: "stop" });
+  assert.equal(requests.at(-1)!.body.stream, undefined);
+  assert.match(warnings.join("\n"), /不支持流式输出/);
+});
+
+test("服务支持流式但不认 stream_options 时去掉它照样流式，之后都不再带", async () => {
+  const warnings: string[] = [];
+  const plain = createOpenAICompatibleModel(
+    { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, apiKey: "sk-test", model: "other" },
+    (message) => warnings.push(message),
+  );
+  const streamed = (content: string) => ({ status: 200, sse: [chunk({ content }), chunk({}, "stop")] });
+  responses.push({ status: 400, body: { error: { message: "Unrecognized request argument supplied: stream_options" } } }, streamed("好"), streamed("还好"));
+  const seen: string[] = [];
+  const ask = () => plain.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: ({ text }) => seen.push(text) });
+
+  assert.deepEqual(await ask(), { text: "好", finish: "stop" });
+  assert.deepEqual(await ask(), { text: "还好", finish: "stop" });
+  assert.deepEqual(seen, ["好", "还好"]);
+  assert.deepEqual(
+    requests.slice(-3).map(({ body }) => [body.stream, body.stream_options]),
+    [
+      [true, { include_usage: true }],
+      [true, undefined],
+      [true, undefined],
+    ],
+  );
+  assert.match(warnings.join("\n"), /不认 stream_options/);
+});
+
+test("输入超出上下文窗口时抛出 too_long；报错里提到思考也不当成不认 enable_thinking", async () => {
+  const warnings: string[] = [];
+  const thinking = createOpenAICompatibleModel(
+    {
+      baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+      apiKey: "sk-test",
+      model: "qwen3.8-max",
+      thinking: true,
+    },
+    (message) => warnings.push(message),
+  );
+  const askThinking = () => thinking.chat({ system: "s", messages: [{ role: "user", content: "很长的问题" }] });
+  responses.push(
+    // 百炼
+    { status: 400, body: { error: { code: "invalid_parameter_error", message: "Range of input length should be [1, 983616] in thinking mode", type: "invalid_request_error" } } },
+    // OpenAI、DeepSeek、vLLM
+    { status: 400, body: { error: { code: "context_length_exceeded", message: "This model's maximum context length is 131072 tokens." } } },
+    // Kimi
+    { status: 400, body: { error: { message: "Invalid request: Your request exceeded model token limit: 262144", type: "invalid_request_error" } } },
+    // 只有错误码认得出来、说法里提到思考的
+    { status: 400, body: { error: { code: "context_length_exceeded", message: "Request rejected in thinking mode" } } },
+    completion("好"),
+  );
+
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(askThinking, (err) => err instanceof LlmError && err.kind === "too_long");
+  }
+  await askThinking();
+  assert.equal(requests.at(-1)!.body.enable_thinking, true);
+  assert.deepEqual(warnings, []);
+});
+
+test("别的 400 还是 api 类错误", async () => {
+  responses.push({ status: 400, body: { error: { code: "invalid_parameter_error", message: "Range of max_tokens should be [1, 65536]" } } });
+  await assert.rejects(ask, (err) => err instanceof LlmError && err.kind === "api");
 });

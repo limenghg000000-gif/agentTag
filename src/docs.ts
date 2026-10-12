@@ -1,6 +1,6 @@
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { type DocBlock, kindOf, renderDocument } from "./doc-render.js";
-import { FeishuApiError } from "./feishu.js";
+import { callFeishu as call, FeishuApiError, isRateLimited } from "./feishu.js";
 
 /** 单次「创建嵌套块」最多插入的块数（飞书接口上限） */
 export const MAX_BLOCKS_PER_INSERT = 1000;
@@ -99,32 +99,6 @@ export interface DocsApi {
   getUrl(documentId: string): Promise<string | undefined>;
 }
 
-interface ApiResponse<T> {
-  code?: number;
-  msg?: string;
-  data?: T;
-}
-
-/** 调飞书接口：接口直接返回 4xx 时 SDK 会抛 axios 的异常，统一换成带 code 和 msg 的 FeishuApiError */
-export async function call<T>(request: () => Promise<ApiResponse<T>>): Promise<T | undefined> {
-  let res: ApiResponse<T>;
-  try {
-    res = await request();
-  } catch (err) {
-    const response = (err as { response?: { status?: number; data?: { code?: number; msg?: string } } })?.response;
-    if (response?.data?.code !== undefined) {
-      throw new FeishuApiError(response.data.code, `飞书接口返回错误 ${response.data.code}：${response.data.msg ?? ""}`, response.status);
-    }
-    if (response?.status) {
-      throw new FeishuApiError(undefined, `飞书接口返回 HTTP ${response.status}`, response.status);
-    }
-    throw err;
-  }
-  if (res.code !== undefined && res.code !== 0) {
-    throw new FeishuApiError(res.code, `飞书接口返回错误 ${res.code}：${res.msg ?? ""}`);
-  }
-  return res.data;
-}
 
 export function createDocsApi(client: Client): DocsApi {
   return {
@@ -475,7 +449,7 @@ export class FeishuDocs {
     if (err.code === 1770002 || err.status === 404 || /not found/i.test(raw)) {
       return `找不到这篇文档，可能已被删除或链接不对（${raw}）`;
     }
-    if (err.status === 429 || err.code === 99991400) {
+    if (isRateLimited(err)) {
       return `飞书接口限流了，等几秒再试（${raw}）`;
     }
     return raw;

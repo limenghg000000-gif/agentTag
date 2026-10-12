@@ -54,6 +54,14 @@ export interface Config {
     /** 按意思检索用的向量模型（和主模型同一个服务、同一个 Key）。关掉，或者模型服务不是百炼又没配时为空，只按关键词检索 */
     embeddingModel?: string;
   };
+  /** 进度卡片上显示模型每轮的思考（SHOW_THINKING，默认 on） */
+  showThinking: boolean;
+  /** 卡片即回答（STREAM_CARD，默认 on）：思考和回答边生成边写进进度卡片，回答不再另外发 */
+  streamCard: boolean;
+  /** 卡片即回答时记下卡片里的回答的目录（每个群一个 JSON 文件），读话题历史时用 */
+  cardAnswersDir: string;
+  /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
+  recentThreadsDir: string;
 }
 
 export interface McpServerConfig {
@@ -212,6 +220,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`MODEL_THINKING_BUDGET 要填不小于 0 的整数（0 表示不限），当前为 ${env.MODEL_THINKING_BUDGET}`);
   }
 
+  const showThinking = (env.SHOW_THINKING?.trim() || "on").toLowerCase();
+  if (showThinking !== "on" && showThinking !== "off") {
+    throw new Error(`SHOW_THINKING 只能是 on 或 off，当前为 ${env.SHOW_THINKING}`);
+  }
+
+  const streamCard = (env.STREAM_CARD?.trim() || "on").toLowerCase();
+  if (streamCard !== "on" && streamCard !== "off") {
+    throw new Error(`STREAM_CARD 只能是 on 或 off，当前为 ${env.STREAM_CARD}`);
+  }
+
   const code = loadCodeConfig(env);
   const knowledgeEnv = env.KNOWLEDGE?.trim().toLowerCase();
   if (knowledgeEnv && !["on", "off"].includes(knowledgeEnv)) {
@@ -258,6 +276,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : undefined,
     code: code && { ...code, workspaceDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "workspaces") },
     mcp: loadMcpConfig(env),
+    showThinking: showThinking === "on",
+    streamCard: streamCard === "on",
+    cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
+    recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),
   };
 }
