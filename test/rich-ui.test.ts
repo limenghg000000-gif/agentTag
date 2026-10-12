@@ -85,6 +85,36 @@ test("查到的数：按写出来的精度四舍五入；按写出来的单位�
   assert.ok(!new NumberEvidence(["0"]).has(1e-12, percent));
 });
 
+test("折线图、柱状图里对不上的点不超过一成：只空掉这几个点，图照画，图下说一句；饼图、横轴、点多了整张不画", () => {
+  const x = Array.from({ length: 20 }, (_, i) => `21:${String(i * 3).padStart(2, "0")}`);
+  const data = x.map((_, i) => 170 + i);
+  const evidence = new NumberEvidence([JSON.stringify(data.slice(0, 19))]);
+  const chart = (type: "line" | "bar" | "pie", values = [...data.slice(0, 19), 179.74], labels = x): AnswerSegment[] => [
+    { kind: "chart", type, title: "union 内存", unit: "MiB", x: labels, series: [{ name: "union", data: values }] },
+  ];
+
+  const line = keepVerified(chart("line"), evidence);
+  assert.equal(line.segments.length, 2);
+  const kept = line.segments[0] as ChartBlock;
+  assert.deepEqual(kept.series[0].data, [...data.slice(0, 19), null]);
+  assert.deepEqual(line.segments[1], { kind: "markdown", text: "📊 图「union 内存」里有 1 个点和这次查到的结果对不上，这几个点没画。" });
+  assert.match(line.dropped[0], /图「union 内存」有 1 个点在查询结果里找不到（如 179.74），只空掉这几个点/);
+  const [element] = segmentElements([kept], (text) => ({ md: text })) as any[];
+  assert.equal(element.chart_spec.invalidType, "break");
+  assert.deepEqual(element.chart_spec.data.values.at(-1), { x: "21:57", value: null, series: "union" });
+  // 没空掉点的折线图不加 invalidType
+  assert.equal((segmentElements(keepVerified(chart("line", data.slice(0, 19).concat(170)), evidence).segments, (text) => ({ md: text })) as any[])[0].chart_spec.invalidType, undefined);
+
+  assert.equal(keepVerified(chart("bar"), evidence).segments[0].kind, "chart");
+  // 饼图少一块，比例就变了
+  assert.equal(keepVerified(chart("pie"), evidence).segments[0].kind, "markdown");
+  // 对不上的点超过一成
+  assert.equal(keepVerified(chart("line", [...data.slice(0, 17), 1, 2, 3]), evidence).segments[0].kind, "markdown");
+  // 横轴上的数对不上
+  const numbered = x.map((_, i) => String(1000 + i));
+  assert.equal(keepVerified(chart("line", data.slice(0, 19).concat(170), numbered), evidence).segments[0].kind, "markdown");
+});
+
 test("只画数都查得到的图：对不上的图换成说明，数字卡片对不上的去掉", () => {
   const evidence = new NumberEvidence(["cpu 41.2 39.0 restarts 0"]);
   const { segments } = splitAnswer(["```kpi", '[{"label":"CPU 最高","value":"41%"},{"label":"内存","value":"77%"},{"label":"状态","value":"正常"}]', "```", "```chart", chartJson, "```", "```chart", chartJson.replace("39", "38"), "```"].join("\n"));

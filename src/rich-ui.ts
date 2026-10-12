@@ -13,7 +13,8 @@ export interface ChartBlock {
   unit?: string;
   /** 横轴（饼图是各块的名字） */
   x: string[];
-  series: { name: string; data: number[] }[];
+  /** null 是核对时对不上、空掉的点（模型写的只能是数） */
+  series: { name: string; data: (number | null)[] }[];
 }
 
 export interface KpiItem {
@@ -432,8 +433,16 @@ function numbersIn(value: string): { n: number; half: number }[] {
 const NUMERIC_LABEL = new RegExp(`^\\s*[-+$¥€£~≈<>≤≥]?\\s*${NUMBER.source}\\s*[^\\d\\s]{0,8}\\s*$`, "i");
 
 /**
+ * 折线图、柱状图里对不上的点不超过这个比例时，只空掉这几个点，图照画，图下说一句；多了就整张不画。
+ * 2026-10-12 测试群：union 内存趋势几十个点里只有 1 个对不上，整张图没画
+ */
+const MAX_MISSING_POINTS = 0.1;
+
+/**
  * 只留下数都查得到的图和数字卡片。dropped 记下去掉了什么，写日志用。
- * 图里的数全都要对得上，对不上的图换成一句说明；数字卡片一个个看，对不上的去掉，值里没有数的（「正常」）照留
+ * 图里的数要对得上：折线图、柱状图里对不上的点不多（见 MAX_MISSING_POINTS）时只空掉这几个点；
+ * 横轴的数、饼图里的数（少一块比例就变了）对不上，或者对不上的点多了，整张图换成一句说明。
+ * 数字卡片一个个看，对不上的去掉，值里没有数的（「正常」）照留
  */
 export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence): { segments: AnswerSegment[]; dropped: string[] } {
   const dropped: string[] = [];
@@ -443,17 +452,29 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   for (const segment of segments) {
     if (segment.kind === "chart") {
       const factors = unitFactors(segment.unit) ?? [1];
-      const missing = [
-        ...segment.x.filter((value) => NUMERIC_LABEL.test(halfWidth(value))).flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? [1], half)).map(({ n }) => n)),
-        ...segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n, factors)),
-      ];
-      if (missing.length > 0) {
+      const found = (n: number | null): n is number => n !== null && evidence.has(n, factors);
+      const badX = segment.x
+        .filter((value) => NUMERIC_LABEL.test(halfWidth(value)))
+        .flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? [1], half)).map(({ n }) => n));
+      const points = segment.series.flatMap((s) => s.data);
+      const badPoints = points.filter((n) => !found(n));
+      const missing = [...badX, ...badPoints];
+      const gaps = missing.length > 0 && badX.length === 0 && segment.type !== "pie" && badPoints.length <= points.length * MAX_MISSING_POINTS;
+      if (missing.length > 0 && !gaps) {
         dropped.push(`图「${segment.title}」有 ${missing.length} 个数在查询结果里找不到（如 ${missing.slice(0, 3).join("、")}）`);
         kept.push({ kind: "markdown", text: `📊 图「${segment.title}」里有数和这次查到的结果对不上，没画出来。` });
         continue;
       }
       if (++charts > MAX_CHARTS) {
         dropped.push(`图「${segment.title}」超过 ${MAX_CHARTS} 张`);
+        continue;
+      }
+      if (gaps) {
+        dropped.push(`图「${segment.title}」有 ${badPoints.length} 个点在查询结果里找不到（如 ${badPoints.slice(0, 3).join("、")}），只空掉这几个点`);
+        kept.push(
+          { ...segment, series: segment.series.map((s) => ({ ...s, data: s.data.map((n) => (found(n) ? n : null)) })) },
+          { kind: "markdown", text: `📊 图「${segment.title}」里有 ${badPoints.length} 个点和这次查到的结果对不上，这几个点没画。` },
+        );
         continue;
       }
     } else if (segment.kind === "actions") {
@@ -580,6 +601,8 @@ function chartElement(chart: ChartBlock): object {
       type: chart.type,
       title: { text: title },
       data: { values },
+      // 空掉的点（null）：折线在这里断开，不把前后两个点连起来
+      ...(chart.type === "line" && values.some((item) => item.value === null) ? { invalidType: "break" } : {}),
       // 柱状图几组并排：横轴按「横轴值 + 系列」分组
       xField: chart.type === "bar" && chart.series.length > 1 ? ["x", "series"] : "x",
       yField: "value",
