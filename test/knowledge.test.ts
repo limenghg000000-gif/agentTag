@@ -1473,6 +1473,33 @@ test("同步到 aiops 没做成，再试一次前有人在表格里归档了这�
   }
 });
 
+test("再试一次前有人在表格里把存进去的那一行的标题、确认人改得很长：卡片上截短，不整段列出来", async () => {
+  let down = true;
+  const setup = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+  });
+  await setup.tool("knowledge_propose").run(code8, { signal });
+  await setup.desk.handleCardAction(setup.click((setup.sent[0].input as { card: any }).card, "save"));
+  await setup.desk.idle();
+  assert.match(cardText(setup.lastCard()), /没能同步到 aiops 经验库/);
+  const longTitle = `gateway-api 报 code=8${"（很长的标题）".repeat(2000)}`;
+  const longName = `张三${"（很长的名字）".repeat(2000)}`;
+  setup.backend.entries[0].title = longTitle;
+  setup.backend.entries[0].confirmedBy = longName;
+  down = false;
+  await setup.desk.handleCardAction(setup.click(setup.lastCard(), "save"));
+  await setup.desk.idle();
+  const text = cardText(setup.lastCard());
+  assert.match(text, /已存进团队经验库：经验 K1「gateway-api 报 code=8（很长的标题）/);
+  assert.ok(!text.includes(longTitle) && !text.includes(longName), "标题、确认人截短了");
+  assert.ok(text.length < 5000, `卡片文字 ${text.length} 字`);
+});
+
 test("同步到 aiops 时结果没传回来，再试一次前表格改了标题：确认改过的以后，按当时发过去的内容找到存进去的那条（分数低也认），内容旧了归档它、按改过的存", async () => {
   let stored: Record<string, unknown> | undefined;
   const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({

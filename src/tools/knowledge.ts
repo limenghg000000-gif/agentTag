@@ -636,7 +636,11 @@ export class KnowledgeDesk {
         unfinished: [`存进去的那一行在表格里被改过，${entry.unsafe}，卡片上先不列它。同步 aiops、归档旧经验这几步先没做，请在表格里删掉后再点「再试一次」`],
       };
     }
-    const out: Outcome = { done: [`已存进团队经验库：经验 ${entry.id}「${entry.title || draft.title}」，确认人 ${entry.confirmedBy ?? confirmedBy}。`], unfinished: [] };
+    // 标题、确认人按表格里现在的来：有人改长了也截短，免得卡片太大改不上、按钮回不来
+    const out: Outcome = {
+      done: [`已存进团队经验库：经验 ${entry.id}「${clip(entry.title || draft.title, MAX_TITLE_CHARS)}」，确认人 ${clip(entry.confirmedBy ?? confirmedBy, MAX_TITLE_CHARS)}。`],
+      unfinished: [],
+    };
     // 旧经验按表格里现在的样子来：卡片发出后可能有人在表格里改过它的 aiops 编号。读不到时不拿卡片上的旧编号凑合
     // （aiops 说重复的那条认不出是要取代的，后面又按表格里的编号归档，aiops 里这个问题就一条都不剩了），后面的步骤等再试一次
     let replaced: KnowledgeEntry | undefined;
@@ -1040,7 +1044,7 @@ export class KnowledgeDesk {
       out.done.push(
         gone
           ? `旧的经验 ${proposal.replacedArchived.id} 已经从表格里删掉了，不用再归档。`
-          : `旧的经验 ${original?.id ?? proposal.replacedArchived.id}${original && !original.unsafe ? `「${original.title}」` : ""}已归档。`,
+          : `旧的经验 ${original?.id ?? proposal.replacedArchived.id}${original && !original.unsafe ? `「${clip(original.title, MAX_TITLE_CHARS)}」` : ""}已归档。`,
       );
     } else if (gone) {
       out.done.push(`旧的经验 ${old.id} 已经从表格里删掉了，不用再归档。`);
