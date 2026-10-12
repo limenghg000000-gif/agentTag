@@ -2752,7 +2752,7 @@ test("卡片即回答：建不了卡片实体时退回原来的进度卡片、�
   await handle(message("你好"));
   await handle(message("再问一次", { messageId: "om_2" }));
   assert.equal(kit.created.length, 1);
-  assert.match(errors[0], /发送流式卡片失败，10 分钟内先用原来的进度卡片/);
+  assert.match(errors[0], /建流式卡片失败，10 分钟内先用原来的进度卡片/);
   assert.deepEqual(markdowns(sent), ["**答案**", "**答案**"]);
   assert.match(cardText(updates.at(-1)!.card), /已完成/);
 
@@ -2798,4 +2798,38 @@ test("卡片即回答：停止时卡片标成已停止，不留草稿，不发�
   assert.deepEqual(markdowns(sent), ["好的，已停止。"]);
   assert.match(cardText(kit.last()), /已停止/);
   assert.doesNotMatch(cardText(kit.last()), /草稿/);
+});
+
+test("卡片即回答：任务跑了 1 分钟以上，回答写完后在话题里补一句提醒；卡片建好了只是发不出去时下次照样试", async () => {
+  let clock = 0;
+  const kit = fakeCardKit();
+  const { model } = fakeModel(() => {
+    clock += 61_000;
+    return { text: "查完了", finish: "stop" };
+  });
+  const { sent, handle } = setup({ model, cardKit: kit.api, streamIntervalMs: 0, now: () => clock });
+  await handle(message("查一下"));
+  assert.deepEqual(markdowns(sent), ["回答好了，在上面的卡片里。"]);
+  assert.equal(kit.last().body.elements.at(-1).content, "查完了");
+
+  // 发消息失败：这次用原来的进度卡片、另外发回答，下次照样建流式卡片
+  let failSend = true;
+  const kit2 = fakeCardKit();
+  const sent2: Sent[] = [];
+  const { handle: handle2 } = setup({
+    cardKit: kit2.api,
+    streamIntervalMs: 0,
+    send: async (to, input, opts) => {
+      if (failSend && "card" in input && (input.card as any).type === "card") {
+        failSend = false;
+        throw new Error("network");
+      }
+      sent2.push({ to, input, opts });
+      return { messageId: `om_reply_${sent2.length}` };
+    },
+  });
+  await handle2(message("你好"));
+  await handle2(message("再问", { messageId: "om_2" }));
+  assert.equal(kit2.created.length, 2);
+  assert.deepEqual(markdowns(sent2), ["**答案**"]);
 });

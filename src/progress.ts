@@ -137,8 +137,8 @@ function isFinished(state: ProgressState): boolean {
 }
 
 /**
- * streaming_mode：模型正在生成（有 live）时要开着，组件才能流式更新；开着的时候卡片上的按钮可能点不了，
- * 所以只在生成时开，工具执行时关掉（实际开关由 StreamingCard 调接口）。
+ * streaming_mode：开着时组件才能流式更新（打字机效果），但卡片上的按钮可能点不了，所以只在模型写回答时开；
+ * 想的时候（开着深度思考能想好几分钟）和调工具时关着，思考按全量更新刷新，停止按钮能点（实际开关由 StreamingCard 调接口）。
  * 卡片即回答时，结束后消息列表里的预览是回答的开头
  */
 function cardConfig(state: ProgressState, streaming: boolean | undefined): object {
@@ -146,7 +146,7 @@ function cardConfig(state: ProgressState, streaming: boolean | undefined): objec
   const preview = streaming && finished && state.answer ? previewOf(state.answer) : undefined;
   return {
     update_multi: true,
-    ...(streaming ? { streaming_mode: !finished && state.live !== undefined, streaming_config: STREAMING_CONFIG } : {}),
+    ...(streaming ? { streaming_mode: !finished && liveText(state) !== "", streaming_config: STREAMING_CONFIG } : {}),
     summary: { content: preview || (finished ? summaryText(state.phase) : "处理中…") },
   };
 }
@@ -167,7 +167,7 @@ function liveText(state: ProgressState): string {
 
 /** 卡片里的回答：太长时只放开头，后面说明全文另外发 */
 function answerElement(answer: string): object {
-  return { tag: "markdown", element_id: ELEMENT.answer, content: escapeOutsideCode(clipAnswer(answer)) };
+  return { tag: "markdown", element_id: ELEMENT.answer, content: escapeAnswer(clipAnswer(answer)) };
 }
 
 /** 回答能不能完整放进卡片。放不下时卡片里只有开头，要另外发全文 */
@@ -181,24 +181,44 @@ function clipAnswer(answer: string): string {
   }
   const head = Array.from(answer).slice(0, MAX_CARD_ANSWER_CHARS).join("");
   // 切在代码块中间时先把代码块合上，不然后面的说明也显示成代码
-  const fence = (head.match(/^[ \t]*```/gm)?.length ?? 0) % 2 === 1 ? "\n```" : "";
-  return `${head}${fence}\n\n${ANSWER_CONTINUED}`;
+  let open: string | undefined;
+  for (const line of head.split("\n")) {
+    open = nextFence(open, line).fence;
+  }
+  return `${head}${open ? `\n${open}` : ""}\n\n${ANSWER_CONTINUED}`;
+}
+
+/** 代码块开头：行首最多 3 个空格，3 个以上反引号或波浪号；反引号开头的后面不能再有反引号（```x``` 是行内代码） */
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
+/** 按 CommonMark 的规则走一行：返回这一行之后还在不在代码块里（fence 是开头那串符号），以及这一行是不是代码块的开头或结尾 */
+function nextFence(fence: string | undefined, line: string): { fence: string | undefined; marker: boolean } {
+  if (fence) {
+    const close = FENCE_CLOSE.exec(line)?.[1];
+    return close && close[0] === fence[0] && close.length >= fence.length ? { fence: undefined, marker: true } : { fence, marker: false };
+  }
+  const open = FENCE_OPEN.exec(line);
+  if (open && !(open[1][0] === "`" && open[2].includes("`"))) {
+    return { fence: open[1], marker: true };
+  }
+  return { fence: undefined, marker: false };
 }
 
 /**
- * 回答里代码块以外的尖括号转义：卡片会把 <at>、<font> 当成标签（工具结果里冒充的 <at id=all></at> 会变成 @所有人）。
- * 代码块里的照原样显示
+ * 回答里的 < 转义：卡片会把 <at>、<font> 当成标签，工具结果里冒充的 <at id=all></at> 会变成 @所有人。
+ * 代码块里照原样显示（代码里 < 很常见），只把 <at 转义，万一飞书在代码块里也认 @ 也不会变成 @。
+ * > 不转义：只转 < 标签就不成立了，> 开头的引用照常显示
  */
-function escapeOutsideCode(text: string): string {
-  let inFence = false;
+function escapeAnswer(text: string): string {
+  let fence: string | undefined;
   return text
     .split("\n")
     .map((line) => {
-      if (/^[ \t]*```/.test(line)) {
-        inFence = !inFence;
-        return line;
-      }
-      return inFence ? line : escapeMarkdown(line);
+      const inCode = fence !== undefined;
+      const next = nextFence(fence, line);
+      fence = next.fence;
+      return inCode && !next.marker ? line.replace(/<(\/?at\b)/gi, "&lt;$1") : line.replace(/</g, "&lt;");
     })
     .join("\n");
 }

@@ -104,6 +104,8 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   let parallelToolCalls = true;
   let thinkingSupported = true;
   let budgetSupported = true;
+  // 服务不支持流式（stream、stream_options 报 400）时退回非流式，之后都不再流式调用
+  let streamSupported = true;
   type Extra = { enable_thinking?: boolean; thinking_budget?: number };
   type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
   /** 发请求，参数不认（400）时去掉重试。send 发出最终的请求体，流式和非流式各自用 */
@@ -152,21 +154,31 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
           : {}),
       };
       let raw: RawReply;
-      try {
-        raw = onDelta
-          ? await readStream(
-              await create(body, thinking, (request) =>
-                client.chat.completions.create({ ...request, stream: true, stream_options: { include_usage: true } }, { signal }),
-              ),
-              onDelta,
-            )
-          : fromCompletion(await create(body, thinking, (request) => client.chat.completions.create(request, { signal })));
-      } catch (err) {
-        // 百炼对输入做内容审核，不通过时返回 400 data_inspection_failed
-        if (err instanceof OpenAI.BadRequestError && err.code === "data_inspection_failed") {
-          return { text: "", finish: "filtered" };
+      for (;;) {
+        const streamed = onDelta !== undefined && streamSupported;
+        try {
+          raw = streamed
+            ? await readStream(
+                await create(body, thinking, (request) =>
+                  client.chat.completions.create({ ...request, stream: true, stream_options: { include_usage: true } }, { signal }),
+                ),
+                onDelta,
+                signal,
+              )
+            : fromCompletion(await create(body, thinking, (request) => client.chat.completions.create(request, { signal })));
+          break;
+        } catch (err) {
+          if (streamed && err instanceof OpenAI.BadRequestError && /\bstream/i.test(err.message)) {
+            warn(`模型服务不支持流式输出（${err.message}），之后不再流式调用，卡片上等整轮生成完再显示`);
+            streamSupported = false;
+            continue;
+          }
+          // 百炼对输入输出做内容审核，不通过时返回 data_inspection_failed：输入在请求时就是 400，流式输出到一半被拦时是流里的一条错误
+          if (err instanceof OpenAI.APIError && err.code === "data_inspection_failed") {
+            return { text: "", finish: "filtered" };
+          }
+          throw toLlmError(err);
         }
-        throw toLlmError(err);
       }
 
       const text = stripThinkTags(raw.content);
@@ -221,7 +233,11 @@ function fromCompletion(completion: OpenAI.Chat.ChatCompletion): RawReply {
  * 读流式结果：正文、思考按顺序拼起来，工具调用按 index 拼参数；每收到一段正文或思考就回调一次。
  * 工具名有的服务只在第一段给，有的每段都给全名，有的拆开给：和已有的一样就不再拼
  */
-async function readStream(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>, onDelta: NonNullable<ChatRequest["onDelta"]>): Promise<RawReply> {
+async function readStream(
+  stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
+  onDelta: NonNullable<ChatRequest["onDelta"]>,
+  signal: AbortSignal | undefined,
+): Promise<RawReply> {
   const reply: RawReply = { content: "", reasoning: "", toolCalls: [], finishReason: undefined, usage: undefined };
   const calls: ToolCall[] = [];
   for await (const chunk of stream) {
@@ -249,6 +265,11 @@ async function readStream(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>
     if (thought || delta.content) {
       onDelta({ reasoning: reply.reasoning, text: reply.content });
     }
+  }
+  // 读到一半被停止时，SDK 不报错、直接结束循环：不能把写了一半的内容当成回答
+  signal?.throwIfAborted();
+  if (!reply.finishReason) {
+    throw new LlmError("api", "模型服务的流式输出没有正常结束（没有 finish_reason），可能中途断开了");
   }
   reply.toolCalls = calls.filter((call) => call && call.name);
   return reply;

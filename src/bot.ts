@@ -3,7 +3,7 @@ import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendRe
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { imageKeysOf } from "./feishu.js";
-import { type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
+import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown } from "./markdown.js";
@@ -32,6 +32,8 @@ import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 const CHUNK_CHARS = 3000;
 /** 流式卡片建不了（比如没开 cardkit:card:write 权限）以后，这么久之内先用原来的进度卡片，不每次都试 */
 const CARDKIT_RETRY_MS = 10 * 60_000;
+/** 卡片即回答时，任务跑了这么久以上，回答写完后在话题里补一句提醒（提问人多半已经去忙别的了） */
+const NOTIFY_AFTER_MS = 60_000;
 /** 连长连接之前还不知道机器人名字时用这个 */
 const FALLBACK_BOT_NAME = "AI 助手";
 /** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
@@ -206,23 +208,31 @@ async function runTask(
   let card: ProgressCard | undefined;
   let cardMessageId: string | undefined;
   if (deps.cardKit && now() >= cardKit.downUntil) {
+    const initial = renderProgressCard(state, task.id, now(), { streaming: true });
+    let cardId: string | undefined;
     try {
-      const initial = renderProgressCard(state, task.id, now(), { streaming: true });
-      const cardId = await deps.cardKit.create(initial);
-      const { messageId } = await send(
-        msg.chatId,
-        { card: { type: "card", data: { card_id: cardId } } },
-        { replyTo: msg.messageId, replyInThread: true },
-      );
-      card = new StreamingCard(deps.cardKit, cardId, initial, logger, deps.streamIntervalMs, cardIntervalMs);
-      cardMessageId = messageId;
-      streaming = true;
+      cardId = await deps.cardKit.create(initial);
     } catch (err) {
       cardKit.downUntil = now() + CARDKIT_RETRY_MS;
       logger.error(
-        `发送流式卡片失败，${CARDKIT_RETRY_MS / 60_000} 分钟内先用原来的进度卡片、回答另外发（看看有没有开 cardkit:card:write 权限） message=${msg.messageId}`,
+        `建流式卡片失败，${CARDKIT_RETRY_MS / 60_000} 分钟内先用原来的进度卡片、回答另外发（看看有没有开 cardkit:card:write 权限） message=${msg.messageId}`,
         err,
       );
+    }
+    if (cardId) {
+      try {
+        const { messageId } = await send(
+          msg.chatId,
+          { card: { type: "card", data: { card_id: cardId } } },
+          { replyTo: msg.messageId, replyInThread: true },
+        );
+        card = new StreamingCard(deps.cardKit, cardId, initial, logger, deps.streamIntervalMs, cardIntervalMs);
+        cardMessageId = messageId;
+        streaming = true;
+      } catch (err) {
+        // 卡片建好了只是发消息失败（多半和卡片无关）：这次用原来的进度卡片，下次照样试流式卡片
+        logger.error(`发送流式卡片失败，这次用原来的进度卡片 message=${msg.messageId}`, err);
+      }
     }
   }
   if (!card) {
@@ -484,6 +494,10 @@ async function runTask(
     if (answer !== undefined) {
       if (streaming && landed && cardMessageId && answerFitsCard(answer)) {
         await rememberCardAnswer(deps, msg, cardMessageId, answer);
+        // 更新卡片不发通知：跑得久的任务补一句，提问人才知道回答好了
+        if (state.endedAt - state.startedAt >= NOTIFY_AFTER_MS) {
+          await reply(CARD_DONE_NOTICE);
+        }
       } else {
         // 没用流式卡片、卡片最后没更新上、或者回答太长卡片里只放了开头：和以前一样另外发全文
         for (const chunk of splitMarkdown(answer, CHUNK_CHARS)) {

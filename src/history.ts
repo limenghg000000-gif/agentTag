@@ -2,6 +2,12 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { FeishuApi, ThreadMessage } from "./feishu.js";
 import type { ChatMessage } from "./llm.js";
 
+/**
+ * 卡片即回答时，任务跑得久，回答写完后在话题里补这一句，提问人才会收到通知（更新卡片不通知）。
+ * 读话题历史时去掉它：它不是回答，还会让「上一条回答在问话」认不出来
+ */
+export const CARD_DONE_NOTICE = "回答好了，在上面的卡片里。";
+
 /** 最多带上话题里最近多少条消息 */
 export const MAX_HISTORY_MESSAGES = 60;
 /** 话题上下文的总字数上限，超出时从较早的消息开始省略（话题第一条始终保留） */
@@ -112,6 +118,9 @@ export class ThreadContextLoader {
     const answers = await this.cardAnswersOf(msg.chatId, all);
     const earlier = all.flatMap((m) => {
       if (m.messageId === msg.messageId || (m.createTime !== 0 && m.createTime > msg.createTime)) {
+        return [];
+      }
+      if (m.fromBot && m.content.trim() === CARD_DONE_NOTICE) {
         return [];
       }
       if (m.fromBot && m.msgType === "interactive") {

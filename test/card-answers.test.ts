@@ -45,13 +45,14 @@ test("同时记几条不会互相覆盖；chat_id 格式不对时不拼文件名
   await assert.rejects(store.get("oc/1", ["om_1"]), /chat_id 格式不对/);
 });
 
-test("文件坏了时读失败，修好以后能重新读", async () => {
+test("文件坏了时挪到 .bad 留着，从空的重新记", async () => {
   const dir = await tempDir();
   const store = new CardAnswerStore(dir);
   await store.save("oc_1", "om_1", "回答");
   await writeFile(path.join(dir, "oc_2.json"), "{坏了");
 
-  await assert.rejects(store.get("oc_2", ["om_1"]));
-  await writeFile(path.join(dir, "oc_2.json"), JSON.stringify({ om_1: { answer: "修好了", at: 1 } }));
-  assert.deepEqual([...(await store.get("oc_2", ["om_1"]))], [["om_1", "修好了"]]);
+  assert.deepEqual([...(await store.get("oc_2", ["om_1"]))], []);
+  await store.save("oc_2", "om_2", "新的");
+  assert.equal(await readFile(path.join(dir, "oc_2.json.bad"), "utf8"), "{坏了");
+  assert.deepEqual([...(await new CardAnswerStore(dir).get("oc_2", ["om_2"]))], [["om_2", "新的"]]);
 });

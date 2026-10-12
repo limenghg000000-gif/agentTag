@@ -91,7 +91,14 @@ async function readEntries(file: string): Promise<Map<string, Entry>> {
     }
     throw err;
   }
-  const data: unknown = JSON.parse(text);
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // 文件坏了（比如手改坏了）：挪到一边留着排查，从空的重新记，不然这个群以后每次都记不下
+    await rename(file, `${file}.bad`);
+    return new Map();
+  }
   const entries = new Map<string, Entry>();
   if (data && typeof data === "object" && !Array.isArray(data)) {
     for (const [id, entry] of Object.entries(data)) {

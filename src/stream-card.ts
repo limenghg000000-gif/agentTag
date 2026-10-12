@@ -61,8 +61,8 @@ interface CardJson {
 
 /**
  * 卡片即回答用的进度卡片（卡片实体）。和 CardUpdater 一样合并短时间内的多次更新、同一时间只有一个请求在途，另外：
- * - 模型生成时（卡片 config.streaming_mode 为 true）先打开卡片的流式模式，之后只是文字变了的组件按组件更新，有打字机效果；
- * - 别的时候（工具执行中、结束）关掉流式模式再全量更新：流式模式开着时卡片上的按钮可能点不了，飞书也会在 10 分钟后自动关掉它；
+ * - 模型写回答时（卡片 config.streaming_mode 为 true）先打开卡片的流式模式，之后只是文字变了的组件按组件更新，有打字机效果；
+ * - 别的时候（想、调工具、结束）关掉流式模式再全量更新：流式模式开着时卡片上的按钮可能点不了，飞书也会在 10 分钟后自动关掉它；
  * - 按组件更新失败一次（比如流式模式被飞书关了）就不再用，之后都全量更新。
  * 更新失败只记日志，不影响任务本身
  */
@@ -76,6 +76,8 @@ export class StreamingCard implements ProgressCard {
   private pending?: object;
   private running?: Promise<void>;
   private lastAt = 0;
+  /** 上一次全量更新的时间：思考的时候流式模式关着，每次刷新都是全量更新，间隔拉长一些 */
+  private lastFullAt = 0;
   private closed = false;
 
   constructor(
@@ -85,7 +87,7 @@ export class StreamingCard implements ProgressCard {
     initial: object,
     private readonly logger: Pick<Console, "error"> = console,
     private readonly minIntervalMs = 300,
-    /** 按组件更新不能用以后，每次都是全量更新，间隔拉长一些 */
+    /** 两次全量更新的最小间隔 */
     private readonly fullIntervalMs = Math.max(minIntervalMs, 1000),
   ) {
     this.layout = layoutOf(initial);
@@ -175,6 +177,8 @@ export class StreamingCard implements ProgressCard {
   private async replace(card: object): Promise<boolean> {
     const json = card as CardJson;
     const body = { ...json, config: { ...json.config, streaming_mode: this.streaming } };
+    await this.wait(this.lastFullAt + this.fullIntervalMs);
+    this.lastFullAt = Date.now();
     const ok = await this.call("更新卡片", (sequence) => this.api.update(this.cardId, body, sequence));
     if (ok) {
       this.layout = layoutOf(card);
@@ -204,9 +208,9 @@ export class StreamingCard implements ProgressCard {
     }
   }
 
-  private async wait(): Promise<void> {
-    const interval = this.elementsBroken ? this.fullIntervalMs : this.minIntervalMs;
-    const delay = this.lastAt + interval - Date.now();
+  /** 等到离上一次请求至少 minIntervalMs，并且不早于 until */
+  private async wait(until = 0): Promise<void> {
+    const delay = Math.max(this.lastAt + this.minIntervalMs, until) - Date.now();
     if (delay > 0) {
       await new Promise((resolve) => setTimeout(resolve, delay));
     }

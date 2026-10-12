@@ -6,8 +6,8 @@ import { createOpenAICompatibleModel, createOpenAICompatibleVisionModel, LlmErro
 
 // 本地假 OpenAI 兼容接口：记录收到的请求，按队列返回预设的状态码和响应
 const requests: { url: string; headers: IncomingHttpHeaders; body: any }[] = [];
-// sse：流式响应，按 Server-Sent Events 逐条发出，最后发 [DONE]
-const responses: ({ status: number; body: object } | { status: number; sse: object[] })[] = [];
+// sse：流式响应，按 Server-Sent Events 逐条发出（每条之间等 delayMs），最后发 [DONE]；done 为 false 时不发 [DONE]
+const responses: ({ status: number; body: object } | { status: number; sse: object[]; delayMs?: number; done?: boolean })[] = [];
 const server = createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => (raw += chunk));
@@ -17,10 +17,18 @@ const server = createServer((req, res) => {
     res.statusCode = next.status;
     if ("sse" in next) {
       res.setHeader("content-type", "text/event-stream");
-      for (const event of next.sse) {
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
-      }
-      res.end("data: [DONE]\n\n");
+      void (async () => {
+        for (const event of next.sse) {
+          if (res.destroyed) {
+            return;
+          }
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+          if (next.delayMs) {
+            await new Promise((resolve) => setTimeout(resolve, next.delayMs));
+          }
+        }
+        res.end(next.done === false ? "" : "data: [DONE]\n\n");
+      })();
       return;
     }
     res.setHeader("content-type", "application/json");
@@ -408,4 +416,45 @@ test("流式时每段都带完整工具名也只算一次；思考里的 <think>
   responses.push(completion("好"));
   await ask();
   assert.equal(requests.at(-1)!.body.stream, undefined);
+});
+
+test("流式读到一半被停止时报中止，不把写了一半的内容当成回答；流没正常结束（没有 finish_reason）时报错", async () => {
+  responses.push({ status: 200, sse: Array.from({ length: 20 }, (_, i) => chunk({ content: `第${i}段` })), delayMs: 20 });
+  const controller = new AbortController();
+  const asking = model.chat({
+    system: "s",
+    messages: [{ role: "user", content: "写长文" }],
+    signal: controller.signal,
+    onDelta: () => controller.abort(),
+  });
+  await assert.rejects(asking, (err: Error) => controller.signal.aborted && !(err instanceof LlmError));
+
+  responses.push({ status: 200, sse: [chunk({ content: "写到一半" })], done: false });
+  await assert.rejects(model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), (err: Error) => {
+    return err instanceof LlmError && err.kind === "api" && /没有正常结束/.test(err.message);
+  });
+});
+
+test("流式输出到一半被内容审核拦下（流里的 data_inspection_failed）视为被拦截", async () => {
+  responses.push({
+    status: 200,
+    sse: [chunk({ content: "前半段" }), { error: { code: "data_inspection_failed", message: "Output data may contain inappropriate content." } }],
+  });
+  assert.deepEqual(await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), { text: "", finish: "filtered" });
+});
+
+test("服务不支持流式（stream_options 报 400）时退回非流式，之后都不再流式调用", async () => {
+  const warnings: string[] = [];
+  const plain = createOpenAICompatibleModel(
+    { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, apiKey: "sk-test", model: "other" },
+    (message) => warnings.push(message),
+  );
+  responses.push({ status: 400, body: { error: { message: "Unrecognized request argument supplied: stream_options" } } }, completion("好"), completion("还好"));
+  const ask = () => plain.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} });
+
+  assert.deepEqual(await ask(), { text: "好", finish: "stop" });
+  assert.equal(requests.at(-1)!.body.stream, undefined);
+  assert.deepEqual(await ask(), { text: "还好", finish: "stop" });
+  assert.equal(requests.at(-1)!.body.stream, undefined);
+  assert.match(warnings.join("\n"), /不支持流式输出/);
 });

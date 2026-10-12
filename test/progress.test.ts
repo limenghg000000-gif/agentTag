@@ -200,6 +200,10 @@ test("卡片即回答：进行中状态、思考、回答各是一个带 element
   assert.equal(button.tag, "button");
   assert.equal(card.config.streaming_mode, true);
   assert.equal(card.config.streaming_config.print_strategy, "fast");
+  // 只在想、还没写回答时不开流式模式：开着时停止按钮可能点不了，深度思考能想好几分钟
+  const thinking = renderProgressCard(state({ live: { round: 1, reasoning: "想", text: "" } }), "t", 0, streaming) as any;
+  assert.equal(thinking.config.streaming_mode, false);
+  assert.match(text(thinking), /正在想/);
 
   // 这一轮想完、去调工具：不要求流式，思考换成最新一段，回答位置空着
   const between = renderProgressCard(state({ thoughts: [{ round: 1, ms: 1000, text: "第一轮", at: 0 }] }), "t", 0, streaming) as any;
@@ -236,7 +240,7 @@ test("卡片即回答：结束后步骤和思考折进面板，下面是回答�
   const [panel, body] = card.body.elements;
   assert.equal(panel.tag, "collapsible_panel");
   assert.equal(body.element_id, ELEMENT.answer);
-  assert.match(body.content, /^结论 &lt;at id=all&gt;&lt;\/at&gt;\n```go\nif a < b \{\}\n```\n很长的说明/);
+  assert.match(body.content, /^结论 &lt;at id=all>&lt;\/at>\n```go\nif a < b \{\}\n```\n很长的说明/);
   assert.equal(card.config.streaming_mode, false);
   assert.match(card.config.summary.content, /^结论 <at id=all><\/at> ```go if a < b \{\} ``` 很长的说明.*…$/);
   assert.equal(Array.from(card.config.summary.content).length, 50);
@@ -262,4 +266,17 @@ test("卡片即回答：回答太长时卡片里只放开头（切在代码块�
   const content: string = card.body.elements.at(-1).content;
   assert.ok(content.endsWith("x\n```\n\n…（回答较长，全文另外发在下面）"));
   assert.ok(Buffer.byteLength(text(card)) <= MAX_CARD_BYTES);
+});
+
+test("卡片即回答：代码块按 CommonMark 认，```x``` 和缩进 4 格的不算开头；代码块里只转义 <at；> 开头的引用照常显示", () => {
+  const render = (answer: string) =>
+    (renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any).body.elements.at(-1).content as string;
+
+  assert.equal(render("```x```\n<at id=all></at>"), "```x```\n&lt;at id=all>&lt;/at>");
+  assert.equal(render("    ```\n<at id=all></at>"), "    ```\n&lt;at id=all>&lt;/at>");
+  assert.equal(
+    render("> 引用\n````go\nm := map[string]<-chan int{}\n<at id=all></at>\n```\n<font>\n````\n<b>"),
+    "> 引用\n````go\nm := map[string]<-chan int{}\n&lt;at id=all>&lt;/at>\n```\n<font>\n````\n&lt;b>",
+  );
+  assert.equal(render("~~~\na<b\n~~~\na<b"), "~~~\na<b\n~~~\na&lt;b");
 });
