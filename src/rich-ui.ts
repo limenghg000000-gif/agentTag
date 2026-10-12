@@ -136,6 +136,22 @@ function text(value: unknown, max = MAX_LABEL_CHARS): string | undefined {
   return chars.length <= max ? chars.join("") : `${chars.slice(0, max - 1).join("")}…`;
 }
 
+/** 图上的名字（横轴的值、系列名）：太长时掐掉中间，Pod 名这类前面一样、结尾不一样的才分得清 */
+function label(value: unknown, max = MAX_LABEL_CHARS): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return undefined;
+  }
+  const chars = Array.from(value.trim());
+  if (chars.length <= max) {
+    return chars.join("");
+  }
+  const tail = Math.floor((max - 1) / 2);
+  return `${chars.slice(0, max - 1 - tail).join("")}…${chars.slice(-tail).join("")}`;
+}
+
 function parseChart(json: unknown): ChartBlock | undefined {
   if (!json || typeof json !== "object") {
     return undefined;
@@ -146,8 +162,9 @@ function parseChart(json: unknown): ChartBlock | undefined {
   if (!type || !title || !Array.isArray(raw.x) || !Array.isArray(raw.series)) {
     return undefined;
   }
-  const x = raw.x.map((label) => text(label));
-  if (x.length === 0 || x.some((label) => label === undefined)) {
+  const x = raw.x.map((value) => label(value));
+  // 横轴的值重了（掐短以后一样也算）：几个点会叠在一起
+  if (x.length === 0 || x.some((value) => value === undefined) || new Set(x).size !== x.length) {
     return undefined;
   }
   const series: ChartBlock["series"] = [];
@@ -156,13 +173,17 @@ function parseChart(json: unknown): ChartBlock | undefined {
       return undefined;
     }
     const { name, data } = item as Record<string, unknown>;
-    const label = text(name) ?? (raw.series.length === 1 ? title : undefined);
-    if (!label || !Array.isArray(data) || data.length !== x.length || !data.every((n) => typeof n === "number" && Number.isFinite(n))) {
+    const seriesName = label(name) ?? (raw.series.length === 1 ? title : undefined);
+    if (!seriesName || !Array.isArray(data) || data.length !== x.length || !data.every((n) => typeof n === "number" && Number.isFinite(n))) {
       return undefined;
     }
-    series.push({ name: label, data: data as number[] });
+    series.push({ name: seriesName, data: data as number[] });
   }
   if (series.length === 0 || series.length > MAX_SERIES || series.length * x.length > MAX_POINTS_PER_CHART || (type === "pie" && series.length !== 1)) {
+    return undefined;
+  }
+  // 系列名重了（掐短以后一样也算）：几条线会画成一条，图例也分不清
+  if (new Set(series.map((item) => item.name)).size !== series.length) {
     return undefined;
   }
   const unit = text(raw.unit, 12);
@@ -214,8 +235,7 @@ export class NumberEvidence {
 
   /** v 是不是哪个查到的数按 v 写出来的精度四舍五入的结果（v 写成 41.2 就看有没有 41.15 到 41.25 之间的数） */
   has(v: number): boolean {
-    const digits = decimalsOf(v);
-    const half = 0.5 * 10 ** -digits;
+    const half = halfStep(v);
     // 浮点误差：0.4123 × 100 不一定正好是 41.23
     const lo = v - half - 1e-9 * Math.max(1, Math.abs(v));
     const hi = v + half + 1e-9 * Math.max(1, Math.abs(v));
@@ -233,15 +253,26 @@ export class NumberEvidence {
   }
 }
 
-function decimalsOf(v: number): number {
-  const [, fraction = ""] = String(v).split(".");
-  return Math.min(fraction.length, 6);
+/**
+ * v 按写出来的最后一位四舍五入时的半格：41.2 → 0.05，1e-7 → 5e-8；整数（包括 1000、1e9）按个位算 → 0.5。
+ * 用科学计数法数位数：很小的数 String() 出来是 1e-7 这样，按小数点数不出位数
+ */
+function halfStep(v: number): number {
+  const [mantissa, exponent] = v.toExponential().split("e");
+  const decimals = (mantissa.split(".")[1] ?? "").length;
+  return 0.5 * 10 ** Math.min(0, Number(exponent) - decimals);
 }
 
-/** 数字卡片的值里写的数：「41%」「1.2 GiB」「0 次」 */
+/**
+ * 数字卡片的值里写的数：「41%」「1.2 GiB」「1,000」「1e9」各是一个数（不拆成 1 和 0、1 和 9）；
+ * 「10~20%」「10-20」是 10 和 20（后一个不当成负数）
+ */
 function numbersIn(value: string): number[] {
-  return [...value.matchAll(/-?\d+(?:\.\d+)?/g)].map((match) => Number(match[0]));
+  return [...value.matchAll(/(?<![\d.])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?/gi)].map((match) => Number(match[0].replace(/,/g, "")));
 }
+
+/** 横轴上写成数的值（时间戳、编号）：和图里的数一样要查得到 */
+const NUMERIC_LABEL = /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i;
 
 /**
  * 只留下数都查得到的图和数字卡片。dropped 记下去掉了什么，写日志用。
@@ -253,7 +284,8 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   let charts = 0;
   for (const segment of segments) {
     if (segment.kind === "chart") {
-      const missing = segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n));
+      const numericX = segment.x.filter((value) => NUMERIC_LABEL.test(value)).map(Number);
+      const missing = [...numericX, ...segment.series.flatMap((s) => s.data)].filter((n) => !evidence.has(n));
       if (missing.length > 0) {
         dropped.push(`图「${segment.title}」有 ${missing.length} 个数在查询结果里找不到（如 ${missing.slice(0, 3).join("、")}）`);
         kept.push({ kind: "markdown", text: `📊 图「${segment.title}」里有数和这次查到的结果对不上，没画出来。` });
@@ -297,15 +329,19 @@ export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text
   });
 }
 
-/** 数字卡片里的文字：模型写的，转义尖括号，去掉会被当成 Markdown 的符号 */
+/** Markdown 符号换成长得像的全角字：直接去掉会把「10~20%」连成「1020%」 */
+const LOOKALIKE: Record<string, string> = { "*": "＊", _: "＿", "~": "～", "`": "ˋ", "[": "［", "]": "］" };
+
+/** 数字卡片里的文字：模型写的，转义尖括号，会被当成 Markdown 的符号换成长得像的字 */
 function plain(value: string): string {
-  return value.replace(/</g, "&lt;").replace(/[*_~`[\]]/g, "");
+  return value.replace(/</g, "&lt;").replace(/[*_~`[\]]/g, (char) => LOOKALIKE[char]);
 }
 
 function kpiElement({ items }: KpiBlock): object {
   return {
     tag: "column_set",
-    flex_mode: "bisect",
+    // 手机上窄：3 个一行放得下；2 个、4 个两个一行
+    flex_mode: items.length === 3 ? "trisect" : "bisect",
     horizontal_spacing: "8px",
     columns: items.map((item) => {
       const value = `**${plain(item.value)}**`;

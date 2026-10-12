@@ -86,7 +86,7 @@ test("卡片组件：折线图、多系列柱状图、饼图、数字卡片；�
   const bar: ChartBlock = { kind: "chart", type: "bar", title: "内存", x: ["a", "b"], series: [{ name: "用量", data: [1, 2] }, { name: "limit", data: [3, 4] }] };
   const pie: ChartBlock = { kind: "chart", type: "pie", title: "占比", x: ["a", "b"], series: [{ name: "s", data: [1, 2] }] };
   const [lineEl, barEl, pieEl, kpiEl] = segmentElements(
-    [line, bar, pie, { kind: "kpi", items: [{ label: "CPU <最高>", value: "**41%**", level: "danger" }] }],
+    [line, bar, pie, { kind: "kpi", items: [{ label: "CPU <最高>", value: "10~20%", level: "danger" }] }],
     () => ({}),
   ) as any[];
   assert.equal(lineEl.tag, "chart");
@@ -103,11 +103,59 @@ test("卡片组件：折线图、多系列柱状图、饼图、数字卡片；�
     { name: "b", value: 2 },
   ]);
   assert.equal(kpiEl.tag, "column_set");
-  assert.equal(kpiEl.columns[0].elements[0].content, "<font color='red'>**41%**</font>");
+  // Markdown 符号换成长得像的字，不能删掉（删了「10~20%」就成了「1020%」）
+  assert.equal(kpiEl.columns[0].elements[0].content, "<font color='red'>**10～20%**</font>");
+  assert.equal(kpiEl.flex_mode, "bisect");
   assert.equal(kpiEl.columns[0].elements[1].content, "CPU &lt;最高>");
 
   assert.equal(
     segmentsAsText([{ kind: "markdown", text: "结论" }, { kind: "kpi", items: [{ label: "CPU", value: "41%" }, { label: "重启", value: "0" }] }, line]),
     "结论\n\n**CPU** 41% · **重启** 0\n\n📊 CPU（这里显示不了图）",
   );
+});
+
+test("查到的数：很小的数按科学计数法的最后一位算精度，整数按个位算", () => {
+  const zero = new NumberEvidence(["error_rate 0"]);
+  assert.ok(!zero.has(1e-7)); // 以前按小数点数位数，1e-7 算成 0 位小数，0 就对上了
+  assert.ok(!new NumberEvidence(["1.6e-7"]).has(1e-7));
+  assert.ok(new NumberEvidence(["1.04e-7"]).has(1e-7));
+  assert.ok(new NumberEvidence(["0.00000012"]).has(1.2e-7));
+  assert.ok(new NumberEvidence(["1000.4"]).has(1000));
+  assert.ok(!new NumberEvidence(["1001"]).has(1000));
+  assert.ok(!new NumberEvidence(["1500000000"]).has(1e9));
+});
+
+test("数字卡片：1,234、1e9 各算一个数；10~20%、10-20 是两个数", () => {
+  const verdict = (value: string, output: string) =>
+    keepVerified([{ kind: "kpi", items: [{ label: "x", value }] }], new NumberEvidence([output])).segments.length === 1;
+  assert.ok(!verdict("1,234 次", "a 1 b 234"));
+  assert.ok(verdict("1,234 次", "count 1234"));
+  assert.ok(!verdict("1e9", "1 9"));
+  assert.ok(verdict("1e9", "1000000000"));
+  assert.ok(verdict("10~20%", "10 20"));
+  assert.ok(verdict("10-20%", "10 20"));
+  assert.ok(verdict("-5%", "-5"));
+});
+
+test("图：横轴写成数的值（时间戳、编号）也要查得到；系列名、横轴值掐短时留着结尾，重了的不画", () => {
+  const ts = JSON.stringify({ type: "line", title: "QPS", x: [1728700000, 1728700060], series: [{ name: "a", data: [41.2, 39] }] });
+  const chart = splitAnswer("```chart\n" + ts + "\n```").segments;
+  assert.deepEqual((chart[0] as ChartBlock).x, ["1728700000", "1728700060"]);
+  assert.equal(keepVerified(chart, new NumberEvidence(["41.2 39"])).segments[0].kind, "markdown");
+  assert.equal(keepVerified(chart, new NumberEvidence(["[1728700000,\"41.2\"],[1728700060,\"39\"]"])).segments[0].kind, "chart");
+
+  const pod = (suffix: string) => `pc-goods-site-deployment-canary-7d9f8b6c5-${suffix}`;
+  const pods = JSON.stringify({ type: "bar", title: "CPU", x: ["now"], series: [{ name: pod("abcde"), data: [1] }, { name: pod("fghij"), data: [2] }] });
+  const names = (splitAnswer("```chart\n" + pods + "\n```").segments[0] as ChartBlock).series.map((s) => s.name);
+  assert.equal(new Set(names).size, 2);
+  assert.ok(names.every((name) => Array.from(name).length === 40 && name.includes("…")), names.join());
+  assert.match(names[0], /abcde$/);
+
+  for (const bad of [
+    { type: "bar", title: "t", x: ["now"], series: [{ name: "a", data: [1] }, { name: "a", data: [2] }] },
+    { type: "bar", title: "t", x: ["x".repeat(50) + "1", "x".repeat(50) + "1"], series: [{ name: "a", data: [1, 2] }] },
+    { type: "line", title: "t", x: ["19:00", "19:00"], series: [{ name: "a", data: [1, 2] }] },
+  ]) {
+    assert.deepEqual(splitAnswer("```chart\n" + JSON.stringify(bad) + "\n```").invalid, ["chart"], JSON.stringify(bad));
+  }
 });

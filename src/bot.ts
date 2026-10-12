@@ -263,6 +263,8 @@ async function runTask(
   let memoryCount: number | undefined;
   // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
   const evidence: ToolEvidence[] = [];
+  // 核对过的回答（拆成段）：回答定下来时就核对，记下来的、显示的都用它
+  let segments: AnswerSegment[] | undefined;
   try {
     if (!(await task.waitTurn())) {
       throw new Error("stopped while queued");
@@ -488,12 +490,16 @@ async function runTask(
       state.thoughts = undefined;
     }
     state.phase = "done";
-    deps.context.remember(msg, prompt, answer);
+    // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画；记下来的也是核对过的（对不上的数后面的提问不能再看到）
+    segments = verifiedSegments(answer, evidence, logger, msg.messageId);
+    const verified = segmentsAsText(segments);
+    deps.context.remember(msg, prompt, verified);
     // 被拦下、被审核拦下的回答里没有结论，不记
     if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
-      await rememberThread(deps, msg, asked, answer, context.askerName);
+      await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
+    segments = undefined;
     if (task.signal.aborted) {
       state.phase = "stopped";
     } else {
@@ -513,21 +519,21 @@ async function runTask(
   state.live = undefined;
   state.answerNote = undefined;
   state.answer = answer;
-  // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画
-  const segments = answer === undefined ? [] : verifiedSegments(answer, evidence, logger, msg.messageId);
-  state.answerSegments = segments;
+  const displayed = answer === undefined ? [] : (segments ?? verifiedSegments(answer, evidence, logger, msg.messageId));
+  state.answerSegments = displayed;
+  const displayedText = segmentsAsText(displayed);
   try {
     const landed = await card?.finish(render(), renderPlainProgressCard(state, now(), { streaming }));
     if (answer !== undefined) {
-      if (streaming && landed && cardMessageId && answerFitsCard(answer)) {
-        await rememberCardAnswer(deps, msg, cardMessageId, answer);
+      if (streaming && landed && cardMessageId && answerFitsCard(displayedText)) {
+        await rememberCardAnswer(deps, msg, cardMessageId, displayedText);
         // 更新卡片不发通知：等得久的（排队加处理）补一句，提问人才知道处理完了
         if (state.endedAt - askedAt >= NOTIFY_AFTER_MS) {
           await reply(CARD_DONE_NOTICE);
         }
       } else {
         // 没用流式卡片、卡片最后没更新上、或者回答太长卡片里只放了开头：和以前一样另外发全文
-        for (const chunk of splitMarkdown(toPostMarkdown(segmentsAsText(segments)), CHUNK_CHARS)) {
+        for (const chunk of splitMarkdown(toPostMarkdown(displayedText), CHUNK_CHARS)) {
           await reply(chunk);
         }
       }

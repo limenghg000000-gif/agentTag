@@ -86,9 +86,10 @@ export function renderProgressCard(state: ProgressState, taskId: string, now = D
   if (total > 0 && !fits(card)) {
     card = buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options);
   }
-  // 还放不下就是图的数据太多：图换成文字说明
+  // 还放不下就是图的数据太多：图换成文字说明（用核对过的那几段，不再从原文拆：对不上被去掉的数字卡片不能回来）
   if (!fits(card) && state.answerSegments && hasUiBlocks(state.answerSegments)) {
-    card = buildProgressCard({ ...state, thoughts: undefined, answerSegments: undefined }, taskId, now, 0, options);
+    const asText: AnswerSegment[] = [{ kind: "markdown", text: segmentsAsText(state.answerSegments) }];
+    card = buildProgressCard({ ...state, thoughts: undefined, answerSegments: asText }, taskId, now, 0, options);
   }
   return card;
 }
@@ -140,7 +141,7 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
   }
   if (streaming && finished && state.answer) {
     const segments = state.answerSegments;
-    if (segments && hasUiBlocks(segments) && answerFitsCard(state.answer)) {
+    if (segments && hasUiBlocks(segments) && answerFitsCard(finalText(state))) {
       elements.push(...segmentElements(segments, (text) => ({ tag: "markdown", content: escapeAnswer(text) })));
     } else {
       elements.push(answerElement(finalText(state)));
@@ -149,9 +150,12 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
   return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
 }
 
-/** 结束后只能放文字时的回答：图换成一句说明，数字卡片换成一行 */
+/**
+ * 结束后只能放文字时的回答：图换成一句说明，数字卡片换成一行。完整显示得下（answerFitsCard）也按这段文字算，和发全文时判断的一样。
+ * 没核对过（answerSegments 没给）时数字卡片不显示，图只有标题
+ */
 function finalText(state: ProgressState): string {
-  return segmentsAsText(state.answerSegments ?? splitAnswer(state.answer ?? "").segments);
+  return segmentsAsText(state.answerSegments ?? splitAnswer(state.answer ?? "").segments.filter((segment) => segment.kind !== "kpi"));
 }
 
 function isFinished(state: ProgressState): boolean {

@@ -322,3 +322,18 @@ test("卡片即回答：生成时图的代码块显示成一行说明；结束�
   assert.ok(Buffer.byteLength(text(tooBig)) <= MAX_CARD_BYTES);
   assert.match(tooBig.body.elements.at(-1).content, /📊 大图（这里显示不了图）/);
 });
+
+test("卡片即回答：图太大换成文字时用核对过的那几段，对不上被去掉的数字卡片不回来；没核对过时不显示数字卡片", () => {
+  const big = JSON.stringify({ type: "line", title: "大图", x: Array.from({ length: 25 }, (_, i) => `第${i}个时间点`.padEnd(38, "长")), series: Array.from({ length: 8 }, (_, s) => ({ name: `系列${s}`.padEnd(38, "名"), data: Array(25).fill(123456.789) })) });
+  const answer = `结论\n\`\`\`kpi\n[{"label":"CPU","value":"41%"},{"label":"内存","value":"88%"}]\n\`\`\`\n\`\`\`chart\n${big}\n\`\`\``;
+  const parsed = splitAnswer(answer).segments;
+  const verified = parsed.map((segment) => (segment.kind === "kpi" ? { ...segment, items: segment.items.slice(0, 1) } : segment));
+  const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer, answerSegments: verified }), "t", 0, streaming) as any;
+  const content = card.body.elements.at(-1).content;
+  assert.match(content, /\*\*CPU\*\* 41%/);
+  assert.match(content, /📊 大图（这里显示不了图）/);
+  assert.doesNotMatch(text(card), /88%/);
+
+  const unchecked = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any;
+  assert.doesNotMatch(text(unchecked), /41%|88%/);
+});

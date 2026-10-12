@@ -2957,15 +2957,21 @@ test("卡片即回答：回答里的图和关键数字按查到的数画出来�
       { text: answerWith(data), finish: "stop" },
     ];
     const { model } = fakeModel(() => results.shift()!);
+    const context = fakeContext();
+    const saved: string[] = [];
+    const recorded: string[] = [];
     const { sent, handle } = setup({
       model,
       ...(withCard ? { cardKit: kit.api } : {}),
       streamIntervalMs: 0,
       mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined },
       logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+      context: context.source,
+      cardAnswers: { save: async (_chat, _thread, _card, answer) => void saved.push(answer) },
+      recentThreads: { record: async (_chat, _thread, turn) => void recorded.push(turn.answer), list: async () => [] },
     });
     await handle(message("看看 pod-a 最近的 CPU"));
-    return { kit, sent, warnings };
+    return { kit, sent, warnings, remembered: [...context.remembered.map((turn) => turn.answer), ...saved, ...recorded] };
   };
 
   const ok = await run("41.2,39", true);
@@ -2978,6 +2984,8 @@ test("卡片即回答：回答里的图和关键数字按查到的数画出来�
   assert.equal(elements[2].columns.length, 1);
   assert.match(ok.warnings.join("\n"), /数字卡片「内存 88%」在查询结果里找不到/);
   assert.deepEqual(markdowns(ok.sent), []);
+  // 记下来的回答（话题上下文、卡片里的回答、最近话题）也是核对过的：对不上的 88% 后面的提问看不到
+  assert.deepEqual(ok.remembered, Array(3).fill("结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"));
 
   const made = await run("41.2,55", true);
   assert.doesNotMatch(JSON.stringify(made.kit.last()), /"tag":"chart"/);
