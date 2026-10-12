@@ -516,10 +516,12 @@ test("输入超出上下文窗口时抛出 too_long；报错里提到思考也�
     { status: 400, body: { error: { code: "context_length_exceeded", message: "This model's maximum context length is 131072 tokens." } } },
     // Kimi
     { status: 400, body: { error: { message: "Invalid request: Your request exceeded model token limit: 262144", type: "invalid_request_error" } } },
+    // 只有错误码认得出来、说法里提到思考的
+    { status: 400, body: { error: { code: "context_length_exceeded", message: "Request rejected in thinking mode" } } },
     completion("好"),
   );
 
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     await assert.rejects(askThinking, (err) => err instanceof LlmError && err.kind === "too_long");
   }
   await askThinking();

@@ -126,7 +126,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
         return await send(request);
       } catch (err) {
         // 输入太长的报错里可能也提到思考（「思考模式下最大输入…」），不能因此当成不认 enable_thinking
-        if (attempt < 3 && err instanceof OpenAI.BadRequestError && !TOO_LONG.test(err.message)) {
+        if (attempt < 3 && err instanceof OpenAI.BadRequestError && !isTooLong(err)) {
           if (request.parallel_tool_calls && /parallel_tool_calls/i.test(err.message)) {
             parallelToolCalls = false;
             continue;
@@ -232,7 +232,16 @@ const STREAM_UNSUPPORTED =
  * OpenAI、DeepSeek、vLLM「maximum context length is N tokens」，Kimi「exceeded model token limit」，智谱「Prompt exceeds max length」
  */
 const TOO_LONG =
-  /range of input length|context[_ ]length|maximum context|(?:model|context) token limit|prompt (?:is )?too long|exceeds? (?:the )?max(?:imum)? (?:input |context )?length|输入[^。\n]{0,10}(?:过长|超长|长度超过)|上下文[^。\n]{0,10}(?:过长|超长|超过)/i;
+  /range of input length|context[_ ]length|maximum context|(?:model|context) token limit|(?:prompt|input) (?:is )?too long|exceeds? (?:the )?max(?:imum)? (?:input |context )?length|输入[^。\n]{0,10}(?:过长|超长|长度超过)|上下文[^。\n]{0,10}(?:过长|超长|超过)/i;
+
+/** 输入超出上下文窗口：认错误码，或者认各家的说法（TOO_LONG） */
+function isTooLong(err: unknown): boolean {
+  return (
+    err instanceof OpenAI.APIError &&
+    (err.status === 400 || err.status === 413) &&
+    (err.code === "context_length_exceeded" || TOO_LONG.test(err.message))
+  );
+}
 
 /** 一次调用拿到的原始结果，流式和非流式整理成一样的再往下处理 */
 interface RawReply {
@@ -419,7 +428,7 @@ function toLlmError(err: unknown): unknown {
   if (err instanceof OpenAI.APIConnectionError) {
     return new LlmError("connection", err.message, { cause: err });
   }
-  if (err instanceof OpenAI.APIError && (err.status === 400 || err.status === 413) && (err.code === "context_length_exceeded" || TOO_LONG.test(err.message))) {
+  if (err instanceof OpenAI.APIError && isTooLong(err)) {
     return new LlmError("too_long", `${err.status} ${err.message}`, { cause: err });
   }
   if (err instanceof OpenAI.APIError) {
