@@ -489,3 +489,25 @@ test("Codex：标题只认末尾括号里的单位，「核心」「秒杀」「
   assert.ok(evidence.has(250, unitFactors("mCPU")));
   assert.ok(evidence.has(0.75, unitFactors("核")));
 });
+
+test("Codex 第二轮：CPU 计数器一半套 rate、一半没套的认不出；limits 按 unit 标签、ephemeral_storage 认字节", () => {
+  assert.equal(promqlUnit("rate(container_cpu_usage_seconds_total[5m]) or container_cpu_usage_seconds_total"), undefined);
+  assert.equal(promqlUnit("rate(container_cpu_usage_seconds_total[5m]) or irate(container_cpu_usage_seconds_total[1m])"), "cores");
+  const limits = JSON.stringify({
+    query: 'kube_pod_container_resource_limits{namespace="prod", pod=~"union-.*"}',
+    data: { result: [
+      { metric: { pod: "a", resource: "ephemeral_storage", unit: "byte" }, value: [1760282600, "2147483648"] },
+      { metric: { pod: "a", resource: "nvidia_com_gpu", unit: "integer" }, value: [1760282600, "1"] },
+      { metric: { pod: "b", resource: "ephemeral-storage" }, value: [1760282600, "1073741824"] },
+      { metric: { pod: "b", resource: "cpu", unit: "core" }, value: [1760282600, "0.5"] },
+    ] },
+  });
+  const evidence = new NumberEvidence([limits]);
+  assert.ok(evidence.has(2, unitFactors("GiB")));
+  assert.ok(!evidence.has(2147483648, unitFactors("%")));
+  assert.ok(evidence.has(1, unitFactors("GiB")));
+  assert.ok(!evidence.has(1073741824, unitFactors("%")));
+  assert.ok(evidence.has(500, unitFactors("mCPU")));
+  assert.ok(!evidence.has(0.5, unitFactors("%")));
+  assert.ok(evidence.has(1, unitFactors("个"))); // GPU 个数不知道单位，照旧
+});

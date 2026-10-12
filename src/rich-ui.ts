@@ -391,32 +391,31 @@ export function promqlUnit(query: string): "cores" | "bytes" | "resource" | unde
   if (/[-+*/%^@]|\bbool\b/.test(bare)) {
     return undefined;
   }
-  const metrics: string[] = [];
-  let counter = false;
+  // 每个指标名记下是不是直接套在 rate/irate 里：rate(x) or x 这种一半是核数、一半是累计秒数，认不出
+  const metrics: { name: string; rated: boolean }[] = [];
   for (const match of bare.matchAll(/(?<![\w.])[A-Za-z_:][\w:]*/g)) {
     const name = match[0];
     if (/^\s*\(/.test(bare.slice(match.index + name.length))) {
       if (!UNIT_KEEPING.has(name)) {
         return undefined;
       }
-      counter ||= name === "rate" || name === "irate";
     } else if (!PROMQL_KEYWORDS.has(name)) {
-      metrics.push(name);
+      metrics.push({ name, rated: /\bi?rate\s*\(\s*$/.test(bare.slice(0, match.index)) });
     }
   }
   if (metrics.length === 0) {
     return undefined;
   }
-  if (counter && metrics.every((name) => /cpu\w*_seconds_total$/.test(name))) {
+  if (metrics.every(({ name, rated }) => rated && /cpu\w*_seconds_total$/.test(name))) {
     return "cores";
   }
-  if (!counter && metrics.every((name) => /_cores$/.test(name))) {
+  if (metrics.every(({ name, rated }) => !rated && /_cores$/.test(name))) {
     return "cores";
   }
-  if (metrics.every((name) => /_bytes(?:_total)?$|^container_memory_(?:rss|cache|swap|mapped_file)$/.test(name))) {
+  if (metrics.every(({ name }) => /_bytes(?:_total)?$|^container_memory_(?:rss|cache|swap|mapped_file)$/.test(name))) {
     return "bytes";
   }
-  if (!counter && metrics.every((name) => /^kube_pod_container_resource_(?:limits|requests)$/.test(name))) {
+  if (metrics.every(({ name, rated }) => !rated && /^kube_pod_container_resource_(?:limits|requests)$/.test(name))) {
     // 每个选择器都写死同一个 resource="cpu"（或 memory）才整个按它算；有的没写、写了正则、几种混着（a or b），按每条序列的标签认
     const selectors = [...query.matchAll(/kube_pod_container_resource_(?:limits|requests)\s*(\{[^{}]*\})?/g)].map((match) => {
       const matchers = [...(match[1] ?? "").matchAll(/\bresource\s*(=~|!=|!~|=)\s*"([^"]*)"/g)];
@@ -434,6 +433,19 @@ const SERIES = /"metric"\s*:\s*\{/g;
 const COMMON_METRIC = new RegExp(`${halfWidth(COMMON_SUFFIX).replace(/[()]/g, "\\$&")}"\\s*:\\s*\\{\\s*"metric"\\s*:\\s*(\\{[^{}]*\\})`);
 /** Prometheus 的一个样本：[时间戳, "值"] */
 const SAMPLE = /\[\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*,\s*"([^"\\]*)"\s*\]/gi;
+
+/**
+ * kube_pod_container_resource_limits/requests 一条序列的单位：kube-state-metrics 带的 unit 标签（core、byte）最准；
+ * 聚合掉了 unit 时按 resource 认：cpu 是核，memory、ephemeral_storage、hugepages-* 是字节
+ */
+function resourceUnit(labels: string): "cores" | "bytes" | undefined {
+  const unit = /"unit"\s*:\s*"(core|byte)"/.exec(labels)?.[1];
+  if (unit) {
+    return unit === "core" ? "cores" : "bytes";
+  }
+  const resource = /"resource"\s*:\s*"([^"]*)"/.exec(labels)?.[1];
+  return resource === "cpu" ? "cores" : resource && /^(?:memory|ephemeral[-_]storage|storage|hugepages[-_].+)$/.test(resource) ? "bytes" : undefined;
+}
 
 /**
  * PromQL 查询结果（aiops 的 query_metrics、query_metrics_range：{"query":…,"data":{"result":[{"metric":{…},"values":[[时间戳,"值"],…]}]}}）
@@ -456,12 +468,10 @@ function promqlSamples(output: string): { rest: string; samples: { unit: "cores"
   const samples: { unit: "cores" | "bytes"; value: number }[] = [];
   // 每条序列都一样的标签（三条以上都是 resource="cpu"）被提到「result（每项都有的字段）」里，序列自己的 metric 里就没有了
   const common = COMMON_METRIC.exec(output)?.[1] ?? "";
-  const resourceOf = (labels: string) => /"resource"\s*:\s*"(cpu|memory)"/.exec(labels)?.[1];
   let rest = output.slice(0, starts[0]);
   starts.forEach((start, i) => {
     const series = output.slice(start, starts[i + 1] ?? output.length);
-    const resource = resourceOf(series.slice(0, series.indexOf("}") + 1)) ?? resourceOf(common);
-    const seriesUnit = unit === "resource" ? (resource === "cpu" ? "cores" : resource === "memory" ? "bytes" : undefined) : unit;
+    const seriesUnit = unit === "resource" ? (resourceUnit(series.slice(0, series.indexOf("}") + 1)) ?? resourceUnit(common)) : unit;
     if (!seriesUnit) {
       rest += series;
       return;
