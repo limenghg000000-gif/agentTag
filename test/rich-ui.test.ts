@@ -9,6 +9,7 @@ import {
   segmentsAsText,
   splitAnswer,
   streamingAnswer,
+  promqlUnit,
   unitFactors,
 } from "../src/rich-ui.js";
 
@@ -74,11 +75,14 @@ test("查到的数：按写出来的精度四舍五入；按写出来的单位�
   // 单位
   assert.equal(unitFactors("120 次"), undefined);
   assert.equal(unitFactors("5 min"), undefined);
-  assert.deepEqual(unitFactors("120ms"), [1, 1000]);
-  assert.deepEqual(unitFactors("0.25 核"), [1, 1e-3]);
-  assert.deepEqual(unitFactors("250 毫核"), [1, 1000]);
-  assert.deepEqual(unitFactors("0.06 mCPU"), [1, 1000]);
-  assert.deepEqual(unitFactors("62 mcpu"), [1, 1000]);
+  assert.deepEqual(unitFactors("120ms")?.any, [1, 1000]);
+  assert.deepEqual(unitFactors("0.25 核")?.any, [1, 1e-3]);
+  assert.deepEqual(unitFactors("250 毫核")?.any, [1, 1000]);
+  assert.deepEqual(unitFactors("0.06 mCPU")?.any, [1, 1000]);
+  assert.deepEqual(unitFactors("62 mcpu")?.any, [1, 1000]);
+  assert.deepEqual(unitFactors("1.2 GiB")?.bytes, [1e-9, 1024 ** -3]);
+  assert.deepEqual(unitFactors("512 字节")?.bytes, [1]);
+  assert.ok(new NumberEvidence(["limits memory 256Mi"]).has(0.25, unitFactors("0.25 GiB"))); // 别的工具写的 MiB → GiB
   assert.ok(new NumberEvidence(['{"value":"0.0000623"}']).has(0.06, unitFactors("0.06 mCPU"))); // 核 → 毫核
   // 浮点误差的余量远小于半格：0 不能当 1e-12 的证据
   assert.ok(!new NumberEvidence(["0"]).has(1e-12));
@@ -346,4 +350,101 @@ test("数字卡片：标签里带上服务名（30 来个字）不截断，值�
   const label = "CPU 占 limit 最高 · yuebai-user-rpc";
   const kpi = splitAnswer("```kpi\n" + JSON.stringify([{ label, value: "50%", level: "ok" }]) + "\n```").segments[0];
   assert.deepEqual(kpi, { kind: "kpi", items: [{ label, value: "50%", level: "ok" }] });
+});
+
+test("PromQL 查回来的数按查询认单位：CPU 的 rate 是核数，*_bytes 是字节，limits 按 resource 标签；有加减乘除、别的函数的认不出", () => {
+  const cpu = 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="prod", pod=~"union-.*", container!=""}[5m]))';
+  assert.equal(promqlUnit(cpu), "cores");
+  assert.equal(promqlUnit('topk(5, sum(rate(container_cpu_usage_seconds_total{namespace="prod"}[5m])) by (pod))'), "cores");
+  assert.equal(promqlUnit('max_over_time(sum by (pod)(irate(container_cpu_usage_seconds_total[1m]))[1h:5m])'), "cores");
+  assert.equal(promqlUnit('sum by (pod) (container_memory_working_set_bytes{namespace="prod", pod=~"union-.*", container!=""})'), "bytes");
+  assert.equal(promqlUnit('sum by (pod, resource) (kube_pod_container_resource_limits{namespace="prod", pod=~"union-.*"})'), "resource");
+  assert.equal(promqlUnit('sum by (pod) (kube_pod_container_resource_limits{resource="cpu", pod=~"union-.*"})'), "cores");
+  assert.equal(promqlUnit('kube_pod_container_resource_requests{resource="memory"}'), "bytes");
+  // 算过的、认不出的：按不知道单位算
+  for (const query of [
+    `100 * ${cpu} / sum by (pod) (kube_pod_container_resource_limits{resource="cpu"})`,
+    `${cpu} * 1000`,
+    "increase(container_cpu_usage_seconds_total[1h])",
+    "container_cpu_usage_seconds_total",
+    'count by (pod) (container_memory_working_set_bytes)',
+    'sum(rate(http_requests_total{code=~"5.."}[5m]))',
+    'rate(container_cpu_cfs_throttled_periods_total[5m])',
+    'sum(rate({app="union"} |= "error" [5m]))',
+    'container_memory_working_set_bytes offset -5m',
+    'sum by (pod) (container_memory_working_set_bytes) > bool 1e8',
+    'sum(rate(container_cpu_usage_seconds_total[5m])) or sum(container_memory_working_set_bytes)',
+  ]) {
+    assert.equal(promqlUnit(query), undefined, query);
+  }
+});
+
+test("2026-10-12 union：CPU 查回来是核数，写成「占 limit %」的图和数字卡片不画；写成 mCPU、在查询里算好百分比的照画；内存字节换成 MiB 照画", () => {
+  const series = (pods: Record<string, string[]>, extra: Record<string, string> = {}) =>
+    Object.entries(pods).map(([pod, values]) => ({ metric: { pod, ...extra }, values: values.map((v, i) => [1760279000 + i * 300, v]) }));
+  const range = (query: string, pods: Record<string, string[]>) =>
+    JSON.stringify({ query, step_seconds: 300, query_start: "2026-10-12T14:23:00Z", query_end: "2026-10-12T15:23:00Z", data: { resultType: "matrix", result: series(pods) } });
+  const cpu = range('sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="prod", pod=~"union-.*", container!=""}[5m]))', {
+    "union-l6qqx": ["0.00241", "0.0332", "0.00262"],
+    "union-2v7gp": ["0.00238", "0.0120", "0.00251"],
+  });
+  const memory = range('sum by (pod) (container_memory_working_set_bytes{namespace="prod", pod=~"union-.*", container!=""})', {
+    "union-sxllq": ["188430745", "188431000", "188432000"],
+  });
+  const limits = JSON.stringify({
+    query: 'sum by (pod, resource) (kube_pod_container_resource_limits{namespace="prod", pod=~"union-.*"})',
+    data: { resultType: "vector", result: [
+      { metric: { pod: "union-l6qqx", resource: "cpu" }, value: [1760282600, "0.256"] },
+      { metric: { pod: "union-l6qqx", resource: "memory" }, value: [1760282600, "268435456"] },
+    ] },
+  });
+  const evidence = new NumberEvidence([cpu, memory, limits]);
+  const chart = (unit: string | undefined, data: number[][], title = "union 各 Pod CPU 占 limit"): AnswerSegment[] => [
+    { kind: "chart", type: "line", title, ...(unit ? { unit } : {}), x: ["22:23", "22:28", "22:33"], series: data.map((d, i) => ({ name: `p${i}`, data: d })) },
+  ];
+  const drawn = (segments: AnswerSegment[]) => keepVerified(segments, evidence).segments[0].kind === "chart";
+  const kpi = (label: string, value: string) => keepVerified([{ kind: "kpi", items: [{ label, value }] }], evidence).segments.length === 1;
+
+  // 测试群里的写法：核数原样当百分比
+  assert.ok(!drawn(chart("%", [[0.0024, 0.0332, 0.0026], [0.0024, 0.012, 0.0025]])));
+  assert.ok(!drawn(chart(undefined, [[0.0024, 0.0332, 0.0026], [0.0024, 0.012, 0.0025]], "union 各 Pod CPU 占 limit（%）")));
+  assert.ok(!kpi("CPU 占 limit 最高 · l6qqx", "0.03%"));
+  assert.ok(!kpi("CPU 峰值", "0.0332 mCPU"));
+  // 换算对的照画
+  assert.ok(drawn(chart("mCPU", [[2.4, 33.2, 2.6], [2.4, 12, 2.5]])));
+  assert.ok(drawn(chart("核", [[0.0024, 0.0332, 0.0026], [0.0024, 0.012, 0.0025]])));
+  assert.ok(drawn(chart(undefined, [[0.0024, 0.0332, 0.0026], [0.0024, 0.012, 0.0025]], "union 各 Pod CPU")));
+  assert.ok(kpi("CPU 峰值 · l6qqx", "33 mCPU"));
+  assert.ok(kpi("CPU limit", "0.256 核"));
+  assert.ok(kpi("内存 limit", "256 MiB"));
+  assert.ok(!kpi("内存 limit", "0.256 MiB"));
+  assert.ok(drawn(chart("MiB", [[179.7, 179.7, 179.7]], "union 内存")));
+  // 字节数原样当 MiB、当百分比：不画
+  assert.ok(!kpi("内存", "188430745 MiB"));
+  assert.ok(!drawn(chart("%", [[179.7, 179.7, 179.7]], "union 内存")));
+  // 在 PromQL 里算好的百分比照画
+  const percent = new NumberEvidence([
+    range('100 * sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~"union-.*"}[5m])) / sum by (pod) (kube_pod_container_resource_limits{resource="cpu", pod=~"union-.*"})', {
+      "union-l6qqx": ["0.941", "12.97", "1.02"],
+    }),
+  ]);
+  assert.equal(keepVerified(chart("%", [[0.94, 12.97, 1.02]]), percent).segments[0].kind, "chart");
+  // 时间戳、步长这些不是样本的数照旧当不知道单位的数；截断了的结果照样认得出样本
+  assert.ok(new NumberEvidence([cpu]).has(300));
+  assert.ok(!new NumberEvidence([cpu.slice(0, cpu.indexOf("0.0332") + 8)]).has(0.0332, unitFactors("%")));
+  // 一次结果里有两条查询：分不清，按不知道单位算（和以前一样）
+  assert.ok(new NumberEvidence([`[${cpu},${cpu}]`]).has(0.0332, unitFactors("%")));
+});
+
+test("折线图：一条线、点不多时在点上标数；几条线或点多时不标", () => {
+  const spec = (series: number, points: number) => {
+    const x = Array.from({ length: points }, (_, i) => `t${i}`);
+    const chart: ChartBlock = { kind: "chart", type: "line", title: "t", x, series: Array.from({ length: series }, (_, s) => ({ name: `s${s}`, data: x.map(() => 1) })) };
+    return (segmentElements([chart], () => ({})) as any[])[0].chart_spec;
+  };
+  assert.deepEqual(spec(1, 12).label, { visible: true });
+  assert.deepEqual(spec(1, 13).label, { visible: false });
+  assert.deepEqual(spec(3, 7).label, { visible: false });
+  const bar: ChartBlock = { kind: "chart", type: "bar", title: "t", x: ["a"], series: [{ name: "s", data: [1] }] };
+  assert.equal((segmentElements([bar], () => ({})) as any[])[0].chart_spec.label, undefined);
 });

@@ -40,6 +40,8 @@ export type AnswerSegment = { kind: "markdown"; text: string } | ChartBlock | Kp
 export const MAX_CHARTS = 3;
 const MAX_SERIES = 8;
 const MAX_POINTS_PER_CHART = 200;
+/** 折线图只有一条线、点不超过这么多时在点上标数 */
+const MAX_LABELED_POINTS = 12;
 const MAX_KPIS = 4;
 export const MAX_ACTIONS = 3;
 /** 按钮上的一句话最多几个字（飞书回调的 value 也有大小限制） */
@@ -318,82 +320,209 @@ const NUMBER = /(?<![\d.])-?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:e[+
 
 /**
  * 写出来的单位决定查到的数能怎么换算过来（查到的数 × 倍数 = 写出来的数）。认不出单位的只认原数，
- * 免得一个比例 0.412 既能当 0.4% 又能当 41.2%、一个字节数原样当成 MiB
+ * 免得一个比例 0.412 既能当 0.4% 又能当 41.2%、一个字节数原样当成 MiB。
+ * any 是不知道单位的数（工具结果里的文字、算过比例的 PromQL）；cores、bytes 是 PromQL 直接查回来、按查询认得出单位的数，
+ * 只认这个单位真正的换算：2026-10-12 测试群 union 的 CPU 是核数 0.0024（2.4 mCPU），模型写成「占 limit 0.0024%」，按原数就对上了
  */
-export function unitFactors(raw: string | undefined): readonly number[] | undefined {
+export interface UnitFactors {
+  readonly any: readonly number[];
+  readonly cores: readonly number[];
+  readonly bytes: readonly number[];
+}
+
+const BYTE_FACTORS = [1, 1e-3, 1e-6, 1e-9, 1e-12, 1 / 1024, 1 / 1024 ** 2, 1 / 1024 ** 3, 1 / 1024 ** 4];
+
+/** 没写单位：查到的数只认原数，什么单位的都行 */
+const PLAIN: UnitFactors = { any: [1], cores: [1], bytes: [1] };
+
+export function unitFactors(raw: string | undefined): UnitFactors | undefined {
   if (!raw) {
     return undefined;
   }
   const text = halfWidth(raw);
   if (/%|百分/.test(text)) {
-    return [1, 100];
+    return { any: [1, 100], cores: [], bytes: [] };
   }
-  if (/(?<![A-Za-z])(?:[KMGT]i?B?|[kmgt]B|bytes?)(?![A-Za-z])|字节/.test(text)) {
-    return [1, 1e-3, 1e-6, 1e-9, 1e-12, 1 / 1024, 1 / 1024 ** 2, 1 / 1024 ** 3, 1 / 1024 ** 4];
+  const bytes = /(?<![A-Za-z])(?:([KMGT])i?B?|([kmgt])B|bytes?)(?![A-Za-z])|字节/.exec(text);
+  if (bytes) {
+    // PromQL 查回来的字节数只认写出来的这一级（MiB 和 MB 常混着写，两种都认）；
+    // 别的工具结果里的数不知道是哪一级（「256Mi」「1228 KiB」都有），哪级换过来都认
+    const prefix = (bytes[1] ?? bytes[2])?.toUpperCase();
+    const power = prefix ? "KMGT".indexOf(prefix) + 1 : 0;
+    return { any: BYTE_FACTORS, cores: [], bytes: power === 0 ? [1] : [1000 ** -power, 1024 ** -power] };
   }
   // 2026-10-12 测试群：模型把查到的核数 ×1000 写成「0.06 mCPU」，认不出 mCPU 就只认原数，对的数也被拦下
   if (/(?<![A-Za-z])m(?:CPU|cpu)?(?![A-Za-z])|毫核|millicores?/.test(text)) {
-    return [1, 1000];
+    return { any: [1, 1000], cores: [1000], bytes: [] };
   }
   if (/核|cores?(?![A-Za-z])/.test(text)) {
-    return [1, 1e-3];
+    return { any: [1, 1e-3], cores: [1], bytes: [] };
   }
   if (/(?<![A-Za-z])ms(?![A-Za-z])|毫秒/.test(text)) {
-    return [1, 1000];
+    return { any: [1, 1000], cores: [], bytes: [] };
   }
   if (/(?<![A-Za-z])s(?![A-Za-z])|秒/.test(text)) {
-    return [1, 1e-3];
+    return { any: [1, 1e-3], cores: [], bytes: [] };
   }
   return undefined;
 }
 
-/** 工具结果里的数（原样，不换算），排好序，按区间查；换算按写出来的单位在查的时候做 */
+/** PromQL 里不改单位的函数：聚合、取范围内的最值均值、取整、改标签。别的（count、increase、histogram_quantile、time…）认不出单位 */
+const UNIT_KEEPING = new Set([
+  "sum", "avg", "min", "max", "topk", "bottomk", "quantile", "sort", "sort_desc",
+  "rate", "irate", "avg_over_time", "max_over_time", "min_over_time", "quantile_over_time", "last_over_time",
+  "abs", "ceil", "floor", "round", "clamp", "clamp_min", "clamp_max", "label_replace", "label_join",
+]);
+const PROMQL_KEYWORDS = new Set(["and", "or", "unless", "group_left", "group_right"]);
+
+/**
+ * PromQL 查回来的数是什么单位：rate(…cpu…seconds_total) 是核数，*_bytes 是字节，kube_pod_container_resource_limits/requests
+ * 按每条序列的 resource 标签（cpu 是核、memory 是字节）。有加减乘除（比如除以 limit 再乘 100）、用了别的函数的认不出，按不知道单位算
+ */
+export function promqlUnit(query: string): "cores" | "bytes" | "resource" | undefined {
+  const bare = query
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`/g, "")
+    .replace(/\{[^{}]*\}/g, "")
+    .replace(/\[[^[\]]*\]/g, "")
+    .replace(/\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^()]*\)/g, "")
+    .replace(/\boffset\s+\w+/g, "");
+  if (/[-+*/%^@]|\bbool\b/.test(bare)) {
+    return undefined;
+  }
+  const metrics: string[] = [];
+  let counter = false;
+  for (const match of bare.matchAll(/(?<![\w.])[A-Za-z_:][\w:]*/g)) {
+    const name = match[0];
+    if (/^\s*\(/.test(bare.slice(match.index + name.length))) {
+      if (!UNIT_KEEPING.has(name)) {
+        return undefined;
+      }
+      counter ||= name === "rate" || name === "irate";
+    } else if (!PROMQL_KEYWORDS.has(name)) {
+      metrics.push(name);
+    }
+  }
+  if (metrics.length === 0) {
+    return undefined;
+  }
+  if (counter && metrics.every((name) => /cpu\w*_seconds_total$/.test(name))) {
+    return "cores";
+  }
+  if (!counter && metrics.every((name) => /_cores$/.test(name))) {
+    return "cores";
+  }
+  if (metrics.every((name) => /_bytes(?:_total)?$|^container_memory_(?:rss|cache|swap|mapped_file)$/.test(name))) {
+    return "bytes";
+  }
+  if (!counter && metrics.every((name) => /^kube_pod_container_resource_(?:limits|requests)$/.test(name))) {
+    const resource = /\bresource\s*=\s*"(cpu|memory)"/.exec(query)?.[1];
+    return resource === "cpu" ? "cores" : resource === "memory" ? "bytes" : "resource";
+  }
+  return undefined;
+}
+
+const QUERY_FIELD = /"query"\s*:\s*("(?:[^"\\]|\\.)*")/g;
+const SERIES = /"metric"\s*:\s*\{/g;
+/** Prometheus 的一个样本：[时间戳, "值"] */
+const SAMPLE = /\[\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*,\s*"([^"\\]*)"\s*\]/gi;
+
+/**
+ * PromQL 查询结果（aiops 的 query_metrics、query_metrics_range：{"query":…,"data":{"result":[{"metric":{…},"values":[[时间戳,"值"],…]}]}}）
+ * 里的样本值，按查询认出单位；剩下的文字（时间戳、步长、查询里写的数）照旧当不知道单位的数。
+ * 只有一个 query、认得出单位、有序列的才拆：一次结果里有几条查询（诊断报告）分不清哪条序列是哪条查询的。
+ * 不整段 JSON.parse：交给模型的结果可能截断了
+ */
+function promqlSamples(output: string): { rest: string; samples: { unit: "cores" | "bytes"; value: number }[] } {
+  const queries = [...output.matchAll(QUERY_FIELD)];
+  const starts = [...output.matchAll(SERIES)].map((match) => match.index);
+  let unit: ReturnType<typeof promqlUnit>;
+  try {
+    unit = queries.length === 1 ? promqlUnit(JSON.parse(queries[0][1]) as string) : undefined;
+  } catch {
+    unit = undefined;
+  }
+  if (!unit || starts.length === 0) {
+    return { rest: output, samples: [] };
+  }
+  const samples: { unit: "cores" | "bytes"; value: number }[] = [];
+  let rest = output.slice(0, starts[0]);
+  starts.forEach((start, i) => {
+    const series = output.slice(start, starts[i + 1] ?? output.length);
+    const labels = series.slice(0, series.indexOf("}") + 1);
+    const resource = /"resource"\s*:\s*"(cpu|memory)"/.exec(labels)?.[1];
+    const seriesUnit = unit === "resource" ? (resource === "cpu" ? "cores" : resource === "memory" ? "bytes" : undefined) : unit;
+    if (!seriesUnit) {
+      rest += series;
+      return;
+    }
+    rest += series.replace(SAMPLE, (sample, ts: string, value: string) => {
+      const n = Number(value);
+      if (!value.trim() || !Number.isFinite(n)) {
+        return sample;
+      }
+      samples.push({ unit: seriesUnit, value: n });
+      return `[${ts},""]`;
+    });
+  });
+  return { rest, samples };
+}
+
+/** 工具结果里的数（原样，不换算），按单位分开、排好序，按区间查；换算按写出来的单位在查的时候做 */
 export class NumberEvidence {
-  private readonly values: Float64Array;
+  private readonly values: Record<keyof UnitFactors, Float64Array>;
 
   constructor(outputs: readonly string[]) {
-    const found: number[] = [];
+    const found: Record<keyof UnitFactors, number[]> = { any: [], cores: [], bytes: [] };
     for (const raw of outputs) {
-      const output = halfWidth(raw);
+      const { rest, samples } = promqlSamples(halfWidth(raw));
+      for (const sample of samples) {
+        found[sample.unit].push(sample.value);
+      }
       // 两种拆法都算：「1,234」既是 1234，也可能是 JSON 数组里的 1 和 234
-      for (const match of [...output.matchAll(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi), ...output.matchAll(NUMBER)]) {
+      for (const match of [...rest.matchAll(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi), ...rest.matchAll(NUMBER)]) {
         const n = Number(match[0].replace(/,/g, ""));
         if (Number.isFinite(n)) {
-          found.push(n);
+          found.any.push(n);
         }
       }
     }
-    this.values = Float64Array.from(found).sort();
+    this.values = {
+      any: Float64Array.from(found.any).sort(),
+      cores: Float64Array.from(found.cores).sort(),
+      bytes: Float64Array.from(found.bytes).sort(),
+    };
   }
 
   /**
-   * v 是不是哪个查到的数（按 factors 里的一个倍数换算以后）按 v 写出来的精度四舍五入的结果：
-   * v 写成 41.2、单位是 % 时，看有没有 41.15 到 41.25 之间的数，或者 0.4115 到 0.4125 之间的数。
+   * v 是不是哪个查到的数（按 factors 里这个数的单位能用的一个倍数换算以后）按 v 写出来的精度四舍五入的结果：
+   * v 写成 41.2、单位是 % 时，看有没有 41.15 到 41.25 之间的数，或者 0.4115 到 0.4125 之间的数（查到的核数、字节数不算）。
    * 卡片里写成文字的数由 half 给出写出来的精度（0.000 是 ±0.0005，转成数就成了 0，按 0 算会放宽到 ±0.5）
    */
-  has(v: number, factors: readonly number[] = [1], half = halfStep(v)): boolean {
+  has(v: number, factors: UnitFactors = PLAIN, half = halfStep(v)): boolean {
     // 1e309 这种转成数是 Infinity：区间算不出来，当查不到
     if (!Number.isFinite(v) || !Number.isFinite(half)) {
       return false;
     }
     // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
     const slack = 8 * Number.EPSILON * Math.abs(v);
-    return factors.some((factor) => this.within((v - half - slack) / factor, (v + half + slack) / factor));
+    return (["any", "cores", "bytes"] as const).some((kind) =>
+      factors[kind].some((factor) => within(this.values[kind], (v - half - slack) / factor, (v + half + slack) / factor)),
+    );
   }
+}
 
-  private within(lo: number, hi: number): boolean {
-    let left = 0;
-    let right = this.values.length;
-    while (left < right) {
-      const mid = (left + right) >> 1;
-      if (this.values[mid] < lo) {
-        left = mid + 1;
-      } else {
-        right = mid;
-      }
+function within(values: Float64Array, lo: number, hi: number): boolean {
+  let left = 0;
+  let right = values.length;
+  while (left < right) {
+    const mid = (left + right) >> 1;
+    if (values[mid] < lo) {
+      left = mid + 1;
+    } else {
+      right = mid;
     }
-    return left < this.values.length && this.values[left] <= hi;
   }
+  return left < values.length && values[left] <= hi;
 }
 
 /**
@@ -452,11 +581,12 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   let kpis = 0;
   for (const segment of segments) {
     if (segment.kind === "chart") {
-      const factors = unitFactors(segment.unit) ?? [1];
+      // 单位写在标题里（「CPU 占 limit（%）」）也算
+      const factors = unitFactors(segment.unit) ?? unitFactors(segment.title) ?? PLAIN;
       const found = (n: number | null): n is number => n !== null && evidence.has(n, factors);
       const badX = segment.x
         .filter((value) => NUMERIC_LABEL.test(halfWidth(value)))
-        .flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? [1], half)).map(({ n }) => n));
+        .flatMap((value) => numbersIn(value).filter(({ n, half }) => !evidence.has(n, unitFactors(value) ?? PLAIN, half)).map(({ n }) => n));
       const points = segment.series.flatMap((s) => s.data);
       const badPoints = points.filter((n) => !found(n));
       const missing = [...badX, ...badPoints];
@@ -485,7 +615,7 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
       }
     } else if (segment.kind === "kpi") {
       const items = segment.items.filter((item) => {
-        const factors = unitFactors(item.value) ?? unitFactors(item.label) ?? [1];
+        const factors = unitFactors(item.value) ?? unitFactors(item.label) ?? PLAIN;
         const ok = numbersIn(item.value).every(({ n, half }) => evidence.has(n, factors, half));
         if (!ok) {
           dropped.push(`数字卡片「${item.label} ${item.value}」在查询结果里找不到`);
@@ -609,6 +739,8 @@ function chartElement(chart: ChartBlock): object {
       yField: "value",
       seriesField: "series",
       legends: { visible: chart.series.length > 1, orient: "bottom" },
+      // 几条折线、点多时每个点都标数会叠成一片（2026-10-12 测试群 union 三个 Pod 的内存、CPU 图），只留一条线、点不多时标
+      ...(chart.type === "line" ? { label: { visible: chart.series.length === 1 && chart.x.length <= MAX_LABELED_POINTS } } : {}),
     },
   };
 }
