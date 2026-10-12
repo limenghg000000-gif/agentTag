@@ -2070,6 +2070,45 @@ test("代码引用的路径要整段对上，改文件记下的行也认", () =>
   assert.deepEqual(unseenCodeCitations("见 src/foo/bar.ts", slashes), [{ text: "src/foo/bar.ts", located: false }]);
 });
 
+test("回答里的绝对路径也要查证：日志、堆栈里要整段对上，代码工具查到的按仓库里的相对路径认", () => {
+  const seen = codeEvidence(
+    ["ai/agent-tag", "ai/aiops-mcp"],
+    [
+      found("code_read_file", [{ path: "internal/logic/user.go", lines: [1, 80] }], "ai/agent-tag"),
+      found("code_read_file", [{ path: "src/x.ts", lines: [1, 20] }]),
+      { tool: "aiops_query_logs", output: "goroutine 1 [running]:\n/build/services/goods/tb.go:8220 +0x1d" },
+      { tool: "aiops_query_logs", output: 'Traceback:\n  File "/app/src/a.py", line 3' },
+    ],
+  );
+  const unseen = (answer: string) => unseenCodeCitations(answer, seen).map((cite) => cite.text);
+  // 堆栈里的绝对路径照样放行
+  assert.deepEqual(unseen("根因在 /build/services/goods/tb.go:8220"), []);
+  assert.deepEqual(unseen("见 `/app/src/a.py`"), []);
+  // 原先回答里的绝对路径一概不查：结果里没有的路径、行号现在打回
+  assert.deepEqual(unseen("报错在 /app/src/user.ts:99，空指针"), ["/app/src/user.ts:99"]);
+  assert.deepEqual(unseen("**/build/services/goods/tb.go**:8221"), ["/build/services/goods/tb.go:8221"]);
+  // 别的绝对路径不能拿来充数：前面少几级、多几级的都不是堆栈里那个文件
+  assert.deepEqual(unseen("/services/goods/tb.go:8220"), ["/services/goods/tb.go:8220"]);
+  assert.deepEqual(unseen("/x/build/services/goods/tb.go:8220"), ["/x/build/services/goods/tb.go:8220"]);
+  // 代码工具读到的按仓库里的相对路径认：容器里的 /app/internal/logic/user.go:35 就是 internal/logic/user.go 第 35 行，读到的行以外的不算
+  assert.deepEqual(unseen("/app/internal/logic/user.go:35"), []);
+  assert.deepEqual(unseen("/app/internal/logic/user.go:99"), ["/app/internal/logic/user.go:99"]);
+  // 开头的 / 当仓库根，和读文件时一样
+  assert.deepEqual(unseen("/internal/logic/user.go:35"), []);
+  // 绝对路径里有仓库名的，只认这个仓库里查到的：src/x.ts 读的是 ai/aiops-mcp 的
+  assert.deepEqual(unseen("/ai/aiops-mcp/src/x.ts:3"), []);
+  assert.deepEqual(unseen("/ai/agent-tag/src/x.ts:3"), ["/ai/agent-tag/src/x.ts:3"]);
+  // 不是绝对路径的开头：~ 家目录下的文件、网址里的路径
+  assert.deepEqual(unseen("配置在 ~/.config/app.yaml"), []);
+  assert.deepEqual(unseen("见 https://lab.yuebai.site/ai/agent-tag/-/blob/master/src/zz.ts"), []);
+  // 删除线包着的、反引号里带空格的绝对路径按整段认
+  assert.deepEqual(unseen("~~/app/src/old.ts~~"), ["/app/src/old.ts"]);
+  assert.deepEqual(unseen("`/app/my dir/a.ts:3`"), ["/app/my dir/a.ts:3"]);
+  // 读起来是命令的，里面的绝对路径一个个认
+  assert.deepEqual(unseen("`go run /app/cmd/main.go`"), ["/app/cmd/main.go"]);
+  assert.deepEqual(unseen("~~/app/src/one.ts or src/two.ts~~"), ["src/two.ts", "/app/src/one.ts"]);
+});
+
 test("代码引用：反引号里带空格的路径按整段认，读起来是命令的里面的路径一个个认", () => {
   const seen = codeEvidence(
     [],
