@@ -2953,6 +2953,34 @@ test("归档：表格里归档了、aiops 那步没做成，再试之前这一�
   assert.equal(backend.entries[0].status, "active");
 });
 
+test("归档没有草稿编号的行：表格里归档了、aiops 那步没做成，再试之前这一行改了编号、原来的编号给了另一条归档的行：按记录编号认出不是同一行，按归档时记下的 aiops 编号归档", async () => {
+  const { backend, base, desk, sent, calls, click, tool, lastCard, handlers } = deskSetup();
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops({ id: "K1" }, 31);
+  delete backend.entries[0].requestId;
+  backend.entries[0].rowId = "rec1";
+  await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  const archiveLesson = handlers.archive_lesson;
+  handlers.archive_lesson = () => {
+    throw new Error("aiops 现在连不上");
+  };
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.match(cardText(lastCard()), /aiops 经验库里同步的经验 #31 没能归档/);
+
+  // 归档的那一行改成了 K7；另一条归档的、也没有草稿编号的行改成了 K1，它同步到 aiops 的 #35 出处也写着 K1
+  backend.entries[0].id = "K7";
+  await base.save(normalizeDraft(dau));
+  Object.assign(backend.entries[1], { id: "K1", aiopsId: 35, status: "archived", rowId: "rec2" });
+  delete backend.entries[1].requestId;
+  handlers.archive_lesson = archiveLesson;
+  const tried = calls.filter((call) => call.tool === "archive_lesson").length;
+  await desk.handleCardAction(click(lastCard(), "archive"));
+  await desk.idle();
+  assert.deepEqual(calls.filter((call) => call.tool === "archive_lesson").slice(tried).map((call) => call.args), [{ id: 31 }]);
+});
+
 test("取代旧经验：旧的在表格里归档了、它在 aiops 里那条没归档成，再试之前有人改了旧的那一行、或者复制出草稿编号一样的行：照样接着归档 aiops 里那条", async () => {
   for (const change of ["edit", "copy"] as const) {
     const setup = deskSetup({ saveLesson: () => JSON.stringify({ saved: true, id: 33 }) });

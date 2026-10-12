@@ -155,6 +155,8 @@ interface SaveProposal extends ProposalBase {
 interface ArchivedRow {
   id: string;
   aiopsId?: number;
+  /** 表格里这一行的记录编号：改编号、把编号给了别的行都不变，再试一次时按它认是不是归档的那一行 */
+  rowId?: string;
 }
 
 /** 起草时定下的内容，发卡片时再补上编号、群、话题这些 */
@@ -926,7 +928,7 @@ export class KnowledgeDesk {
       }
       const out: Outcome = { done: [`经验 ${id} 上次已经在表格里归档了。`], unfinished: [] };
       // 读到的不是归档的那一行（编号给了别的有效的行、草稿编号对不上）：不认它记的 aiops 编号
-      const original = archivedOriginal(current, target.entry.requestId);
+      const original = archivedOriginal(current, target.entry.requestId, proposal.archivedRow);
       const linked = original?.aiopsId ?? aiopsId;
       if (linked !== undefined) {
         await this.archiveLinked([...new Set([original?.id ?? id, id, target.entry.id])], linked, confirmedBy, task, out);
@@ -1038,7 +1040,7 @@ export class KnowledgeDesk {
     const seen = proposal.replaces!;
     if (proposal.replacedArchived) {
       // 上次已经归档了旧的那一行，只差 aiops 那步：之后那一行在表格里改了也接着做（核对卡片上的内容是归档之前的事）
-      const original = gone ? undefined : archivedOriginal(old, seen.requestId);
+      const original = gone ? undefined : archivedOriginal(old, seen.requestId, proposal.replacedArchived);
       out.done.push(
         gone
           ? `旧的经验 ${proposal.replacedArchived.id} 已经从表格里删掉了，不用再归档。`
@@ -1090,7 +1092,7 @@ export class KnowledgeDesk {
     if (!recorded) {
       return { ids: [...new Set([old.id, seen.id])], ...(old.aiopsId !== undefined ? { aiopsId: old.aiopsId } : {}) };
     }
-    const original = gone ? undefined : archivedOriginal(old, seen.requestId);
+    const original = gone ? undefined : archivedOriginal(old, seen.requestId, proposal.replacedArchived);
     const aiopsId = original?.aiopsId ?? recorded.aiopsId;
     return { ids: [...new Set([original?.id ?? recorded.id, recorded.id, seen.id])], ...(aiopsId !== undefined ? { aiopsId } : {}) };
   }
@@ -1488,15 +1490,21 @@ function describe(err: unknown): string {
 
 /** 在表格里归档了（或者已经被删了）的那一行：记下当时的编号和它记的 aiops 编号 */
 function archivedRow(entry: KnowledgeEntry): ArchivedRow {
-  return { id: entry.id, ...(entry.aiopsId !== undefined ? { aiopsId: entry.aiopsId } : {}) };
+  return { id: entry.id, ...(entry.aiopsId !== undefined ? { aiopsId: entry.aiopsId } : {}), ...(entry.rowId ? { rowId: entry.rowId } : {}) };
 }
 
 /**
- * 再试一次时重新读到的那一行是不是之前归档的那一行：要是已归档的，有草稿编号的草稿编号要对得上。
- * 之前那一行被删了、编号给了别的行（有效的，或者草稿编号不一样）时不算，不拿它记的 aiops 编号去归档 aiops 里不相干的经验
+ * 再试一次时重新读到的那一行是不是之前归档的那一行：要是已归档的，有草稿编号的草稿编号要对得上，记下了记录编号的记录编号也要对得上。
+ * 之前那一行被删了、编号给了别的行（有效的，或者草稿编号、记录编号不一样，比如没有草稿编号的行改了编号、原来的编号给了另一行归档的）时不算，
+ * 不拿它记的 aiops 编号去归档 aiops 里不相干的经验
  */
-function archivedOriginal(current: KnowledgeEntry | undefined, requestId: string | undefined): KnowledgeEntry | undefined {
-  return current && current.status === "archived" && (requestId === undefined || current.requestId === requestId) ? current : undefined;
+function archivedOriginal(current: KnowledgeEntry | undefined, requestId: string | undefined, recorded: ArchivedRow | undefined): KnowledgeEntry | undefined {
+  return current &&
+    current.status === "archived" &&
+    (requestId === undefined || current.requestId === requestId) &&
+    (!recorded?.rowId || !current.rowId || current.rowId === recorded.rowId)
+    ? current
+    : undefined;
 }
 
 /** aiops 少了同步、归档要用的哪些工具 */
