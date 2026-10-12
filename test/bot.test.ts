@@ -378,6 +378,21 @@ test("在话题里 @ 机器人说「停止」会停掉这个话题的任务，�
   assert.match(cardText(updates.at(-1)!.card), /已停止/);
 });
 
+test("点「接着查」按钮问的「停止」不当成停止指令：按钮上的话是模型写的，不能停掉话题里别的任务", async () => {
+  const { model, running } = blockingModel();
+  const { deps, sent, updates, handle } = setup({ model });
+
+  const task = handle(message("写一篇长文"));
+  await running;
+  // 按钮问的会跑成一次只读的提问；这里只看话题里写长文的任务没被停
+  const asked = handle(message("停止", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }), { readOnly: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(!markdowns(sent).includes("好的，已停止。"));
+  assert.ok(!updates.some((update) => /已停止/.test(cardText(update.card))));
+  deps.tasks.stopChat("oc_1");
+  await Promise.all([task, asked]);
+});
+
 test("没有进行中的任务时说「停止」如实告知", async () => {
   const { sent, handle } = setup();
 
@@ -3166,12 +3181,16 @@ test("代码工具读到的数（部署文件里的副本数、资源配置）�
   const codeRead: Tool = {
     spec: { name: "code_read_file", description: "读代码", parameters: { type: "object", properties: {} } },
     describe: () => "读代码",
-    run: async (_args, ctx) =>
-      codeResult(ctx, [
-        ["deploy/union.yaml（master 分支 @ 1a2b3c4，共 40 行，下面是第 11 到 12 行）", { commit: "1a2b3c4" }],
-        ["11| spec:", { path: "deploy/union.yaml", lines: [11, 11] }],
-        ["12|   replicas: 6", { path: "deploy/union.yaml", lines: [12, 12] }],
-      ]),
+    run: async (_args, ctx) => {
+      // 和 numberedLines 一样：行号「12|」这一段记下这一行，后面是代码
+      const { text, facts } = new ToolOutputBuilder("ai/aiops-mcp")
+        .parts(["deploy/union.yaml", { path: "deploy/union.yaml" }], "（", ["master 分支 @ 1a2b3c4", { commit: "1a2b3c4" }], "，共 40 行，下面是第 11 到 12 行）")
+        .parts(["11|", { path: "deploy/union.yaml", lines: [11, 11] }], " spec:")
+        .parts(["12|", { path: "deploy/union.yaml", lines: [12, 12] }], "   replicas: 6")
+        .build();
+      ctx.onFacts?.(facts);
+      return text;
+    },
   };
   const results: ChatResult[] = [
     { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_read_file", arguments: "{}" }] },
@@ -3198,10 +3217,24 @@ test("代码工具读到的数（部署文件里的副本数、资源配置）�
   assert.match(warnings.join("\n"), /数字卡片「起 11」在查询结果里找不到/);
 });
 
-test("代码工具结果只留代码本身：读文件、搜索的行号、文件名、提交号不算", () => {
-  assert.equal(
-    codeContent("deploy/a.yaml（共 40 行，下面是第 11 到 12 行）\n11| spec:\n12|   replicas: 6\n13| "),
-    "spec:\n  replicas: 6\n",
-  );
-  assert.equal(codeContent("在 1 个分支上共搜到 2 处：\n【master，2 处】\ndeploy/v2/a.yaml:12:  replicas: 6\nsrc/x.go:7:const limit = 9"), "  replicas: 6\nconst limit = 9");
+test("代码工具结果只留代码本身：只认工具记下的代码行，行号、文件名、提交号、写回来的搜索词不算", () => {
+  const read = new ToolOutputBuilder("ai/aiops-mcp")
+    .parts(["deploy/a.yaml", { path: "deploy/a.yaml" }], "（共 40 行，下面是第 11 到 13 行）")
+    .parts(["11|", { path: "deploy/a.yaml", lines: [11, 11] }], " spec:")
+    .parts(["12|", { path: "deploy/a.yaml", lines: [12, 12] }], "   replicas: 6")
+    .parts(["13|", { path: "deploy/a.yaml", lines: [13, 13] }], " ")
+    .build();
+  assert.equal(codeContent(read.text, read.facts), "spec:\n  replicas: 6\n");
+
+  const search = new ToolOutputBuilder("ai/aiops-mcp")
+    .line("在 1 个分支上共搜到 2 处：")
+    .parts("【", ["master", { branch: "master" }], "，2 处】")
+    .parts(["deploy/v2/a.yaml:12", { path: "deploy/v2/a.yaml", lines: [12, 12] }], ":  replicas: 6")
+    .parts(["src/x.go:7", { path: "src/x.go", lines: [7, 7] }], ":const limit = 9")
+    .build();
+  assert.equal(codeContent(search.text, search.facts), "  replicas: 6\nconst limit = 9");
+
+  // 没搜到时把搜的词原样写回来：长得像搜索结果，也不算
+  const miss = new ToolOutputBuilder("ai/aiops-mcp").parts("没有搜到「foo:12: limit 99」（", ["master", { branch: "master" }], "）。").build();
+  assert.equal(codeContent(miss.text, miss.facts), "");
 });

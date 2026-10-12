@@ -77,6 +77,9 @@ test("查到的数：按写出来的精度四舍五入；按写出来的单位�
   assert.deepEqual(unitFactors("120ms"), [1, 1000]);
   assert.deepEqual(unitFactors("0.25 核"), [1, 1e-3]);
   assert.deepEqual(unitFactors("250 毫核"), [1, 1000]);
+  assert.deepEqual(unitFactors("0.06 mCPU"), [1, 1000]);
+  assert.deepEqual(unitFactors("62 mcpu"), [1, 1000]);
+  assert.ok(new NumberEvidence(['{"value":"0.0000623"}']).has(0.06, unitFactors("0.06 mCPU"))); // 核 → 毫核
   // 浮点误差的余量远小于半格：0 不能当 1e-12 的证据
   assert.ok(!new NumberEvidence(["0"]).has(1e-12));
   assert.ok(!new NumberEvidence(["0"]).has(1e-12, percent));

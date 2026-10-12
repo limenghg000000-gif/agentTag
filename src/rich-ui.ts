@@ -329,7 +329,8 @@ export function unitFactors(raw: string | undefined): readonly number[] | undefi
   if (/(?<![A-Za-z])(?:[KMGT]i?B?|[kmgt]B|bytes?)(?![A-Za-z])|字节/.test(text)) {
     return [1, 1e-3, 1e-6, 1e-9, 1e-12, 1 / 1024, 1 / 1024 ** 2, 1 / 1024 ** 3, 1 / 1024 ** 4];
   }
-  if (/(?<![A-Za-z])m(?![A-Za-z])|毫核|millicores?/.test(text)) {
+  // 2026-10-12 测试群：模型把查到的核数 ×1000 写成「0.06 mCPU」，认不出 mCPU 就只认原数，对的数也被拦下
+  if (/(?<![A-Za-z])m(?:CPU|cpu)?(?![A-Za-z])|毫核|millicores?/.test(text)) {
     return [1, 1000];
   }
   if (/核|cores?(?![A-Za-z])/.test(text)) {

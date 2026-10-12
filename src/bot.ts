@@ -175,7 +175,8 @@ export function createMessageHandler(deps: BotDeps) {
     const reply = (markdown: string) =>
       send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
 
-    if (STOP_COMMAND.test(question)) {
+    // 点「接着查」按钮问的不当成指令：按钮上的话是模型写的，写个「停止」不能停掉话题里别的任务
+    if (!options.readOnly && STOP_COMMAND.test(question)) {
       // 在话题里说「停止」停这个话题的任务；在群里直接说则停这个群的所有任务
       const stopped = msg.rootId ? tasks.stopThread(threadKeyOf(msg)) : tasks.stopChat(msg.chatId);
       logger.info(`停止指令 message=${msg.messageId} 停止了 ${stopped} 个任务`);
@@ -268,6 +269,8 @@ async function runTask(
   let result: AgentResult | undefined;
   let source = "none";
   let memoryCount: number | undefined;
+  // 这次交给模型的工具有几个：模型一个工具都没调时，分得清是没给它工具还是它自己没调
+  let toolCount: number | undefined;
   // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
   const evidence: ToolEvidence[] = [];
   // 核对过的回答（拆成段）：回答定下来时就核对，记下来的、显示的都用它
@@ -333,14 +336,15 @@ async function runTask(
           succeeded.add(tool.spec.name);
           // 和 runAgent 交给模型时一样截短：截断处以后的模型没看到，不算
           const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
+          const seenFacts = output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit);
           evidence.push(
             code
               ? {
                   tool: tool.spec.name,
-                  facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit),
+                  facts: seenFacts,
                   // 读文件、搜索读到的代码拿来核对图和数字卡片里的数（副本数、资源配置）；代码位置只认 facts。
                   // 别的代码工具（提交记录、文件列表、改代码、看改动）的结果不算
-                  ...(CODE_SOURCE_TOOLS.has(tool.spec.name) ? { output: codeContent(seenByModel(output, limit)) } : {}),
+                  ...(CODE_SOURCE_TOOLS.has(tool.spec.name) ? { output: codeContent(seenByModel(output, limit), seenFacts) } : {}),
                 }
               : {
                   tool: tool.spec.name,
@@ -367,6 +371,7 @@ async function runTask(
         !(followUp && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
+    toolCount = taskTools.length;
     if (followUp) {
       logger.info(`点按钮接着问的，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
@@ -574,6 +579,7 @@ async function runTask(
   logger.info(
     `${state.phase === "stopped" ? "已停止" : "已回复"} message=${msg.messageId} 上下文=${source} ` +
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
+      `${toolCount === undefined ? "" : `可用工具=${toolCount} `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
 }
@@ -915,19 +921,19 @@ const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_up
 /** 结果里有代码原文的代码工具 */
 const CODE_SOURCE_TOOLS: ReadonlySet<string> = new Set(["code_read_file", "code_search"]);
 
-/** 读文件「12| 内容」、搜索「文件:12:内容」这样的一行 */
-const CODE_LINE = /^\d+\| (.*)$|^.+?:\d+:(.*)$/;
-
 /**
- * 代码工具结果里真正是代码的部分：读文件、搜索结果的每一行只留代码本身。
- * 行号、共几行、提交号、文件名不算读到的数：不然读了第 12 行，模型编一个 12 也对得上
+ * 代码工具结果里真正是代码的部分：工具记下的每一行代码（读文件的「12|」、搜索的「文件:12」后面）到行尾的内容，去掉分隔的空格或冒号。
+ * 只认 facts 记下的行，不从文字里认格式：行号、共几行、提交号、文件名不算读到的数（读了第 12 行，模型编一个 12 也对得上），
+ * 「没有搜到「foo:12: limit 99」」这类把搜的词原样写回来的也不算
  */
-export function codeContent(output: string): string {
-  return output
-    .split("\n")
-    .flatMap((line) => {
-      const match = CODE_LINE.exec(line);
-      return match ? [match[1] ?? match[2]] : [];
+export function codeContent(output: string, facts: readonly CodeFact[]): string {
+  const starts = new Set(facts.flatMap((fact) => ("lines" in fact && fact.lines && fact.lines[0] === fact.lines[1] ? [fact.at] : [])));
+  return [...starts]
+    .sort((a, b) => a - b)
+    .flatMap((at) => {
+      const end = output.indexOf("\n", at);
+      const rest = output.slice(at, end === -1 ? undefined : end);
+      return /^[ :]/.test(rest) ? [rest.slice(1)] : [];
     })
     .join("\n");
 }
