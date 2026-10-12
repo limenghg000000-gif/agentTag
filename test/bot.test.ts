@@ -10,6 +10,7 @@ import {
   blockedCodeAnswer,
   blockUnverifiedOps,
   type BotDeps,
+  codeContent,
   codeEvidence,
   createCardActionHandler,
   createMessageHandler,
@@ -900,15 +901,19 @@ test("点「接着查」按钮问的只给读的工具（写权限名单里的�
   assert.doesNotMatch(requests[0].system, /WRITE_ALLOWED_USERS/);
   assert.match(logs.join("\n"), /点按钮接着问的，这次只给读的工具 message=om_1 sender=ou_admin/);
 
-  // 名单外的人：还是按没权限说
+  // 名单外的人：没权限、按钮问的两句都说
   await handle(message("union 有没有重启", { messageId: "om_2", senderId: "ou_guest" }), { readOnly: true });
   assert.match(requests[1].system, /WRITE_ALLOWED_USERS/);
-  assert.doesNotMatch(requests[1].system, /「接着查」按钮问的/);
+  assert.match(requests[1].system, /「接着查」按钮问的/);
 
-  // 没有写的工具时不用提
+  // 没有写文档、改代码的工具时，也不给改群记忆的工具：按钮上的话是模型写的，可以写成「记住…」
   const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
-  await setup({ model: plain.model }).handle(message("x"), { readOnly: true });
-  assert.doesNotMatch(plain.requests[0].system, /「接着查」按钮问的/);
+  const { handle: ask } = setup({ model: plain.model, memory: await memoryStore() });
+  await ask(message("x"), { readOnly: true });
+  assert.deepEqual(plain.requests[0].tools?.map((t) => t.name) ?? [], []);
+  assert.match(plain.requests[0].system, /「接着查」按钮问的/);
+  await ask(message("记住发版在周三", { messageId: "om_2" }));
+  assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), ["memory_save", "memory_update", "memory_delete"]);
 });
 
 test("点「接着查」按钮：交给 followUp，不等它跑完；白名单外的群、没配 followUp 时不处理", async () => {
@@ -3161,11 +3166,17 @@ test("代码工具读到的数（部署文件里的副本数、资源配置）�
   const codeRead: Tool = {
     spec: { name: "code_read_file", description: "读代码", parameters: { type: "object", properties: {} } },
     describe: () => "读代码",
-    run: async (_args, ctx) => codeResult(ctx, [["deploy/union.yaml（master 分支 @ 1a2b3c4）：", { commit: "1a2b3c4" }], ["replicas: 6", { path: "deploy/union.yaml", lines: [12, 12] }]]),
+    run: async (_args, ctx) =>
+      codeResult(ctx, [
+        ["deploy/union.yaml（master 分支 @ 1a2b3c4，共 40 行，下面是第 11 到 12 行）", { commit: "1a2b3c4" }],
+        ["11| spec:", { path: "deploy/union.yaml", lines: [11, 11] }],
+        ["12|   replicas: 6", { path: "deploy/union.yaml", lines: [12, 12] }],
+      ]),
   };
   const results: ChatResult[] = [
     { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_read_file", arguments: "{}" }] },
-    { text: '结论\n```kpi\n[{"label":"副本数","value":"6"},{"label":"上限","value":"9"}]\n```', finish: "stop" },
+    // 12 是行号、40 是文件行数、11 是起始行：都不是读到的数
+    { text: '结论\n```kpi\n[{"label":"副本数","value":"6"},{"label":"上限","value":"12"},{"label":"总数","value":"40"},{"label":"起","value":"11"}]\n```', finish: "stop" },
   ];
   const { model } = fakeModel(() => results.shift()!);
   const { handle } = setup({
@@ -3182,5 +3193,15 @@ test("代码工具读到的数（部署文件里的副本数、资源配置）�
   const tiles = kit.last().body.elements.find((e: any) => e.tag === "column_set");
   assert.equal(tiles?.columns.length, 1);
   assert.match(JSON.stringify(tiles), /副本数/);
-  assert.match(warnings.join("\n"), /数字卡片「上限 9」在查询结果里找不到/);
+  assert.match(warnings.join("\n"), /数字卡片「上限 12」在查询结果里找不到/);
+  assert.match(warnings.join("\n"), /数字卡片「总数 40」在查询结果里找不到/);
+  assert.match(warnings.join("\n"), /数字卡片「起 11」在查询结果里找不到/);
+});
+
+test("代码工具结果只留代码本身：读文件、搜索的行号、文件名、提交号不算", () => {
+  assert.equal(
+    codeContent("deploy/a.yaml（共 40 行，下面是第 11 到 12 行）\n11| spec:\n12|   replicas: 6\n13| "),
+    "spec:\n  replicas: 6\n",
+  );
+  assert.equal(codeContent("在 1 个分支上共搜到 2 处：\n【master，2 处】\ndeploy/v2/a.yaml:12:  replicas: 6\nsrc/x.go:7:const limit = 9"), "  replicas: 6\nconst limit = 9");
 });

@@ -338,8 +338,9 @@ async function runTask(
               ? {
                   tool: tool.spec.name,
                   facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit),
-                  // 原文只拿来核对图和数字卡片里的数（读到的副本数、资源配置）；代码位置只认 facts
-                  output: seenByModel(output, limit),
+                  // 读文件、搜索读到的代码拿来核对图和数字卡片里的数（副本数、资源配置）；代码位置只认 facts。
+                  // 别的代码工具（提交记录、文件列表、改代码、看改动）的结果不算
+                  ...(CODE_SOURCE_TOOLS.has(tool.spec.name) ? { output: codeContent(seenByModel(output, limit)) } : {}),
                 }
               : {
                   tool: tool.spec.name,
@@ -355,16 +356,21 @@ async function runTask(
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
-    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具
-    const followUp = hasWrites && !noPermission && options.readOnly === true;
+    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮）
+    const followUp = options.readOnly === true;
     const readOnly = noPermission || followUp;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
-    const taskTools = allTools.filter((tool) => !(readOnly && tool.writes) && (createDoc || tool.spec.name !== "feishu_doc_create"));
-    if (noPermission) {
-      logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
-    } else if (followUp) {
+    const taskTools = allTools.filter(
+      (tool) =>
+        !(readOnly && tool.writes) &&
+        !(followUp && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
+        (createDoc || tool.spec.name !== "feishu_doc_create"),
+    );
+    if (followUp) {
       logger.info(`点按钮接着问的，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (noPermission) {
+      logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
@@ -905,6 +911,29 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
  * 它们结果里的数不算查到的数：模型先记一句「CPU 99%」，不能再拿回执里的 99 去画图
  */
 const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
+
+/** 结果里有代码原文的代码工具 */
+const CODE_SOURCE_TOOLS: ReadonlySet<string> = new Set(["code_read_file", "code_search"]);
+
+/** 读文件「12| 内容」、搜索「文件:12:内容」这样的一行 */
+const CODE_LINE = /^\d+\| (.*)$|^.+?:\d+:(.*)$/;
+
+/**
+ * 代码工具结果里真正是代码的部分：读文件、搜索结果的每一行只留代码本身。
+ * 行号、共几行、提交号、文件名不算读到的数：不然读了第 12 行，模型编一个 12 也对得上
+ */
+export function codeContent(output: string): string {
+  return output
+    .split("\n")
+    .flatMap((line) => {
+      const match = CODE_LINE.exec(line);
+      return match ? [match[1] ?? match[2]] : [];
+    })
+    .join("\n");
+}
+
+/** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
+const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
 
 /** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact）和模型看到的原文（只核对数），别的工具是模型看到的原文 */
 export interface ToolEvidence {

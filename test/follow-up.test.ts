@@ -97,9 +97,54 @@ test("点「接着查」：同一个按钮 1 分钟内再点（别人点也算�
   assert.equal((sent[3].input as { markdown: string }).markdown, "👉 接着问：at id=all/at看看");
 });
 
+test("点「接着查」：读卡片、发那句失败了不算点过，再点还能问", async () => {
+  let failSend = true;
+  let card: "missing" | "error" | "ok" = "missing";
+  const sent: string[] = [];
+  const followUp = createFollowUp({
+    api: {
+      async getMessage(messageId) {
+        if (card === "error") {
+          throw new Error("飞书 500");
+        }
+        return card === "ok" ? { messageId, fromBot: true, msgType: "interactive", content: "", createTime: 1 } : undefined;
+      },
+      async listThreadMessages() {
+        return [];
+      },
+    },
+    send: async (_to, input) => {
+      if (failSend) {
+        throw new Error("发送失败");
+      }
+      sent.push((input as { markdown: string }).markdown);
+      return { messageId: `om_ask${sent.length}` } as never;
+    },
+    handle: async () => {},
+    logger: quiet,
+    now: () => 10_000,
+  });
+
+  await followUp(click("q1"), "q1");
+  card = "error";
+  await assert.rejects(followUp(click("q1"), "q1"), /飞书 500/);
+  card = "ok";
+  await assert.rejects(followUp(click("q1"), "q1"), /发送失败/);
+  failSend = false;
+  await followUp(click("q1"), "q1");
+  assert.deepEqual(sent, ["👉 接着问：q1"]);
+  // 发出去了才算点过
+  await followUp(click("q1"), "q1");
+  assert.equal(sent.length, 1);
+});
+
 test("替人接着问的那句：写出来、认回去；名字里的 Markdown 符号和尖括号去掉", () => {
   assert.deepEqual(parseFollowUp(followUpText("李四", "union 有没有重启")), { name: "李四", question: "union 有没有重启" });
   assert.deepEqual(parseFollowUp(followUpText(undefined, "union 有没有重启")), { question: "union 有没有重启" });
   assert.equal(followUpText("<b>**李四**</b>", "q"), "👉 b李四/b 接着问：q");
+  // 普通回答碰巧这样开头的不算：多行、超过按钮的长度、带尖括号
+  assert.equal(parseFollowUp("👉 李四 接着问：union 有没有重启\n\n查到 union 重启了 2 次"), undefined);
+  assert.equal(parseFollowUp(`👉 接着问：${"很".repeat(41)}`), undefined);
+  assert.equal(parseFollowUp("👉 接着问：<b>q</b>"), undefined);
   assert.equal(parseFollowUp("处理完了，结果在上面的卡片里。"), undefined);
 });
