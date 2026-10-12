@@ -21,6 +21,10 @@ export type KnowledgeCategory = keyof typeof KNOWLEDGE_CATEGORIES;
 export const MAX_TITLE_CHARS = 80;
 /** 表格里编号那一列写进了像密钥、手机号、身份证号的东西时，读出来的编号换成这个 */
 const HIDDEN_ID = "（编号里像是有密钥或个人信息）";
+/** 编号的字数上限：表格里改得更长的放不进卡片 */
+const MAX_ID_CHARS = 32;
+/** 表格里编号改得超过 MAX_ID_CHARS 字时，读出来的编号换成这个 */
+const LONG_ID = "（编号太长）";
 /** 正文每个字段的字数上限 */
 export const MAX_FIELD_CHARS = 2000;
 /** 写进系统提示词时每条经验最多多少字 */
@@ -265,18 +269,22 @@ export class KnowledgeBase {
   private checkRow(entry: KnowledgeEntry): KnowledgeEntry {
     const missing = [entry.title ? "" : "标题", entry.conclusion ? "" : "结论"].filter(Boolean);
     // 字数上限和起草时一样：表格里改得超长的行放不进卡片和提示词
-    const tooLong = draftFields(entry)
-      .filter(([, text, limit]) => text !== undefined && text.trim().length > limit)
-      .map(([name, , limit]) => `${name}超过了 ${limit} 字`);
+    const longId = entry.id.trim().length > MAX_ID_CHARS;
+    const tooLong = [
+      ...(longId ? [`编号超过了 ${MAX_ID_CHARS} 字`] : []),
+      ...draftFields(entry)
+        .filter(([, text, limit]) => text !== undefined && text.trim().length > limit)
+        .map(([name, , limit]) => `${name}超过了 ${limit} 字`),
+    ];
     const incomplete = [missing.length > 0 ? `${missing.join("、")}是空的` : "", ...tooLong].filter(Boolean).join("，") || undefined;
     const unsafe = entrySensitive(entry);
     const warning = [incomplete && `${incomplete}，请在表格里改好`, unsafe && `${unsafe}，请在表格里删掉`].filter(Boolean).join("；");
     if (!warning) {
       return entry;
     }
-    // 编号里就写着密钥或个人信息的：编号换成 HIDDEN_ID，日志、卡片、报错里写到这一行时都不会写出来。
+    // 编号里就写着密钥或个人信息的：编号换成 HIDDEN_ID，日志、卡片、报错里写到这一行时都不会写出来；编号太长的换成 LONG_ID，免得卡片太大发不出去。
     // 这一行不检索、不同步、不归档，用不着原来的编号；编号也不是 K 加数字，不影响发新编号
-    const id = findSensitive(entry.id) ? HIDDEN_ID : entry.id;
+    const id = findSensitive(entry.id) ? HIDDEN_ID : longId ? LONG_ID : entry.id;
     if (!this.warned.has(`${entry.id}\n${warning}`)) {
       this.warned.add(`${entry.id}\n${warning}`);
       this.logger.warn(`经验库：表格里 ${id} 的${warning}。这一行先不拿来检索、也不给模型看`);

@@ -507,6 +507,39 @@ test("话题里第三轮以后的追问：查经验库带上最近几轮提问�
   assert.equal(lines.length, 4);
 });
 
+test("追问时贴了一大段日志：查经验库的文字截短到两个库都查得到的长度，第一个问题照样带上，中间几轮放得下几轮放几轮", async () => {
+  const queries: string[] = [];
+  const knowledge = {
+    async lookup(query: string) {
+      queries.push(query);
+      return { text: "", ids: [] };
+    },
+    tools: () => [],
+  };
+  const { model } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history: ChatMessage[] = [
+    { role: "user", content: "[张三] gateway-api 报 code=8，帮我看看" },
+    { role: "assistant", content: "需要日志" },
+    { role: "user", content: `[张三] ${"上一轮的说明".repeat(60)}` },
+    { role: "assistant", content: "收到" },
+  ];
+  const { handle } = setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source });
+  await handle(message(`日志如下：${"ERROR upstream timeout ".repeat(100)}`));
+  const query = queries[0];
+  assert.ok(query.length <= 800, `查的文字有 ${query.length} 字，aiops 只取前 800 字`);
+  assert.match(query, /^日志如下：ERROR upstream timeout/);
+  assert.match(query, /\n\[张三\] gateway-api 报 code=8，帮我看看$/, "第一个问题在两个库取的那一段里");
+
+  // 这次的提问短：最近几轮都放得下
+  queries.length = 0;
+  await handle(message("怎么修？"));
+  const lines = queries[0].split("\n");
+  assert.equal(lines[0], "怎么修？");
+  assert.match(lines[1], /^\[张三\] 上一轮的说明/);
+  assert.equal(lines[2], "[张三] gateway-api 报 code=8，帮我看看");
+  assert.equal(lines.length, 3);
+});
+
 test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有一边没查成时提示词里说明", async () => {
   const hung = { lookup: () => new Promise<undefined>(() => {}), tools: () => [] };
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));

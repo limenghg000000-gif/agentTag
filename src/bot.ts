@@ -649,13 +649,27 @@ async function readImages(
 
 /**
  * 自动查经验库用的文字：这次的提问，话题里最近几轮提问（新的在前），最后是话题的第一个问题。
- * 两个库都只取前面一段去查，所以这次的提问放最前面；中间几轮每轮限长，第一个问题不会被挤出去。
+ * 两个库都只取前面一段去查（LOOKUP_QUERY_CHARS），所以这次的提问放最前面；拼起来不超过那一段，第一个问题不会被挤出去：
+ * 这次的提问很长（追问时贴了一大段日志）就截短，中间几轮每轮限长，放得下几轮放几轮。
  * 只追问一句「怎么修？」时，上一轮给的错误码、服务名也能带上
  */
 function lookupQuery(asked: string, history: readonly ChatMessage[]): string {
   const asks = history.flatMap((m) => (m.role === "user" ? [m.content] : []));
-  const recent = asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse().map((text) => text.slice(0, LOOKUP_TURN_CHARS));
-  return [...new Set([asked, ...recent, ...asks.slice(0, 1)])].join("\n");
+  if (asks.length === 0) {
+    return asked;
+  }
+  const first = asks[0].slice(0, LOOKUP_TURN_CHARS);
+  const parts = [asked.slice(0, LOOKUP_QUERY_CHARS - first.length - 1)];
+  let used = parts[0].length + 1 + first.length;
+  for (const turn of asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse()) {
+    const text = turn.slice(0, LOOKUP_TURN_CHARS);
+    if (used + text.length + 1 > LOOKUP_QUERY_CHARS) {
+      break;
+    }
+    parts.push(text);
+    used += text.length + 1;
+  }
+  return [...new Set([...parts, first])].join("\n");
 }
 
 /**
@@ -753,6 +767,8 @@ const KNOWLEDGE_LOOKUP_MS = 8000;
 const LOOKUP_RECENT_TURNS = 3;
 /** 带上的每轮提问最多取多少字 */
 const LOOKUP_TURN_CHARS = 200;
+/** 查经验库的文字最多多长：两个库只取前面一段去查（aiops 800 字，团队经验库 1000 字），按短的算 */
+const LOOKUP_QUERY_CHARS = 800;
 
 const CODE_TOOL_PREFIX = "code_";
 /**

@@ -3418,6 +3418,24 @@ test("有人在表格里把某一项改得比起草时的上限还长：这一�
   assert.deepEqual((await fresh.search("日活", { limit: 5 })).map((hit) => hit.entry.id).sort(), ["K1", "K2"]);
 });
 
+test("表格里把编号改得很长：这一行不拿来检索，日志、卡片上不写那串编号，免得卡片太大发不出去；新编号照常往后排", async () => {
+  const warnings: string[] = [];
+  const setup = deskSetup({ aiops: false });
+  const { base, backend, tool } = setup;
+  await base.save(normalizeDraft(dau), { requestId: "req-1" });
+  const longId = `K1${"-很长的编号".repeat(400)}`;
+  backend.entries[0].id = longId;
+  const fresh = new KnowledgeBase(backend, { logger: { ...quiet, warn: (line: string) => warnings.push(line) } });
+  assert.deepEqual(await fresh.search("日活"), []);
+  assert.ok(warnings.some((line) => line.includes("表格里 （编号太长） 的编号超过了 32 字，请在表格里改好")), warnings.join("\n"));
+  assert.ok(!warnings.some((line) => line.includes("很长的编号")));
+  assert.equal((await fresh.saved("req-1", "K1"))?.id, "（编号太长）", "按草稿编号还认得出是存过的那一行");
+  assert.doesNotMatch(await tool("knowledge_search").run({ query: "日活" }, { signal }), /很长的编号/);
+  await assert.rejects(tool("knowledge_propose_archive").run({ id: longId }, { signal }));
+  assert.equal(setup.sent.length, 0);
+  assert.equal((await base.save(normalizeDraft({ ...dau, title: "周活的口径", keywords: "周活" }))).id, "K2");
+});
+
 test("表格里不止一行用了同一个编号（有人复制了行）：这几行都不拿来检索、看全文、起草归档，新编号照常往后排", async () => {
   const { base, backend, desk, sent, tool } = deskSetup({ aiops: false });
   await base.save(normalizeDraft(dau));
