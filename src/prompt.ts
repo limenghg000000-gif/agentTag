@@ -33,7 +33,7 @@ const RICH_TEXT_RULES = [
   "- 同一个数在关键数字、表格和标签里颜色要一样，整篇回答用同一套档位：占 limit 的比例（CPU、内存、磁盘）低于 60% 算正常（green，关键数字的 level 写 ok），60% 及以上、低于 80% 算注意（orange，warn），80% 及以上算高风险（red，danger）；别的指标先定一套档位，整篇都按它来。表格里正常的数不用上色。",
   '- 有趋势或对比时可以画图：写一个 ```chart 代码块，内容是 JSON，如 {"type":"line","title":"pc-goods-site 各 Pod CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[41,39]}]}，data 和 x 一一对应。折线图（line）看趋势，x 是时间；柱状图（bar）做对比，x 是服务或 Pod；饼图（pie）看占比，只能有一个系列。一次最多 3 张图，每张不超过 8 个系列、200 个点。普通问答不画图。',
   '- 查完数据的回答最后可以放 2～3 个「接着查」按钮：写一个 ```actions 代码块，内容是 JSON 数组，每项是群成员接下来最可能问的一句话（20 个字以内，说清楚查哪个服务、看什么），如 ["union 最近 1 小时的内存趋势","pc-goods-site 有没有重启过"]。点了按钮就在这个话题里接着问这句话，只查不改，所以不要放改东西的操作（重启、回滚、改配置、写文档）。普通问答不放按钮。',
-  "- 图和关键数字里的每个数都会和这次工具查到的结果核对，对不上的不画：直接用查询结果里的数（可以四舍五入、把比例写成百分比、把字节换成 MiB 或 GiB），不要估算、心算；要百分比、差值这类算出来的数，在查询里算好（比如 PromQL 里除以 limit 再乘 100）。没查到数据就不画。",
+  "- 图和关键数字里的每个数都会和这次工具查到的结果核对，对不上的不画：直接用查询结果里的数（可以四舍五入、把比例写成百分比、把字节换成 MiB 或 GiB），不要估算、心算；要百分比、差值这类算出来的数，在查询里算好（比如 PromQL 里除以 limit 再乘 100）。没查到数据就不画。PromQL 查回来的数不带单位，写进图、关键数字、表格和结论之前先认准：rate(container_cpu_usage_seconds_total[5m]) 是核数（0.0024 是 2.4 mCPU，不是 0.0024%），container_memory_working_set_bytes 这类 *_bytes 是字节，kube_pod_container_resource_limits 里 cpu 是核、memory 是字节；核数、字节数直接写成百分比会被拦下。",
 ];
 
 export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, extra, showThinking, richText }: PromptContext): string {
