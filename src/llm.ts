@@ -104,8 +104,10 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   let parallelToolCalls = true;
   let thinkingSupported = true;
   let budgetSupported = true;
-  // 服务不支持流式（stream、stream_options 报 400）、改成非流式又成功了，之后都不再流式调用
+  // 服务不支持流式（stream 报 400）、改成非流式又成功了，之后都不再流式调用
   let streamSupported = true;
+  // 流式时要用量的 stream_options 是可选参数：服务不认它、去掉后流式成功了，之后都不再带（流式时就没有用量统计）
+  let streamOptionsSupported = true;
   type Extra = { enable_thinking?: boolean; thinking_budget?: number };
   type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
   /** 发请求，参数不认（400）时去掉重试。send 发出最终的请求体，流式和非流式各自用 */
@@ -154,7 +156,8 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
           : {}),
       };
       let raw: RawReply;
-      // 流式请求被说不支持流式（400）时，这次改成非流式再试
+      // 流式请求被说不认 stream_options（400）时先去掉它再流式试；还说不支持流式时，这次改成非流式再试
+      let streamOptions = streamOptionsSupported;
       let fallback = false;
       for (;;) {
         const streamed = onDelta !== undefined && streamSupported && !fallback;
@@ -162,7 +165,10 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
           raw = streamed
             ? await readStream(
                 await create(body, thinking, (request) =>
-                  client.chat.completions.create({ ...request, stream: true, stream_options: { include_usage: true } }, { signal }),
+                  client.chat.completions.create(
+                    { ...request, stream: true, ...(streamOptions ? { stream_options: { include_usage: true } } : {}) },
+                    { signal },
+                  ),
                 ),
                 onDelta,
                 signal,
@@ -171,11 +177,18 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
           if (fallback) {
             warn(`模型服务不支持流式输出，改成非流式成功了，之后不再流式调用，卡片上等整轮生成完再显示`);
             streamSupported = false;
+          } else if (streamed && !streamOptions && streamOptionsSupported) {
+            warn(`模型服务不认 stream_options，去掉后流式成功了，之后流式调用不再带它（没有用量统计）`);
+            streamOptionsSupported = false;
           }
           break;
         } catch (err) {
           if (streamed && err instanceof OpenAI.BadRequestError && STREAM_UNSUPPORTED.test(err.message)) {
-            fallback = true;
+            if (streamOptions && /stream_options/i.test(err.message)) {
+              streamOptions = false;
+            } else {
+              fallback = true;
+            }
             continue;
           }
           // 百炼对输入输出做内容审核，不通过时返回 data_inspection_failed：输入在请求时就是 400，流式输出到一半被拦时是流里的一条错误

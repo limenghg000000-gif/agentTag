@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -72,4 +72,25 @@ test("文件坏了时挪到 .bad 留着，从空的重新记", async () => {
   const [bad] = (await readdir(path.join(dir, "oc_1"))).filter((name) => /^om_broken\.json\.\d+\.bad$/.test(name));
   assert.equal(await readFile(path.join(dir, "oc_1", bad), "utf8"), "{坏了");
   assert.deepEqual([...(await new CardAnswerStore(dir).get("oc_1", "om_broken", ["om_2"]))], [["om_2", "新的"]]);
+});
+
+test("记的时候顺便删掉半年没记新回答的话题文件，每个群一天最多清理一次", async () => {
+  const dir = await tempDir();
+  let clock = Date.now();
+  const store = new CardAnswerStore(dir, 60, () => clock);
+  await store.save("oc_1", "om_old", "om_a", "老话题");
+  await store.save("oc_1", "om_recent", "om_b", "最近的话题");
+  const longAgo = new Date(clock - 200 * 24 * 3600_000);
+  await utimes(path.join(dir, "oc_1", "om_old.json"), longAgo, longAgo);
+  await writeFile(path.join(dir, "oc_1", "om_x.json.1.bad"), "{坏了");
+  await utimes(path.join(dir, "oc_1", "om_x.json.1.bad"), longAgo, longAgo);
+
+  // 刚清理过（第一次记的时候），一天内不再清理
+  await store.save("oc_1", "om_new", "om_c", "新话题");
+  assert.deepEqual((await readdir(path.join(dir, "oc_1"))).sort(), ["om_new.json", "om_old.json", "om_recent.json", "om_x.json.1.bad"]);
+
+  clock += 25 * 3600_000;
+  await store.save("oc_1", "om_new", "om_d", "新话题");
+  assert.deepEqual((await readdir(path.join(dir, "oc_1"))).sort(), ["om_new.json", "om_recent.json", "om_x.json.1.bad"]);
+  assert.deepEqual([...(await store.get("oc_1", "om_recent", ["om_b"]))], [["om_b", "最近的话题"]]);
 });

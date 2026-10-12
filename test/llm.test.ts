@@ -443,18 +443,56 @@ test("流式输出到一半被内容审核拦下（流里的 data_inspection_fai
   assert.deepEqual(await model.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} }), { text: "", finish: "filtered" });
 });
 
-test("服务不支持流式（stream_options 报 400）时退回非流式，之后都不再流式调用", async () => {
+test("服务不支持流式时退回非流式，之后都不再流式调用", async () => {
   const warnings: string[] = [];
   const plain = createOpenAICompatibleModel(
     { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, apiKey: "sk-test", model: "other" },
     (message) => warnings.push(message),
   );
-  responses.push({ status: 400, body: { error: { message: "Unrecognized request argument supplied: stream_options" } } }, completion("好"), completion("还好"));
+  responses.push(
+    { status: 400, body: { error: { message: "Unrecognized request argument supplied: stream_options" } } },
+    { status: 400, body: { error: { message: "stream is not supported for this model" } } },
+    completion("好"),
+    completion("还好"),
+  );
   const ask = () => plain.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: () => {} });
 
   assert.deepEqual(await ask(), { text: "好", finish: "stop" });
-  assert.equal(requests.at(-1)!.body.stream, undefined);
+  // 先去掉 stream_options 再流式试了一次，还不行才改成非流式
+  assert.deepEqual(
+    requests.slice(-3).map(({ body }) => [body.stream, body.stream_options]),
+    [
+      [true, { include_usage: true }],
+      [true, undefined],
+      [undefined, undefined],
+    ],
+  );
   assert.deepEqual(await ask(), { text: "还好", finish: "stop" });
   assert.equal(requests.at(-1)!.body.stream, undefined);
   assert.match(warnings.join("\n"), /不支持流式输出/);
+});
+
+test("服务支持流式但不认 stream_options 时去掉它照样流式，之后都不再带", async () => {
+  const warnings: string[] = [];
+  const plain = createOpenAICompatibleModel(
+    { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, apiKey: "sk-test", model: "other" },
+    (message) => warnings.push(message),
+  );
+  const streamed = (content: string) => ({ status: 200, sse: [chunk({ content }), chunk({}, "stop")] });
+  responses.push({ status: 400, body: { error: { message: "Unrecognized request argument supplied: stream_options" } } }, streamed("好"), streamed("还好"));
+  const seen: string[] = [];
+  const ask = () => plain.chat({ system: "s", messages: [{ role: "user", content: "问" }], onDelta: ({ text }) => seen.push(text) });
+
+  assert.deepEqual(await ask(), { text: "好", finish: "stop" });
+  assert.deepEqual(await ask(), { text: "还好", finish: "stop" });
+  assert.deepEqual(seen, ["好", "还好"]);
+  assert.deepEqual(
+    requests.slice(-3).map(({ body }) => [body.stream, body.stream_options]),
+    [
+      [true, { include_usage: true }],
+      [true, undefined],
+      [true, undefined],
+    ],
+  );
+  assert.match(warnings.join("\n"), /不认 stream_options/);
 });
