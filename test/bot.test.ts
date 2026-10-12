@@ -2996,6 +2996,37 @@ test("卡片即回答：回答里的图和关键数字按查到的数画出来�
   assert.deepEqual(markdowns(plain.sent), ["结论：CPU 正常\n\n**CPU 最高** 41%\n\n📊 pod-a CPU（这里显示不了图）"]);
 });
 
+test("记忆工具结果里的数是模型自己写的，不算查到的数：先记「CPU 99%」再画 99% 的数字卡片不行", async () => {
+  const kit = fakeCardKit();
+  const warnings: string[] = [];
+  const results: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [{ id: "c1", name: "memory_save", arguments: JSON.stringify({ content: "union CPU 最高 99%", kind: "background" }) }],
+    },
+    { text: '结论\n```kpi\n[{"label":"CPU 最高","value":"99%"}]\n```', finish: "stop" },
+  ];
+  const { model } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    memory: await memoryStore(),
+    cardKit: kit.api,
+    streamIntervalMs: 0,
+    logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+  });
+
+  await handle(message("union 的 CPU 怎么样"));
+
+  const elements = kit.last().body.elements;
+  // 记忆这一步本身成功了（卡片上有这一步），但它写进去的数不能拿来证明卡片
+  assert.match(JSON.stringify(elements[0]), /记住：union CPU 最高 99%/);
+  assert.doesNotMatch(JSON.stringify(elements[0]), /❌/);
+  assert.deepEqual(elements.slice(1).map((e: any) => e.tag), ["markdown"]);
+  assert.doesNotMatch(JSON.stringify(elements.slice(1)), /99%/);
+  assert.match(warnings.join("\n"), /数字卡片「CPU 最高 99%」在查询结果里找不到/);
+});
+
 test("卡片即回答：停止时卡片标成已停止，不留草稿，不发回答", async () => {
   const kit = fakeCardKit();
   let started!: () => void;

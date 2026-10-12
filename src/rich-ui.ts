@@ -43,6 +43,12 @@ function langOf(line: string): string {
   return line.trim().replace(/^(`{3,}|~{3,})/, "").trim().split(/\s+/)[0]?.toLowerCase() ?? "";
 }
 
+/** 图、数字卡片的代码块开头：缩进不超过 3 个空格（缩进 4 个是缩进代码块，讲写法的例子，不画） */
+function uiLang(line: string): string | undefined {
+  const lang = langOf(line);
+  return /^ {0,3}(?:`{3,}|~{3,})/.test(line) && UI_LANGS.has(lang) ? lang : undefined;
+}
+
 /**
  * 把回答拆成几段：普通的 Markdown 和 ```chart、```kpi 块。块里的 JSON 不对、格式不对的不要（记在 invalid 里），
  * 没写完的块（回答被截断）也不要
@@ -79,8 +85,9 @@ export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid:
       }
       continue;
     }
-    if (!inCode && next.marker && UI_LANGS.has(langOf(line))) {
-      block = { lang: langOf(line), lines: [] };
+    const lang = !inCode && next.marker ? uiLang(line) : undefined;
+    if (lang) {
+      block = { lang, lines: [] };
       continue;
     }
     markdown.push(line);
@@ -105,8 +112,9 @@ export function streamingAnswer(text: string): string {
       hidden = !(next.marker && !next.fence);
       continue;
     }
-    if (!inCode && next.marker && UI_LANGS.has(langOf(line))) {
-      out.push(langOf(line) === "chart" ? "📊 图表画好后显示在这里…" : "📌 关键数字整理好后显示在这里…");
+    const lang = !inCode && next.marker ? uiLang(line) : undefined;
+    if (lang) {
+      out.push(lang === "chart" ? "📊 图表画好后显示在这里…" : "📌 关键数字整理好后显示在这里…");
       hidden = true;
       continue;
     }
@@ -211,34 +219,68 @@ function parseKpi(json: unknown): KpiBlock | undefined {
   return { kind: "kpi", items };
 }
 
+/** 数字卡片里写的数、工具结果里的数：1,234 是一个数，.5 是 0.5；10-20 里的 - 不当负号 */
+const NUMBER = /(?<![\d.])-?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?/gi;
+
 /**
- * 工具结果里的数，加上常见的换算（比例 ×100 成百分比；字节换成 KiB、MiB、GiB、KB、MB、GB；核换成毫核、毫核换成核），排好序，按区间查
+ * 写出来的单位决定查到的数能怎么换算过来（查到的数 × 倍数 = 写出来的数）。认不出单位的只认原数，
+ * 免得一个比例 0.412 既能当 0.4% 又能当 41.2%、一个字节数原样当成 MiB
  */
+export function unitFactors(text: string | undefined): readonly number[] | undefined {
+  if (!text) {
+    return undefined;
+  }
+  if (/%|百分/.test(text)) {
+    return [1, 100];
+  }
+  if (/(?<![A-Za-z])(?:[KMGT]i?B?|[kmgt]B|bytes?)(?![A-Za-z])|字节/.test(text)) {
+    return [1, 1e-3, 1e-6, 1e-9, 1e-12, 1 / 1024, 1 / 1024 ** 2, 1 / 1024 ** 3, 1 / 1024 ** 4];
+  }
+  if (/(?<![A-Za-z])m(?![A-Za-z])|毫核|millicores?/.test(text)) {
+    return [1, 1000];
+  }
+  if (/核|cores?(?![A-Za-z])/.test(text)) {
+    return [1, 1e-3];
+  }
+  if (/(?<![A-Za-z])ms(?![A-Za-z])|毫秒/.test(text)) {
+    return [1, 1000];
+  }
+  if (/(?<![A-Za-z])s(?![A-Za-z])|秒/.test(text)) {
+    return [1, 1e-3];
+  }
+  return undefined;
+}
+
+/** 工具结果里的数（原样，不换算），排好序，按区间查；换算按写出来的单位在查的时候做 */
 export class NumberEvidence {
   private readonly values: Float64Array;
 
   constructor(outputs: readonly string[]) {
-    const factors = [1, 100, 1 / 1024, 1 / 1024 ** 2, 1 / 1024 ** 3, 1e-3, 1e-6, 1e-9, 1000];
     const found: number[] = [];
     for (const output of outputs) {
-      for (const match of output.matchAll(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi)) {
-        const n = Number(match[0]);
+      // 两种拆法都算：「1,234」既是 1234，也可能是 JSON 数组里的 1 和 234
+      for (const match of [...output.matchAll(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi), ...output.matchAll(NUMBER)]) {
+        const n = Number(match[0].replace(/,/g, ""));
         if (Number.isFinite(n)) {
-          for (const factor of factors) {
-            found.push(n * factor);
-          }
+          found.push(n);
         }
       }
     }
     this.values = Float64Array.from(found).sort();
   }
 
-  /** v 是不是哪个查到的数按 v 写出来的精度四舍五入的结果（v 写成 41.2 就看有没有 41.15 到 41.25 之间的数） */
-  has(v: number): boolean {
+  /**
+   * v 是不是哪个查到的数（按 factors 里的一个倍数换算以后）按 v 写出来的精度四舍五入的结果：
+   * v 写成 41.2、单位是 % 时，看有没有 41.15 到 41.25 之间的数，或者 0.4115 到 0.4125 之间的数
+   */
+  has(v: number, factors: readonly number[] = [1]): boolean {
     const half = halfStep(v);
-    // 浮点误差：0.4123 × 100 不一定正好是 41.23
-    const lo = v - half - 1e-9 * Math.max(1, Math.abs(v));
-    const hi = v + half + 1e-9 * Math.max(1, Math.abs(v));
+    // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
+    const slack = 8 * Number.EPSILON * Math.abs(v);
+    return factors.some((factor) => this.within((v - half - slack) / factor, (v + half + slack) / factor));
+  }
+
+  private within(lo: number, hi: number): boolean {
     let left = 0;
     let right = this.values.length;
     while (left < right) {
@@ -263,12 +305,9 @@ function halfStep(v: number): number {
   return 0.5 * 10 ** Math.min(0, Number(exponent) - decimals);
 }
 
-/**
- * 数字卡片的值里写的数：「41%」「1.2 GiB」「1,000」「1e9」各是一个数（不拆成 1 和 0、1 和 9）；
- * 「10~20%」「10-20」是 10 和 20（后一个不当成负数）
- */
+/** 数字卡片的值里写的数：「41%」「1.2 GiB」「1,234」「1e9」「.5」各是一个数；「10~20%」「10-20」是 10 和 20 */
 function numbersIn(value: string): number[] {
-  return [...value.matchAll(/(?<![\d.])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?/gi)].map((match) => Number(match[0].replace(/,/g, "")));
+  return [...value.matchAll(NUMBER)].map((match) => Number(match[0].replace(/,/g, "")));
 }
 
 /** 横轴上写成数的值（时间戳、编号）：和图里的数一样要查得到 */
@@ -282,10 +321,14 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   const dropped: string[] = [];
   const kept: AnswerSegment[] = [];
   let charts = 0;
+  let kpis = 0;
   for (const segment of segments) {
     if (segment.kind === "chart") {
-      const numericX = segment.x.filter((value) => NUMERIC_LABEL.test(value)).map(Number);
-      const missing = [...numericX, ...segment.series.flatMap((s) => s.data)].filter((n) => !evidence.has(n));
+      const factors = unitFactors(segment.unit) ?? [1];
+      const missing = [
+        ...segment.x.filter((value) => NUMERIC_LABEL.test(value)).filter((value) => !evidence.has(Number(value))).map(Number),
+        ...segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n, factors)),
+      ];
       if (missing.length > 0) {
         dropped.push(`图「${segment.title}」有 ${missing.length} 个数在查询结果里找不到（如 ${missing.slice(0, 3).join("、")}）`);
         kept.push({ kind: "markdown", text: `📊 图「${segment.title}」里有数和这次查到的结果对不上，没画出来。` });
@@ -297,16 +340,23 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
       }
     } else if (segment.kind === "kpi") {
       const items = segment.items.filter((item) => {
-        const ok = numbersIn(item.value).every((n) => evidence.has(n));
+        const factors = unitFactors(item.value) ?? unitFactors(item.label) ?? [1];
+        const ok = numbersIn(item.value).every((n) => evidence.has(n, factors));
         if (!ok) {
           dropped.push(`数字卡片「${item.label} ${item.value}」在查询结果里找不到`);
         }
         return ok;
       });
-      if (items.length === 0) {
+      // 几组数字卡片加起来也最多 MAX_KPIS 个
+      const room = items.slice(0, Math.max(0, MAX_KPIS - kpis));
+      if (room.length < items.length) {
+        dropped.push(`数字卡片超过 ${MAX_KPIS} 个：${items.slice(room.length).map((item) => item.label).join("、")}`);
+      }
+      kpis += room.length;
+      if (room.length === 0) {
         continue;
       }
-      kept.push({ kind: "kpi", items });
+      kept.push({ kind: "kpi", items: room });
       continue;
     }
     kept.push(segment);

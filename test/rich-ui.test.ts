@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type AnswerSegment,
   type ChartBlock,
   keepVerified,
   NumberEvidence,
@@ -8,6 +9,7 @@ import {
   segmentsAsText,
   splitAnswer,
   streamingAnswer,
+  unitFactors,
 } from "../src/rich-ui.js";
 
 const chartJson = '{"type":"line","title":"CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[41.2,39]}]}';
@@ -53,17 +55,31 @@ test("生成中的回答：图和数字卡片的代码块换成一行说明", ()
   assert.equal(streamingAnswer("```go\nx := 1\n```"), "```go\nx := 1\n```");
 });
 
-test("查到的数：按写出来的精度四舍五入，认百分比、字节、核数的换算", () => {
+test("查到的数：按写出来的精度四舍五入；按写出来的单位认百分比、字节、核数的换算，认不出单位的只认原数", () => {
   const evidence = new NumberEvidence(['{"cpu":0.4123,"mem_bytes":944242688,"cores":0.25}', "restarts 0, ready 3/3"]);
+  const percent = unitFactors("41%")!;
+  const mib = unitFactors("MiB")!;
   assert.ok(evidence.has(0.4123));
-  assert.ok(evidence.has(41.2)); // 0.4123 × 100
-  assert.ok(evidence.has(41));
-  assert.ok(!evidence.has(41.3));
-  assert.ok(evidence.has(900.5)); // 字节 → MiB
-  assert.ok(evidence.has(0.9)); // → GiB
-  assert.ok(evidence.has(250)); // 核 → 毫核
+  assert.ok(evidence.has(41.2, percent)); // 0.4123 × 100
+  assert.ok(evidence.has(41, percent));
+  assert.ok(!evidence.has(41.3, percent));
+  assert.ok(!evidence.has(41.2)); // 没写单位：不乘 100
+  assert.ok(evidence.has(900.5, mib)); // 字节 → MiB
+  assert.ok(evidence.has(0.9, unitFactors("0.9 GiB"))); // → GiB
+  assert.ok(!evidence.has(900.5)); // 没写单位：不换算
+  assert.ok(evidence.has(250, unitFactors("250m"))); // 核 → 毫核
+  assert.ok(!evidence.has(250, percent));
   assert.ok(evidence.has(0));
-  assert.ok(!evidence.has(73));
+  assert.ok(!evidence.has(73, percent));
+  // 单位
+  assert.equal(unitFactors("120 次"), undefined);
+  assert.equal(unitFactors("5 min"), undefined);
+  assert.deepEqual(unitFactors("120ms"), [1, 1000]);
+  assert.deepEqual(unitFactors("0.25 核"), [1, 1e-3]);
+  assert.deepEqual(unitFactors("250 毫核"), [1, 1000]);
+  // 浮点误差的余量远小于半格：0 不能当 1e-12 的证据
+  assert.ok(!new NumberEvidence(["0"]).has(1e-12));
+  assert.ok(!new NumberEvidence(["0"]).has(1e-12, percent));
 });
 
 test("只画数都查得到的图：对不上的图换成说明，数字卡片对不上的去掉", () => {
@@ -158,4 +174,29 @@ test("图：横轴写成数的值（时间戳、编号）也要查得到；系�
   ]) {
     assert.deepEqual(splitAnswer("```chart\n" + JSON.stringify(bad) + "\n```").invalid, ["chart"], JSON.stringify(bad));
   }
+});
+
+test("查到的数里 1,234 也算 1234；数字卡片里 .5 是 0.5；几组数字卡片加起来最多 4 个；缩进 4 格的 ```chart 是讲写法的例子", () => {
+  const kpi = (value: string, output: string) =>
+    keepVerified([{ kind: "kpi", items: [{ label: "x", value }] }], new NumberEvidence([output])).segments.length === 1;
+  assert.ok(kpi("1,234 次", "total 1,234"));
+  assert.ok(kpi("1234 次", "total 1,234"));
+  assert.ok(!kpi(".5%", "nothing here"));
+  assert.ok(kpi(".5%", "ratio 0.005"));
+
+  const blocks: AnswerSegment[] = [
+    { kind: "kpi", items: [1, 2, 3].map((n) => ({ label: `a${n}`, value: String(n) })) },
+    { kind: "kpi", items: [4, 5, 6].map((n) => ({ label: `b${n}`, value: String(n) })) },
+  ];
+  const capped = keepVerified(blocks, new NumberEvidence(["1 2 3 4 5 6"]));
+  assert.deepEqual(
+    capped.segments.map((s) => (s.kind === "kpi" ? s.items.map((item) => item.label) : [])),
+    [["a1", "a2", "a3"], ["b4"]],
+  );
+  assert.match(capped.dropped.join("\n"), /数字卡片超过 4 个：b5、b6/);
+
+  const example = "写法如下：\n\n    ```chart\n    " + chartJson + "\n    ```";
+  assert.deepEqual(splitAnswer(example), { segments: [{ kind: "markdown", text: example }], invalid: [] });
+  assert.equal(streamingAnswer(example), example);
+  assert.equal(splitAnswer("   ```chart\n" + chartJson + "\n   ```").segments[0].kind, "chart");
 });

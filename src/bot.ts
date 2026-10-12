@@ -25,7 +25,7 @@ import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { createMemoryTools } from "./tools/memory.js";
-import { createRecentThreadsTool } from "./tools/recent-threads.js";
+import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
@@ -329,7 +329,12 @@ async function runTask(
           evidence.push(
             code
               ? { tool: tool.spec.name, facts: output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit) }
-              : { tool: tool.spec.name, output: seenByModel(output, limit), ...(mcpNames.has(tool.spec.name) ? { links: true } : {}) },
+              : {
+                  tool: tool.spec.name,
+                  output: seenByModel(output, limit),
+                  ...(mcpNames.has(tool.spec.name) ? { links: true } : {}),
+                  ...(tool.writes || MODEL_ECHO_TOOLS.has(tool.spec.name) ? { echo: true } : {}),
+                },
           );
           return output;
         },
@@ -557,7 +562,7 @@ function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], log
   if (!hasUiBlocks(segments)) {
     return segments;
   }
-  const checked = keepVerified(segments, new NumberEvidence(evidence.flatMap((item) => (item.output === undefined ? [] : [item.output]))));
+  const checked = keepVerified(segments, new NumberEvidence(evidence.flatMap((item) => (item.output === undefined || item.echo ? [] : [item.output]))));
   if (checked.dropped.length > 0) {
     logger.warn(`回答里的图、数字卡片对不上查询结果，没画 message=${messageId}：${checked.dropped.join("；")}`);
   }
@@ -872,11 +877,19 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
   return [...cites.values()];
 }
 
+/**
+ * 结果里的内容是模型自己写进去的工具：记忆（记的、查的都是之前模型写的）、最近话题（之前的回答）。
+ * 它们结果里的数不算查到的数：模型先记一句「CPU 99%」，不能再拿回执里的 99 去画图
+ */
+const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
+
 /** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact），别的工具是模型看到的原文 */
 export interface ToolEvidence {
   tool: string;
   output?: string;
   facts?: readonly CodeFact[];
+  /** 结果里的内容是模型自己写进去的（写操作的回执、记忆、之前的回答）：里面的数不能当图和数字卡片的依据 */
+  echo?: boolean;
   /** output 里的代码永久链接（见 codeLinks）算查到的代码：MCP 服务的结果是，网页、搜索结果不是 */
   links?: boolean;
 }
