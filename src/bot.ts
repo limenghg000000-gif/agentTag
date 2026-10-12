@@ -20,9 +20,11 @@ import {
   visibleThought,
 } from "./progress.js";
 import { buildSystemPrompt } from "./prompt.js";
+import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { createMemoryTools } from "./tools/memory.js";
+import { createRecentThreadsTool } from "./tools/recent-threads.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
@@ -99,6 +101,8 @@ export interface BotDeps {
   context: ThreadContextSource;
   /** 按群保存的长期记忆。不传时不带记忆，也没有记忆工具 */
   memory?: MemoryStore;
+  /** 按群记下最近几个话题的问答。不传时不记，也没有 chat_recent_threads 工具 */
+  recentThreads?: Pick<RecentThreadStore, "record" | "list">;
   tasks: TaskRegistry;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   updateCard: (messageId: string, card: object) => Promise<void>;
@@ -291,7 +295,10 @@ async function runTask(
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
     const mcpNames = new Set(mcpTools.map((tool) => tool.spec.name));
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? [])].map(
+    const recentThreadTools = deps.recentThreads
+      ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
+      : [];
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
@@ -477,6 +484,10 @@ async function runTask(
     }
     state.phase = "done";
     deps.context.remember(msg, prompt, answer);
+    // 被拦下、被审核拦下的回答里没有结论，不记
+    if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
+      await rememberThread(deps, msg, asked, answer, context.askerName);
+    }
   } catch (err) {
     if (task.signal.aborted) {
       state.phase = "stopped";
@@ -521,6 +532,15 @@ async function runTask(
       `${memoryCount === undefined ? "" : `记忆=${memoryCount}条 `}` +
       `工具调用=${result?.toolCalls ?? state.steps.length} 用时=${state.endedAt - state.startedAt}ms`,
   );
+}
+
+/** 记下这个话题的问答，之后别的话题用 chat_recent_threads 查。记不下只是别的话题查不到这次，不影响这次回答 */
+async function rememberThread(deps: BotDeps, msg: NormalizedMessage, question: string, answer: string, askerName: string | undefined): Promise<void> {
+  try {
+    await deps.recentThreads?.record(msg.chatId, threadKeyOf(msg), { question, answer, ...(askerName ? { askerName } : {}) });
+  } catch (err) {
+    (deps.logger ?? console).error(`记下话题问答失败 message=${msg.messageId}`, err);
+  }
 }
 
 /** 记下卡片里的回答，之后读话题历史时用。记不下只是这个话题后面的提问看不到这条回答，不影响这次 */

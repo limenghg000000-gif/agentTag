@@ -1,5 +1,6 @@
-import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { readdir, readFile, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
+import { FileQueue, writeAtomically } from "./file-store.js";
 import { MAX_HISTORY_MESSAGES } from "./history.js";
 
 /** 话题文件多久没记新回答就删掉：每个提问都会开一个新话题，不删的话文件只增不减 */
@@ -21,7 +22,7 @@ interface Entry {
  */
 export class CardAnswerStore {
   /** 同一个文件的读写排队，避免两次记录互相覆盖 */
-  private readonly queues = new Map<string, Promise<unknown>>();
+  private readonly queue = new FileQueue();
   /** 每个群上一次清理的时间 */
   private readonly sweptAt = new Map<string, number>();
 
@@ -34,7 +35,7 @@ export class CardAnswerStore {
   /** threadKey 是话题第一条消息的 id（见 threadKeyOf） */
   async save(chatId: string, threadKey: string, messageId: string, answer: string): Promise<void> {
     const file = this.fileOf(chatId, threadKey);
-    await this.queued(file, async () => {
+    await this.queue.run(file, async () => {
       const entries = await readEntries(file);
       entries.delete(messageId);
       entries.set(messageId, { answer, at: this.now() });
@@ -53,7 +54,7 @@ export class CardAnswerStore {
   /** 这个话题里这些消息记过回答的，返回消息 id → 回答 */
   async get(chatId: string, threadKey: string, messageIds: readonly string[]): Promise<Map<string, string>> {
     const file = this.fileOf(chatId, threadKey);
-    return this.queued(file, async () => {
+    return this.queue.run(file, async () => {
       const entries = await readEntries(file);
       const found = new Map<string, string>();
       for (const id of messageIds) {
@@ -79,24 +80,12 @@ export class CardAnswerStore {
         continue;
       }
       const file = path.join(dir, name);
-      await this.queued(file, async () => {
+      await this.queue.run(file, async () => {
         if ((await stat(file)).mtimeMs < now - KEEP_THREAD_MS) {
           await unlink(file);
         }
       }).catch(() => {});
     }
-  }
-
-  private queued<T>(file: string, run: () => Promise<T>): Promise<T> {
-    const next = (this.queues.get(file) ?? Promise.resolve()).catch(() => {}).then(run);
-    this.queues.set(file, next);
-    const clear = () => {
-      if (this.queues.get(file) === next) {
-        this.queues.delete(file);
-      }
-    };
-    next.then(clear, clear);
-    return next;
   }
 
   private fileOf(chatId: string, threadKey: string): string {
@@ -138,12 +127,4 @@ async function readEntries(file: string): Promise<Map<string, Entry>> {
     }
   }
   return entries;
-}
-
-/** 先写临时文件再改名，写到一半断电也不会留下半个文件 */
-async function writeAtomically(file: string, content: string): Promise<void> {
-  await mkdir(path.dirname(file), { recursive: true });
-  const temp = `${file}.${process.pid}.tmp`;
-  await writeFile(temp, content, "utf8");
-  await rename(temp, file);
 }

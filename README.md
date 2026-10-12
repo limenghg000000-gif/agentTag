@@ -68,6 +68,8 @@
 | `src/progress.ts` | 进度卡片的样子，以及合并、限速地更新卡片 |
 | `src/stream-card.ts` | 卡片即回答：飞书卡片实体接口，按组件流式更新思考和回答 |
 | `src/card-answers.ts` | 卡片即回答时记下卡片里的回答，读话题历史时换回文字 |
+| `src/file-store.ts` | 同一个文件的读写排队、先写临时文件再改名（卡片里的回答、话题问答共用） |
+| `src/recent-threads.ts` | 按群记下最近 30 个话题的问答；群成员在新话题里说「上面那个」时，模型用 `chat_recent_threads` 查（`src/tools/recent-threads.ts`） |
 | `src/prompt.ts` | 系统提示词（机器人名字、当前时间、工具使用规则） |
 | `src/llm.ts` | 模型调用层：`ChatModel` 接口和 OpenAI 兼容实现（含工具调用），换模型服务只动这里或环境变量 |
 | `src/markdown.ts` | 长回答按行切分，代码块不被切坏 |
@@ -164,7 +166,7 @@ npm start
 | `MCP_<名字>_WRITE_TOOLS` | 否 | 额外算作「会写东西」的工具。名字里带 create、save、delete 这类动词的程序自己认，不用列；aiops 的 promote_case 默认就算 |
 | `MCP_<名字>_PROMPT` | 否 | 这个服务在飞书群里的使用说明文件，默认 `prompts/mcp/<名字>.md` |
 | `MCP_<名字>_THINKING` | 否 | `on`（默认）或 `off`。调过这个服务的工具（包括读剧本）以后，这次任务后面几轮打开思考：排查线上问题每拿到一次结果都要想清楚下一步查什么。只在 `MODEL_THINKING` 关着时有影响 |
-| `DATA_DIR` | 否 | 数据目录，默认启动目录下的 `data`。群记忆存在 `<DATA_DIR>/memory/<chat_id>.json`，卡片里的回答按话题记在 `<DATA_DIR>/card-answers/<chat_id>/<话题第一条消息 id>.json`（每个话题最近 60 条，读话题历史用；半年没再记新回答的话题文件自动删掉） |
+| `DATA_DIR` | 否 | 数据目录，默认启动目录下的 `data`。群记忆存在 `<DATA_DIR>/memory/<chat_id>.json`，卡片里的回答按话题记在 `<DATA_DIR>/card-answers/<chat_id>/<话题第一条消息 id>.json`（每个话题最近 60 条，读话题历史用；半年没再记新回答的话题文件自动删掉），每个群最近 30 个话题的问答记在 `<DATA_DIR>/recent-threads/<chat_id>.json`（`chat_recent_threads` 用） |
 
 **换模型**：百炼上的其他模型（千问其他型号，以及 Kimi、GLM、DeepSeek 等第三方模型）只需改 `MODEL_ID`，模型 ID 在百炼控制台的模型列表里查。要换到别家的 OpenAI 兼容接口，再改 `MODEL_BASE_URL` 和 `MODEL_API_KEY`。
 

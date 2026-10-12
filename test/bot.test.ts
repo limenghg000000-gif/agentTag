@@ -234,6 +234,66 @@ test("回答被截断或被内容审核拦下时如实说明", async () => {
   assert.match(markdowns(sent)[1], /内容审核/);
 });
 
+test("答完以后记下这个话题的问答；模型能用 chat_recent_threads 看本群别的话题", async () => {
+  const recorded: { chatId: string; threadKey: string; turn: { question: string; answer: string; askerName?: string } }[] = [];
+  const listed: { chatId: string; exclude?: string }[] = [];
+  const recentThreads: BotDeps["recentThreads"] = {
+    async record(chatId, threadKey, turn) {
+      recorded.push({ chatId, threadKey, turn });
+    },
+    async list(chatId, exclude) {
+      listed.push({ chatId, exclude });
+      return [{ threadKey: "om_old", topic: "礼金链接为什么转不了", question: "礼金链接为什么转不了", answer: "礼金链接不走取券逻辑", turns: 1, at: 0 }];
+    },
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "上面那个说的是礼金链接", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "chat_recent_threads", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, recentThreads, context: fakeContext({ askerName: "ML" }).source });
+
+  await handle(message("给产品解释一下上面那个", { messageId: "om_now", rootId: "om_root" }));
+
+  assert.ok(requests[0].tools?.some((tool) => tool.name === "chat_recent_threads"));
+  assert.match(requests[0].system, /chat_recent_threads/);
+  assert.deepEqual(listed, [{ chatId: "oc_1", exclude: "om_root" }]);
+  assert.match(requests[1].messages.at(-1)!.content, /礼金链接不走取券逻辑/);
+  assert.deepEqual(markdowns(sent), ["上面那个说的是礼金链接"]);
+  assert.deepEqual(recorded, [
+    { chatId: "oc_1", threadKey: "om_root", turn: { question: "给产品解释一下上面那个", answer: "上面那个说的是礼金链接", askerName: "ML" } },
+  ]);
+});
+
+test("被内容审核拦下、出错的不记话题问答；记不下也照常回答", async () => {
+  const recorded: string[] = [];
+  const recentThreads: BotDeps["recentThreads"] = {
+    async record(_chatId, _threadKey, turn) {
+      recorded.push(turn.answer);
+      throw new Error("磁盘满了");
+    },
+    async list() {
+      return [];
+    },
+  };
+  const results: (ChatResult | Error)[] = [{ text: "", finish: "filtered" }, new LlmError("connection", "boom"), { text: "正常回答", finish: "stop" }];
+  const { model } = fakeModel(() => {
+    const next = results.shift()!;
+    if (next instanceof Error) {
+      throw next;
+    }
+    return next;
+  });
+  const { sent, handle } = setup({ model, recentThreads });
+
+  await handle(message("敏感问题", { messageId: "om_a" }));
+  await handle(message("你好", { messageId: "om_b" }));
+  await handle(message("正常问题", { messageId: "om_c" }));
+
+  assert.deepEqual(recorded, ["正常回答"]);
+  assert.equal(markdowns(sent).at(-1), "正常回答");
+});
+
 test("模型调用失败时卡片标成出错，并在话题里说明原因", async () => {
   const { model } = fakeModel(() => {
     throw new LlmError("connection", "boom");

@@ -50,6 +50,8 @@ export interface Config {
   streamCard: boolean;
   /** 卡片即回答时记下卡片里的回答的目录（每个群一个 JSON 文件），读话题历史时用 */
   cardAnswersDir: string;
+  /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
+  recentThreadsDir: string;
 }
 
 export interface McpServerConfig {
@@ -256,6 +258,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     showThinking: showThinking === "on",
     streamCard: streamCard === "on",
     cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
+    recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
   };
 }
 
