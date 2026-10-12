@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { COMMON_SUFFIX, compactText } from "../src/mcp-result.js";
 import {
   type AnswerSegment,
   type ChartBlock,
@@ -447,4 +448,44 @@ test("折线图：一条线、点不多时在点上标数；几条线或点多�
   assert.deepEqual(spec(3, 7).label, { visible: false });
   const bar: ChartBlock = { kind: "chart", type: "bar", title: "t", x: ["a"], series: [{ name: "s", data: [1] }] };
   assert.equal((segmentElements([bar], () => ({})) as any[])[0].chart_spec.label, undefined);
+});
+
+test("Codex：标题只认末尾括号里的单位，「核心」「秒杀」「百分位」不是单位；resource 几种混着、写正则时按每条序列认；提出来的公共标签也认", () => {
+  // 标题
+  for (const word of ["核心接口", "秒杀活动 QPS", "P99 百分位延迟", "数据核对"]) {
+    assert.equal(unitFactors(word), undefined, word);
+  }
+  assert.ok(unitFactors("0.25 核") && unitFactors("0.25核") && unitFactors("CPU 核数") && unitFactors("耗时（秒）") && unitFactors("12 秒"));
+  const drawn = (title: string, output: string) =>
+    keepVerified([{ kind: "chart", type: "bar", title, x: ["a"], series: [{ name: "s", data: [0.25] }] }], new NumberEvidence([output])).segments[0].kind === "chart";
+  assert.ok(!drawn("核心接口 QPS", "qps 250"));
+  assert.ok(drawn("union CPU（核）", "limits cpu 250m"));
+  assert.ok(drawn("union CPU (cores)", "limits cpu 250m"));
+
+  // 几种 resource 混着、写正则：按每条序列的标签
+  assert.equal(promqlUnit('kube_pod_container_resource_limits{resource="cpu"} or kube_pod_container_resource_limits{resource="memory"}'), "resource");
+  assert.equal(promqlUnit('sum by (pod) (kube_pod_container_resource_limits{resource=~"cpu"})'), "resource");
+  const mixed = JSON.stringify({
+    query: 'kube_pod_container_resource_limits{resource="cpu"} or kube_pod_container_resource_limits{resource="memory"}',
+    data: { result: [
+      { metric: { pod: "a", resource: "cpu" }, value: [1760282600, "0.256"] },
+      { metric: { pod: "a", resource: "memory" }, value: [1760282600, "268435456"] },
+    ] },
+  });
+  assert.ok(new NumberEvidence([mixed]).has(256, unitFactors("MiB")));
+  assert.ok(!new NumberEvidence([mixed]).has(0.256, unitFactors("MiB")));
+
+  // 三条以上都是 resource="cpu"：resource 被提到公共字段里
+  const hoisted = compactText(
+    JSON.stringify({
+      query: 'sum by (pod, resource) (kube_pod_container_resource_requests{namespace="prod", resource=~"cpu"})',
+      data: { resultType: "vector", result: ["a", "b", "c"].map((pod, i) => ({ metric: { namespace: "prod", pod, resource: "cpu" }, value: [1760282600, String(0.25 * (i + 1))] })) },
+    }),
+  );
+  assert.ok(hoisted.includes(COMMON_SUFFIX));
+  const evidence = new NumberEvidence([hoisted]);
+  assert.ok(!evidence.has(0.25, unitFactors("%")));
+  assert.ok(!evidence.has(0.5, unitFactors("%")));
+  assert.ok(evidence.has(250, unitFactors("mCPU")));
+  assert.ok(evidence.has(0.75, unitFactors("核")));
 });

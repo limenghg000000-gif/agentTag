@@ -1,4 +1,5 @@
 import { nextFence } from "./markdown.js";
+import { COMMON_SUFFIX } from "./mcp-result.js";
 
 /**
  * 卡片里的图表和关键数字：模型在回答里写 ```chart、```kpi 代码块（内容是 JSON），回答写完以后换成飞书卡片的图表组件和一排数字小卡片。
@@ -340,7 +341,8 @@ export function unitFactors(raw: string | undefined): UnitFactors | undefined {
     return undefined;
   }
   const text = halfWidth(raw);
-  if (/%|百分/.test(text)) {
+  // 「核心接口」「秒杀」「百分位」里的字不是单位
+  if (/%|百分比/.test(text)) {
     return { any: [1, 100], cores: [], bytes: [] };
   }
   const bytes = /(?<![A-Za-z])(?:([KMGT])i?B?|([kmgt])B|bytes?)(?![A-Za-z])|字节/.exec(text);
@@ -355,13 +357,13 @@ export function unitFactors(raw: string | undefined): UnitFactors | undefined {
   if (/(?<![A-Za-z])m(?:CPU|cpu)?(?![A-Za-z])|毫核|millicores?/.test(text)) {
     return { any: [1, 1000], cores: [1000], bytes: [] };
   }
-  if (/核|cores?(?![A-Za-z])/.test(text)) {
+  if (/(?<![\u4e00-\u9fff])核(?![\u4e00-\u9fff])|核数|cores?(?![A-Za-z])/.test(text)) {
     return { any: [1, 1e-3], cores: [1], bytes: [] };
   }
   if (/(?<![A-Za-z])ms(?![A-Za-z])|毫秒/.test(text)) {
     return { any: [1, 1000], cores: [], bytes: [] };
   }
-  if (/(?<![A-Za-z])s(?![A-Za-z])|秒/.test(text)) {
+  if (/(?<![A-Za-z])s(?![A-Za-z])|秒(?![\u4e00-\u9fff])/.test(text)) {
     return { any: [1, 1e-3], cores: [], bytes: [] };
   }
   return undefined;
@@ -415,7 +417,12 @@ export function promqlUnit(query: string): "cores" | "bytes" | "resource" | unde
     return "bytes";
   }
   if (!counter && metrics.every((name) => /^kube_pod_container_resource_(?:limits|requests)$/.test(name))) {
-    const resource = /\bresource\s*=\s*"(cpu|memory)"/.exec(query)?.[1];
+    // 每个选择器都写死同一个 resource="cpu"（或 memory）才整个按它算；有的没写、写了正则、几种混着（a or b），按每条序列的标签认
+    const selectors = [...query.matchAll(/kube_pod_container_resource_(?:limits|requests)\s*(\{[^{}]*\})?/g)].map((match) => {
+      const matchers = [...(match[1] ?? "").matchAll(/\bresource\s*(=~|!=|!~|=)\s*"([^"]*)"/g)];
+      return matchers.length === 1 && matchers[0][1] === "=" ? matchers[0][2] : undefined;
+    });
+    const resource = selectors.every((value) => value === selectors[0]) ? selectors[0] : undefined;
     return resource === "cpu" ? "cores" : resource === "memory" ? "bytes" : "resource";
   }
   return undefined;
@@ -423,6 +430,8 @@ export function promqlUnit(query: string): "cores" | "bytes" | "resource" | unde
 
 const QUERY_FIELD = /"query"\s*:\s*("(?:[^"\\]|\\.)*")/g;
 const SERIES = /"metric"\s*:\s*\{/g;
+/** 结果整理时提出来的每条序列都一样的标签（核对前全角括号已经换成半角） */
+const COMMON_METRIC = new RegExp(`${halfWidth(COMMON_SUFFIX).replace(/[()]/g, "\\$&")}"\\s*:\\s*\\{\\s*"metric"\\s*:\\s*(\\{[^{}]*\\})`);
 /** Prometheus 的一个样本：[时间戳, "值"] */
 const SAMPLE = /\[\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*,\s*"([^"\\]*)"\s*\]/gi;
 
@@ -445,11 +454,13 @@ function promqlSamples(output: string): { rest: string; samples: { unit: "cores"
     return { rest: output, samples: [] };
   }
   const samples: { unit: "cores" | "bytes"; value: number }[] = [];
+  // 每条序列都一样的标签（三条以上都是 resource="cpu"）被提到「result（每项都有的字段）」里，序列自己的 metric 里就没有了
+  const common = COMMON_METRIC.exec(output)?.[1] ?? "";
+  const resourceOf = (labels: string) => /"resource"\s*:\s*"(cpu|memory)"/.exec(labels)?.[1];
   let rest = output.slice(0, starts[0]);
   starts.forEach((start, i) => {
     const series = output.slice(start, starts[i + 1] ?? output.length);
-    const labels = series.slice(0, series.indexOf("}") + 1);
-    const resource = /"resource"\s*:\s*"(cpu|memory)"/.exec(labels)?.[1];
+    const resource = resourceOf(series.slice(0, series.indexOf("}") + 1)) ?? resourceOf(common);
     const seriesUnit = unit === "resource" ? (resource === "cpu" ? "cores" : resource === "memory" ? "bytes" : undefined) : unit;
     if (!seriesUnit) {
       rest += series;
@@ -581,8 +592,8 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   let kpis = 0;
   for (const segment of segments) {
     if (segment.kind === "chart") {
-      // 单位写在标题里（「CPU 占 limit（%）」）也算
-      const factors = unitFactors(segment.unit) ?? unitFactors(segment.title) ?? PLAIN;
+      // 单位写在标题末尾的括号里（「CPU 占 limit（%）」）也算；标题别处的字不算（「核心接口 QPS」）
+      const factors = unitFactors(segment.unit) ?? unitFactors(/[（(]([^（）()]{1,12})[）)]\s*$/.exec(segment.title)?.[1]) ?? PLAIN;
       const found = (n: number | null): n is number => n !== null && evidence.has(n, factors);
       const badX = segment.x
         .filter((value) => NUMERIC_LABEL.test(halfWidth(value)))
