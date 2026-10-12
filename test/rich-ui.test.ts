@@ -159,6 +159,15 @@ test("图：横轴写成数的值（时间戳、编号）也要查得到；系�
   assert.deepEqual((chart[0] as ChartBlock).x, ["1728700000", "1728700060"]);
   assert.equal(keepVerified(chart, new NumberEvidence(["41.2 39"])).segments[0].kind, "markdown");
   assert.equal(keepVerified(chart, new NumberEvidence(["[1728700000,\"41.2\"],[1728700060,\"39\"]"])).segments[0].kind, "chart");
+  // 带千分位、单位的数也要查得到；时间不算
+  const xs = (x: string[], output: string) =>
+    keepVerified([{ kind: "chart", type: "bar", title: "t", x, series: [{ name: "a", data: x.map(() => 39) }] }], new NumberEvidence([output])).segments[0].kind;
+  assert.equal(xs(["1,000"], "39"), "markdown");
+  assert.equal(xs(["1,000"], "1000 39"), "chart");
+  assert.equal(xs(["500 ms"], "39"), "markdown");
+  assert.equal(xs(["500 ms"], "0.5 39"), "chart");
+  assert.equal(xs(["50%"], "0.5 39"), "chart");
+  assert.equal(xs(["19:00", "2026-10-12", "pod-a"], "39"), "chart");
 
   const pod = (suffix: string) => `pc-goods-site-deployment-canary-7d9f8b6c5-${suffix}`;
   const pods = JSON.stringify({ type: "bar", title: "CPU", x: ["now"], series: [{ name: pod("abcde"), data: [1] }, { name: pod("fghij"), data: [2] }] });

@@ -310,8 +310,11 @@ function numbersIn(value: string): number[] {
   return [...value.matchAll(NUMBER)].map((match) => Number(match[0].replace(/,/g, "")));
 }
 
-/** 横轴上写成数的值（时间戳、编号）：和图里的数一样要查得到 */
-const NUMERIC_LABEL = /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i;
+/**
+ * 横轴上写成数的值（时间戳、编号，带千分位、单位的也算：1,000、500 ms、50%）：和图里的数一样要查得到。
+ * 19:00、10-12 这种时间、日期不算（后面还跟着数）
+ */
+const NUMERIC_LABEL = new RegExp(`^\\s*${NUMBER.source}\\s*[^\\d\\s]{0,8}\\s*$`, "i");
 
 /**
  * 只留下数都查得到的图和数字卡片。dropped 记下去掉了什么，写日志用。
@@ -326,7 +329,7 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
     if (segment.kind === "chart") {
       const factors = unitFactors(segment.unit) ?? [1];
       const missing = [
-        ...segment.x.filter((value) => NUMERIC_LABEL.test(value)).filter((value) => !evidence.has(Number(value))).map(Number),
+        ...segment.x.filter((value) => NUMERIC_LABEL.test(value)).flatMap((value) => numbersIn(value).filter((n) => !evidence.has(n, unitFactors(value) ?? [1]))),
         ...segment.series.flatMap((s) => s.data).filter((n) => !evidence.has(n, factors)),
       ];
       if (missing.length > 0) {
