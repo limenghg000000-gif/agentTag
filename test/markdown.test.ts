@@ -168,6 +168,12 @@ test("拆出表格：代码块里的、只有表头的不拆；最多拆 max 张
   assert.deepEqual(parts[1], { kind: "text", text: "| b |\n|---|\n| 2 |" });
   assert.deepEqual(splitTables(two, 0), [{ kind: "text", text: two }]);
   assert.deepEqual(splitTables("", 5), []);
+  // 缩进 4 格、用 Tab 的是缩进代码块里的例子，不拆；缩进 3 格以内的照拆
+  for (const indent of ["    ", "\t", "  \t"]) {
+    const example = `例子：\n\n${indent}| a | b |\n${indent}|---|---|\n${indent}| 1 | 2 |`;
+    assert.deepEqual(splitTables(example, 5), [{ kind: "text", text: example }], JSON.stringify(indent));
+  }
+  assert.deepEqual(splitTables("   | a |\n   |---|\n   | 1 |", 5).map((part) => part.kind), ["table"]);
 });
 
 test("表格的格子：尖括号转义，名单里的 <font> 放过，<text_tag> 换成同色的字（灰色标签换成 grey）", () => {

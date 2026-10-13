@@ -867,9 +867,12 @@ export function tableElement(table: MarkdownTable): object {
   };
 }
 
-/** 表头：按纯文字显示，去掉标签和粗体、行内代码的符号；尖括号换成全角（万一按富文本显示也成不了 @）；空的表头飞书不收，放一个空格 */
+/**
+ * 表头：按纯文字显示，去掉标签和 ** 粗体、行内代码的符号（__ 不去：__init__ 这类名字里的下划线要留着）；
+ * 尖括号换成全角（万一按富文本显示也成不了 @）；空的表头飞书不收，放一个空格
+ */
 function headerText(head: string): string {
-  return stripRichTags(head).replace(/\*\*|__|`/g, "").replace(/</g, "＜").trim() || " ";
+  return stripRichTags(head).replace(/\*\*|`/g, "").replace(/</g, "＜").trim() || " ";
 }
 
 function chartElement(chart: ChartBlock): object {

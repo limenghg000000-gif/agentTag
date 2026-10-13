@@ -207,7 +207,8 @@ export interface MarkdownTable {
 
 /**
  * 拆出代码块外的表格，文字和表格按先后排（文字前后的空行去掉，空的不要）。
- * 最多拆 max 张，再往后的表格留在文字里；只有表头、没有数据行的不拆
+ * 最多拆 max 张，再往后的表格留在文字里；只有表头、没有数据行的不拆；
+ * 表头缩进 4 格以上（或用 Tab）的不拆：可能是缩进代码块里讲表格写法的例子，照 Markdown 原样显示
  */
 export function splitTables(text: string, max: number): ({ kind: "text"; text: string } | { kind: "table"; table: MarkdownTable })[] {
   const parts: ({ kind: "text"; text: string } | { kind: "table"; table: MarkdownTable })[] = [];
@@ -233,7 +234,7 @@ export function splitTables(text: string, max: number): ({ kind: "text"; text: s
     const next = nextFence(fence, line);
     fence = next.fence;
     const delimiter = lines[i + 1];
-    if (!inCode && !next.marker && found < max && delimiter !== undefined && isTableStart(line, delimiter)) {
+    if (!inCode && !next.marker && found < max && delimiter !== undefined && !INDENTED_CODE.test(line) && isTableStart(line, delimiter)) {
       let end = i + 2;
       while (end < lines.length && isTableBody(lines[end])) {
         end++;
@@ -251,6 +252,9 @@ export function splitTables(text: string, max: number): ({ kind: "text"; text: s
   flush();
   return parts;
 }
+
+/** 缩进代码块的一行：前面 4 个以上空格，或者不到 4 个空格后跟 Tab */
+const INDENTED_CODE = /^(?: {4}| {0,3}\t)/;
 
 function parseTable([head, delimiter, ...body]: string[]): MarkdownTable {
   const header = cellsOf(head);

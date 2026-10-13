@@ -621,12 +621,12 @@ test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算�
 
 test("表格组件：表头按纯文字显示（去掉标签、粗体、反引号，尖括号换全角，空的放空格），格子里冒充的 @ 转义", () => {
   const table = tableElement({
-    header: ["**Pod**", "", "<font color='red'>`CPU`</font> <at id=all></at>"],
-    align: [undefined, undefined, "right"],
-    rows: [["`api-1`", "x", "<at id=all></at>"]],
+    header: ["**Pod**", "", "<font color='red'>`CPU`</font> <at id=all></at>", "__init__"],
+    align: [undefined, undefined, "right", undefined],
+    rows: [["`api-1`", "x", "<at id=all></at>", "y"]],
   }) as any;
-  assert.deepEqual(table.columns.map((c: any) => c.display_name), ["Pod", " ", "CPU ＜at id=all>＜/at>"]);
-  assert.deepEqual(table.rows, [{ c0: "`api-1`", c1: "x", c2: "&lt;at id=all>&lt;/at>" }]);
+  assert.deepEqual(table.columns.map((c: any) => c.display_name), ["Pod", " ", "CPU ＜at id=all>＜/at>", "__init__"]);
+  assert.deepEqual(table.rows, [{ c0: "`api-1`", c1: "x", c2: "&lt;at id=all>&lt;/at>", c3: "y" }]);
   assert.equal(table.columns[2].horizontal_align, "right");
   assert.equal("horizontal_align" in table.columns[0], false);
 });
