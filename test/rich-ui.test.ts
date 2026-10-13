@@ -81,7 +81,9 @@ test("查到的数：按写出来的精度四舍五入；按写出来的单位�
   assert.deepEqual(unitFactors("250 毫核")?.any, [1, 1000]);
   assert.deepEqual(unitFactors("0.06 mCPU")?.any, [1, 1000]);
   assert.deepEqual(unitFactors("62 mcpu")?.any, [1, 1000]);
-  assert.deepEqual(unitFactors("1.2 GiB")?.bytes, [1e-9, 1024 ** -3]);
+  assert.deepEqual(unitFactors("1.2 GiB")?.bytes, [1024 ** -3]);
+  assert.deepEqual(unitFactors("1.2 GB")?.bytes, [1e-9, 1024 ** -3]);
+  assert.deepEqual(unitFactors("256Mi")?.bytes, [1024 ** -2]);
   assert.deepEqual(unitFactors("512 字节")?.bytes, [1]);
   assert.ok(new NumberEvidence(["limits memory 256Mi"]).has(0.25, unitFactors("0.25 GiB"))); // 别的工具写的 MiB → GiB
   assert.ok(new NumberEvidence(['{"value":"0.0000623"}']).has(0.06, unitFactors("0.06 mCPU"))); // 核 → 毫核
@@ -532,4 +534,24 @@ test("Codex 第三轮：resource 写死成 ephemeral_storage 也算字节；百�
   assert.ok(!evidence.has(0.256, unitFactors("%")));
   assert.ok(evidence.has(256, unitFactors("mCPU")));
   assert.ok(evidence.has(1760282600)); // 时间戳照旧
+});
+
+test("2026-10-13 union：字节除以 100 万的数标成 MiB、GiB 不画；标 MB 的两种换算都认", () => {
+  const memory = JSON.stringify({
+    query: 'sum by (pod) (container_memory_working_set_bytes{namespace="prod", pod=~"union-.*", container!=""})',
+    data: { resultType: "matrix", result: [{ metric: { pod: "union-2v7gp" }, values: [[1760279000, "153511526"], [1760280800, "153511526"]] }] },
+  });
+  const evidence = new NumberEvidence([memory]);
+  // 153511526 字节 = 146.4 MiB = 153.5 MB
+  assert.ok(evidence.has(146.4, unitFactors("MiB")));
+  assert.ok(!evidence.has(153.5, unitFactors("MiB")));
+  assert.ok(evidence.has(153.5, unitFactors("MB")));
+  assert.ok(evidence.has(146.4, unitFactors("MB")));
+  assert.ok(evidence.has(0.143, unitFactors("GiB")));
+  assert.ok(!evidence.has(0.154, unitFactors("GiB")));
+  const kpi = (value: string) => keepVerified([{ kind: "kpi", items: [{ label: "内存 · 2v7gp", value }] }], evidence).segments.length === 1;
+  assert.ok(kpi("146.4 MiB"));
+  assert.ok(!kpi("153.5 MiB"));
+  // 别的工具写的 MiB（不知道单位的数）照旧哪级换过来都认
+  assert.ok(new NumberEvidence(["memory 153.5 MB"]).has(153.5, unitFactors("MiB")));
 });
