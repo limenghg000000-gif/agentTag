@@ -7,7 +7,7 @@ import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type Th
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
-import { type AnswerSegment, hasUiBlocks, keepVerified, NumberEvidence, segmentsAsText, splitAnswer } from "./rich-ui.js";
+import { type AnswerSegment, hasUiBlocks, keepVerified, mislabeledBytes, NumberEvidence, segmentsAsText, splitAnswer } from "./rich-ui.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   answerFitsCard,
@@ -377,7 +377,7 @@ async function runTask(
     );
     toolCount = taskTools.length;
     if (followUp) {
-      logger.info(`点按钮接着问的，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+      logger.info(`点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
@@ -396,6 +396,7 @@ async function runTask(
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
       ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+      reviewByteUnits(evidence),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
     // 卡片上显示思考、不是用英文问的（群里一般说中文）：每次查完、下一轮要思考之前，提醒模型用中文想。
@@ -418,6 +419,9 @@ async function runTask(
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
+      // 按钮上的话是接着要查的新问题，第 1 轮就要求调工具：2026-10-13 点「接着查」问 product-service-api 最近 1 小时的错误日志，
+      // 可用工具 30 个，模型两轮都没调工具，照着话题里之前的回答写了线上数据，整条回答被拦
+      ...(followUp ? { requireTool: true } : {}),
       ...(thinksAfter ? { thinkAfter: thinksAfter } : {}),
       ...(steer ? { steer } : {}),
       system: buildSystemPrompt({
@@ -590,6 +594,12 @@ async function runTask(
 
 /** 拆出回答里的图和数字卡片，数对不上查询结果的去掉；去掉了什么、哪些块格式不对写日志 */
 function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], logger: Logger, messageId: string, rich: boolean): AnswerSegment[] {
+  // 打回重做以后正文里还是有按 1000 换算却写成 MiB 的数：可能是模型自己算的、碰巧对上，照发，记一行看打回管不管用
+  const numbers = new NumberEvidence(evidenceOutputs(evidence));
+  const mislabeled = mislabeledBytes(answer, numbers);
+  if (mislabeled.length > 0) {
+    logger.warn(`回答里写成 MiB、GiB 的数按 1000 换算才对得上查询结果 message=${messageId}：${mislabeled.map((item) => `${item.written}（${item.raw} 字节 = ${item.binary}）`).join("、")}`);
+  }
   // 没教模型写图和数字卡片（不是流式卡片）时，回答里的 ```chart 是用户要的代码示例，原样留着
   if (!rich) {
     return answer.trim() ? [{ kind: "markdown", text: answer }] : [];
@@ -601,11 +611,34 @@ function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], log
   if (!hasUiBlocks(segments)) {
     return segments;
   }
-  const checked = keepVerified(segments, new NumberEvidence(evidence.flatMap((item) => (item.output === undefined || item.echo ? [] : [item.output]))));
+  const checked = keepVerified(segments, numbers);
   if (checked.dropped.length > 0) {
     logger.warn(`回答里的图、数字卡片对不上查询结果，没画 message=${messageId}：${checked.dropped.join("；")}`);
   }
   return checked.segments;
+}
+
+/** 拿来核对数的工具结果：模型自己写进去的（写文档、记记忆）不算 */
+function evidenceOutputs(evidence: readonly ToolEvidence[]): string[] {
+  return evidence.flatMap((item) => (item.output === undefined || item.echo ? [] : [item.output]));
+}
+
+/**
+ * 回答里写成 MiB、GiB 的数，查到的字节数按 1000 换算才对得上：打回让模型核对单位。
+ * 2026-10-13 测试群：「2v7gp 从 144.9 MiB 跳到 153.2 MiB」其实是 MB，表格里同一个 Pod 最高才 146.4 MiB
+ */
+export function reviewByteUnits(evidence: readonly ToolEvidence[]) {
+  return (answer: string): string | undefined => {
+    const mislabeled = mislabeledBytes(answer, new NumberEvidence(evidenceOutputs(evidence)));
+    if (mislabeled.length === 0) {
+      return undefined;
+    }
+    const items = mislabeled.map((item) => `${item.written}（查到的 ${item.raw} 字节按 1024 换算是 ${item.binary}）`).join("、");
+    return (
+      `回答里这几个数写成了 MiB/GiB，可查到的字节数按 1024 换算对不上，按 1000 换算（MB/GB）才对得上：${items}。` +
+      "字节换 MiB 要除以 1048576，换 GiB 要除以 1073741824。是从查到的字节数换算来的，改成按 1024 换算的数；是自己算出来的（平均值、合计、差值），确认算对了就保留。其余内容不用改，重新给出完整的回答。"
+    );
+  };
 }
 
 /** 记下这个话题的问答，之后别的话题用 chat_recent_threads 查。记不下只是别的话题查不到这次，不影响这次回答 */
@@ -692,7 +725,7 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
       ? ` 输入=${event.usage.input} 输出=${event.usage.output}${event.usage.reasoning ? ` 其中思考=${event.usage.reasoning}` : ""}`
       : "";
     const next = event.toolNames.length > 0 ? `调用 ${event.toolNames.join(", ")}` : "给出回答";
-    const think = event.thinking ? " 思考=开" : "";
+    const think = `${event.thinking ? " 思考=开" : ""}${event.requireTool ? " 要求调工具" : ""}`;
     logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${think}${usage} → ${next}`);
   } else if (event.type === "retry") {
     logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);

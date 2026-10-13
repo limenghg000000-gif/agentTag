@@ -1,4 +1,4 @@
-import { nextFence } from "./markdown.js";
+import { cellsOf, isTableBody, isTableStart, nextFence } from "./markdown.js";
 import { COMMON_SUFFIX } from "./mcp-result.js";
 
 /**
@@ -534,15 +534,23 @@ export class NumberEvidence {
     if (!Number.isFinite(v) || !Number.isFinite(half)) {
       return false;
     }
+    return (["any", "cores", "bytes"] as const).some((kind) =>
+      factors[kind].some((factor) => this.near(kind, v, factor, half) !== undefined),
+    );
+  }
+
+  /** kind 里换算（× factor）以后按写出来的精度能四舍五入成 v 的一个原数，没有就是 undefined */
+  near(kind: keyof UnitFactors, v: number, factor: number, half = halfStep(v)): number | undefined {
+    if (!Number.isFinite(v) || !Number.isFinite(half)) {
+      return undefined;
+    }
     // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
     const slack = 8 * Number.EPSILON * Math.abs(v);
-    return (["any", "cores", "bytes"] as const).some((kind) =>
-      factors[kind].some((factor) => within(this.values[kind], (v - half - slack) / factor, (v + half + slack) / factor)),
-    );
+    return within(this.values[kind], (v - half - slack) / factor, (v + half + slack) / factor);
   }
 }
 
-function within(values: Float64Array, lo: number, hi: number): boolean {
+function within(values: Float64Array, lo: number, hi: number): number | undefined {
   let left = 0;
   let right = values.length;
   while (left < right) {
@@ -553,7 +561,7 @@ function within(values: Float64Array, lo: number, hi: number): boolean {
       right = mid;
     }
   }
-  return left < values.length && values[left] <= hi;
+  return left < values.length && values[left] <= hi ? values[left] : undefined;
 }
 
 /**
@@ -668,6 +676,86 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
     kept.push(segment);
   }
   return { segments: kept, dropped };
+}
+
+/** 写成 MiB、GiB 这种按 1024 算的字节单位的数（带千分位的也算：1,531.8 MiB） */
+const BINARY_BYTES = /(?<![\w.,])((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(\s*)([KMGT])i(?=B?(?![A-Za-z]))/g;
+/** 表头里写的按 1024 算的字节单位：「内存 (MiB)」「Memory/GiB」 */
+const BINARY_UNIT = /(?<![A-Za-z])([KMGT])iB?(?![A-Za-z])/;
+/** 只写了一个数的格子（可以加粗）：单位写在表头里 */
+const BARE_NUMBER = /^[*_]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)[*_]*$/;
+/** 行内代码：两头的反引号一样多（``a`b``），可以跨行，不跨空行；开头的反引号转义了（\`）的不算 */
+const CODE_SPAN = /(?<![`\\])(`+)(?!`)((?:(?!\n[ \t]*\n)[\s\S])*?)(?<!`)\1(?!`)/g;
+
+/** 写成 MiB、GiB，查到的字节数却只有按 1000 换算才对得上的一个数 */
+export interface MislabeledBytes {
+  /** 回答里写的，如「153.2 MiB」；表格里单位写在表头的，也写成这样 */
+  readonly written: string;
+  /** 对上的那个查到的字节数 */
+  readonly raw: number;
+  /** 这个字节数按 1024 换算、按写出来的精度，如「146.1 MiB」 */
+  readonly binary: string;
+}
+
+/**
+ * 回答正文、表格里写成 MiB、GiB 的数，PromQL 查回来的字节数按 1000 换算才对得上（按 1024 对不上，别的工具结果里也没有原样的这个数）：
+ * 多半是把 MB 标成了 MiB。表头写了单位（「内存 (MiB)」）、格子里只写数的也算。代码里的不算。
+ * 不直接改数：模型自己算的平均值、合计可能碰巧和某个字节数按 1000 换算对上，交给模型核对。
+ * 2026-10-13 测试群：2v7gp 的 144,949,248 → 153,182,208 字节写成了「144.9 MiB 跳到 153.2 MiB」，应为 138.2 → 146.1 MiB
+ */
+export function mislabeledBytes(text: string, evidence: NumberEvidence): MislabeledBytes[] {
+  const found = new Map<string, MislabeledBytes>();
+  const check = (written: string, prefix: string) => {
+    const digits = written.replace(/,/g, "");
+    const power = "KMGT".indexOf(prefix) + 1;
+    const n = Number(digits);
+    const half = writtenHalf(digits);
+    const binary = 1024 ** -power;
+    // 不知道单位的数只认原样的，不按 1024 换算：里面有 PromQL 的时间戳，1760281200 秒按 1024³ 换算是 1.64，写成 1.6 GiB 的就都放过了
+    if (evidence.near("bytes", n, binary, half) !== undefined || evidence.near("any", n, 1, half) !== undefined) {
+      return;
+    }
+    const raw = evidence.near("bytes", n, 1000 ** -power, half);
+    const unit = `${prefix}iB`;
+    const key = `${written} ${unit}`;
+    if (raw !== undefined && !found.has(key)) {
+      // toFixed 只认 0～100 位小数；写得再细也只按 20 位给
+      const decimals = Math.min((digits.split(".")[1] ?? "").length, 20);
+      found.set(key, { written: key, raw, binary: `${(raw * binary).toFixed(decimals)} ${unit}` });
+    }
+  };
+  // 代码块（``` 和 ~~~ 都算）和行内代码里的是配置、命令示例，不算。代码块那几行换成空行，行内代码换成空格（换行留着，表格还按行认）。
+  // 认代码按原文认，认完再把全角换成半角：「～～～」「｀153.2 MiB｀」显示出来不是代码
+  const lines: string[] = [];
+  let fence: string | undefined;
+  for (const line of text.split("\n")) {
+    const next = nextFence(fence, line);
+    lines.push(!fence && !next.marker ? line : "");
+    fence = next.fence;
+  }
+  const prose = halfWidth(lines.join("\n").replace(CODE_SPAN, (span) => span.replace(/[^\n]/g, " "))).split("\n");
+  for (const line of prose) {
+    for (const match of line.matchAll(BINARY_BYTES)) {
+      check(match[1], match[3]);
+    }
+  }
+  // 表头写了单位、格子里只写数的：「| Pod | 内存 (MiB) |」下面的「| 2v7gp | 153.2 |」
+  for (let i = 0; i + 1 < prose.length; i++) {
+    if (!isTableStart(prose[i], prose[i + 1])) {
+      continue;
+    }
+    const units = cellsOf(prose[i]).map((cell) => BINARY_UNIT.exec(cell)?.[1]);
+    for (i += 2; i < prose.length && isTableBody(prose[i]); i++) {
+      cellsOf(prose[i]).forEach((cell, column) => {
+        const prefix = units[column];
+        const bare = prefix ? BARE_NUMBER.exec(cell) : null;
+        if (prefix && bare) {
+          check(bare[1], prefix);
+        }
+      });
+    }
+  }
+  return [...found.values()];
 }
 
 const LEVEL_COLOR: Record<NonNullable<KpiItem["level"]>, string> = { danger: "red", warn: "orange", ok: "green" };
