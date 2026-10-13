@@ -42,6 +42,9 @@ test("结束后收成一行，步骤放进折叠面板，没有按钮", () => {
   assert.equal(panel.tag, "collapsible_panel");
   assert.equal(panel.header.title.content, "✅ 已完成 · 1 步 · 用时 1 分 15 秒");
   assert.equal(done.config.summary.content, "已完成");
+  // 卡片撑满聊天窗口，简单版本也一样
+  assert.equal(done.config.width_mode, "fill");
+  assert.equal((renderPlainProgressCard(state({ phase: "done", endedAt: 0 })) as any).config.width_mode, "fill");
 
   const stopped = renderProgressCard(state({ phase: "stopped", endedAt: 3000 }), "t") as any;
   assert.deepEqual(stopped.body.elements, [{ tag: "markdown", content: "⏹️ 已停止 · 用时 3 秒" }]);

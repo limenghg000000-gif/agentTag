@@ -174,6 +174,8 @@ function cardConfig(state: ProgressState, streaming: boolean | undefined): objec
   const preview = streaming && finished && state.answer ? previewOf(finalText(state)) : undefined;
   return {
     update_multi: true,
+    // 撑满聊天窗口：默认最宽 600px，电脑上全屏时卡片只占左边一小块，表格要往右拖着看（2026-10-13 测试群）
+    width_mode: "fill",
     ...(streaming ? { streaming_mode: !finished && liveText(state) !== "", streaming_config: STREAMING_CONFIG } : {}),
     summary: { content: preview || (finished ? summaryText(state.phase) : "处理中…") },
   };
