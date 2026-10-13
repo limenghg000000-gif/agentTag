@@ -364,7 +364,8 @@ export class KnowledgeDesk {
       run: async (args, { signal }) => {
         const entry = await raceAbort(base.get(String(args.id ?? "")), signal);
         if (!entry) {
-          throw new KnowledgeError(`团队经验库里没有 ${String(args.id ?? "")}`);
+          // 模型写的编号会写进日志（工具失败时记下原因）：像有密钥、个人信息的不原样带上
+          throw new KnowledgeError(`团队经验库里没有 ${preview(args.id)}`);
         }
         if (!usable(entry)) {
           throw new KnowledgeError(unusableNote(entry));
@@ -1137,7 +1138,7 @@ export class KnowledgeDesk {
   private async activeEntry(id: string): Promise<KnowledgeEntry> {
     const entry = await this.options.base.get(id);
     if (!entry) {
-      throw new KnowledgeError(`团队经验库里没有 ${id}`);
+      throw new KnowledgeError(`团队经验库里没有 ${preview(id)}`);
     }
     if (entry.status !== "active") {
       throw new KnowledgeError(`经验 ${entry.id} 已经归档了`);
@@ -1562,8 +1563,8 @@ function person(openId: string, name: string | undefined): Person {
 }
 
 /**
- * 进度卡片上工具步骤里显示的参数（模型写的，还没检查过）：前 30 个字。
- * 整段像有密钥、手机号、身份证号的不显示：卡片群里人人看得到，起草时这些要等 normalizeDraft 才拦下
+ * 进度卡片上工具步骤里、报错里显示的参数（模型写的，还没检查过）：前 30 个字。
+ * 整段像有密钥、手机号、身份证号的不显示：卡片群里人人看得到，报错还会写进日志，起草时这些要等 normalizeDraft 才拦下
  */
 function preview(value: unknown): string {
   const raw = typeof value === "string" ? value : "";

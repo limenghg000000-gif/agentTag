@@ -3790,6 +3790,24 @@ test("进度卡片上的工具步骤：标题、查询、编号里像有密钥�
   assert.equal(tool("knowledge_propose_archive").describe({ aiops_id: 31 }), "起草归档经验 aiops #31");
 });
 
+test("找不到的编号里像有密钥、手机号的，报错（会写进日志）里不带原文；正常的编号照常带上", async () => {
+  const { tool } = deskSetup();
+  const secret = ["password", "correcthorsebatterystaple"].join("=");
+  const phone = ["138", "0013", "8000"].join("");
+  for (const [name, args] of [
+    ["knowledge_get", { id: secret }],
+    ["knowledge_propose_archive", { id: phone }],
+    ["knowledge_propose", { ...dau, replaces: secret }],
+  ] as const) {
+    await assert.rejects(tool(name).run(args, { signal }), (err: Error) => {
+      assert.match(err.message, /团队经验库里没有 （像是有密钥或个人信息，不显示）/, name);
+      assert.ok(!err.message.includes("correcthorse") && !err.message.includes(phone), err.message);
+      return true;
+    });
+  }
+  await assert.rejects(tool("knowledge_get").run({ id: "K9" }, { signal }), /团队经验库里没有 K9$/);
+});
+
 test("草稿和归档原因里的手机号、身份证号不让发卡片；打了码的、更长的数字里的一段、校验位不对的不算", async () => {
   const id = idCard("11010519491231002");
   for (const text of ["用户 13800138000 反馈下单失败", "联系 +86 138-0013-8000", "手机 138 0013 8000", `身份证 ${id}`, `身份证 ${id.toLowerCase()}`]) {
