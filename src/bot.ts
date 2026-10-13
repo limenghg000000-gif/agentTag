@@ -1452,9 +1452,11 @@ const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
  * 前后的分界和回答里认路径（CODE_PATHS）一样。
  * 前面是绝对路径的算，报错堆栈里写的是全路径（/app/src/a.ts:12、File "/app/src/a.py"）；写成 ./src/a.ts 的也算。
  * 绝对路径前面的引号、括号要是分界（(/app/src/a.ts:12)），夹在路径字符中间的（x(/app/src/a.ts）是一个更长的路径的一截，不是绝对路径。
+ * 方括号紧挨着的绝对路径一直算：ThinkPHP 的报错日志写成「[0]报错信息[/var/www/html/app/a.php:46]」，信息末尾紧挨着 [。
+ * 2026-10-13 点「接着查」问 gateway-api 的 error 日志，回答引用的 app/utils/Redirect.php:46 等 3 处没认出来，查了 12 步的回答整条被拦
  * 绝对路径前面那几级目录名里可以有 @、+、! 这些字符：Go 模块缓存（/go/pkg/mod/github.com/!acme/svc@v1.2.3/...）、pnpm（.pnpm/@acme+svc@1.0.0/...）
  */
-const PATH_START = `(?:${NOT_GLUED}|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])/(?:[^\\s/"'\`()（）<>]+/)*)|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])\\./))`;
+const PATH_START = `(?:${NOT_GLUED}|(?<=(?:^|[\\s"\`（=[]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])/(?:[^\\s/"'\`()（）<>]+/)*)|(?<=(?:^|[\\s"\`（=]|(?<!${PATH_CHAR}[${SOFT_DELIM}]*)['(])\\./))`;
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1481,9 +1483,9 @@ function mentionsLine(text: string, path: string, line: number): boolean {
   return false;
 }
 
-/** 这段没有固定格式的结果里有没有 path 的第 line 行：path:35，或者 Python 堆栈的 "path", line 35 */
+/** 这段没有固定格式的结果里有没有 path 的第 line 行：path:35，Python 堆栈的 "path", line 35，PHP 堆栈的 path(35) */
 function hasLine(output: string, path: string, line: number): boolean {
-  return pathPattern(path, `(?::|", line )${line}(?!\\d)`).test(output);
+  return pathPattern(path, `(?::${line}(?!\\d)|", line ${line}(?!\\d)|\\(${line}\\))`).test(output);
 }
 
 /**

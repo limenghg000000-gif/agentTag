@@ -2446,6 +2446,33 @@ test("代码引用按行认：搜索结果、报错堆栈里的「路径:行号�
   assert.deepEqual(unseenCodeCitations("见 `src/app.ts`：入口", seen), []);
 });
 
+test("PHP 日志里的文件和行号认得出：ThinkPHP 的 [文件:行]、堆栈的 文件(行)", () => {
+  const seen = codeEvidence(
+    [],
+    [
+      {
+        tool: "aiops_query_logs",
+        output:
+          '[2026-10-12T20:31:05+08:00][error] [0]Undefined array key "goods_id"[/var/www/html/app/api/service/GoodsService.php:5604]\n' +
+          "[2026-10-12T20:31:06+08:00][error] [0]Call to a member function get() on null[/var/www/html/app/callback/controller/Wechat.php:60]\n" +
+          "#0 /var/www/html/app/utils/Redirect.php(46): think\\Response->send()",
+      },
+    ],
+  );
+  // 2026-10-13 gateway-api 的 error 日志：这 3 处都在日志里，原先认不出来，整条回答被拦
+  assert.deepEqual(
+    unseenCodeCitations("报错在 app/api/service/GoodsService.php:5604、app/callback/controller/Wechat.php:60，从 app/utils/Redirect.php:46 调过来", seen),
+    [],
+  );
+  // 行号对不上的照样不认
+  assert.equal(seen("app/api/service/GoodsService.php", 5605), false);
+  assert.equal(seen("app/utils/Redirect.php", 4), false);
+  assert.equal(seen("app/utils/Redirect.php", 460), false);
+  // 方括号里只认绝对路径：x[src/a.php:3] 里的 src/a.php 还是更长的路径的一截
+  const glued = codeEvidence([], [{ tool: "aiops_query_logs", output: "x[src/a.php:3]" }]);
+  assert.equal(glued("src/a.php", 3), false);
+});
+
 test("代码引用的路径要整段对上，改文件记下的行也认", () => {
   const seen = codeEvidence(
     [],
