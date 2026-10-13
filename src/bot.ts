@@ -13,10 +13,10 @@ import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   answerFitsCard,
   CardUpdater,
+  finalCards,
   type ProgressCard,
   type ProgressState,
   type ProgressStep,
-  renderPlainProgressCard,
   renderProgressCard,
   ASK_ACTION,
   STOP_ACTION,
@@ -597,7 +597,7 @@ async function runTask(
   state.answerSegments = displayed;
   const displayedText = segmentsAsText(displayed);
   try {
-    const landed = await card?.finish(render(), renderPlainProgressCard(state, now(), { streaming }));
+    const landed = await card?.finish(...finalCards(state, task.id, now(), { streaming }));
     if (answer !== undefined) {
       if (streaming && landed && cardMessageId && answerFitsCard(displayedText)) {
         await rememberCardAnswer(deps, msg, cardMessageId, displayedText);

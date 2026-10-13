@@ -1,6 +1,6 @@
 import { stripThinkTags } from "./llm.js";
-import { escapeCardMarkdown, nextFence, richCardLine, stripRichTags } from "./markdown.js";
-import { type AnswerSegment, hasUiBlocks, segmentElements, segmentsAsText, splitAnswer, streamingAnswer } from "./rich-ui.js";
+import { escapeCardMarkdown, nextFence, richCardLine, splitTables, stripRichTags } from "./markdown.js";
+import { type AnswerSegment, hasUiBlocks, MAX_TABLES, segmentElements, segmentsAsText, splitAnswer, streamingAnswer, tableElement } from "./rich-ui.js";
 
 /** 卡片上停止按钮回传的值 */
 export const STOP_ACTION = "stop_task";
@@ -49,6 +49,8 @@ export interface CardOptions {
    * 模型生成时按组件流式更新（打字机效果），见 StreamingCard
    */
   streaming?: boolean;
+  /** 回答里的表格照 Markdown 显示，不换成飞书的表格组件：带表格组件的卡片发不出去时退回这样 */
+  markdownTables?: boolean;
 }
 
 /** 流式卡片里各组件的 element_id */
@@ -88,16 +90,32 @@ export function renderProgressCard(state: ProgressState, taskId: string, now = D
   if (total > 0 && !fits(card)) {
     card = buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, options);
   }
+  // 表格组件每一格都带着列名，比 Markdown 表格占地方：还放不下先把表格照 Markdown 显示
+  const asMarkdown = { ...options, markdownTables: true };
+  if (!fits(card) && !options.markdownTables) {
+    card = buildProgressCard({ ...state, thoughts: undefined }, taskId, now, 0, asMarkdown);
+  }
   // 还放不下就是图的数据太多：图换成文字说明（用核对过的那几段，不再从原文拆：对不上被去掉的数字卡片不能回来）
   if (!fits(card) && state.answerSegments && hasUiBlocks(state.answerSegments)) {
     const asText: AnswerSegment[] = [{ kind: "markdown", text: segmentsAsText(state.answerSegments) }];
-    card = buildProgressCard({ ...state, thoughts: undefined, answerSegments: asText }, taskId, now, 0, options);
+    card = buildProgressCard({ ...state, thoughts: undefined, answerSegments: asText }, taskId, now, 0, asMarkdown);
   }
   return card;
 }
 
+/**
+ * 结束时依次试着推的几张卡片：完整的；带表格组件的发不出去时，表格照 Markdown 显示的（没有表格组件时不要这张）；
+ * 再不行是简单版本（renderPlainProgressCard）
+ */
+export function finalCards(state: ProgressState, taskId: string, now = Date.now(), options: CardOptions = {}): [object, ...object[]] {
+  const card = renderProgressCard(state, taskId, now, options);
+  const markdownTables = renderProgressCard(state, taskId, now, { ...options, markdownTables: true });
+  const plain = renderPlainProgressCard(state, now, options);
+  return JSON.stringify(markdownTables) === JSON.stringify(card) ? [card, plain] : [card, markdownTables, plain];
+}
+
 /** omitted：最早的几段思考只显示标题、不显示正文 */
-function buildProgressCard(state: ProgressState, taskId: string, now: number, omitted: number, { streaming }: CardOptions): object {
+function buildProgressCard(state: ProgressState, taskId: string, now: number, omitted: number, { streaming, markdownTables }: CardOptions): object {
   const finished = isFinished(state);
   const thoughts = state.thoughts ?? [];
   const id = (elementId: string) => (streaming ? { element_id: elementId } : {});
@@ -142,14 +160,39 @@ function buildProgressCard(state: ProgressState, taskId: string, now: number, om
     });
   }
   if (streaming && finished && state.answer) {
-    const segments = state.answerSegments;
-    if (segments && hasUiBlocks(segments) && answerFitsCard(finalText(state))) {
-      elements.push(...segmentElements(segments, (text) => ({ tag: "markdown", content: escapeAnswer(text) }), (q) => ({ action: ASK_ACTION, q })));
-    } else {
-      elements.push(answerElement(finalText(state)));
-    }
+    elements.push(...finalAnswerElements(state, markdownTables ? 0 : MAX_TABLES));
   }
   return { schema: "2.0", config: cardConfig(state, streaming), body: { elements } };
+}
+
+/**
+ * 结束后卡片里的回答：图、数字卡片、表格（最多 maxTables 张）换成组件。
+ * 回答太长时只放开头一段文字；什么组件都没有时和以前一样是一个文字组件
+ */
+function finalAnswerElements(state: ProgressState, maxTables: number): object[] {
+  const text = finalText(state);
+  if (!answerFitsCard(text)) {
+    return [answerElement(text)];
+  }
+  const tables = { left: maxTables };
+  const render = (markdown: string) => markdownElements(markdown, tables);
+  const segments = state.answerSegments;
+  if (segments && hasUiBlocks(segments)) {
+    return segmentElements(segments, render, (q) => ({ action: ASK_ACTION, q }));
+  }
+  const elements = render(text);
+  return tables.left < maxTables ? elements : [answerElement(text)];
+}
+
+/** 一段回答文字：代码块外的表格换成表格组件（还能放 tables.left 张，放一张少一张；再多的照 Markdown 显示），别的照旧 */
+function markdownElements(text: string, tables: { left: number }): object[] {
+  return splitTables(text, tables.left).map((part) => {
+    if (part.kind === "table") {
+      tables.left--;
+      return tableElement(part.table);
+    }
+    return { tag: "markdown", content: escapeAnswer(part.text) };
+  });
 }
 
 /**
@@ -174,6 +217,8 @@ function cardConfig(state: ProgressState, streaming: boolean | undefined): objec
   const preview = streaming && finished && state.answer ? previewOf(finalText(state)) : undefined;
   return {
     update_multi: true,
+    // 撑满聊天窗口：默认最宽 600px，电脑上全屏时卡片只占左边一小块，表格要往右拖着看（2026-10-13 测试群）
+    width_mode: "fill",
     ...(streaming ? { streaming_mode: !finished && liveText(state) !== "", streaming_config: STREAMING_CONFIG } : {}),
     summary: { content: preview || (finished ? summaryText(state.phase) : "处理中…") },
   };
@@ -339,8 +384,8 @@ export type PatchCard = (card: object) => Promise<void>;
 /** 已发出的进度卡片：进行中的更新合并着推，结束时推最终状态 */
 export interface ProgressCard {
   update(card: object): void;
-  /** 推送最终状态并等它完成。失败时再试一次 fallback（如果给了）。返回卡片最后有没有更新成功 */
-  finish(card: object, fallback?: object): Promise<boolean>;
+  /** 推送最终状态并等它完成。失败时依次改推 fallbacks 里的卡片。返回卡片最后有没有更新成功 */
+  finish(card: object, ...fallbacks: object[]): Promise<boolean>;
 }
 
 /**
@@ -367,30 +412,25 @@ export class CardUpdater implements ProgressCard {
     this.kick();
   }
 
-  /** 推送最终状态并等它完成。失败时再试一次 fallback（如果给了） */
-  async finish(card: object, fallback?: object): Promise<boolean> {
+  /** 推送最终状态并等它完成。失败时依次改推 fallbacks 里的卡片，都失败才记日志 */
+  async finish(card: object, ...fallbacks: object[]): Promise<boolean> {
     this.closed = true;
     this.pending = undefined;
     while (this.running) {
       await this.running;
     }
     await this.wait();
-    try {
-      await this.patch(card);
-      return true;
-    } catch (err) {
-      if (!fallback) {
-        this.logger.error("更新进度卡片失败", err);
-        return false;
-      }
+    let failure: unknown;
+    for (const candidate of [card, ...fallbacks]) {
       try {
-        await this.patch(fallback);
+        await this.patch(candidate);
         return true;
-      } catch (err2) {
-        this.logger.error("更新进度卡片失败", err2);
-        return false;
+      } catch (err) {
+        failure = err;
       }
     }
+    this.logger.error("更新进度卡片失败", failure);
+    return false;
   }
 
   private kick(): void {

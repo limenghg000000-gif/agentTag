@@ -106,7 +106,7 @@ export class StreamingCard implements ProgressCard {
     this.kick();
   }
 
-  async finish(card: object, fallback?: object): Promise<boolean> {
+  async finish(card: object, ...fallbacks: object[]): Promise<boolean> {
     this.closed = true;
     this.pending = undefined;
     while (this.running) {
@@ -115,7 +115,7 @@ export class StreamingCard implements ProgressCard {
     if (this.streaming) {
       await this.setStreaming(false);
     }
-    for (const candidate of fallback ? [card, fallback] : [card]) {
+    for (const candidate of [card, ...fallbacks]) {
       if (await this.replace(candidate, true)) {
         return true;
       }

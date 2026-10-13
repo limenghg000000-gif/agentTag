@@ -118,6 +118,31 @@ export function richCardLine(line: string): string {
     });
 }
 
+/** <text_tag> 的颜色换成 <font> 的：灰色标签是 neutral，灰色字是 grey */
+const TAG_FONT_COLOR: Record<string, string> = { neutral: "grey" };
+
+/**
+ * 原生表格里一格的文字（按 lark_md 显示）：和回答正文一样转义尖括号、只放过名单里的颜色；
+ * <text_tag> 换成同色的 <font>（格子里认不认 text_tag 文档里查不到，认不了会把标签原文显示出来）
+ */
+export function richCardCell(cell: string): string {
+  return cell.replace(/</g, "&lt;").replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
+    const value = richColor(tag, color);
+    if (!value) {
+      return all;
+    }
+    return `<font color='${tag.toLowerCase() === "font" ? value : (TAG_FONT_COLOR[value] ?? value)}'>${inner}</font>`;
+  });
+}
+
+/** 一格里只有一个 <text_tag>（前后的空白不算）时，返回标签的字和颜色：整列都是这样的格子画成彩色标签 */
+export function cellTag(cell: string): { text: string; color: string } | undefined {
+  const match = /^<(text_tag)\s+color\s*=\s*(['"]?)([a-z]+)\2\s*>((?:(?!<|&lt;).)*?)<\/text_tag\s*>$/i.exec(cell.trim());
+  const color = match ? richColor(match[1], match[3]) : undefined;
+  const text = match?.[4].trim();
+  return color && text ? { text, color } : undefined;
+}
+
 /**
  * 去掉卡片会画出来的 <font>、<text_tag> 标签，只留文字：检查回答里的路径、线上数据时按显示出来的文字看。
  * 只去 richCardLine 会恢复的那种（同一行、颜色在名单里、中间没有别的标签），别的照原文留着
@@ -176,6 +201,78 @@ export function isTableStart(head: string, delimiter: string): boolean {
 /** 表格往下的行：不是空行、带 |、不是代码块的开头 */
 export function isTableBody(line: string): boolean {
   return line.trim() !== "" && PIPE.test(line) && !nextFence(undefined, line).marker;
+}
+
+/** 回答里的一张表格：表头、各列的对齐（|:---:| 居中、|---:| 靠右，没写是 undefined）、各行（格数按表头补齐，多出来的不要） */
+export interface MarkdownTable {
+  header: string[];
+  align: ("left" | "center" | "right" | undefined)[];
+  rows: string[][];
+}
+
+/**
+ * 拆出代码块外的表格，文字和表格按先后排（文字前后的空行去掉，空的不要）。
+ * 最多拆 max 张，再往后的表格留在文字里；只有表头、没有数据行的不拆；
+ * 表头缩进 4 格以上（或用 Tab）的不拆：可能是缩进代码块里讲表格写法的例子，照 Markdown 原样显示
+ */
+export function splitTables(text: string, max: number): ({ kind: "text"; text: string } | { kind: "table"; table: MarkdownTable })[] {
+  const parts: ({ kind: "text"; text: string } | { kind: "table"; table: MarkdownTable })[] = [];
+  const lines = text.split("\n");
+  let buf: string[] = [];
+  const flush = () => {
+    while (buf.length > 0 && buf[0].trim() === "") {
+      buf.shift();
+    }
+    while (buf.length > 0 && buf[buf.length - 1].trim() === "") {
+      buf.pop();
+    }
+    if (buf.length > 0) {
+      parts.push({ kind: "text", text: buf.join("\n") });
+    }
+    buf = [];
+  };
+  let fence: string | undefined;
+  let found = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const inCode = fence !== undefined;
+    const next = nextFence(fence, line);
+    fence = next.fence;
+    const delimiter = lines[i + 1];
+    if (!inCode && !next.marker && found < max && delimiter !== undefined && !INDENTED_CODE.test(line) && isTableStart(line, delimiter)) {
+      let end = i + 2;
+      while (end < lines.length && isTableBody(lines[end])) {
+        end++;
+      }
+      if (end > i + 2) {
+        flush();
+        parts.push({ kind: "table", table: parseTable(lines.slice(i, end)) });
+        found++;
+        i = end - 1;
+        continue;
+      }
+    }
+    buf.push(line);
+  }
+  flush();
+  return parts;
+}
+
+/** 缩进代码块的一行：前面 4 个以上空格，或者不到 4 个空格后跟 Tab */
+const INDENTED_CODE = /^(?: {4}| {0,3}\t)/;
+
+function parseTable([head, delimiter, ...body]: string[]): MarkdownTable {
+  const header = cellsOf(head);
+  const align = cellsOf(delimiter).map((mark) => {
+    const left = mark.startsWith(":");
+    const right = mark.endsWith(":");
+    return left && right ? "center" : right ? "right" : left ? "left" : undefined;
+  });
+  const rows = body.map((row) => {
+    const cells = cellsOf(row);
+    return header.map((_, i) => cells[i] ?? "");
+  });
+  return { header, align, rows };
 }
 
 /** 表头、|---|、各行 改成列表 */
