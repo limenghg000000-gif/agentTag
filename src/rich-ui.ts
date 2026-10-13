@@ -643,7 +643,7 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
         dropped.push(`图「${segment.title}」有 ${badPoints.length} 个点在查询结果里找不到（如 ${badPoints.slice(0, 3).join("、")}），只空掉这几个点`);
         kept.push(
           { ...segment, series: segment.series.map((s) => ({ ...s, data: s.data.map((n) => (found(n) ? n : null)) })) },
-          { kind: "markdown", text: `📊 图「${segment.title}」里有 ${badPoints.length} 个点和这次查到的结果对不上，这几个点没画。` },
+          { kind: "markdown", text: `📊 图「${segment.title}」里有 ${badPoints.length} 个点和这次查到的结果对不上，${badPoints.length === 1 ? "这个点" : "这几个点"}没画。` },
         );
         continue;
       }
@@ -875,12 +875,18 @@ function headerText(head: string): string {
   return stripRichTags(head).replace(/\*\*|`/g, "").replace(/</g, "＜").trim() || " ";
 }
 
+/**
+ * 图的高度固定，宽度跟着卡片：按比例画时高度跟着宽度走，卡片撑满窗口后电脑全屏时一张图有 680px 左右高，占满一屏（2026-10-13 测试群）。
+ * 320px 比以前 600px 宽的卡片里 16:9 的图（约 340px）略矮；定了高度飞书就不看 aspect_ratio
+ */
+const CHART_HEIGHT = "320px";
+
 function chartElement(chart: ChartBlock): object {
   const title = chart.unit ? `${chart.title}（${chart.unit}）` : chart.title;
   if (chart.type === "pie") {
     return {
       tag: "chart",
-      aspect_ratio: "4:3",
+      height: CHART_HEIGHT,
       chart_spec: {
         type: "pie",
         title: { text: title },
@@ -896,7 +902,7 @@ function chartElement(chart: ChartBlock): object {
   const values = chart.series.flatMap((s) => s.data.map((value, i) => ({ x: chart.x[i], value, series: s.name })));
   return {
     tag: "chart",
-    aspect_ratio: "16:9",
+    height: CHART_HEIGHT,
     chart_spec: {
       type: chart.type,
       title: { text: title },
