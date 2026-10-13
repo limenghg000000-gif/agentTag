@@ -3102,11 +3102,45 @@ test("卡片即回答：提示词里允许表格、小标题和彩色标签；�
   assert.match(rich.requests[0].system, /表格/);
   assert.match(rich.requests[0].system, /<text_tag color='red'>高风险<\/text_tag>/);
   assert.doesNotMatch(rich.requests[0].system, /不渲染表格/);
+  // 长串不放进表格：2026-10-13 淘宝口令、链接放在表格里，要往右拖着看
+  assert.match(rich.requests[0].system, /口令、链接、报错原文、长 ID 这类长串不放进表格，写在表格下面/);
 
   const plain = fakeModel(() => ({ text: "好的", finish: "stop" }));
   await setup({ model: plain.model }).handle(message("你好"));
   assert.match(plain.requests[0].system, /飞书消息不渲染表格，需要对比时用列表/);
   assert.doesNotMatch(plain.requests[0].system, /text_tag/);
+});
+
+test("卡片即回答：回答里的表格换成表格组件；带表格组件的卡片推不上去时表格照 Markdown 显示，照样算发出去了", async () => {
+  const answer = "结论\n\n| Pod | 状态 |\n|---|---|\n| api-1 | <text_tag color='green'>正常</text_tag> |";
+  const ask = async (rejectTables: boolean) => {
+    const kit = fakeCardKit();
+    const update = kit.api.update;
+    kit.api.update = async (id, card, sequence) => {
+      if (rejectTables && JSON.stringify(card).includes('"tag":"table"')) {
+        throw new Error("200621 table not supported");
+      }
+      await update(id, card, sequence);
+    };
+    const answers = answerStore();
+    const { model } = fakeModel(() => ({ text: answer, finish: "stop" }));
+    const { sent, handle } = setup({ model, cardKit: kit.api, cardAnswers: answers.store, streamIntervalMs: 0 });
+    await handle(message("看看 Pod"));
+    return { kit, sent, answers };
+  };
+
+  const ok = await ask(false);
+  const table = ok.kit.last().body.elements.at(-1);
+  assert.equal(table.tag, "table");
+  assert.deepEqual(table.rows, [{ c0: "api-1", c1: [{ text: "正常", color: "green" }] }]);
+  assert.deepEqual(markdowns(ok.sent), []);
+  assert.equal(ok.answers.saved[0].answer, answer);
+
+  const rejected = await ask(true);
+  assert.equal(rejected.kit.last().body.elements.at(-1).content, answer);
+  assert.equal(rejected.kit.last().body.elements.at(-1).element_id, "answer");
+  assert.deepEqual(markdowns(rejected.sent), []);
+  assert.equal(rejected.answers.saved.length, 1);
 });
 
 test("卡片即回答：回答太长另外发全文时，表格改成列表、标签去掉", async () => {
