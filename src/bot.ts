@@ -26,7 +26,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
-import { findSensitive } from "./knowledge.js";
+import { containsSecret, maskPersonal } from "./knowledge.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
@@ -321,7 +321,7 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    const knowledge = await lookupKnowledge(deps, taskContext, { text: asked, full: askedFull }, history, task.signal, state, () => card?.update(render()));
+    const knowledge = await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
@@ -739,34 +739,31 @@ async function readImages(
  * 两个库都只取前面一段去查（LOOKUP_QUERY_CHARS），所以这次的提问放最前面；拼起来不超过那一段，第一个问题不会被挤出去：
  * 这次的提问很长（追问时贴了一大段日志）就截短，中间几轮每轮限长，放得下几轮放几轮。
  * 只追问一句「怎么修？」时，上一轮给的错误码、服务名也能带上。
- * 上文里每句话前面标的发言人去掉：名字对查经验没用，也不该发给 aiops、记进它的调用日志
+ * 上文里每句话前面标的发言人去掉：名字对查经验没用，也不该发给 aiops、记进它的调用日志。
+ * 每轮用截短前的全文（asked 也是）；secret 是用到的几轮里有没有像密钥的
  */
-function lookupQuery(asked: { text: string; full: string }, history: readonly ChatMessage[]): string {
-  const users = history.flatMap((m) => (m.role === "user" ? [m] : []));
-  const asks = users.map((m) => unlabelUserMessage(m.content));
-  // 截短前先看每轮的全文：密钥、手机号截在一半（<password>… 的结尾截掉了）就认不出来了，会发到 aiops；
-  // 上文的长消息、长的图片文字早就截短了，截掉的后半段可能正是认出前面是密钥的那部分（data 在前、kind: Secret 在后的 Secret）。
-  // 有的话用全文，交给经验库认出来：有密钥的不查 aiops，手机号、身份证号打码再查
-  const fulls = users.map((m) => unlabelUserMessage(m.full ?? m.content));
-  const whole = [asked.full, ...fulls.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse(), ...fulls.slice(0, 1)];
-  if (whole.some((turn) => findSensitive(turn) !== undefined)) {
-    return [...new Set(whole)].join("\n");
-  }
+function lookupQuery(asked: string, history: readonly ChatMessage[]): { query: string; secret: boolean } {
+  const asks = history.flatMap((m) => (m.role === "user" ? [unlabelUserMessage(m.full ?? m.content)] : []));
+  const recent = asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse();
+  // 截短前先用每轮的全文认密钥、给手机号身份证号打码：截在一半就认不出来了（<password>… 的结尾截掉了、号码只剩半截），会发到 aiops。
+  // 给模型看的上文早就截短了（长消息、长的图片文字），截掉的后半段可能正是认出前面是密钥的那部分（data 在前、kind: Secret 在后的 Secret），所以用全文
+  const secret = [asked, ...recent, ...asks.slice(0, 1)].some(containsSecret);
+  const current = maskPersonal(asked);
   if (asks.length === 0) {
-    return asked.text;
+    return { query: current, secret };
   }
-  const first = asks[0].slice(0, LOOKUP_TURN_CHARS);
-  const parts = [asked.text.slice(0, LOOKUP_QUERY_CHARS - first.length - 1)];
+  const first = maskPersonal(asks[0]).slice(0, LOOKUP_TURN_CHARS);
+  const parts = [current.slice(0, LOOKUP_QUERY_CHARS - first.length - 1)];
   let used = parts[0].length + 1 + first.length;
-  for (const turn of asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse()) {
-    const text = turn.slice(0, LOOKUP_TURN_CHARS);
+  for (const turn of recent) {
+    const text = maskPersonal(turn).slice(0, LOOKUP_TURN_CHARS);
     if (used + text.length + 1 > LOOKUP_QUERY_CHARS) {
       break;
     }
     parts.push(text);
     used += text.length + 1;
   }
-  return [...new Set([...parts, first])].join("\n");
+  return { query: [...new Set([...parts, first])].join("\n"), secret };
 }
 
 /**
@@ -776,7 +773,7 @@ function lookupQuery(asked: { text: string; full: string }, history: readonly Ch
 async function lookupKnowledge(
   deps: BotDeps,
   task: TaskToolContext,
-  asked: { text: string; full: string },
+  asked: string,
   history: readonly ChatMessage[],
   signal: AbortSignal,
   state: ProgressState,
@@ -786,11 +783,11 @@ async function lookupKnowledge(
   if (!knowledge) {
     return undefined;
   }
-  const query = lookupQuery(asked, history);
+  const { query, secret } = lookupQuery(asked, history);
   // 经验库自己按库限时；这里再给整个检索一个上限：飞书接口不认中止信号，卡住了也不能拖住回答
   const timeout = timeoutSignal(deps.knowledgeLookupMs ?? KNOWLEDGE_LOOKUP_MS);
   try {
-    const found = await raceAbort(knowledge.lookup(query, task, signal), AbortSignal.any([signal, timeout.signal]));
+    const found = await raceAbort(knowledge.lookup(query, task, signal, { secret }), AbortSignal.any([signal, timeout.signal]));
     if (!found) {
       return undefined;
     }

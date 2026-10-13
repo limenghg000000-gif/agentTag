@@ -236,15 +236,16 @@ export class KnowledgeDesk {
    * 每个库最多等 lookupMs（飞书接口不认中止信号，到时间就不等了），向量没算完时团队经验库只按关键词。
    * 一边没查成时用另一边的，查了的都没查成时返回 undefined。用户停止任务时抛出中止错误。
    * 提问（连同话题里前几次的提问）里像是有密钥时不拿去查 aiops：查询会发到 aiops、记进 MCP 审计日志。
+   * 查询是截短拼起来的，截掉的部分里有密钥时调用方传 secret（截短前认的）；查询里自己看得出来的也算。
    * 手机号、身份证号格式确定，换成 *** 再查 aiops（用户反馈的问题常带着号码，整条不查就漏了 aiops 里的经验）
    */
-  async lookup(query: string, task: McpTaskContext, signal?: AbortSignal): Promise<KnowledgeLookup | undefined> {
+  async lookup(query: string, task: McpTaskContext, signal?: AbortSignal, options: { secret?: boolean } = {}): Promise<KnowledgeLookup | undefined> {
     const { base, aiops } = this.options;
     const timeout = timeoutSignal(this.lookupMs);
     const semantic = timeoutSignal(this.semanticMs);
     const deadline = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
     try {
-      const secret = aiops?.searchable === true && containsSecret(query);
+      const secret = aiops?.searchable === true && (options.secret === true || containsSecret(query));
       if (secret) {
         this.logger.warn(`提问里像是有密钥，这次不拿它去查 aiops 经验库 message=${task.messageId}`);
       }

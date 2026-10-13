@@ -550,12 +550,12 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   assert.match(query, /^日志如下：ERROR upstream timeout/);
   assert.match(query, /\ngateway-api 报 code=8，帮我看看$/, "第一个问题在两个库取的那一段里");
 
-  // 话题里有一轮写着密钥：整轮不截短，免得截掉 </password> 以后经验库认不出来、把前半截发给 aiops
+  // 话题里有一轮写着密钥：截短前认出来，告诉经验库不查 aiops（截掉 </password> 以后经验库自己认不出来，会把前半截发给 aiops）
   const secret = ["Correct", "Horse", "Battery", "Staple9!"].join("");
-  const leaked: string[] = [];
+  const leaked: { query: string; secret?: boolean }[] = [];
   const secretKnowledge = {
-    async lookup(query: string) {
-      leaked.push(query);
+    async lookup(query: string, _task: unknown, _signal?: AbortSignal, options: { secret?: boolean } = {}) {
+      leaked.push({ query, ...options });
       return { text: "", ids: [] };
     },
     tools: () => [],
@@ -570,8 +570,8 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   // 截到 200 字时密码整个留着、</password> 截掉了：只看截短的认不出来
   assert.equal(firstTurn.indexOf("</password>"), 200);
   assert.ok(!containsSecret(firstTurn.slice(0, 200)));
-  assert.ok(leaked[0].includes(firstTurn), "整轮带上");
-  assert.ok(containsSecret(leaked[0]), "经验库认得出有密钥，不会查 aiops");
+  assert.equal(leaked[0].secret, true, "告诉经验库有密钥，不会查 aiops");
+  assert.ok(leaked[0].query.length <= 800, "查的文字照样截短");
 
   // 这次的提问短：最近几轮都放得下
   queries.length = 0;
@@ -600,10 +600,10 @@ test("上文里截短过的长消息、太长的图片文字：查经验库前�
   assert.ok(!containsSecret(clipped) && !containsSecret(manifest.slice(0, 200)), "只看截短的认不出来");
   assert.ok(containsSecret(manifest));
 
-  const queries: string[] = [];
+  const lookups: { query: string; secret?: boolean }[] = [];
   const knowledge = {
-    async lookup(query: string) {
-      queries.push(query);
+    async lookup(query: string, _task: unknown, _signal?: AbortSignal, options: { secret?: boolean } = {}) {
+      lookups.push({ query, ...options });
       return { text: "", ids: [] };
     },
     tools: () => [],
@@ -614,16 +614,41 @@ test("上文里截短过的长消息、太长的图片文字：查经验库前�
     { role: "assistant", content: "收到" },
   ];
   await setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source }).handle(message("怎么修？"));
-  assert.ok(containsSecret(queries[0]), "经验库认得出有密钥，不会查 aiops");
+  assert.equal(lookups[0].secret, true, "告诉经验库有密钥，不会查 aiops");
   assert.equal(requests[0].messages[0].content, `[张三] ${clipped}`, "模型看到的还是截短的");
 
   // 提问里截图的文字太长：给模型看的截到 4000 字，查经验库前用全文认
   const { handle } = setup({ model, knowledge, images: { read: async () => new Map([["img_a", manifest]]) } });
   await handle(message("![image](img_a)\n这个 Secret 怎么配", { resources: [{ type: "image", fileKey: "img_a" }] }));
-  assert.ok(containsSecret(queries[1]), "经验库认得出有密钥，不会查 aiops");
+  assert.equal(lookups[1].secret, true, "告诉经验库有密钥，不会查 aiops");
   const prompt = requests.at(-1)!.messages.at(-1)!.content;
   assert.match(prompt, /（图片文字太长，后面省略）/);
   assert.doesNotMatch(prompt, /kind: Secret/);
+});
+
+test("上文里有手机号、这次贴了一大段日志：号码截短前打码，查的文字照样截短，第一个问题不会被挤出去", async () => {
+  const phone = ["138", "0013", "8000"].join("");
+  const lookups: { query: string; secret?: boolean }[] = [];
+  const knowledge = {
+    async lookup(query: string, _task: unknown, _signal?: AbortSignal, options: { secret?: boolean } = {}) {
+      lookups.push({ query, ...options });
+      return { text: "", ids: [] };
+    },
+    tools: () => [],
+  };
+  const { model } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history: ChatMessage[] = [
+    { role: "user", content: `[张三] 用户 ${phone} 反馈 order-api 下单报 code=8` },
+    { role: "assistant", content: "需要日志" },
+  ];
+  await setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source }).handle(
+    message(`日志如下：${"ERROR upstream timeout ".repeat(100)}`),
+  );
+  const { query, secret } = lookups[0];
+  assert.ok(query.length <= 800, `查的文字有 ${query.length} 字，aiops 只取前 800 字`);
+  assert.match(query, /\n用户 \*\*\* 反馈 order-api 下单报 code=8$/, "第一个问题在两个库取的那一段里，号码打了码");
+  assert.ok(!query.includes(phone.slice(0, 7)));
+  assert.notEqual(secret, true, "手机号打码后照常查 aiops");
 });
 
 test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有一边没查成时提示词里说明", async () => {

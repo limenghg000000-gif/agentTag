@@ -3090,6 +3090,11 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   await desk.lookup(["gateway-api 报 code=8，告警发到 https://discord.com/api/webhooks/", "123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789"].join(""), task);
   await desk.lookup(["gateway-api 报 code=8，告警发到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?", "key=693a91f6-7b2c-4bc4-97a0-0ec2a1fa5aaa"].join(""), task);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
+  // 查询是截短拼起来的：密钥在截掉的那部分里时调用方说一声，也不查 aiops
+  const flagged = await desk.lookup("gateway-api 报 code=8", task, undefined, { secret: true });
+  assert.deepEqual(flagged?.ids, ["K1"]);
+  assert.equal(flagged?.aiopsSkipped, true);
+  assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
   assert.deepEqual((await desk.lookup("gateway-api 报 code=8，token 过期了", task))?.ids, ["K1", "aiops#31", "aiops#40"]);
   assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 1);
 });
