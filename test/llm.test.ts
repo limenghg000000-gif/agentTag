@@ -212,6 +212,59 @@ test("服务不认 parallel_tool_calls 时去掉它重试，之后不再带", as
   assert.deepEqual(bodies, [true, undefined, undefined]);
 });
 
+test("requireTool 时带 tool_choice: required（有工具才带）；服务不认时去掉重试并提示一次，报错里提到思考也不关思考", async () => {
+  const warnings: string[] = [];
+  const forced = createOpenAICompatibleModel(
+    {
+      baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`,
+      apiKey: "sk-test",
+      model: "qwen3.8-max",
+      thinking: false,
+    },
+    (message) => warnings.push(message),
+  );
+  const tool = { name: "fetch_url", description: "读网页", parameters: { type: "object", properties: {} } };
+  const send = (requireTool?: boolean, tools = [tool]) =>
+    forced.chat({ system: "s", messages: [{ role: "user", content: "查" }], tools, ...(requireTool ? { requireTool } : {}) });
+  responses.push(completion("好"), completion("好"), completion("好"));
+  await send(true);
+  assert.equal(requests.at(-1)!.body.tool_choice, "required");
+  await send();
+  assert.equal(requests.at(-1)!.body.tool_choice, undefined);
+  await send(true, []);
+  assert.equal(requests.at(-1)!.body.tool_choice, undefined);
+
+  responses.push(
+    { status: 400, body: { error: { code: "invalid_parameter_error", message: "tool_choice 'required' is not supported in thinking mode" } } },
+    completion("好"),
+    completion("好"),
+  );
+  assert.deepEqual(await send(true), { text: "好", finish: "stop" });
+  await send(true);
+  const bodies = requests.slice(-3).map((r) => [r.body.tool_choice, r.body.enable_thinking]);
+  assert.deepEqual(bodies, [["required", false], [undefined, false], [undefined, false]]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /不支持强制调用工具/);
+});
+
+test("报错里提到 required、去掉 tool_choice 后照样报错的（工具参数写错了）不算不认强制调用，之后照样带", async () => {
+  const warnings: string[] = [];
+  const forced = createOpenAICompatibleModel(
+    { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`, apiKey: "sk-test", model: "qwen3.8-max" },
+    (message) => warnings.push(message),
+  );
+  const tool = { name: "fetch_url", description: "读网页", parameters: { type: "object", properties: {}, required: "url" } };
+  const send = () => forced.chat({ system: "s", messages: [{ role: "user", content: "查" }], tools: [tool], requireTool: true });
+  const schemaError = { status: 400, body: { error: { code: "invalid_parameter_error", message: "tools[0].function.parameters: 'required' must be an array" } } };
+  responses.push(schemaError, schemaError, completion("好"));
+
+  await assert.rejects(send, (err) => err instanceof LlmError && err.kind === "api");
+  assert.deepEqual(requests.slice(-2).map((r) => r.body.tool_choice), ["required", undefined]);
+  await send();
+  assert.equal(requests.at(-1)!.body.tool_choice, "required");
+  assert.deepEqual(warnings, []);
+});
+
 test("按配置传 enable_thinking；模型不支持时去掉重试并提示一次", async () => {
   const warnings: string[] = [];
   const noThink = createOpenAICompatibleModel(

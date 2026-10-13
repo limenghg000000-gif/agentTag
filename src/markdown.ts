@@ -165,7 +165,7 @@ const PIPE = /(?<!\\)\|/;
 const DELIMITER_CELL = /^:?-+:?$/;
 
 /** 表格的头两行：表头带 |，第二行是 |---|（两边的 | 可有可无，但至少有一个 |），两行格数一样 */
-function isTableStart(head: string, delimiter: string): boolean {
+export function isTableStart(head: string, delimiter: string): boolean {
   if (!PIPE.test(head) || !PIPE.test(delimiter)) {
     return false;
   }
@@ -174,7 +174,7 @@ function isTableStart(head: string, delimiter: string): boolean {
 }
 
 /** 表格往下的行：不是空行、带 |、不是代码块的开头 */
-function isTableBody(line: string): boolean {
+export function isTableBody(line: string): boolean {
   return line.trim() !== "" && PIPE.test(line) && !nextFence(undefined, line).marker;
 }
 
@@ -189,7 +189,8 @@ function tableToList(rows: string[]): string[] {
   });
 }
 
-function cellsOf(row: string): string[] {
+/** 表格一行的各格（去掉两边的 |，\| 是格子里的竖线） */
+export function cellsOf(row: string): string[] {
   return row
     .trim()
     .replace(/^\|/, "")

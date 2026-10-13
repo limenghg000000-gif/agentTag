@@ -1085,6 +1085,8 @@ test("配了写权限名单：名单外的人只拿到读的工具，提示词�
   assert.deepEqual(guarded.requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "code_search"]);
   assert.match(guarded.requests[0].system, /这次提问的人没有让你改东西的权限（管理员在 WRITE_ALLOWED_USERS 里配置）/);
   assert.match(logs.join("\n"), /发起人不在写权限名单里，这次只给读的工具 message=om_1 sender=ou_guest/);
+  // 不是点按钮问的，不要求先调工具
+  assert.equal(guarded.requests[0].requireTool, undefined);
 
   await handle(message("把这篇文档改一下", { messageId: "om_2", senderId: "ou_admin" }));
   assert.deepEqual(guarded.requests[1].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit", "code_search", "code_open_pr"]);
@@ -1112,7 +1114,11 @@ test("点「接着查」按钮问的只给读的工具（写权限名单里的�
   assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read"]);
   assert.match(requests[0].system, /点你上一条回答下面的「接着查」按钮问的/);
   assert.doesNotMatch(requests[0].system, /WRITE_ALLOWED_USERS/);
-  assert.match(logs.join("\n"), /点按钮接着问的，这次只给读的工具 message=om_1 sender=ou_admin/);
+  assert.match(logs.join("\n"), /点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=om_1 sender=ou_admin/);
+  // 按钮问的第 1 轮要求先调工具，这一轮不思考；日志写明
+  assert.equal(requests[0].requireTool, true);
+  assert.equal(requests[0].thinking, false);
+  assert.match(logs.join("\n"), /模型第1轮 message=om_1 用时=\d+ms 要求调工具 → 给出回答/);
 
   // 名单外的人：没权限、按钮问的两句都说
   await handle(message("union 有没有重启", { messageId: "om_2", senderId: "ou_guest" }), { readOnly: true });
@@ -1125,6 +1131,8 @@ test("点「接着查」按钮问的只给读的工具（写权限名单里的�
   await ask(message("x"), { readOnly: true });
   assert.deepEqual(plain.requests[0].tools?.map((t) => t.name) ?? [], []);
   assert.match(plain.requests[0].system, /「接着查」按钮问的/);
+  // 一个工具都没有时不要求
+  assert.equal(plain.requests[0].requireTool, undefined);
   await ask(message("记住发版在周三", { messageId: "om_2" }));
   assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), ["memory_save", "memory_update", "memory_delete"]);
 });
@@ -3265,6 +3273,39 @@ test("卡片即回答：建卡片实体按 card_id 发到话题里，思考和�
   assert.equal(final.body.elements[0].tag, "collapsible_panel");
   assert.equal(final.config.summary.content, "今天**周一**");
   assert.deepEqual(answers.saved, [{ chatId: "oc_1", threadKey: "om_1", messageId: "om_reply_1", answer: "今天**周一**" }]);
+});
+
+test("回答里把 MB 写成了 MiB：打回时点名是哪个数、按 1024 应该是多少，改过来以后照常发出；写对的不打回", async () => {
+  // 2026-10-13 测试群：2v7gp 的 144,949,248 → 153,182,208 字节写成了「144.9 MiB 跳到 153.2 MiB」，表格里最高才 146.4 MiB
+  const metrics: Tool = {
+    spec: { name: "aiops_query_metrics_range", description: "查指标", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查指标",
+    run: async () =>
+      JSON.stringify({
+        query: 'sum by (pod) (container_memory_working_set_bytes{namespace="prod", pod=~"union-.*", container!=""})',
+        data: { resultType: "matrix", result: [{ metric: { pod: "union-2v7gp" }, values: [[1760279400, "144949248"], [1760281200, "153182208"]] }] },
+      }),
+  };
+  const call: ChatResult = { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_metrics_range", arguments: "{}" }] };
+  const run = async (answers: string[]) => {
+    const results: ChatResult[] = [call, ...answers.map((text): ChatResult => ({ text, finish: "stop" }))];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined } });
+    await handle(message("prod union 最近 24 小时内存趋势"));
+    return { requests, sent };
+  };
+
+  const wrong = await run(["2v7gp 从 144.9 MiB 跳到 153.2 MiB", "2v7gp 从 138.2 MiB 跳到 146.1 MiB"]);
+  assert.equal(wrong.requests.length, 3);
+  assert.match(
+    wrong.requests[2].messages.at(-1)!.content,
+    /144\.9 MiB（查到的 144949248 字节按 1024 换算是 138\.2 MiB）、153\.2 MiB（查到的 153182208 字节按 1024 换算是 146\.1 MiB）/,
+  );
+  assert.deepEqual(markdowns(wrong.sent), ["2v7gp 从 138.2 MiB 跳到 146.1 MiB"]);
+
+  const right = await run(["2v7gp 从 138.2 MiB 跳到 146.1 MiB，涨了约 8 MiB"]);
+  assert.equal(right.requests.length, 2);
+  assert.deepEqual(markdowns(right.sent), ["2v7gp 从 138.2 MiB 跳到 146.1 MiB，涨了约 8 MiB"]);
 });
 
 test("卡片即回答：回答没通过检查时卡片里换成重做说明，重做的回答写出来以后替换它", async () => {
