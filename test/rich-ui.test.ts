@@ -587,6 +587,18 @@ test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算�
   // ~~~ 代码块里的不算；行内代码前后的照样查
   assert.deepEqual(found("~~~yaml\nmemory: 153.2 MiB\n~~~"), []);
   assert.equal(found("`limit` 当前 153.2 MiB").length, 1);
+  // 两个反引号的行内代码、跨行的行内代码也不算；空行隔开的不算一段行内代码
+  assert.deepEqual(found("``memory: 153.2 MiB``"), []);
+  assert.deepEqual(found("`limits:\nmemory: 153.2 MiB`"), []);
+  assert.equal(found("`a\n\n153.2 MiB`").length, 1);
+  // 表头写了单位、格子里只写数（可以加粗）的也算；按 1024 算对的、表头写 MB 的、格子里不止一个数的不算
+  assert.deepEqual(found("| Pod | 内存 (MiB) |\n|---|---:|\n| 2v7gp | **153.2** |\n| sxllq | 179.7 |"), [
+    { written: "153.2 MiB", raw: 153182208, binary: "146.1 MiB" },
+  ]);
+  assert.deepEqual(found("| Pod | Memory/GiB |\n| --- | --- |\n| 2v7gp | 0.153 |"), [{ written: "0.153 GiB", raw: 153182208, binary: "0.143 GiB" }]);
+  assert.deepEqual(found("| Pod | 内存 (MB) |\n|---|---|\n| 2v7gp | 153.2 |"), []);
+  assert.deepEqual(found("| Pod | 内存 (MiB) |\n|---|---|\n| 2v7gp | 153.2 / 256 |"), []);
+  assert.deepEqual(found("| Pod | 内存 (MiB) |\n|---|---|\n| 2v7gp | `153.2` |"), []);
   // 带千分位的照样认；写得特别细的不会因为 toFixed 出错
   const big = new NumberEvidence([JSON.stringify({ query: "sum(container_memory_working_set_bytes)", data: { result: [{ metric: {}, value: [1, "1531800000"] }] } })]);
   assert.deepEqual(mislabeledBytes("合计 1,531.8 MiB", big), [{ written: "1,531.8 MiB", raw: 1531800000, binary: "1460.8 MiB" }]);

@@ -377,7 +377,7 @@ async function runTask(
     );
     toolCount = taskTools.length;
     if (followUp) {
-      logger.info(`点按钮接着问的，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+      logger.info(`点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
@@ -419,6 +419,9 @@ async function runTask(
     result = await runAgent({
       model,
       ...(deep ? { thinking: true } : {}),
+      // 按钮上的话是接着要查的新问题，第 1 轮就要求调工具：2026-10-13 点「接着查」问 product-service-api 最近 1 小时的错误日志，
+      // 可用工具 30 个，模型两轮都没调工具，照着话题里之前的回答写了线上数据，整条回答被拦
+      ...(followUp ? { requireTool: true } : {}),
       ...(thinksAfter ? { thinkAfter: thinksAfter } : {}),
       ...(steer ? { steer } : {}),
       system: buildSystemPrompt({
@@ -722,7 +725,7 @@ function logEvent(logger: Logger, messageId: string, event: AgentEvent): void {
       ? ` 输入=${event.usage.input} 输出=${event.usage.output}${event.usage.reasoning ? ` 其中思考=${event.usage.reasoning}` : ""}`
       : "";
     const next = event.toolNames.length > 0 ? `调用 ${event.toolNames.join(", ")}` : "给出回答";
-    const think = event.thinking ? " 思考=开" : "";
+    const think = `${event.thinking ? " 思考=开" : ""}${event.requireTool ? " 要求调工具" : ""}`;
     logger.info(`模型第${event.round}轮 message=${messageId} 用时=${event.ms}ms${think}${usage} → ${next}`);
   } else if (event.type === "retry") {
     logger.warn(`回答没通过检查，已让模型重做 message=${messageId}：${event.reason.slice(0, 60)}…`);

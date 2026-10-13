@@ -264,6 +264,35 @@ test("打回重做的那一轮起打开思考；显式关掉思考时照旧关�
   assert.deepEqual(await run(false), [false, false, false]);
 });
 
+test("requireTool：只有第一轮要求调工具，这一轮不思考（指定了思考也一样）；第二轮起照常；没有工具时不要求", async () => {
+  const run = async (options: { thinking?: boolean; tools?: Tool[] }) => {
+    const { model, requests } = scriptedModel([
+      { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+      { text: "答案", finish: "stop" },
+    ]);
+    const events: AgentEvent[] = [];
+    await runAgent({
+      model,
+      system: "s",
+      messages: user,
+      tools: options.tools ?? [echoTool()],
+      signal,
+      requireTool: true,
+      ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
+      onEvent: (event) => events.push(event),
+    });
+    const rounds = events.flatMap((event) => (event.type === "model" ? [event.requireTool] : []));
+    return { requests: requests.map((request) => [request.requireTool, request.thinking]), rounds };
+  };
+
+  assert.deepEqual(await run({}), { requests: [[true, false], [undefined, undefined]], rounds: [true, undefined] });
+  assert.deepEqual((await run({ thinking: true })).requests, [[true, false], [undefined, true]]);
+
+  const { model, requests } = scriptedModel([{ text: "答案", finish: "stop" }]);
+  await runAgent({ model, system: "s", messages: user, tools: [], signal, requireTool: true });
+  assert.deepEqual([requests[0].requireTool, requests[0].thinking], [undefined, undefined]);
+});
+
 test("review 拿到这次调过的工具名，通过时直接返回", async () => {
   const { model } = scriptedModel([
     { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },

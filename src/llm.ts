@@ -29,6 +29,11 @@ export interface ChatRequest {
   /** 这次单独打开或关掉思考；不传用配置里的 */
   thinking?: boolean;
   /**
+   * 这一轮必须调工具（tool_choice: "required"），有工具时才带。模型服务不认、报 400 时去掉重试，之后都不再带（打一行警告），
+   * 照常由模型自己决定调不调
+   */
+  requireTool?: boolean;
+  /**
    * 传了就流式调用：边生成边回调，给的是到目前为止的全部思考和正文（不是增量），用来在进度卡片上边想边显示。
    * 最终结果和不传时一样由 chat() 返回
    */
@@ -101,10 +106,11 @@ export class LlmError extends Error {
 export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: string) => void = console.warn): ChatModel {
   const client = new OpenAI({ baseURL: config.baseURL, apiKey: config.apiKey });
   // 百炼默认一轮只调一个工具；打开并行后，互不依赖的几个工具可以一轮发出，少等几轮模型。
-  // 这两个参数个别服务或模型不认、报 400 时，去掉重试，之后都不再带
+  // 这几个参数（还有强制调工具的 tool_choice）个别服务或模型不认、报 400 时，去掉重试，之后都不再带
   let parallelToolCalls = true;
   let thinkingSupported = true;
   let budgetSupported = true;
+  let toolChoiceSupported = true;
   // 服务不支持流式（stream 报 400）、改成非流式又成功了，之后都不再流式调用
   let streamSupported = true;
   // 流式时要用量的 stream_options 是可选参数：服务不认它、去掉后流式成功了，之后都不再带（流式时就没有用量统计）
@@ -112,13 +118,18 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
   type Extra = { enable_thinking?: boolean; thinking_budget?: number };
   type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
   /** 发请求，参数不认（400）时去掉重试。send 发出最终的请求体，流式和非流式各自用 */
-  const create = async <T>(body: Body, thinkingWanted: boolean | undefined, send: (request: Body & Extra) => Promise<T>): Promise<T> => {
+  const create = async <T>(
+    body: Body,
+    wanted: Pick<ChatRequest, "thinking" | "requireTool">,
+    send: (request: Body & Extra) => Promise<T>,
+  ): Promise<T> => {
     for (let attempt = 0; ; attempt++) {
-      const thinking = thinkingSupported ? (thinkingWanted ?? config.thinking) : undefined;
+      const thinking = thinkingSupported ? (wanted.thinking ?? config.thinking) : undefined;
       const budget = thinking && budgetSupported ? config.thinkingBudget : undefined;
       const request: Body & Extra = {
         ...body,
         ...(body.tools && parallelToolCalls ? { parallel_tool_calls: true } : {}),
+        ...(body.tools && wanted.requireTool && toolChoiceSupported ? { tool_choice: "required" as const } : {}),
         ...(thinking !== undefined ? { enable_thinking: thinking } : {}),
         ...(budget !== undefined ? { thinking_budget: budget } : {}),
       };
@@ -126,7 +137,13 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
         return await send(request);
       } catch (err) {
         // 输入太长的报错里可能也提到思考（「思考模式下最大输入…」），不能因此当成不认 enable_thinking
-        if (attempt < 3 && err instanceof OpenAI.BadRequestError && !isTooLong(err)) {
+        if (attempt < 4 && err instanceof OpenAI.BadRequestError && !isTooLong(err)) {
+          // 先看这一条：不认强制调用的报错里可能也提到思考（「思考模式下不支持…」），不能因此当成不认 enable_thinking
+          if (request.tool_choice !== undefined && /tool_choice|\brequired\b/i.test(err.message)) {
+            warn(`模型 ${config.model} 不支持强制调用工具（${err.message}），之后不再传 tool_choice`);
+            toolChoiceSupported = false;
+            continue;
+          }
           if (request.parallel_tool_calls && /parallel_tool_calls/i.test(err.message)) {
             parallelToolCalls = false;
             continue;
@@ -149,7 +166,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
 
   return {
     model: config.model,
-    async chat({ system, messages, tools, signal, thinking, onDelta }) {
+    async chat({ system, messages, tools, signal, thinking, requireTool, onDelta }) {
       const body: Body = {
         model: config.model,
         messages: [{ role: "system", content: system }, ...messages.map(toOpenAIMessage)],
@@ -166,7 +183,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
         try {
           raw = streamed
             ? await readStream(
-                await create(body, thinking, (request) =>
+                await create(body, { thinking, requireTool }, (request) =>
                   client.chat.completions.create(
                     { ...request, stream: true, ...(streamOptions ? { stream_options: { include_usage: true } } : {}) },
                     { signal },
@@ -175,7 +192,7 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
                 onDelta,
                 signal,
               )
-            : fromCompletion(await create(body, thinking, (request) => client.chat.completions.create(request, { signal })));
+            : fromCompletion(await create(body, { thinking, requireTool }, (request) => client.chat.completions.create(request, { signal })));
           if (fallback) {
             warn(`模型服务不支持流式输出，改成非流式成功了，之后不再流式调用，卡片上等整轮生成完再显示`);
             streamSupported = false;

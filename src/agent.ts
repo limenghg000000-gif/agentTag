@@ -21,7 +21,17 @@ const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限�
 
 export type AgentEvent =
   /** 一轮模型调用结束。toolNames 为空表示这一轮给出了回答；reasoning 是这一轮的思考内容（模型返回了才有） */
-  | { type: "model"; round: number; ms: number; usage?: TokenUsage; toolNames: string[]; thinking?: boolean; reasoning?: string }
+  | {
+      type: "model";
+      round: number;
+      ms: number;
+      usage?: TokenUsage;
+      toolNames: string[];
+      thinking?: boolean;
+      reasoning?: string;
+      /** 这一轮要求了必须调工具（见 AgentRequest.requireTool） */
+      requireTool?: boolean;
+    }
   | { type: "tool_start"; id: string; label: string }
   /** error 是交给模型的失败原因 */
   | { type: "tool_end"; id: string; name: string; ok: boolean; ms: number; error?: string }
@@ -44,6 +54,11 @@ export interface AgentRequest {
   now?: () => number;
   /** 这次任务单独打开或关掉思考；不传用模型的配置 */
   thinking?: boolean;
+  /**
+   * 第一轮必须先调工具（模型服务认 tool_choice 时强制，不认时照常由模型决定，回答还会被 review 打回）。
+   * 这一轮不思考，指定了 thinking 也一样：先查什么用不着深想，思考模式下模型服务也不一定认强制调用；第二轮起照常
+   */
+  requireTool?: boolean;
   /**
    * 调过某个工具以后，后面几轮打开思考（没传 thinking 时才看）：比如调过 aiops 的工具就是在排查线上问题，
    * 每拿到一次结果都要想清楚下一步查什么。返回 true 的工具调过一次，这次任务后面每一轮都开着
@@ -85,6 +100,7 @@ export async function runAgent({
   maxToolRounds = MAX_TOOL_ROUNDS,
   now = Date.now,
   thinking,
+  requireTool,
   thinkAfter,
   review,
   steer,
@@ -113,7 +129,8 @@ export async function runAgent({
       }
     }
     const startedAt = now();
-    const think = thinking ?? (investigating ? true : undefined);
+    const force = requireTool === true && round === 0 && !lastRound && specs.length > 0;
+    const think = force ? false : (thinking ?? (investigating ? true : undefined));
     const onDelta = stream ? (soFar: { reasoning: string; text: string }) => onEvent({ type: "delta", round: round + 1, ...soFar }) : undefined;
     let result: ChatResult;
     for (let level = 0; ; ) {
@@ -124,6 +141,7 @@ export async function runAgent({
           tools: specs,
           signal,
           ...(think !== undefined ? { thinking: think } : {}),
+          ...(force ? { requireTool: true } : {}),
           ...(onDelta ? { onDelta } : {}),
         });
         break;
@@ -151,6 +169,7 @@ export async function runAgent({
       toolNames: result.finish === "tool_calls" ? (result.toolCalls ?? []).map((call) => call.name) : [],
       ...(think !== undefined ? { thinking: think } : {}),
       ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+      ...(force ? { requireTool: true } : {}),
     });
     if (result.finish !== "tool_calls" || !result.toolCalls?.length) {
       const redo = !lastRound && !reviewed && result.finish !== "filtered" ? review?.(result.text, usedTools) : undefined;

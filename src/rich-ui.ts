@@ -1,4 +1,4 @@
-import { nextFence } from "./markdown.js";
+import { cellsOf, isTableBody, isTableStart, nextFence } from "./markdown.js";
 import { COMMON_SUFFIX } from "./mcp-result.js";
 
 /**
@@ -680,10 +680,16 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
 
 /** 写成 MiB、GiB 这种按 1024 算的字节单位的数（带千分位的也算：1,531.8 MiB） */
 const BINARY_BYTES = /(?<![\w.,])((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(\s*)([KMGT])i(?=B?(?![A-Za-z]))/g;
+/** 表头里写的按 1024 算的字节单位：「内存 (MiB)」「Memory/GiB」 */
+const BINARY_UNIT = /(?<![A-Za-z])([KMGT])iB?(?![A-Za-z])/;
+/** 只写了一个数的格子（可以加粗）：单位写在表头里 */
+const BARE_NUMBER = /^[*_]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)[*_]*$/;
+/** 行内代码：两头的反引号一样多（``a`b``），可以跨行，不跨空行 */
+const CODE_SPAN = /(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n)[\s\S])*?)(?<!`)\1(?!`)/g;
 
 /** 写成 MiB、GiB，查到的字节数却只有按 1000 换算才对得上的一个数 */
 export interface MislabeledBytes {
-  /** 回答里写的，如「153.2 MiB」 */
+  /** 回答里写的，如「153.2 MiB」；表格里单位写在表头的，也写成这样 */
   readonly written: string;
   /** 对上的那个查到的字节数 */
   readonly raw: number;
@@ -693,40 +699,61 @@ export interface MislabeledBytes {
 
 /**
  * 回答正文、表格里写成 MiB、GiB 的数，PromQL 查回来的字节数按 1000 换算才对得上（按 1024 对不上，别的工具结果里也没有这个数）：
- * 多半是把 MB 标成了 MiB。代码里的不算。不直接改数：模型自己算的平均值、合计可能碰巧和某个字节数按 1000 换算对上，交给模型核对。
+ * 多半是把 MB 标成了 MiB。表头写了单位（「内存 (MiB)」）、格子里只写数的也算。代码里的不算。
+ * 不直接改数：模型自己算的平均值、合计可能碰巧和某个字节数按 1000 换算对上，交给模型核对。
  * 2026-10-13 测试群：2v7gp 的 144,949,248 → 153,182,208 字节写成了「144.9 MiB 跳到 153.2 MiB」，应为 138.2 → 146.1 MiB
  */
 export function mislabeledBytes(text: string, evidence: NumberEvidence): MislabeledBytes[] {
   const found = new Map<string, MislabeledBytes>();
-  // 代码块（``` 和 ~~~ 都算）和行内代码里的是配置、命令示例，不算
-  const prose: string[] = [];
+  const check = (written: string, prefix: string) => {
+    const digits = written.replace(/,/g, "");
+    const power = "KMGT".indexOf(prefix) + 1;
+    const n = Number(digits);
+    const half = writtenHalf(digits);
+    const binary = 1024 ** -power;
+    if (evidence.near("bytes", n, binary, half) !== undefined || evidence.near("any", n, 1, half) !== undefined || evidence.near("any", n, binary, half) !== undefined) {
+      return;
+    }
+    const raw = evidence.near("bytes", n, 1000 ** -power, half);
+    const unit = `${prefix}iB`;
+    const key = `${written} ${unit}`;
+    if (raw !== undefined && !found.has(key)) {
+      // toFixed 只认 0～100 位小数；写得再细也只按 20 位给
+      const decimals = Math.min((digits.split(".")[1] ?? "").length, 20);
+      found.set(key, { written: key, raw, binary: `${(raw * binary).toFixed(decimals)} ${unit}` });
+    }
+  };
+  // 代码块（``` 和 ~~~ 都算）和行内代码里的是配置、命令示例，不算。代码块那几行换成空行，行内代码换成空格（换行留着，表格还按行认）
+  const lines: string[] = [];
   let fence: string | undefined;
   for (const line of halfWidth(text).split("\n")) {
     const next = nextFence(fence, line);
-    if (!fence && !next.marker) {
-      prose.push(line.replace(/`[^`]*`/g, " "));
-    }
+    lines.push(!fence && !next.marker ? line : "");
     fence = next.fence;
   }
-  for (const part of prose) {
-    for (const match of part.matchAll(BINARY_BYTES)) {
-      const [, written, , prefix] = match;
-      const digits = written.replace(/,/g, "");
-      const power = "KMGT".indexOf(prefix) + 1;
-      const n = Number(digits);
-      const half = writtenHalf(digits);
-      const binary = 1024 ** -power;
-      if (evidence.near("bytes", n, binary, half) !== undefined || evidence.near("any", n, 1, half) !== undefined || evidence.near("any", n, binary, half) !== undefined) {
-        continue;
-      }
-      const raw = evidence.near("bytes", n, 1000 ** -power, half);
-      const unit = `${prefix}iB`;
-      const key = `${written} ${unit}`;
-      if (raw !== undefined && !found.has(key)) {
-        // toFixed 只认 0～100 位小数；写得再细也只按 20 位给
-        const decimals = Math.min((digits.split(".")[1] ?? "").length, 20);
-        found.set(key, { written: key, raw, binary: `${(raw * binary).toFixed(decimals)} ${unit}` });
-      }
+  const prose = lines
+    .join("\n")
+    .replace(CODE_SPAN, (span) => span.replace(/[^\n]/g, " "))
+    .split("\n");
+  for (const line of prose) {
+    for (const match of line.matchAll(BINARY_BYTES)) {
+      check(match[1], match[3]);
+    }
+  }
+  // 表头写了单位、格子里只写数的：「| Pod | 内存 (MiB) |」下面的「| 2v7gp | 153.2 |」
+  for (let i = 0; i + 1 < prose.length; i++) {
+    if (!isTableStart(prose[i], prose[i + 1])) {
+      continue;
+    }
+    const units = cellsOf(prose[i]).map((cell) => BINARY_UNIT.exec(cell)?.[1]);
+    for (i += 2; i < prose.length && isTableBody(prose[i]); i++) {
+      cellsOf(prose[i]).forEach((cell, column) => {
+        const prefix = units[column];
+        const bare = prefix ? BARE_NUMBER.exec(cell) : null;
+        if (prefix && bare) {
+          check(bare[1], prefix);
+        }
+      });
     }
   }
   return [...found.values()];
