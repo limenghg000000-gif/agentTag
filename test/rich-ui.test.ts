@@ -106,11 +106,14 @@ test("折线图、柱状图里对不上的点不超过一成：只空掉这几�
   assert.equal(line.segments.length, 2);
   const kept = line.segments[0] as ChartBlock;
   assert.deepEqual(kept.series[0].data, [...data.slice(0, 19), null]);
-  assert.deepEqual(line.segments[1], { kind: "markdown", text: "📊 图「union 内存」里有 1 个点和这次查到的结果对不上，这几个点没画。" });
+  assert.deepEqual(line.segments[1], { kind: "markdown", text: "📊 图「union 内存」里有 1 个点和这次查到的结果对不上，这个点没画。" });
   assert.match(line.dropped[0], /图「union 内存」有 1 个点在查询结果里找不到（如 179.74），只空掉这几个点/);
   const [element] = segmentElements([kept], (text) => [{ md: text }]) as any[];
   assert.equal(element.chart_spec.invalidType, "break");
   assert.deepEqual(element.chart_spec.data.values.at(-1), { x: "21:57", value: null, series: "union" });
+  // 空掉 2 个点时说「这几个点」
+  const two = keepVerified(chart("line", [...data.slice(0, 18), 179.74, 178.74]), evidence);
+  assert.equal((two.segments[1] as { text: string }).text, "📊 图「union 内存」里有 2 个点和这次查到的结果对不上，这几个点没画。");
   // 没空掉点的折线图不加 invalidType
   assert.equal((segmentElements(keepVerified(chart("line", data.slice(0, 19).concat(170)), evidence).segments, (text) => [{ md: text }]) as any[])[0].chart_spec.invalidType, undefined);
 
@@ -148,6 +151,11 @@ test("卡片组件：折线图、多系列柱状图、饼图、数字卡片；�
     () => [],
   ) as any[];
   assert.equal(lineEl.tag, "chart");
+  // 高度固定、宽度跟着卡片：卡片撑满窗口时图不跟着变得很高
+  for (const element of [lineEl, barEl, pieEl]) {
+    assert.equal(element.height, "320px");
+    assert.equal("aspect_ratio" in element, false);
+  }
   assert.equal(lineEl.chart_spec.title.text, "CPU（%）");
   assert.deepEqual(lineEl.chart_spec.data.values, [
     { x: "19:00", value: 41.2, series: "pod-a" },
