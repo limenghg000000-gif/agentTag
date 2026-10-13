@@ -1,4 +1,4 @@
-import { cellsOf, isTableBody, isTableStart, nextFence } from "./markdown.js";
+import { cellsOf, cellTag, isTableBody, isTableStart, type MarkdownTable, nextFence, richCardCell, stripRichTags } from "./markdown.js";
 import { COMMON_SUFFIX } from "./mcp-result.js";
 
 /**
@@ -761,15 +761,15 @@ export function mislabeledBytes(text: string, evidence: NumberEvidence): Mislabe
 const LEVEL_COLOR: Record<NonNullable<KpiItem["level"]>, string> = { danger: "red", warn: "orange", ok: "green" };
 
 /**
- * 卡片里的组件：markdown 段交给 renderMarkdown（转义、限长），图换成图表组件，数字卡片换成一排分栏，
+ * 卡片里的组件：markdown 段交给 renderMarkdown（转义、限长、表格换成表格组件，可以是几个组件），图换成图表组件，数字卡片换成一排分栏，
  * 「接着查」换成按钮放在最后（askValue 给出按钮回传的值；不给时不放按钮）
  */
-export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text: string) => object, askValue?: (question: string) => object): object[] {
+export function segmentElements(segments: AnswerSegment[], renderMarkdown: (text: string) => object[], askValue?: (question: string) => object): object[] {
   const elements: object[] = [];
   const buttons: object[] = [];
   for (const segment of segments) {
     if (segment.kind === "markdown") {
-      elements.push(renderMarkdown(segment.text));
+      elements.push(...renderMarkdown(segment.text));
     } else if (segment.kind === "kpi") {
       elements.push(kpiElement(segment));
     } else if (segment.kind === "chart") {
@@ -823,6 +823,53 @@ function kpiElement({ items }: KpiBlock): object {
       };
     }),
   };
+}
+
+/** 一张卡片最多几张表格组件（飞书的限制），再多的照 Markdown 显示 */
+export const MAX_TABLES = 5;
+/** 表格组件一页几行（飞书最多 10），多的分页 */
+const TABLE_PAGE_SIZE = 10;
+/** 行高随内容变，一格最高这么多（飞书默认 124px，约 5 行字），再长的格子显示不全 */
+const TABLE_ROW_MAX_HEIGHT = "300px";
+
+/**
+ * 回答里的 Markdown 表格换成飞书的表格组件：卡片多宽表格就多宽，长的格子换行显示，不用往右拖；超过 10 行分页，首列冻结（手机上横着划时名字还在）。
+ * 每格按 lark_md 显示（粗体、行内代码、<font> 的颜色，<text_tag> 换成同色的字）；
+ * 整列每格都是一个 <text_tag> 的（状态、风险）画成彩色标签
+ */
+export function tableElement(table: MarkdownTable): object {
+  const tags = table.header.map((_, i) => {
+    const cells = table.rows.map((row) => cellTag(row[i]));
+    return cells.every((tag) => tag !== undefined) ? cells : undefined;
+  });
+  return {
+    tag: "table",
+    page_size: Math.min(TABLE_PAGE_SIZE, table.rows.length),
+    row_height: "auto",
+    row_max_height: TABLE_ROW_MAX_HEIGHT,
+    freeze_first_column: true,
+    header_style: { text_align: "left", text_size: "normal", background_style: "grey", text_color: "default", bold: true, lines: 2 },
+    columns: table.header.map((head, i) => ({
+      name: `c${i}`,
+      display_name: headerText(head),
+      data_type: tags[i] ? "options" : "lark_md",
+      width: "auto",
+      ...(table.align[i] ? { horizontal_align: table.align[i] } : {}),
+    })),
+    rows: table.rows.map((row, r) =>
+      Object.fromEntries(
+        row.map((cell, i) => {
+          const tag = tags[i]?.[r];
+          return [`c${i}`, tag ? [tag] : richCardCell(cell)];
+        }),
+      ),
+    ),
+  };
+}
+
+/** 表头：按纯文字显示，去掉标签和粗体、行内代码的符号；尖括号换成全角（万一按富文本显示也成不了 @）；空的表头飞书不收，放一个空格 */
+function headerText(head: string): string {
+  return stripRichTags(head).replace(/\*\*|__|`/g, "").replace(/</g, "＜").trim() || " ";
 }
 
 function chartElement(chart: ChartBlock): object {

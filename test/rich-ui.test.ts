@@ -12,6 +12,7 @@ import {
   splitAnswer,
   streamingAnswer,
   promqlUnit,
+  tableElement,
   unitFactors,
 } from "../src/rich-ui.js";
 
@@ -107,11 +108,11 @@ test("折线图、柱状图里对不上的点不超过一成：只空掉这几�
   assert.deepEqual(kept.series[0].data, [...data.slice(0, 19), null]);
   assert.deepEqual(line.segments[1], { kind: "markdown", text: "📊 图「union 内存」里有 1 个点和这次查到的结果对不上，这几个点没画。" });
   assert.match(line.dropped[0], /图「union 内存」有 1 个点在查询结果里找不到（如 179.74），只空掉这几个点/);
-  const [element] = segmentElements([kept], (text) => ({ md: text })) as any[];
+  const [element] = segmentElements([kept], (text) => [{ md: text }]) as any[];
   assert.equal(element.chart_spec.invalidType, "break");
   assert.deepEqual(element.chart_spec.data.values.at(-1), { x: "21:57", value: null, series: "union" });
   // 没空掉点的折线图不加 invalidType
-  assert.equal((segmentElements(keepVerified(chart("line", data.slice(0, 19).concat(170)), evidence).segments, (text) => ({ md: text })) as any[])[0].chart_spec.invalidType, undefined);
+  assert.equal((segmentElements(keepVerified(chart("line", data.slice(0, 19).concat(170)), evidence).segments, (text) => [{ md: text }]) as any[])[0].chart_spec.invalidType, undefined);
 
   assert.equal(keepVerified(chart("bar"), evidence).segments[0].kind, "chart");
   // 饼图少一块，比例就变了
@@ -144,7 +145,7 @@ test("卡片组件：折线图、多系列柱状图、饼图、数字卡片；�
   const pie: ChartBlock = { kind: "chart", type: "pie", title: "占比", x: ["a", "b"], series: [{ name: "s", data: [1, 2] }] };
   const [lineEl, barEl, pieEl, kpiEl] = segmentElements(
     [line, bar, pie, { kind: "kpi", items: [{ label: "CPU <最高>", value: "10~20%", level: "danger" }] }],
-    () => ({}),
+    () => [],
   ) as any[];
   assert.equal(lineEl.tag, "chart");
   assert.equal(lineEl.chart_spec.title.text, "CPU（%）");
@@ -335,7 +336,7 @@ test("「接着查」按钮：```actions 里的问题尖括号换成全角、合
   assert.deepEqual(keepVerified(twice, new NumberEvidence([])).segments, [segments[1]]);
 
   // 按钮在最后，前面一行提示；不给回传值时不放按钮
-  const elements = segmentElements([segments[1], segments[0]], (text) => ({ md: text }), (q) => ({ action: "ask", q })) as any[];
+  const elements = segmentElements([segments[1], segments[0]], (text) => [{ md: text }], (q) => ({ action: "ask", q })) as any[];
   assert.deepEqual(elements[0], { md: "结论" });
   assert.equal(elements[1].content, "可以接着查：");
   assert.deepEqual(
@@ -346,7 +347,7 @@ test("「接着查」按钮：```actions 里的问题尖括号换成全角、合
       ["button", "a", { action: "ask", q: "a" }],
     ],
   );
-  assert.deepEqual(segmentElements(segments, (text) => ({ md: text })), [{ md: "结论" }]);
+  assert.deepEqual(segmentElements(segments, (text) => [{ md: text }]), [{ md: "结论" }]);
   assert.equal(segmentsAsText([segments[0], { kind: "actions", questions: ["x", "y"] }]), "结论\n\n可以接着问：「x」「y」");
 });
 
@@ -444,13 +445,13 @@ test("折线图：一条线、点不多时在点上标数；几条线或点多�
   const spec = (series: number, points: number) => {
     const x = Array.from({ length: points }, (_, i) => `t${i}`);
     const chart: ChartBlock = { kind: "chart", type: "line", title: "t", x, series: Array.from({ length: series }, (_, s) => ({ name: `s${s}`, data: x.map(() => 1) })) };
-    return (segmentElements([chart], () => ({})) as any[])[0].chart_spec;
+    return (segmentElements([chart], () => []) as any[])[0].chart_spec;
   };
   assert.deepEqual(spec(1, 12).label, { visible: true });
   assert.deepEqual(spec(1, 13).label, { visible: false });
   assert.deepEqual(spec(3, 7).label, { visible: false });
   const bar: ChartBlock = { kind: "chart", type: "bar", title: "t", x: ["a"], series: [{ name: "s", data: [1] }] };
-  assert.equal((segmentElements([bar], () => ({})) as any[])[0].chart_spec.label, undefined);
+  assert.equal((segmentElements([bar], () => []) as any[])[0].chart_spec.label, undefined);
 });
 
 test("Codex：标题只认末尾括号里的单位，「核心」「秒杀」「百分位」不是单位；resource 几种混着、写正则时按每条序列认；提出来的公共标签也认", () => {
@@ -616,4 +617,16 @@ test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算�
   // 认不出单位的查询（算过的）里的字节数不算：不知道它是不是字节
   const unknown = new NumberEvidence([JSON.stringify({ query: "sum(container_memory_working_set_bytes) / 2", data: { result: [{ metric: {}, value: [1, "153182208"] }] } })]);
   assert.deepEqual(mislabeledBytes("153.2 MiB", unknown), []);
+});
+
+test("表格组件：表头按纯文字显示（去掉标签、粗体、反引号，尖括号换全角，空的放空格），格子里冒充的 @ 转义", () => {
+  const table = tableElement({
+    header: ["**Pod**", "", "<font color='red'>`CPU`</font> <at id=all></at>"],
+    align: [undefined, undefined, "right"],
+    rows: [["`api-1`", "x", "<at id=all></at>"]],
+  }) as any;
+  assert.deepEqual(table.columns.map((c: any) => c.display_name), ["Pod", " ", "CPU ＜at id=all>＜/at>"]);
+  assert.deepEqual(table.rows, [{ c0: "`api-1`", c1: "x", c2: "&lt;at id=all>&lt;/at>" }]);
+  assert.equal(table.columns[2].horizontal_align, "right");
+  assert.equal("horizontal_align" in table.columns[0], false);
 });

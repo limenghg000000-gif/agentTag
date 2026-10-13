@@ -5,6 +5,7 @@ import {
   ASK_ACTION,
   CardUpdater,
   ELEMENT,
+  finalCards,
   formatDuration,
   MAX_CARD_ANSWER_CHARS,
   MAX_CARD_BYTES,
@@ -13,7 +14,7 @@ import {
   renderProgressCard,
   STOP_ACTION,
 } from "../src/progress.js";
-import { splitAnswer } from "../src/rich-ui.js";
+import { MAX_TABLES, splitAnswer } from "../src/rich-ui.js";
 
 const state = (extra: Partial<ProgressState>): ProgressState => ({ phase: "thinking", steps: [], startedAt: 0, ...extra });
 const text = (card: object) => JSON.stringify(card);
@@ -184,6 +185,29 @@ test("CardUpdater 最终状态推送失败时改用简单版本", async () => {
   assert.deepEqual(patched, ["fancy", "plain"]);
 });
 
+test("CardUpdater 最终状态有几张备用卡片时依次试，都失败才记日志", async () => {
+  const patched: string[] = [];
+  const errors: unknown[] = [];
+  const failing = new Set(["fancy", "tables"]);
+  const updater = new CardUpdater(async (card) => {
+    const v = (card as { v: string }).v;
+    patched.push(v);
+    if (failing.has(v)) {
+      throw new Error(v);
+    }
+  }, { error: (...args: unknown[]) => errors.push(args) }, 0);
+
+  assert.equal(await updater.finish({ v: "fancy" }, { v: "tables" }, { v: "plain" }), true);
+  assert.deepEqual(patched, ["fancy", "tables", "plain"]);
+  assert.equal(errors.length, 0);
+
+  const second = new CardUpdater(async (card) => {
+    throw new Error((card as { v: string }).v);
+  }, { error: (...args: unknown[]) => errors.push(args) }, 0);
+  assert.equal(await second.finish({ v: "fancy" }, { v: "tables" }, { v: "plain" }), false);
+  assert.equal(errors.length, 1);
+});
+
 const streaming = { streaming: true };
 
 test("卡片即回答：进行中状态、思考、回答各是一个带 element_id 的组件，生成时要求打开流式模式", () => {
@@ -286,14 +310,98 @@ test("卡片即回答：代码块按 CommonMark 认，```x``` 和缩进 4 格的
   assert.equal(render("~~~\na<b\n~~~\na<b"), "~~~\na<b\n~~~\na&lt;b");
 });
 
-test("卡片即回答：回答里的表格、小标题、<font>、<text_tag> 照样显示，预览去掉标签和标题符号", () => {
+test("卡片即回答：回答里的小标题、<font>、<text_tag> 照样显示，表格换成表格组件，预览去掉标签和标题符号", () => {
   const answer = "# 结论 <text_tag color='red'>高风险</text_tag>\n\n| 服务 | CPU |\n|---|---|\n| union | <font color='red'>92%</font> |\n<at id=all></at>";
   const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any;
+  const [first, table, last] = card.body.elements.slice(-3);
+  assert.equal(first.content, "#### 结论 <text_tag color='red'>高风险</text_tag>");
+  assert.equal(table.tag, "table");
+  assert.deepEqual(table.rows, [{ c0: "union", c1: "<font color='red'>92%</font>" }]);
+  // 表格到 <at 那一行为止（带不带 | 都一样：这一行没有 |，是正文）
+  assert.equal(last.content, "&lt;at id=all>&lt;/at>");
+  assert.match(card.config.summary.content, /^结论 高风险 \| 服务 \| CPU \|/);
+
+  // 照 Markdown 显示时和以前一样是一个组件
+  const markdown = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, { ...streaming, markdownTables: true }) as any;
   assert.equal(
-    card.body.elements.at(-1).content,
+    markdown.body.elements.at(-1).content,
     "#### 结论 <text_tag color='red'>高风险</text_tag>\n\n| 服务 | CPU |\n|---|---|\n| union | <font color='red'>92%</font> |\n&lt;at id=all>&lt;/at>",
   );
-  assert.match(card.config.summary.content, /^结论 高风险 \| 服务 \| CPU \|/);
+  assert.equal(markdown.body.elements.at(-1).element_id, ELEMENT.answer);
+});
+
+test("卡片即回答：表格组件撑满卡片、行高随内容、超过 10 行分页；整列都是 <text_tag> 的画成彩色标签，对齐照 |---:|", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => `| **api-${i}** | ${i % 2 ? "<text_tag color='red'>高风险</text_tag>" : "<text_tag color='green'>正常</text_tag>"} | ${i}% <text_tag color='orange'>注意</text_tag> |`);
+  const answer = ["结论", "| Pod | 状态 | **CPU** <b> |", "|---|:---:|---:|", ...rows, "", "下一步"].join("\n");
+  const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any;
+  const [before, table, after] = card.body.elements.slice(1);
+  assert.deepEqual([before.content, after.content], ["结论", "下一步"]);
+  assert.equal(table.page_size, 10);
+  assert.equal(table.row_height, "auto");
+  assert.equal(table.freeze_first_column, true);
+  assert.deepEqual(
+    table.columns.map((c: any) => [c.name, c.display_name, c.data_type, c.width, c.horizontal_align]),
+    [
+      ["c0", "Pod", "lark_md", "auto", undefined],
+      ["c1", "状态", "options", "auto", "center"],
+      ["c2", "CPU ＜b>", "lark_md", "auto", "right"],
+    ],
+  );
+  assert.equal(table.rows.length, 12);
+  assert.deepEqual(table.rows[0], { c0: "**api-0**", c1: [{ text: "正常", color: "green" }], c2: "0% <font color='orange'>注意</font>" });
+  assert.deepEqual(table.rows[1].c1, [{ text: "高风险", color: "red" }]);
+  // 有一格是空的、不是标签：整列按文字显示，标签换成同色的字
+  const mixed = renderProgressCard(state({ phase: "done", endedAt: 0, answer: "| Pod | 状态 |\n|---|---|\n| a | <text_tag color='red'>高风险</text_tag> |\n| b | |" }), "t", 0, streaming) as any;
+  const mixedTable = mixed.body.elements.at(-1);
+  assert.equal(mixedTable.columns[1].data_type, "lark_md");
+  assert.deepEqual(mixedTable.rows, [{ c0: "a", c1: "<font color='red'>高风险</font>" }, { c0: "b", c1: "" }]);
+  // 一张表 1 行：一页 1 行
+  const small = renderProgressCard(state({ phase: "done", endedAt: 0, answer: "| a |\n|---|\n| 1 |" }), "t", 0, streaming) as any;
+  assert.equal(small.body.elements.at(-1).page_size, 1);
+});
+
+test("卡片即回答：一张卡片最多 5 张表格组件，再多的照 Markdown；回答太长只放开头时不换", () => {
+  const tables = Array.from({ length: MAX_TABLES + 1 }, (_, i) => `| 第${i}张 |\n|---|\n| ${i} |`).join("\n\n");
+  const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer: tables }), "t", 0, streaming) as any;
+  assert.deepEqual(card.body.elements.slice(1).map((e: any) => e.tag), [...Array(MAX_TABLES).fill("table"), "markdown"]);
+  assert.equal(card.body.elements.at(-1).content, `| 第${MAX_TABLES}张 |\n|---|\n| ${MAX_TABLES} |`);
+
+  const long = `| a |\n|---|\n| 1 |\n\n${"很长".repeat(MAX_CARD_ANSWER_CHARS)}`;
+  const clipped = renderProgressCard(state({ phase: "done", endedAt: 0, answer: long }), "t", 0, streaming) as any;
+  assert.doesNotMatch(text(clipped), /"tag":"table"/);
+});
+
+test("卡片即回答：有图、数字卡片时 Markdown 段里的表格也换成表格组件，几段加起来最多 5 张", () => {
+  const table = (i: number) => `| 第${i}张 |\n|---|\n| ${i} |`;
+  const kpi = '```kpi\n[{"label":"CPU","value":"2%"}]\n```';
+  const answer = [table(0), table(1), table(2), kpi, table(3), table(4), table(5)].join("\n\n");
+  const segments = splitAnswer(answer).segments;
+  const card = renderProgressCard(state({ phase: "done", endedAt: 0, answer, answerSegments: segments }), "t", 0, streaming) as any;
+  assert.deepEqual(card.body.elements.slice(1).map((e: any) => e.tag), ["table", "table", "table", "column_set", "table", "table", "markdown"]);
+});
+
+test("卡片即回答：结束时先推带表格组件的，推不上去改推表格照 Markdown 的，再不行推简单版本；没有表格组件时少一张", () => {
+  const answer = "结论\n\n| a |\n|---|\n| 1 |";
+  const [full, markdown, plain, ...rest] = finalCards(state({ phase: "done", endedAt: 0, answer }), "t", 0, streaming) as any[];
+  assert.equal(rest.length, 0);
+  assert.equal(full.body.elements.at(-1).tag, "table");
+  assert.equal(markdown.body.elements.at(-1).content, answer);
+  assert.deepEqual(plain, renderPlainProgressCard(state({ phase: "done", endedAt: 0, answer }), 0, streaming));
+  assert.equal(finalCards(state({ phase: "done", endedAt: 0, answer: "结论" }), "t", 0, streaming).length, 2);
+  // 不是卡片即回答时卡片里没有回答，也是两张
+  assert.equal(finalCards(state({ phase: "done", endedAt: 0, answer }), "t", 0).length, 2);
+});
+
+test("卡片即回答：表格组件太占地方、卡片放不下时先把表格照 Markdown 显示，图还在", () => {
+  const rows = Array.from({ length: 20 }, (_, i) => `| ${"服务".repeat(6)}-${i} | ${i} | ${i} | ${i} | ${i} | ${i} |`).join("\n");
+  const table = `| 服务 | 一 | 二 | 三 | 四 | 五 |\n|---|---|---|---|---|---|\n${rows}`;
+  const chart = JSON.stringify({ type: "line", title: "大图", x: Array.from({ length: 25 }, (_, i) => `第${i}个时间点`.padEnd(38, "长")), series: Array.from({ length: 2 }, (_, s) => ({ name: `系列${s}`.padEnd(38, "名"), data: Array(25).fill(123456.789) })) });
+  const answer = [table, table, table, table, `\`\`\`chart\n${chart}\n\`\`\``].join("\n\n");
+  const done = state({ phase: "done", endedAt: 0, answer, answerSegments: splitAnswer(answer).segments });
+  const card = renderProgressCard(done, "t", 0, streaming) as any;
+  assert.ok(Buffer.byteLength(text(card)) <= MAX_CARD_BYTES);
+  assert.deepEqual(card.body.elements.slice(1).map((e: any) => e.tag), ["markdown", "chart"]);
+  assert.deepEqual(card, renderProgressCard(done, "t", 0, { ...streaming, markdownTables: true }));
 });
 
 test("卡片即回答：生成时图的代码块显示成一行说明；结束后按段画成图和数字卡片；放不下、简单版本时换成文字", () => {

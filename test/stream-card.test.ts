@@ -148,6 +148,15 @@ test("全量更新失败时下一次照样全量推最新的；结束时最终�
 
   const { api: api2 } = fakeKit((call) => call.op === "update" && call.texts.answer === "最终");
   assert.equal(await new StreamingCard(api2, "card_2", card(false, {}), quiet, 0, 0).finish(card(false, { answer: "最终" }), card(false, { answer: "简单" })), true);
+
+  // 几张备用卡片依次试：带表格组件的、表格照 Markdown 的、简单版本
+  const { api: api3, calls: calls3 } = fakeKit((call) => call.op === "update" && call.texts.answer === "表格组件");
+  const third = new StreamingCard(api3, "card_3", card(false, {}), quiet, 0, 0);
+  assert.equal(await third.finish(card(false, { answer: "表格组件" }), card(false, { answer: "Markdown 表格" }), card(false, { answer: "简单" })), true);
+  assert.deepEqual(
+    calls3.map((call) => call.op === "update" && call.texts.answer),
+    ["表格组件", "Markdown 表格"],
+  );
 });
 
 test("全量更新至少隔 fullIntervalMs：等的时候来了新的推最新的；等的时候结束了就不推旧的，直接推最终卡片", async () => {

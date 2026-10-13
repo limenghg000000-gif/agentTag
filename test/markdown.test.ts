@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { richCardLine, splitMarkdown, stripRichTags, toPostMarkdown } from "../src/markdown.js";
+import { cellTag, richCardCell, richCardLine, splitMarkdown, splitTables, stripRichTags, toPostMarkdown } from "../src/markdown.js";
 
 test("短文本原样返回", () => {
   assert.deepEqual(splitMarkdown("你好", 100), ["你好"]);
@@ -135,4 +135,53 @@ test("改成普通消息：行内代码里讲标签写法的例子原样留着�
   // 没有收尾的反引号不算代码
   assert.equal(toPostMarkdown("``a <font color='red'>x</font>`"), "``a x`");
   assert.equal(toPostMarkdown("| 写法 | 效果 |\n|---|---|\n| `<font color='red'>x</font>` | <font color='red'>x</font> |"), "- **`<font color='red'>x</font>`**：效果 x");
+});
+
+test("拆出表格：代码块外的表格单独拿出来，前后的文字去掉空行；对齐按 |:---:| 认，格数按表头补齐、多的不要", () => {
+  const text = ["结论", "", "| Pod | CPU | 内存 |", "|:---|:---:|---:|", "| api-1 | 92% |", "| api-2 \\| x | 40% | 1 | 多的 |", "", "下一步"].join("\n");
+  assert.deepEqual(splitTables(text, 5), [
+    { kind: "text", text: "结论" },
+    {
+      kind: "table",
+      table: {
+        header: ["Pod", "CPU", "内存"],
+        align: ["left", "center", "right"],
+        rows: [
+          ["api-1", "92%", ""],
+          ["api-2 | x", "40%", "1"],
+        ],
+      },
+    },
+    { kind: "text", text: "下一步" },
+  ]);
+  // 没写冒号的列不定对齐；两边不写 | 的也算
+  assert.deepEqual(splitTables("a | b\n--- | ---\nx | y", 5), [{ kind: "table", table: { header: ["a", "b"], align: [undefined, undefined], rows: [["x", "y"]] } }]);
+});
+
+test("拆出表格：代码块里的、只有表头的不拆；最多拆 max 张，后面的留在文字里", () => {
+  const fenced = "```\n| a | b |\n|---|---|\n| x | y |\n```";
+  assert.deepEqual(splitTables(fenced, 5), [{ kind: "text", text: fenced }]);
+  assert.deepEqual(splitTables("| a | b |\n|---|---|\n\n说明", 5), [{ kind: "text", text: "| a | b |\n|---|---|\n\n说明" }]);
+  const two = "| a |\n|---|\n| 1 |\n\n| b |\n|---|\n| 2 |";
+  const parts = splitTables(two, 1);
+  assert.deepEqual(parts.map((part) => part.kind), ["table", "text"]);
+  assert.deepEqual(parts[1], { kind: "text", text: "| b |\n|---|\n| 2 |" });
+  assert.deepEqual(splitTables(two, 0), [{ kind: "text", text: two }]);
+  assert.deepEqual(splitTables("", 5), []);
+});
+
+test("表格的格子：尖括号转义，名单里的 <font> 放过，<text_tag> 换成同色的字（灰色标签换成 grey）", () => {
+  assert.equal(richCardCell("<font color='red'>92%</font> <at id=all></at>"), "<font color='red'>92%</font> &lt;at id=all>&lt;/at>");
+  assert.equal(richCardCell("<text_tag color='red'>高风险</text_tag> 内存"), "<font color='red'>高风险</font> 内存");
+  assert.equal(richCardCell('<text_tag color="neutral">未知</text_tag>'), "<font color='grey'>未知</font>");
+  assert.equal(richCardCell("<font color='pink'>x</font>"), "&lt;font color='pink'>x&lt;/font>");
+  assert.equal(richCardCell("**api-1** `a<b`"), "**api-1** `a&lt;b`");
+});
+
+test("表格的格子：只有一个 <text_tag> 时取出字和颜色", () => {
+  assert.deepEqual(cellTag(" <text_tag color='green'>正常</text_tag> "), { text: "正常", color: "green" });
+  assert.deepEqual(cellTag("<text_tag color='grey'>未知</text_tag>"), { text: "未知", color: "neutral" });
+  for (const cell of ["<text_tag color='red'>高</text_tag> 92%", "<text_tag color='pink'>x</text_tag>", "<text_tag color='red'> </text_tag>", "<font color='red'>高</font>", "正常", ""]) {
+    assert.equal(cellTag(cell), undefined, cell);
+  }
 });
