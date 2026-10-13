@@ -2845,7 +2845,7 @@ test("草稿很长、同步到 aiops 没做成后表格里又改过：卡片上�
       return JSON.stringify({ saved: true, id: 31 });
     },
   });
-  const long = { ...code8, question: "关".repeat(1500), conclusion: "结".repeat(1500), handling: "处".repeat(1500), basis: "查".repeat(1500) };
+  const long = { ...code8, question: "关".repeat(1200), conclusion: "结".repeat(1200), handling: "处".repeat(1200), basis: "查".repeat(1200) };
   await tool("knowledge_propose").run(long, { signal });
   const card = (sent[0].input as { card: any }).card;
   assert.ok(cardBytes(card) > MAX_CARD_BYTES / 2, "两份放不下");
@@ -2853,7 +2853,7 @@ test("草稿很长、同步到 aiops 没做成后表格里又改过：卡片上�
   await desk.idle();
   assert.match(cardText(lastCard()), /没能同步到 aiops 经验库/);
 
-  const edited = `改过的结论：${"新".repeat(1490)}`;
+  const edited = `改过的结论：${"新".repeat(1190)}`;
   backend.entries[0].conclusion = edited;
   down = false;
   await desk.handleCardAction(click(lastCard(), "save"));
@@ -2868,6 +2868,76 @@ test("草稿很长、同步到 aiops 没做成后表格里又改过：卡片上�
   await desk.idle();
   assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 2);
   assert.equal(lastCard().header.title.content, "已存进经验库");
+});
+
+test("没做完时表格里改得太长、卡片上列不下：不列、不同步也不归档旧的，请人在表格里改短；改短了照常列出来核对", async () => {
+  const huge = (row: KnowledgeEntry) => {
+    row.question = "关".repeat(2000);
+    row.conclusion = "结".repeat(2000);
+    row.handling = "处".repeat(2000);
+    row.basis = "查".repeat(2000);
+  };
+
+  // 同步到 aiops 没做成后改的
+  let down = true;
+  const sync = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+  });
+  await sync.tool("knowledge_propose").run(code8, { signal });
+  await sync.desk.handleCardAction(sync.click((sync.sent[0].input as { card: any }).card, "save"));
+  await sync.desk.idle();
+  down = false;
+  huge(sync.backend.entries[0]);
+  await sync.desk.handleCardAction(sync.click(sync.lastCard(), "save"));
+  await sync.desk.idle();
+  let review = sync.lastCard();
+  assert.ok(cardBytes(review) <= MAX_CARD_BYTES);
+  assert.match(cardText(review), /经验 K1 在表格里改过，改过的内容太长，卡片上列不下（飞书卡片有大小上限），没有同步到 aiops 经验库。请在表格里改短一些后再点「再试一次」/);
+  assert.doesNotMatch(cardText(review), /表格里现在的内容/);
+  assert.equal(sync.calls.filter((call) => call.tool === "save_lesson").length, 1, "改过的没人确认，不同步");
+
+  sync.backend.entries[0].conclusion = "改短了的结论";
+  sync.backend.entries[0].question = code8.question;
+  sync.backend.entries[0].handling = undefined;
+  sync.backend.entries[0].basis = undefined;
+  await sync.desk.handleCardAction(sync.click(review, "save"));
+  await sync.desk.idle();
+  review = sync.lastCard();
+  assert.match(cardText(review), /表格里现在的内容.*改短了的结论/);
+  await sync.desk.handleCardAction(sync.click(review, "save"));
+  await sync.desk.idle();
+  assert.equal(sync.calls.filter((call) => call.tool === "save_lesson").length, 2);
+  assert.equal(sync.lastCard().header.title.content, "已存进经验库");
+
+  // 取代旧经验、归档旧的没做成后改的
+  const swap = deskSetup({ aiops: false });
+  await swap.base.save(normalizeDraft(dau));
+  await swap.tool("knowledge_propose").run({ ...dau, title: "日活的口径（改过）", replaces: "K1" }, { signal });
+  const update = swap.backend.update.bind(swap.backend);
+  let limited = true;
+  swap.backend.update = async (row, changes) => {
+    if (row.id === "K1" && limited) {
+      throw new KnowledgeError("飞书接口限流");
+    }
+    return update(row, changes);
+  };
+  await swap.desk.handleCardAction(swap.click((swap.sent[0].input as { card: any }).card, "save"));
+  await swap.desk.idle();
+  limited = false;
+  huge(swap.backend.entries[1]);
+  await swap.desk.handleCardAction(swap.click(swap.lastCard(), "save"));
+  await swap.desk.idle();
+  review = swap.lastCard();
+  assert.ok(cardBytes(review) <= MAX_CARD_BYTES);
+  assert.match(cardText(review), /新的经验 K2 在表格里改过，改过的内容太长，卡片上列不下（飞书卡片有大小上限），旧的经验 K1 先没归档/);
+  assert.doesNotMatch(cardText(review), /表格里现在的内容/);
+  assert.equal(swap.backend.entries[0].status, "active");
+  assert.match(cardText(review), /"op":"save"/, "还能点再试一次");
 });
 
 test("归档 aiops 经验：点归档时重新取一遍，卡片发出后在 aiops 里改过的不归档、卡片作废；没改过的照常归档，已经归档了的算做完", async () => {

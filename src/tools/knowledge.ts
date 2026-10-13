@@ -63,6 +63,11 @@ const SYNC_ROUNDS = 2;
 const CARD_LESSON_FIELD_CHARS = 1500;
 /** 确认卡片超过飞书的大小上限时，上面列的经验每项截到多少字，依次试到放得下（全文在表格、aiops 里） */
 const CARD_SHRINK_CHARS = [800, 300, 100];
+/**
+ * 一条经验在卡片上全列出来最多占多大：等着点「保存」的草稿、要点「再试一次」核对的表格里现在的内容都不截，
+ * 剩下的留给截短后的草稿、没做成的和按钮。起草时就按它查，存得进去的改一点再列出来核对也放得下
+ */
+const DRAFT_CARD_BYTES = Math.floor((MAX_CARD_BYTES * 2) / 3);
 
 /** 这次任务的信息 */
 export interface KnowledgeTaskContext {
@@ -840,6 +845,11 @@ export class KnowledgeDesk {
     if (sameContent(current, proposal.approved?.draft ?? proposal.draft)) {
       return current;
     }
+    if (!draftFits(current)) {
+      proposal.reconfirm = undefined;
+      out.unfinished.push(`经验 ${entry.id} 在表格里改过，改过的内容太长，卡片上列不下（飞书卡片有大小上限），没有同步到 aiops 经验库。请在表格里改短一些后再点「再试一次」`);
+      return undefined;
+    }
     proposal.reconfirm = current;
     out.unfinished.push(
       `经验 ${entry.id} 在表格里改过，和确认的内容不一样，改过的没有同步到 aiops 经验库（告警自动排查会引用，要写权限名单里的人确认）。卡片上列出了表格里现在的内容，核对后点「再试一次」就按它同步`,
@@ -1022,6 +1032,11 @@ export class KnowledgeDesk {
         return false;
       }
       if (!sameContent(edited, proposal.approved?.draft ?? proposal.draft)) {
+        if (!draftFits(edited)) {
+          proposal.reconfirm = undefined;
+          out.unfinished.push(`新的经验 ${current.id} 在表格里改过，改过的内容太长，卡片上列不下（飞书卡片有大小上限），旧的经验 ${oldId} 先没归档。请在表格里改短一些后再点「再试一次」`);
+          return false;
+        }
         proposal.reconfirm = edited;
         out.unfinished.push(
           `新的经验 ${current.id} 在表格里改过，和确认的内容不一样，旧的经验 ${oldId} 先没归档（改过的也取代它，要写权限名单里的人确认）。卡片上列出了表格里现在的内容，核对后点「再试一次」`,
@@ -1223,8 +1238,8 @@ export class KnowledgeDesk {
     this.sweep();
     // 卡片太大飞书不收：要保存的草稿不截（点「保存」的人要看到全文），让模型写短了再起草
     const card = renderProposalCard(proposal);
-    if (!cardFits(card)) {
-      throw new KnowledgeError(tooBigNote(proposal, card));
+    if (!cardFits(card) || (proposal.kind === "save" && !draftFits(proposal.draft))) {
+      throw new KnowledgeError(tooBigNote(proposal));
     }
     const { messageId } = await this.options.send(ctx.chatId, { card }, { replyTo: ctx.messageId, replyInThread: true });
     proposal.cardMessageId = messageId;
@@ -1326,7 +1341,7 @@ const HEADERS: Record<ProposalState, { save: string; archive: string; template: 
  * 确认卡片（飞书卡片 JSON 2.0）：草稿全文、说明和按钮；处理完以后去掉按钮，写上结果。
  * 草稿、表格、aiops、归档原因、发起人名字都是别处来的，写进 markdown 前转义尖括号（escapeCardMarkdown），卡片自己的格式不转。
  * 超过飞书卡片的大小上限时，上面列的经验每项截短：要归档的（全文在表格、aiops 里）、已经处理过的草稿（加了结果、表格里现在的内容）。
- * 等着点「保存」的草稿不截，起草时就按卡片大小查过（publish）；表格里现在的内容要点「再试一次」确认，也不截
+ * 等着点「保存」的草稿不截，起草时就按大小查过（publish、draftFits）；表格里现在的内容要点「再试一次」确认，也不截，太长的不列
  */
 export function renderProposalCard(proposal: Proposal): object {
   const card = proposalCard(proposal);
@@ -1347,13 +1362,13 @@ function cardFits(card: object): boolean {
   return Buffer.byteLength(JSON.stringify(card)) <= MAX_CARD_BYTES;
 }
 
-/** 草稿太长、确认卡片放不下时告诉模型删到多少字：按这张卡片每个字平均占多大估（中文一个字比英文、数字占得多） */
-function tooBigNote(proposal: Proposal, card: object): string {
+/** 草稿太长、确认卡片放不下时告诉模型删到多少字：按这条草稿每个字平均占多大估（中文一个字比英文、数字占得多） */
+function tooBigNote(proposal: Proposal): string {
   if (proposal.kind !== "save") {
     return "要归档的经验太长，确认卡片放不下，请在表格或 aiops 里手动归档";
   }
   const chars = [proposal.draft.title, ...fieldLines(proposal.draft).map(([, value]) => value)].join("").length;
-  const target = Math.floor((chars * MAX_CARD_BYTES * 0.9) / Buffer.byteLength(JSON.stringify(card)) / 100) * 100;
+  const target = Math.floor((chars * DRAFT_CARD_BYTES * 0.9) / draftBytes(proposal.draft) / 100) * 100;
   return `草稿太长，确认卡片放不下（飞书卡片有大小上限）：现在各项合计 ${chars} 字，请写得更精炼（排查过程只留能定位到原因的几步），合计 ${target} 字以内再起草`;
 }
 
@@ -1446,12 +1461,11 @@ function proposalCard(proposal: Proposal, cap?: number): object {
   }
   const reconfirm = proposal.kind === "save" && proposal.state === "partial" ? proposal.reconfirm : undefined;
   if (reconfirm && proposal.kind === "save") {
-    const lines: [string, string][] = [["类别", KNOWLEDGE_CATEGORIES[reconfirm.category]], ["标题", reconfirm.title], ...fieldLines(reconfirm)];
     elements.push({
       tag: "markdown",
       content: [
         `**表格里现在的内容**（和确认的不一样；点「再试一次」就按下面的${[proposal.syncAiops ? "同步到 aiops" : "", proposal.replaces ? "取代旧经验" : ""].filter(Boolean).join("、")}，不同意的话在表格里改回来或者点「不用了」）：`,
-        fieldsMarkdown(lines),
+        draftMarkdown(reconfirm),
       ].join("\n"),
     });
   }
@@ -1476,6 +1490,23 @@ function proposalCard(proposal: Proposal, cap?: number): object {
     header: { title: { tag: "plain_text", content: title }, template: header.template },
     body: { elements },
   };
+}
+
+/** 一条经验在卡片上全列出来 */
+function draftMarkdown(draft: KnowledgeDraft): string {
+  return fieldsMarkdown([["类别", KNOWLEDGE_CATEGORIES[draft.category]], ["标题", draft.title], ...fieldLines(draft)]);
+}
+
+function draftBytes(draft: KnowledgeDraft): number {
+  return Buffer.byteLength(JSON.stringify(draftMarkdown(draft)));
+}
+
+/**
+ * 这条经验全列出来放得进卡片（DRAFT_CARD_BYTES）。起草的放不下让模型写短；表格里改过的放不下就不列、不让确认，
+ * 请人在表格里改短（截短了列，点「再试一次」的人就没看到全文）
+ */
+function draftFits(draft: KnowledgeDraft): boolean {
+  return draftBytes(draft) <= DRAFT_CARD_BYTES;
 }
 
 /** 卡片上一项一行：「**名字**：内容」，内容转义 */
