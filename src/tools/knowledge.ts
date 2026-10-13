@@ -365,7 +365,7 @@ export class KnowledgeDesk {
         const entry = await raceAbort(base.get(String(args.id ?? "")), signal);
         if (!entry) {
           // 模型写的编号会写进日志（工具失败时记下原因）：像有密钥、个人信息的不原样带上
-          throw new KnowledgeError(`团队经验库里没有 ${preview(args.id)}`);
+          throw new KnowledgeError(`团队经验库里没有 ${preview(String(args.id ?? ""))}`);
         }
         if (!usable(entry)) {
           throw new KnowledgeError(unusableNote(entry));
