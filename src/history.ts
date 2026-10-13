@@ -100,11 +100,14 @@ export class ThreadContextLoader {
     };
   }
 
-  /** 记下一轮问答，读不到飞书话题时用 */
-  remember(msg: NormalizedMessage, question: string, answer: string): void {
+  /** 记下一轮问答，读不到飞书话题时用。questionFull 是提问截短前的全文（图片文字截短了才和 question 不一样） */
+  remember(msg: NormalizedMessage, question: string, answer: string, questionFull?: string): void {
     const key = threadKeyOf(msg);
     const turns = this.local.get(key) ?? [];
-    turns.push({ role: "user", content: question }, { role: "assistant", content: answer });
+    turns.push(
+      { role: "user", content: question, ...(questionFull !== undefined && questionFull !== question ? { full: questionFull } : {}) },
+      { role: "assistant", content: answer },
+    );
     // 只保留最近的若干轮，Map 按插入顺序，删掉最早的话题
     this.local.delete(key);
     this.local.set(key, turns.slice(-40));
@@ -202,17 +205,18 @@ export function unlabelUserMessage(content: string): string {
  * 机器人连续发的几条（长回答被拆开）合成一条。超出字数上限时省略较早的消息，但保留话题第一条。
  */
 export function toChatMessages(messages: ThreadMessage[]): ChatMessage[] {
-  const rendered = messages.map((m) => ({
-    fromBot: m.fromBot,
-    content: clip(m.fromBot ? m.content : labelUserMessage(m.senderName, m.content)),
-  }));
+  const rendered = messages.map((m) => {
+    const whole = m.fromBot ? m.content : labelUserMessage(m.senderName, m.content);
+    const content = clip(whole);
+    return { fromBot: m.fromBot, content, ...(!m.fromBot && content !== whole ? { full: whole } : {}) };
+  });
 
   let total = 0;
   let start = rendered.length;
   while (start > 0 && total + rendered[start - 1].content.length <= MAX_HISTORY_CHARS) {
     total += rendered[--start].content.length;
   }
-  let kept = rendered.slice(start);
+  let kept: { fromBot: boolean; content: string; full?: string }[] = rendered.slice(start);
   if (start > 0) {
     const omitted = start - 1;
     kept = [
@@ -228,7 +232,7 @@ export function toChatMessages(messages: ThreadMessage[]): ChatMessage[] {
     if (m.fromBot && last?.role === "assistant") {
       last.content += `\n${m.content}`;
     } else {
-      result.push(m.fromBot ? { role: "assistant", content: m.content } : { role: "user", content: m.content });
+      result.push(m.fromBot ? { role: "assistant", content: m.content } : { role: "user", content: m.content, ...(m.full !== undefined ? { full: m.full } : {}) });
     }
   }
   return result;

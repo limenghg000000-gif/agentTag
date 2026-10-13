@@ -81,7 +81,8 @@ function docRequested(question: string, history: readonly ChatMessage[]): boolea
 
 export interface ThreadContextSource {
   load(msg: NormalizedMessage): Promise<ThreadContext>;
-  remember(msg: NormalizedMessage, question: string, answer: string): void;
+  /** questionFull：提问截短前的全文（和 question 一样时可以不给） */
+  remember(msg: NormalizedMessage, question: string, answer: string, questionFull?: string): void;
 }
 
 /** 按任务创建工具时用得上的信息 */
@@ -301,7 +302,16 @@ async function runTask(
     const images = await readImages(deps, msg, context, task.signal, state, () => card?.update(render()));
     const known = new Set([...imageKeysOf(msg), ...(context.images ?? []).map((ref) => ref.imageKey)]);
     const asked = inlineImages(question, images, known);
-    const history = context.history.map((m) => (m.role === "user" ? { ...m, content: inlineImages(m.content, images, known) } : m));
+    // 截短前的全文（图片文字不截、上文的长消息用原文）只拿来在查经验前认密钥，不给模型
+    const askedFull = inlineImages(question, images, known, true);
+    const history = context.history.map((m): ChatMessage => {
+      if (m.role !== "user") {
+        return m;
+      }
+      const content = inlineImages(m.content, images, known);
+      const full = inlineImages(m.full ?? m.content, images, known, true);
+      return { role: "user", content, ...(full !== content ? { full } : {}) };
+    });
     const memory = await loadGroupMemory(deps, msg, context.askerName);
     memoryCount = memory?.count;
     const taskContext: TaskToolContext = {
@@ -311,7 +321,7 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    const knowledge = await lookupKnowledge(deps, taskContext, asked, history, task.signal, state, () => card?.update(render()));
+    const knowledge = await lookupKnowledge(deps, taskContext, { text: asked, full: askedFull }, history, task.signal, state, () => card?.update(render()));
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
@@ -567,7 +577,7 @@ async function runTask(
     // 回答里的图和数字卡片：数都要在这次查到的结果里找得到，对不上的不画；记下来的也是核对过的（对不上的数后面的提问不能再看到）
     segments = verifiedSegments(answer, evidence, logger, msg.messageId, streaming);
     const verified = segmentsAsText(segments);
-    deps.context.remember(msg, prompt, verified);
+    deps.context.remember(msg, prompt, verified, labelUserMessage(context.askerName, askedFull || "（@ 了你，没有写别的内容）"));
     // 被拦下、被审核拦下的回答里没有结论，不记
     if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
       await rememberThread(deps, msg, asked, verified, context.askerName);
@@ -731,19 +741,22 @@ async function readImages(
  * 只追问一句「怎么修？」时，上一轮给的错误码、服务名也能带上。
  * 上文里每句话前面标的发言人去掉：名字对查经验没用，也不该发给 aiops、记进它的调用日志
  */
-function lookupQuery(asked: string, history: readonly ChatMessage[]): string {
-  const asks = history.flatMap((m) => (m.role === "user" ? [unlabelUserMessage(m.content)] : []));
-  if (asks.length === 0) {
-    return asked;
+function lookupQuery(asked: { text: string; full: string }, history: readonly ChatMessage[]): string {
+  const users = history.flatMap((m) => (m.role === "user" ? [m] : []));
+  const asks = users.map((m) => unlabelUserMessage(m.content));
+  // 截短前先看每轮的全文：密钥、手机号截在一半（<password>… 的结尾截掉了）就认不出来了，会发到 aiops；
+  // 上文的长消息、长的图片文字早就截短了，截掉的后半段可能正是认出前面是密钥的那部分（data 在前、kind: Secret 在后的 Secret）。
+  // 有的话用全文，交给经验库认出来：有密钥的不查 aiops，手机号、身份证号打码再查
+  const fulls = users.map((m) => unlabelUserMessage(m.full ?? m.content));
+  const whole = [asked.full, ...fulls.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse(), ...fulls.slice(0, 1)];
+  if (whole.some((turn) => findSensitive(turn) !== undefined)) {
+    return [...new Set(whole)].join("\n");
   }
-  // 截短前先看整轮：密钥、手机号截在一半（<password>… 的结尾截掉了）就认不出来了，会发到 aiops。
-  // 有的话整轮不截，交给经验库认出来：有密钥的不查 aiops，手机号、身份证号打码再查
-  const turns = [asked, ...asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse(), asks[0]];
-  if (turns.some((turn) => findSensitive(turn) !== undefined)) {
-    return [...new Set(turns)].join("\n");
+  if (asks.length === 0) {
+    return asked.text;
   }
   const first = asks[0].slice(0, LOOKUP_TURN_CHARS);
-  const parts = [asked.slice(0, LOOKUP_QUERY_CHARS - first.length - 1)];
+  const parts = [asked.text.slice(0, LOOKUP_QUERY_CHARS - first.length - 1)];
   let used = parts[0].length + 1 + first.length;
   for (const turn of asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse()) {
     const text = turn.slice(0, LOOKUP_TURN_CHARS);
@@ -763,7 +776,7 @@ function lookupQuery(asked: string, history: readonly ChatMessage[]): string {
 async function lookupKnowledge(
   deps: BotDeps,
   task: TaskToolContext,
-  asked: string,
+  asked: { text: string; full: string },
   history: readonly ChatMessage[],
   signal: AbortSignal,
   state: ProgressState,

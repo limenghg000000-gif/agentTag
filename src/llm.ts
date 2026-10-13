@@ -8,7 +8,8 @@ export interface ToolCall {
 }
 
 export type ChatMessage =
-  | { role: "user"; content: string }
+  /** full：截短前的全文（截短了才有），只给程序自己核对用（查经验前认密钥），不发给模型 */
+  | { role: "user"; content: string; full?: string }
   | { role: "assistant"; content: string; toolCalls?: ToolCall[] }
   | { role: "tool"; toolCallId: string; content: string };
 

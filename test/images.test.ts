@@ -42,6 +42,18 @@ test("把图片标记换成识别出的文字，没识别出来的换成「没�
   assert.equal(inlineImages(readme, new Map(), known), readme);
 });
 
+test("识别出的文字原样返回；放进提问时太长的截到 4000 字给模型看，full 时不截（查经验前用全文认密钥）", async () => {
+  const long = `开头${"字".repeat(5000)}结尾`;
+  const { reader } = setup({ describe: async () => long });
+  const results = await reader.read([{ messageId: "om_1", imageKey: "img_a" }]);
+  assert.equal(results.get("img_a"), long);
+  const known = new Set(["img_a"]);
+  const clipped = inlineImages("![image](img_a)", results, known);
+  assert.match(clipped, /\n开头字+\n（图片文字太长，后面省略）\n\[图片内容结束\]\n$/);
+  assert.doesNotMatch(clipped, /结尾/);
+  assert.ok(inlineImages("![image](img_a)", results, known, true).includes(`\n${long}\n[图片内容结束]`));
+});
+
 test("挑图片：提问里的在前，再从新到旧挑上文里还看得到的，同一张只挑一次，最多 4 张", () => {
   const asked = [{ messageId: "om_q", imageKey: "img_q" }];
   const context = [

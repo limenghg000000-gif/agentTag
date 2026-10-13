@@ -583,6 +583,49 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   assert.equal(lines.length, 3);
 });
 
+test("上文里截短过的长消息、太长的图片文字：查经验库前用截短前的全文认密钥，后半段才看得出是 Secret 的也不发给 aiops", async () => {
+  const base64 = (text: string) => Buffer.from(text).toString("base64");
+  // kubectl 输出的键按字母排：data 在 kind 前面，证书长时 kind: Secret 在 6000 字以后
+  const manifest = [
+    "apiVersion: v1",
+    "data:",
+    `  db: ${base64(["S3cr3t", "P@ss!"].join(""))}`,
+    `  ca.crt: ${base64("not a secret, just a long public certificate body ".repeat(120))}`,
+    "kind: Secret",
+    "metadata:",
+    "  name: app",
+  ].join("\n");
+  const clipped = `${manifest.slice(0, 6000)}…（后面省略）`;
+  assert.ok(manifest.indexOf("kind: Secret") > 6000);
+  assert.ok(!containsSecret(clipped) && !containsSecret(manifest.slice(0, 200)), "只看截短的认不出来");
+  assert.ok(containsSecret(manifest));
+
+  const queries: string[] = [];
+  const knowledge = {
+    async lookup(query: string) {
+      queries.push(query);
+      return { text: "", ids: [] };
+    },
+    tools: () => [],
+  };
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history: ChatMessage[] = [
+    { role: "user", content: `[张三] ${clipped}`, full: `[张三] ${manifest}` },
+    { role: "assistant", content: "收到" },
+  ];
+  await setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source }).handle(message("怎么修？"));
+  assert.ok(containsSecret(queries[0]), "经验库认得出有密钥，不会查 aiops");
+  assert.equal(requests[0].messages[0].content, `[张三] ${clipped}`, "模型看到的还是截短的");
+
+  // 提问里截图的文字太长：给模型看的截到 4000 字，查经验库前用全文认
+  const { handle } = setup({ model, knowledge, images: { read: async () => new Map([["img_a", manifest]]) } });
+  await handle(message("![image](img_a)\n这个 Secret 怎么配", { resources: [{ type: "image", fileKey: "img_a" }] }));
+  assert.ok(containsSecret(queries[1]), "经验库认得出有密钥，不会查 aiops");
+  const prompt = requests.at(-1)!.messages.at(-1)!.content;
+  assert.match(prompt, /（图片文字太长，后面省略）/);
+  assert.doesNotMatch(prompt, /kind: Secret/);
+});
+
 test("查经验库卡住时最多等 knowledgeLookupMs，照常回答；只有一边没查成时提示词里说明", async () => {
   const hung = { lookup: () => new Promise<undefined>(() => {}), tools: () => [] };
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));

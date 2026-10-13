@@ -7,7 +7,7 @@ import type { VisionModel } from "./llm.js";
 export const MAX_IMAGES_PER_TASK = 4;
 /** 识别一张图片最多等多久（下载加识别） */
 const IMAGE_TIMEOUT_MS = 60_000;
-/** 识别结果的字数上限 */
+/** 交给模型的识别结果的字数上限（识别结果本身不截短：查经验前要用全文认密钥，见 inlineImages） */
 const MAX_IMAGE_TEXT_CHARS = 4000;
 /** 记住最近识别过的图片：话题里每次提问都会重新读上文，同一张图不用再识别 */
 const MAX_CACHED_IMAGES = 200;
@@ -43,7 +43,7 @@ export class ImageReader {
     return this.options.vision.model;
   }
 
-  /** 识别这些图片，返回 image_key → 文字。识别不了的不在结果里，原因写进日志 */
+  /** 识别这些图片，返回 image_key → 文字（没截短，放进提问时 inlineImages 截）。识别不了的不在结果里，原因写进日志 */
   async read(refs: readonly ImageRef[], signal?: AbortSignal): Promise<Map<string, string>> {
     const results = new Map<string, string>();
     await Promise.all(
@@ -77,7 +77,7 @@ export class ImageReader {
     try {
       const image = await raceAbort(download(ref.messageId, ref.imageKey), abort);
       stage = "识别";
-      const text = clipText((await vision.describe(image, IMAGE_INSTRUCTION, abort)).trim());
+      const text = (await vision.describe(image, IMAGE_INSTRUCTION, abort)).trim();
       if (!text) {
         logger.warn(`识别图片没有得到文字 message=${ref.messageId} image=${ref.imageKey} 模型=${vision.model}`);
         return undefined;
@@ -111,9 +111,10 @@ export function imageKeysIn(text: string): string[] {
 
 /**
  * 把文字里飞书图片的 ![image](image_key) 换成识别出的内容，没识别出来的换成 UNREAD_IMAGE。
- * 只换 known 里的（消息里真有这张图）：群成员自己贴的 Markdown 图片语法原样保留
+ * 只换 known 里的（消息里真有这张图）：群成员自己贴的 Markdown 图片语法原样保留。
+ * 识别的文字太长时截短（给模型看的）；full 为 true 时不截（程序自己核对用，比如查经验前认密钥：截掉的后半段可能正是认出前面是密钥的那部分）
  */
-export function inlineImages(text: string, results: ReadonlyMap<string, string>, known: ReadonlySet<string>): string {
+export function inlineImages(text: string, results: ReadonlyMap<string, string>, known: ReadonlySet<string>, full = false): string {
   return text.replace(IMAGE_MARK, (mark, key: string) => {
     if (!known.has(key)) {
       return mark;
@@ -121,7 +122,7 @@ export function inlineImages(text: string, results: ReadonlyMap<string, string>,
     const content = results.get(key);
     return content === undefined
       ? UNREAD_IMAGE
-      : `\n[图片内容：机器人用看图模型识别的文字，个别字可能识别错]\n${content}\n[图片内容结束]\n`;
+      : `\n[图片内容：机器人用看图模型识别的文字，个别字可能识别错]\n${full ? content : clipText(content)}\n[图片内容结束]\n`;
   });
 }
 

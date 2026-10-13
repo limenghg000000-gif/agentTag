@@ -70,6 +70,20 @@ test("去掉标的发言人拿回原话：名字里带「]」「] 」、原话�
   assert.equal(unlabelUserMessage("（中间较早的 3 条消息已省略）"), "（中间较早的 3 条消息已省略）");
 });
 
+test("太长的消息截短给模型看，截短前的全文另外留着（只给程序查经验前认密钥用）；没截短的、机器人的不留", () => {
+  const long = `开头${"字".repeat(7000)}结尾`;
+  const result = toChatMessages([
+    item("a", { senderName: "张三", content: long }),
+    item("b", { fromBot: true, content: "好".repeat(7000) }),
+    item("c", { content: "短的" }),
+  ]);
+  assert.equal(result[0].role, "user");
+  assert.match(result[0].content, /^\[张三\] 开头字+…（后面省略）$/);
+  assert.equal(result[0].role === "user" ? result[0].full : undefined, `[张三] ${long}`);
+  assert.deepEqual(Object.keys(result[1]), ["role", "content"]);
+  assert.deepEqual(result[2], { role: "user", content: "[群成员] 短的" });
+});
+
 test("超出字数上限时省略较早的消息，但保留话题第一条", () => {
   const long = "字".repeat(5000);
   const messages = Array.from({ length: 10 }, (_, i) => item(`m${i}`, { senderName: "张三", content: `${i}${long}` }));
@@ -149,6 +163,17 @@ test("读不到飞书话题时退回本地记下的问答，并只提示一次",
   ]);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /im:message\.group_msg/);
+
+  // 提问里的图片文字截短过：截短前的全文也记下（和给模型看的一样时不记）
+  const second = message({ messageId: "om_5", createTime: 1000 });
+  loader.remember(second, "[群成员] 截短的", "好", "[群成员] 截短前的全文");
+  loader.remember(second, "[群成员] 没截短", "好", "[群成员] 没截短");
+  assert.deepEqual((await loader.load(message({ rootId: "om_5", threadId: "omt_5" }))).history, [
+    { role: "user", content: "[群成员] 截短的", full: "[群成员] 截短前的全文" },
+    { role: "assistant", content: "好" },
+    { role: "user", content: "[群成员] 没截短" },
+    { role: "assistant", content: "好" },
+  ]);
 });
 
 test("在群里直接 @ 时单独读这条消息拿到提问人名字，读不到就不带名字", async () => {
