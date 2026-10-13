@@ -156,6 +156,9 @@ export async function runAgent({
       const redo = !lastRound && !reviewed && result.finish !== "filtered" ? review?.(result.text, usedTools) : undefined;
       if (redo) {
         reviewed = true;
+        // 重做这一轮起打开思考（没指定时）：2026-10-13 点「接着查」按钮问 product-service-api 最近 1 小时的错误日志，
+        // 模型没调工具就照着话题和群记忆答了；打回时写明了要先用 aiops 查，不思考的第二轮还是没调工具，整条回答被拦
+        investigating = true;
         onEvent({ type: "retry", reason: redo });
         conversation.push({ role: "assistant", content: result.text }, { role: "user", content: redo });
         continue;

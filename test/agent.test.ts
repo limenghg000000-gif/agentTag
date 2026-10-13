@@ -240,6 +240,30 @@ test("回答没通过 review 时交回模型重做一次，第二次不再检查
   assert.ok(events.some((e) => e.type === "retry" && e.reason === "先查再答"));
 });
 
+test("打回重做的那一轮起打开思考；显式关掉思考时照旧关着", async () => {
+  // 2026-10-13：点「接着查」按钮问错误日志，模型没调工具就答；打回后不思考的第二轮还是没调工具，整条回答被拦
+  const run = async (thinking?: boolean) => {
+    const { model, requests } = scriptedModel([
+      { text: "照着话题答的", finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
+      { text: "查过的答案", finish: "stop" },
+    ]);
+    await runAgent({
+      model,
+      system: "s",
+      messages: user,
+      tools: [echoTool()],
+      signal,
+      ...(thinking !== undefined ? { thinking } : {}),
+      review: () => "先查再答",
+    });
+    return requests.map((request) => request.thinking);
+  };
+
+  assert.deepEqual(await run(), [undefined, true, true]);
+  assert.deepEqual(await run(false), [false, false, false]);
+});
+
 test("review 拿到这次调过的工具名，通过时直接返回", async () => {
   const { model } = scriptedModel([
     { text: "", finish: "tool_calls", toolCalls: [call("c1", "echo", { text: "a" })] },
