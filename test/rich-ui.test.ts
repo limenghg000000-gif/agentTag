@@ -599,6 +599,14 @@ test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算�
   assert.deepEqual(found("| Pod | 内存 (MB) |\n|---|---|\n| 2v7gp | 153.2 |"), []);
   assert.deepEqual(found("| Pod | 内存 (MiB) |\n|---|---|\n| 2v7gp | 153.2 / 256 |"), []);
   assert.deepEqual(found("| Pod | 内存 (MiB) |\n|---|---|\n| 2v7gp | `153.2` |"), []);
+  // 全角的「～～～」「｀」显示出来不是代码，照样查
+  assert.equal(found("～～～\n当前 153.2 MiB").length, 1);
+  assert.equal(found("｀153.2 MiB｀").length, 1);
+  // PromQL 的时间戳（1760281200 秒按 1024³ 换算是 1.64）不能把写成 1.6 GiB 的放过去
+  const timed = new NumberEvidence([
+    JSON.stringify({ query: "sum(container_memory_working_set_bytes)", data: { result: [{ metric: {}, values: [[1760281200, "1600000000"]] }] } }),
+  ]);
+  assert.deepEqual(mislabeledBytes("当前 1.6 GiB", timed), [{ written: "1.6 GiB", raw: 1600000000, binary: "1.5 GiB" }]);
   // 带千分位的照样认；写得特别细的不会因为 toFixed 出错
   const big = new NumberEvidence([JSON.stringify({ query: "sum(container_memory_working_set_bytes)", data: { result: [{ metric: {}, value: [1, "1531800000"] }] } })]);
   assert.deepEqual(mislabeledBytes("合计 1,531.8 MiB", big), [{ written: "1,531.8 MiB", raw: 1531800000, binary: "1460.8 MiB" }]);

@@ -698,7 +698,7 @@ export interface MislabeledBytes {
 }
 
 /**
- * 回答正文、表格里写成 MiB、GiB 的数，PromQL 查回来的字节数按 1000 换算才对得上（按 1024 对不上，别的工具结果里也没有这个数）：
+ * 回答正文、表格里写成 MiB、GiB 的数，PromQL 查回来的字节数按 1000 换算才对得上（按 1024 对不上，别的工具结果里也没有原样的这个数）：
  * 多半是把 MB 标成了 MiB。表头写了单位（「内存 (MiB)」）、格子里只写数的也算。代码里的不算。
  * 不直接改数：模型自己算的平均值、合计可能碰巧和某个字节数按 1000 换算对上，交给模型核对。
  * 2026-10-13 测试群：2v7gp 的 144,949,248 → 153,182,208 字节写成了「144.9 MiB 跳到 153.2 MiB」，应为 138.2 → 146.1 MiB
@@ -711,7 +711,8 @@ export function mislabeledBytes(text: string, evidence: NumberEvidence): Mislabe
     const n = Number(digits);
     const half = writtenHalf(digits);
     const binary = 1024 ** -power;
-    if (evidence.near("bytes", n, binary, half) !== undefined || evidence.near("any", n, 1, half) !== undefined || evidence.near("any", n, binary, half) !== undefined) {
+    // 不知道单位的数只认原样的，不按 1024 换算：里面有 PromQL 的时间戳，1760281200 秒按 1024³ 换算是 1.64，写成 1.6 GiB 的就都放过了
+    if (evidence.near("bytes", n, binary, half) !== undefined || evidence.near("any", n, 1, half) !== undefined) {
       return;
     }
     const raw = evidence.near("bytes", n, 1000 ** -power, half);
@@ -723,18 +724,16 @@ export function mislabeledBytes(text: string, evidence: NumberEvidence): Mislabe
       found.set(key, { written: key, raw, binary: `${(raw * binary).toFixed(decimals)} ${unit}` });
     }
   };
-  // 代码块（``` 和 ~~~ 都算）和行内代码里的是配置、命令示例，不算。代码块那几行换成空行，行内代码换成空格（换行留着，表格还按行认）
+  // 代码块（``` 和 ~~~ 都算）和行内代码里的是配置、命令示例，不算。代码块那几行换成空行，行内代码换成空格（换行留着，表格还按行认）。
+  // 认代码按原文认，认完再把全角换成半角：「～～～」「｀153.2 MiB｀」显示出来不是代码
   const lines: string[] = [];
   let fence: string | undefined;
-  for (const line of halfWidth(text).split("\n")) {
+  for (const line of text.split("\n")) {
     const next = nextFence(fence, line);
     lines.push(!fence && !next.marker ? line : "");
     fence = next.fence;
   }
-  const prose = lines
-    .join("\n")
-    .replace(CODE_SPAN, (span) => span.replace(/[^\n]/g, " "))
-    .split("\n");
+  const prose = halfWidth(lines.join("\n").replace(CODE_SPAN, (span) => span.replace(/[^\n]/g, " "))).split("\n");
   for (const line of prose) {
     for (const match of line.matchAll(BINARY_BYTES)) {
       check(match[1], match[3]);
