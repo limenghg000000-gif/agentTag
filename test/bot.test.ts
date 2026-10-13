@@ -3102,6 +3102,8 @@ test("卡片即回答：提示词里允许表格、小标题和彩色标签；�
   assert.match(rich.requests[0].system, /表格/);
   assert.match(rich.requests[0].system, /<text_tag color='red'>高风险<\/text_tag>/);
   assert.doesNotMatch(rich.requests[0].system, /不渲染表格/);
+  // 长串不放进表格：2026-10-13 淘宝口令、链接放在表格里，要往右拖着看
+  assert.match(rich.requests[0].system, /口令、链接、报错原文、长 ID 这类长串不放进表格，写在表格下面/);
 
   const plain = fakeModel(() => ({ text: "好的", finish: "stop" }));
   await setup({ model: plain.model }).handle(message("你好"));
