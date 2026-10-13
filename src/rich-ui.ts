@@ -678,8 +678,8 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
   return { segments: kept, dropped };
 }
 
-/** 写成 MiB、GiB 这种按 1024 算的字节单位的数 */
-const BINARY_BYTES = /(?<![\w.,])(\d+(?:\.\d+)?)(\s*)([KMGT])i(?=B?(?![A-Za-z]))/g;
+/** 写成 MiB、GiB 这种按 1024 算的字节单位的数（带千分位的也算：1,531.8 MiB） */
+const BINARY_BYTES = /(?<![\w.,])((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(\s*)([KMGT])i(?=B?(?![A-Za-z]))/g;
 
 /** 写成 MiB、GiB，查到的字节数却只有按 1000 换算才对得上的一个数 */
 export interface MislabeledBytes {
@@ -698,10 +698,20 @@ export interface MislabeledBytes {
  */
 export function mislabeledBytes(text: string, evidence: NumberEvidence): MislabeledBytes[] {
   const found = new Map<string, MislabeledBytes>();
-  const prose = halfWidth(text).split(/(```[\s\S]*?```|`[^`\n]*`)/).filter((_, i) => i % 2 === 0);
+  // 代码块（``` 和 ~~~ 都算）和行内代码里的是配置、命令示例，不算
+  const prose: string[] = [];
+  let fence: string | undefined;
+  for (const line of halfWidth(text).split("\n")) {
+    const next = nextFence(fence, line);
+    if (!fence && !next.marker) {
+      prose.push(line.replace(/`[^`]*`/g, " "));
+    }
+    fence = next.fence;
+  }
   for (const part of prose) {
     for (const match of part.matchAll(BINARY_BYTES)) {
-      const [, digits, , prefix] = match;
+      const [, written, , prefix] = match;
+      const digits = written.replace(/,/g, "");
       const power = "KMGT".indexOf(prefix) + 1;
       const n = Number(digits);
       const half = writtenHalf(digits);
@@ -711,9 +721,11 @@ export function mislabeledBytes(text: string, evidence: NumberEvidence): Mislabe
       }
       const raw = evidence.near("bytes", n, 1000 ** -power, half);
       const unit = `${prefix}iB`;
-      const written = `${digits} ${unit}`;
-      if (raw !== undefined && !found.has(written)) {
-        found.set(written, { written, raw, binary: `${(raw * binary).toFixed((digits.split(".")[1] ?? "").length)} ${unit}` });
+      const key = `${written} ${unit}`;
+      if (raw !== undefined && !found.has(key)) {
+        // toFixed 只认 0～100 位小数；写得再细也只按 20 位给
+        const decimals = Math.min((digits.split(".")[1] ?? "").length, 20);
+        found.set(key, { written: key, raw, binary: `${(raw * binary).toFixed(decimals)} ${unit}` });
       }
     }
   }

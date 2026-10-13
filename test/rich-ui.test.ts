@@ -584,6 +584,13 @@ test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算�
   assert.equal(found("153.2 MiB，还是 153.2 MiB").length, 1);
   assert.deepEqual(found("`153.2 MiB` 和\n```\n153.2 MiB\n```"), []);
   assert.deepEqual(found("大约 0.1 GiB"), []);
+  // ~~~ 代码块里的不算；行内代码前后的照样查
+  assert.deepEqual(found("~~~yaml\nmemory: 153.2 MiB\n~~~"), []);
+  assert.equal(found("`limit` 当前 153.2 MiB").length, 1);
+  // 带千分位的照样认；写得特别细的不会因为 toFixed 出错
+  const big = new NumberEvidence([JSON.stringify({ query: "sum(container_memory_working_set_bytes)", data: { result: [{ metric: {}, value: [1, "1531800000"] }] } })]);
+  assert.deepEqual(mislabeledBytes("合计 1,531.8 MiB", big), [{ written: "1,531.8 MiB", raw: 1531800000, binary: "1460.8 MiB" }]);
+  assert.equal(mislabeledBytes(`合计 1531.8${"0".repeat(120)} MiB`, big).length, 1);
   // 认不出单位的查询（算过的）里的字节数不算：不知道它是不是字节
   const unknown = new NumberEvidence([JSON.stringify({ query: "sum(container_memory_working_set_bytes) / 2", data: { result: [{ metric: {}, value: [1, "153182208"] }] } })]);
   assert.deepEqual(mislabeledBytes("153.2 MiB", unknown), []);
