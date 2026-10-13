@@ -18,6 +18,7 @@ import { raceAbort } from "../src/abort.js";
 import { generateKeyPairSync } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { buildSystemPrompt } from "../src/prompt.js";
+import { MAX_CARD_BYTES } from "../src/progress.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
@@ -2778,6 +2779,95 @@ test("归档 aiops 经验的卡片上列出排查过程和关键词，太长的�
   assert.match(text, /\*\*关键词\*\*：code=8,load shedding/);
   assert.match(text, /\*\*排查过程\*\*：(看 Pod CPU，)+…（后面省略，全文见 aiops 经验库里的 #40）/);
   assert.doesNotMatch(text, /来自飞书团队经验库 K9/);
+});
+
+const cardBytes = (card: any) => Buffer.byteLength(cardText(card));
+
+test("起草：每项都没超字数、合起来卡片超过飞书的大小上限的不发卡片，告诉模型现在多少字、写到多少字以内；旧卡片照旧能用，照着写短了照常发", async () => {
+  const { backend, desk, sent, click, tool } = deskSetup();
+  await tool("knowledge_propose").run(code8, { signal });
+  const long = { ...code8, scope: "网".repeat(2000), question: "关".repeat(2000), conclusion: "结".repeat(2000), handling: "处".repeat(2000), basis: "查".repeat(2000) };
+  let target = 0;
+  await assert.rejects(tool("knowledge_propose").run(long, { signal }), (err: Error) => {
+    assert.match(err.message, /草稿太长，确认卡片放不下/);
+    const [, now, limit] = err.message.match(/现在各项合计 (\d+) 字.*合计 (\d+) 字以内/)!;
+    assert.ok(Number(now) > 10_000);
+    target = Number(limit);
+    return true;
+  });
+  assert.equal(sent.length, 1, "放不下的卡片没发");
+  assert.ok(target > 3000 && target < 8000, `写到 ${target} 字以内`);
+
+  // 旧草稿没被换掉，还能点保存
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "save"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 1);
+
+  const each = Math.floor((target - code8.title.length - 200) / 5);
+  const short = { ...long, scope: "网".repeat(each), question: "关".repeat(each), conclusion: "结".repeat(each), handling: "处".repeat(each), basis: "查".repeat(each) };
+  await tool("knowledge_propose").run(short, { signal });
+  const card = (sent.at(-1)!.input as { card: any }).card;
+  assert.equal(sent.length, 3, "保存结果一条、新卡片一条");
+  assert.ok(cardBytes(card) <= MAX_CARD_BYTES);
+  assert.match(cardText(card), new RegExp(`\\*\\*结论\\*\\*：结{${each}}\\\\n`), "要保存的草稿不截");
+});
+
+test("归档：要归档的经验很长、卡片超过飞书的大小上限时每项再截短，放得下", async () => {
+  const { base, sent, tool, handlers } = deskSetup();
+  handlers.get_knowledge = (args) =>
+    JSON.stringify({
+      id: args.id,
+      title: "user-rpc 降载",
+      status: "active",
+      ...Object.fromEntries(["service", "symptom", "root_cause", "solution", "diagnosis_path", "keywords", "error_codes", "alertname"].map((key, i) => [key, "服现根办查词码警"[i].repeat(3000)])),
+    });
+  await tool("knowledge_propose_archive").run({ aiops_id: 40 }, { signal });
+  const lessonCard = (sent.at(-1)!.input as { card: any }).card;
+  assert.ok(cardBytes(lessonCard) <= MAX_CARD_BYTES);
+  assert.match(cardText(lessonCard), /\*\*根因\*\*：根+…（后面省略，全文见 aiops 经验库里的 #40）/);
+  assert.match(cardText(lessonCard), /"op":"archive"/);
+
+  await base.save(normalizeDraft({ ...dau, scope: "网".repeat(2000), question: "关".repeat(2000), conclusion: "结".repeat(2000), handling: "处".repeat(2000), basis: "查".repeat(2000) }));
+  await tool("knowledge_propose_archive").run({ id: "K1" }, { signal });
+  const teamCard = (sent.at(-1)!.input as { card: any }).card;
+  assert.ok(cardBytes(teamCard) <= MAX_CARD_BYTES);
+  assert.match(cardText(teamCard), /\*\*结论\*\*：结+…（后面省略，全文见经验库表格里的 K1）/);
+  assert.match(cardText(teamCard), /"op":"archive"/);
+});
+
+test("草稿很长、同步到 aiops 没做成后表格里又改过：卡片上确认过的草稿截短，表格里现在的内容全列出来，卡片放得下", async () => {
+  let down = true;
+  const { backend, desk, sent, calls, click, tool, lastCard } = deskSetup({
+    saveLesson: () => {
+      if (down) {
+        throw new Error("aiops 现在连不上");
+      }
+      return JSON.stringify({ saved: true, id: 31 });
+    },
+  });
+  const long = { ...code8, question: "关".repeat(1500), conclusion: "结".repeat(1500), handling: "处".repeat(1500), basis: "查".repeat(1500) };
+  await tool("knowledge_propose").run(long, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  assert.ok(cardBytes(card) > MAX_CARD_BYTES / 2, "两份放不下");
+  await desk.handleCardAction(click(card, "save"));
+  await desk.idle();
+  assert.match(cardText(lastCard()), /没能同步到 aiops 经验库/);
+
+  const edited = `改过的结论：${"新".repeat(1490)}`;
+  backend.entries[0].conclusion = edited;
+  down = false;
+  await desk.handleCardAction(click(lastCard(), "save"));
+  await desk.idle();
+  const review = lastCard();
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 1, "改过的没人确认，不同步");
+  assert.ok(cardBytes(review) <= MAX_CARD_BYTES);
+  assert.match(cardText(review), /\*\*结论\*\*：结+…（后面省略）/);
+  assert.ok(cardText(review).includes(`表格里现在的内容`) && cardText(review).includes(edited), "表格里现在的内容不截");
+
+  await desk.handleCardAction(click(review, "save"));
+  await desk.idle();
+  assert.equal(calls.filter((call) => call.tool === "save_lesson").length, 2);
+  assert.equal(lastCard().header.title.content, "已存进经验库");
 });
 
 test("归档 aiops 经验：点归档时重新取一遍，卡片发出后在 aiops 里改过的不归档、卡片作废；没改过的照常归档，已经归档了的算做完", async () => {

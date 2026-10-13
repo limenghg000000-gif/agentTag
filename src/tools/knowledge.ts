@@ -37,6 +37,7 @@ import {
 } from "../knowledge-aiops.js";
 import { escapeCardMarkdown } from "../markdown.js";
 import type { McpTaskContext } from "../mcp.js";
+import { MAX_CARD_BYTES } from "../progress.js";
 import type { Tool } from "./tool.js";
 
 /** 确认卡片上按钮回传的 action */
@@ -60,6 +61,8 @@ const RENDER_ATTEMPTS = 3;
 const SYNC_ROUNDS = 2;
 /** 归档 aiops 经验的卡片上每一项最多列多少字（aiops 里的经验不限长） */
 const CARD_LESSON_FIELD_CHARS = 1500;
+/** 确认卡片超过飞书的大小上限时，上面列的经验每项截到多少字，依次试到放得下（全文在表格、aiops 里） */
+const CARD_SHRINK_CHARS = [800, 300, 100];
 
 /** 这次任务的信息 */
 export interface KnowledgeTaskContext {
@@ -1218,7 +1221,12 @@ export class KnowledgeDesk {
       state: "pending",
     } as Proposal;
     this.sweep();
-    const { messageId } = await this.options.send(ctx.chatId, { card: renderProposalCard(proposal) }, { replyTo: ctx.messageId, replyInThread: true });
+    // 卡片太大飞书不收：要保存的草稿不截（点「保存」的人要看到全文），让模型写短了再起草
+    const card = renderProposalCard(proposal);
+    if (!cardFits(card)) {
+      throw new KnowledgeError(tooBigNote(proposal, card));
+    }
+    const { messageId } = await this.options.send(ctx.chatId, { card }, { replyTo: ctx.messageId, replyInThread: true });
     proposal.cardMessageId = messageId;
     // 卡片发的时候任务停了：卡片已经发出去，作废它、不登记，停掉的任务发的卡片不能再点保存；旧卡片照旧能用
     if (signal.aborted) {
@@ -1316,14 +1324,54 @@ const HEADERS: Record<ProposalState, { save: string; archive: string; template: 
 
 /**
  * 确认卡片（飞书卡片 JSON 2.0）：草稿全文、说明和按钮；处理完以后去掉按钮，写上结果。
- * 草稿、表格、aiops、归档原因、发起人名字都是别处来的，写进 markdown 前转义尖括号（escapeCardMarkdown），卡片自己的格式不转
+ * 草稿、表格、aiops、归档原因、发起人名字都是别处来的，写进 markdown 前转义尖括号（escapeCardMarkdown），卡片自己的格式不转。
+ * 超过飞书卡片的大小上限时，上面列的经验每项截短：要归档的（全文在表格、aiops 里）、已经处理过的草稿（加了结果、表格里现在的内容）。
+ * 等着点「保存」的草稿不截，起草时就按卡片大小查过（publish）；表格里现在的内容要点「再试一次」确认，也不截
  */
 export function renderProposalCard(proposal: Proposal): object {
+  const card = proposalCard(proposal);
+  if (cardFits(card) || (proposal.kind === "save" && proposal.state === "pending")) {
+    return card;
+  }
+  let smaller = card;
+  for (const cap of CARD_SHRINK_CHARS) {
+    smaller = proposalCard(proposal, cap);
+    if (cardFits(smaller)) {
+      break;
+    }
+  }
+  return smaller;
+}
+
+function cardFits(card: object): boolean {
+  return Buffer.byteLength(JSON.stringify(card)) <= MAX_CARD_BYTES;
+}
+
+/** 草稿太长、确认卡片放不下时告诉模型删到多少字：按这张卡片每个字平均占多大估（中文一个字比英文、数字占得多） */
+function tooBigNote(proposal: Proposal, card: object): string {
+  if (proposal.kind !== "save") {
+    return "要归档的经验太长，确认卡片放不下，请在表格或 aiops 里手动归档";
+  }
+  const chars = [proposal.draft.title, ...fieldLines(proposal.draft).map(([, value]) => value)].join("").length;
+  const target = Math.floor((chars * MAX_CARD_BYTES * 0.9) / Buffer.byteLength(JSON.stringify(card)) / 100) * 100;
+  return `草稿太长，确认卡片放不下（飞书卡片有大小上限）：现在各项合计 ${chars} 字，请写得更精炼（排查过程只留能定位到原因的几步），合计 ${target} 字以内再起草`;
+}
+
+/** 列在卡片上的一项，cap 给了就截到这么多字 */
+function capped(value: string, cap: number | undefined, rest: string): string {
+  return cap !== undefined && value.length > cap ? `${value.slice(0, cap)}…（后面省略${rest}）` : value;
+}
+
+function proposalCard(proposal: Proposal, cap?: number): object {
   const header = HEADERS[proposal.state];
   const notes: string[] = [];
   let body: [string, string][];
   if (proposal.kind === "save") {
-    body = [["类别", KNOWLEDGE_CATEGORIES[proposal.draft.category]], ["标题", proposal.draft.title], ...fieldLines(proposal.draft)];
+    body = [
+      ["类别", KNOWLEDGE_CATEGORIES[proposal.draft.category]],
+      ["标题", proposal.draft.title],
+      ...fieldLines(proposal.draft).map(([name, value]): [string, string] => [name, capped(value, cap, "")]),
+    ];
     if (proposal.caseId !== undefined) {
       notes.push(`来自 aiops 案例 #${proposal.caseId}`);
     }
@@ -1340,7 +1388,12 @@ export function renderProposalCard(proposal: Proposal): object {
     }
   } else if (proposal.target.type === "team") {
     const { entry } = proposal.target;
-    body = [["编号", entry.id], ["类别", KNOWLEDGE_CATEGORIES[entry.category]], ["标题", entry.title], ...fieldLines(entry)];
+    body = [
+      ["编号", entry.id],
+      ["类别", KNOWLEDGE_CATEGORIES[entry.category]],
+      ["标题", entry.title],
+      ...fieldLines(entry).map(([name, value]): [string, string] => [name, capped(value, cap, `，全文见经验库表格里的 ${entry.id}`)]),
+    ];
   } else {
     const { lesson } = proposal.target;
     // 排查过程、关键词也列出来：标题相近的经验靠它们区分，排查过程末尾还注明了是不是从团队经验库同步的。aiops 里的不限长，每项截一下
@@ -1359,10 +1412,7 @@ export function renderProposalCard(proposal: Proposal): object {
       ] as [string, string | undefined][]
     )
       .filter((pair): pair is [string, string] => Boolean(pair[1]))
-      .map(([name, value]) => [
-        name,
-        value.length > CARD_LESSON_FIELD_CHARS ? `${value.slice(0, CARD_LESSON_FIELD_CHARS)}…（后面省略，全文见 aiops 经验库里的 #${lesson.id}）` : value,
-      ]);
+      .map(([name, value]) => [name, capped(value, Math.min(cap ?? CARD_LESSON_FIELD_CHARS, CARD_LESSON_FIELD_CHARS), `，全文见 aiops 经验库里的 #${lesson.id}`)]);
   }
   if (proposal.kind === "archive" && proposal.reason) {
     notes.push(`归档原因：${proposal.reason}`);
