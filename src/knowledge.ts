@@ -1037,17 +1037,20 @@ const CURL_COOKIE = new RegExp(
 const COOKIE_ATTRIBUTES = new Set(["expires", "max-age", "domain", "path", "samesite", "priority", "partitioned", "secure", "httponly"]);
 /**
  * 不在 Cookie 头里、单独写的登录态 Cookie：日志里的 JSESSIONID=…、"PHPSESSID":"…"、地址里的 ;jsessionid=…、nginx 的 cookie_PHPSESSID=…。
- * 名字是各框架固定的会话 Cookie（Java、PHP、ASP、ASP.NET、Express、Koa、Laravel、CodeIgniter、Play、Django 的 sessionid、Rails 的 _xxx_session），
- * 看到就是会话；值不短于 16 个字符（这些框架的会话号都比这长），到空白、引号、分隔符、括号、中文为止。第 1 组是名字，第 2 组是值
+ * 名字是各框架固定的会话 Cookie（Java、Jenkins 的 JSESSIONID.xxxx、PHP、ASP、ASP.NET、Nexus、Express、Koa、Keycloak、Django 的 sessionid、oauth2-proxy），
+ * 和以 session 收尾、前面带分隔符的（grafana_session、laravel_session、ci_session、PLAY_SESSION、KEYCLOAK_SESSION、Rails 的 _xxx_session），
+ * 看到就是会话；值不短于 16 个字符（这些会话号都比这长），到空白、引号、分隔符、括号、中文为止。
+ * 逗号不是分隔符：PHP 的 session.sid_bits_per_character=6 生成的会话号里有逗号。第 1 组是名字，第 2 组是值。
+ * 以 session 收尾的名字不是哪个框架固定的，值还要带数字、不带冒号（会话号都带数字；redis_session: redis-master:6379 这种是地址）
  */
 const SESSION_COOKIE = new RegExp(
-  String.raw`(?<![\w.$-])(?:cookie[_.:-])?\\?["']?(JSESSIONID(?:SSO)?|PHPSESSID|ASPSESSIONID[A-Z]{8}|ASP\.NET_SessionId|\.ASPXAUTH|\.AspNetCore\.(?:Session|Cookies|Identity\.Application)|connect\.sid|koa[.:]sess|laravel_session|ci_session|PLAY_SESSION|sessionid|_session_id|_[a-z0-9]+(?:_[a-z0-9]+)*_session)\\?["']?[^\S\r\n]*[=:][^\S\r\n]*\\?["']?([^\s"'\`,;&?#|\\<>()[\]{}\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{16,})`,
+  String.raw`(?<![\w.$-])(?:cookie[_.:-])?\\?["']?(JSESSIONID(?:SSO)?(?:\.[0-9a-f]{8})?|PHPSESSID|ASPSESSIONID[A-Z]{8}|ASP\.NET_SessionId|\.ASPXAUTH|\.AspNetCore\.(?:Session|Cookies|Identity\.Application)|NXSESSIONID|connect\.sid|koa[.:]sess|sessionid|_session_id|AUTH_SESSION_ID|_oauth2_proxy|_?[a-z0-9]+(?:[_.-][a-z0-9]+)*[_.-]session)\\?["']?[^\S\r\n]*[=:][^\S\r\n]*\\?["']?([^\s"'\`;&?#|\\<>()[\]{}\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{16,})`,
   "gi",
 );
 
 /**
  * Cookie 里的值：登录态（sessionid、PHPSESSID、laravel_session、connect.sid…）拿到就能冒充登录的人。Cookie 头里的名字五花八门，
- * 不按名字挑，不短于 8 个字符的都算；值里不能有空白、逗号、引号、中文（RFC 6265），到这些为止，后面是说明。
+ * 不按名字挑，不短于 8 个字符的都算；值到空白、分号、引号、中文为止，后面是说明。逗号算在值里（PHP 的会话号里有逗号，见 SESSION_COOKIE）。
  * 单独写的按名字认（SESSION_COOKIE）；sessionid 只认 Django 的小写写法，sessionId 多半是业务里的会话编号
  */
 function cookieValues(text: string): string[] {
@@ -1058,11 +1061,16 @@ function cookieValues(text: string): string[] {
   return [
     ...lists.flatMap((list) =>
       list.split(";").flatMap((pair) => {
-        const match = /^\s*([^=\s]+)=\s*"?([^\s",;\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]*)/.exec(pair);
+        const match = /^\s*([^=\s]+)=\s*"?([^\s";\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]*)/.exec(pair);
         return match && !COOKIE_ATTRIBUTES.has(match[1].toLowerCase()) && match[2].length >= 8 ? [match[2]] : [];
       }),
     ),
-    ...[...text.matchAll(SESSION_COOKIE)].flatMap(([, name, value]) => (/^sessionid$/i.test(name) && name !== "sessionid" ? [] : [value])),
+    ...[...text.matchAll(SESSION_COOKIE)].flatMap(([, name, value]) => {
+      if (/^sessionid$/i.test(name) && name !== "sessionid") {
+        return [];
+      }
+      return /session$/i.test(name) && (!/\d/.test(value) || value.includes(":")) ? [] : [value];
+    }),
   ];
 }
 /**

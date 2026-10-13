@@ -321,6 +321,13 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     `ASP.NET_SessionId=${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4")}`,
     `sessionid=${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4t5")}`,
     `_gitlab_session=${"8f14e45fceea167a".concat("5c9a2d71b3e04f68")}`,
+    // 以 session 收尾的名字（Grafana、Keycloak 这些），Jenkins 的 JSESSIONID.xxxx，PHP 会话号里带逗号的（Cookie 头里的也算）
+    `grafana_session=${"8f14e45fceea167a".concat("5c9a2d71b3e04f68")}`,
+    `user_session=${"8f14e45fceea167a".concat("5c9a2d71")}`,
+    `KEYCLOAK_SESSION=${"prod/2f1c8a3e-5b7d".concat("-4e9a-8c1f-0d6b3a9e7f21")}`,
+    `JSESSIONID.4b1a7c2e=${"node0abcde1fghij".concat("2klmno3pq.node0")}`,
+    `PHPSESSID=${"abcde,fghij".concat("klmnopqrstuv")}`,
+    `Cookie: PHPSESSID=${"abcde,fg".concat("hijklmnopqrstuv")}; lang=zh`,
     // PostgreSQL 的 .pgpass：主机像主机的、端口是 5432 的、提到了 pgpass 的；密码里转义的冒号、反斜杠
     ["db.example.com:5432:prod:svc", "CorrectHorseBatteryStaple9"].join(":"),
     ["postgres:5432:app:app", "correcthorsebatterystaple"].join(":"),
@@ -514,7 +521,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     "curl -bcookies.txt https://x；curl -sSb ~/.cookies https://x；curl -b 'sid=${SESSION_ID}' https://x",
     // 单独写的会话 Cookie 是报错词、打码、占位、变量、很短的，名字不是框架固定的（sessionId 多半是业务里的会话编号）
     "JSESSIONID=expired_session_value；PHPSESSID=******；JSESSIONID=<session-id>；JSESSIONID=${SESSION_ID}；PHPSESSID=xxxxxxxxxxxxxxxx；JSESSIONID=8F14E45F 过期；PHPSESSID 没带上",
-    `sessionId=${"8f14e45fceea167a".concat("5c9a2d71b3e04f68")}；user_session=${"8f14e45fceea167a".concat("5c9a2d71")}；JSESSIONID: 每次请求都变`,
+    `sessionId=${"8f14e45fceea167a".concat("5c9a2d71b3e04f68")}；JSESSIONID: 每次请求都变`,
+    // 以 session 收尾的名字后面是地址（带冒号）、不带数字的
+    "redis_session: redis-master.default.svc:6379\nredis_session: 127.0.0.1:6379/0\ncache_session=memcached-cluster-primary",
     // Redis 的 key 也是几段冒号；.pgpass 里密码是变量、打码的；Azure 的 AccountKey 是变量的
     "order:1001:item:detail:summary；user:10086:coupon:list:available；db.example.com:5432:prod:svc:${PGPASSWORD}；*:*:*:*:******；AccountName=prod;AccountKey=${AZURE_STORAGE_KEY}",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
