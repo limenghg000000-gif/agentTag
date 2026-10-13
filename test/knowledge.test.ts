@@ -3601,6 +3601,30 @@ function idCard(first17: string): string {
   return first17 + "10X98765432"[sum % 11];
 }
 
+test("进度卡片上的工具步骤：标题、查询、编号里像有密钥或手机号、身份证号的不显示原文，别的照常显示前 30 个字", () => {
+  const { tool } = deskSetup();
+  const secret = ["password", "correcthorsebatterystaple"].join("=");
+  const phone = ["138", "0013", "8000"].join("");
+  for (const [name, args] of [
+    ["knowledge_propose", { title: `数据库连不上 ${secret}` }],
+    ["knowledge_propose", { title: `用户 ${phone} 反馈下单失败` }],
+    ["knowledge_propose", { title: `身份证 ${idCard("11010519491231002")} 实名失败` }],
+    ["knowledge_search", { query: `连不上 ${secret}` }],
+    ["knowledge_search", { query: ["连不上", "api_key: |", "  correcthorsebatterystaple9"].join("\n") }],
+    ["knowledge_get", { id: secret }],
+    ["knowledge_propose_archive", { id: phone }],
+  ] as const) {
+    const step = tool(name).describe(args);
+    assert.ok(!step.includes("correcthorse") && !step.includes(phone) && !step.includes("1101051949"), step);
+    assert.match(step, /（像是有密钥或个人信息，不显示）/, step);
+  }
+  const title = "gateway-api 报 code=8 ResourceExhausted 的原因和处理";
+  assert.equal(tool("knowledge_propose").describe({ title }), `起草经验：${title.slice(0, 30)}…`);
+  assert.equal(tool("knowledge_search").describe({ query: "code=8" }), "查经验库：code=8");
+  assert.equal(tool("knowledge_get").describe({ id: "K3" }), "看经验 K3");
+  assert.equal(tool("knowledge_propose_archive").describe({ aiops_id: 31 }), "起草归档经验 aiops #31");
+});
+
 test("草稿和归档原因里的手机号、身份证号不让发卡片；打了码的、更长的数字里的一段、校验位不对的不算", async () => {
   const id = idCard("11010519491231002");
   for (const text of ["用户 13800138000 反馈下单失败", "联系 +86 138-0013-8000", "手机 138 0013 8000", `身份证 ${id}`, `身份证 ${id.toLowerCase()}`]) {

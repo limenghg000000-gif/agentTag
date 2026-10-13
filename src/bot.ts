@@ -447,14 +447,18 @@ async function runTask(
         richText: streaming,
         ...(deps.knowledge
           ? {
-              knowledge: knowledge
-                ? {
-                    hits: knowledge.text,
-                    ...(knowledge.aiops ? { aiopsHits: true } : {}),
-                    ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}),
-                    ...(knowledge.aiopsSkipped ? { aiopsSkipped: true } : {}),
-                  }
-                : { failed: true },
+              knowledge: {
+                ...(knowledge
+                  ? {
+                      hits: knowledge.text,
+                      ...(knowledge.aiops ? { aiopsHits: true } : {}),
+                      ...(knowledge.missed?.length ? { missed: knowledge.missed } : {}),
+                      ...(knowledge.aiopsSkipped ? { aiopsSkipped: true } : {}),
+                    }
+                  : { failed: true }),
+                // 起草的工具是按钮问的才拿掉的，提示词叫人直接 @；本来就没有（没配写权限名单）时照实说存不了
+                ...(followUp && allTools.some((tool) => KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) ? { draftsHidden: true } : {}),
+              },
             }
           : {}),
       }),

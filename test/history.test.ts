@@ -60,10 +60,12 @@ test("话题消息整理成对话：标上发言人，机器人连续发的几�
   ]);
 });
 
-test("去掉标的发言人拿回原话：名字里带「]」、原话里带「] 」都不会去多去少", () => {
+test("去掉标的发言人拿回原话：名字里带「]」「] 」、原话里带「] 」都不会去多去少", () => {
   assert.equal(unlabelUserMessage(labelUserMessage("张三", "gateway-api 报 code=8")), "gateway-api 报 code=8");
   assert.equal(unlabelUserMessage(labelUserMessage(undefined, "怎么修？")), "怎么修？");
   assert.equal(unlabelUserMessage(labelUserMessage("A]B", "看下 [x] 这一项")), "看下 [x] 这一项");
+  assert.equal(unlabelUserMessage(labelUserMessage("[Ops] Alice Smith", "gateway failed")), "gateway failed");
+  assert.equal(unlabelUserMessage(labelUserMessage("Ops] Team\n二组", "[x] done")), "[x] done");
   assert.equal(unlabelUserMessage(labelUserMessage("张三", "[x] 已勾选")), "[x] 已勾选");
   assert.equal(unlabelUserMessage("（中间较早的 3 条消息已省略）"), "（中间较早的 3 条消息已省略）");
 });

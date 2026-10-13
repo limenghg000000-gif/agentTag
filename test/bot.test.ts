@@ -1150,6 +1150,13 @@ test("点「接着查」按钮问的不给起草经验卡片的工具，只能�
   const typed = fakeModel(() => ({ text: "好", finish: "stop" }));
   await setup({ model: typed.model, knowledge }).handle(message("把这个沉淀成经验"));
   assert.deepEqual(typed.requests[0].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+
+  // 没配写权限名单（本来就没有起草的工具）时按钮问的：照实说没配名单，不叫人改成直接 @（直接 @ 也存不了）
+  const searchOnly = { ...knowledge, tools: () => [tool("knowledge_search"), tool("knowledge_get")] };
+  const unset = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: unset.model, knowledge: searchOnly }).handle(message("把这个沉淀成经验"), { readOnly: true });
+  assert.match(unset.requests[0].system, /管理员还没配写权限名单 WRITE_ALLOWED_USERS/);
+  assert.doesNotMatch(unset.requests[0].system, /不能起草存进或归档经验的卡片/);
 });
 
 test("点「接着查」按钮问的不能切分支：code_branches 只能列，switch_to 报错", async () => {

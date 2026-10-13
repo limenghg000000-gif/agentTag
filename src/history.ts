@@ -184,14 +184,17 @@ function askerNameOf(msg: NormalizedMessage, own: ThreadMessage | undefined): st
   return own && !own.fromBot ? own.senderName : msg.senderName;
 }
 
-/** 用户消息前标上发言人，方便模型分清话题里是谁说的 */
+/**
+ * 用户消息前标上发言人，方便模型分清话题里是谁说的。
+ * 名字里的「]」换成全角、换行换成空格，标签只到第一个「]」，unlabelUserMessage 去得干净
+ */
 export function labelUserMessage(name: string | undefined, content: string): string {
-  return `[${name || "群成员"}] ${content}`;
+  return `[${(name || "群成员").replace(/\]/g, "］").replace(/\s*\n\s*/g, " ")}] ${content}`;
 }
 
-/** 去掉 labelUserMessage 标的发言人，拿回原话。名字里带「]」也认得：取到第一个「] 」为止 */
+/** 去掉 labelUserMessage 标的发言人，拿回原话 */
 export function unlabelUserMessage(content: string): string {
-  return content.replace(/^\[[^\n]*?\] /, "");
+  return content.replace(/^\[[^\]\n]*\] /, "");
 }
 
 /**

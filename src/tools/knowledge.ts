@@ -351,7 +351,7 @@ export class KnowledgeDesk {
           required: ["id"],
         },
       },
-      describe: (args) => `看经验 ${String(args.id ?? "")}`,
+      describe: (args) => `看经验 ${preview(String(args.id ?? ""))}`,
       run: async (args, { signal }) => {
         const entry = await raceAbort(base.get(String(args.id ?? "")), signal);
         if (!entry) {
@@ -426,7 +426,7 @@ export class KnowledgeDesk {
           },
         },
       },
-      describe: (args) => `起草归档经验 ${args.id ? String(args.id) : `aiops #${String(args.aiops_id ?? "")}`}`,
+      describe: (args) => `起草归档经验 ${args.id ? preview(String(args.id)) : `aiops #${preview(String(args.aiops_id ?? ""))}`}`,
       run: async (args, { signal }) => {
         const id = typeof args.id === "string" && args.id.trim() ? args.id : undefined;
         const aiopsId = optionalInteger(args.aiops_id, "aiops_id");
@@ -1479,8 +1479,17 @@ function person(openId: string, name: string | undefined): Person {
   return { openId, ...(name && !findSensitive(name) ? { name } : {}) };
 }
 
+/**
+ * 进度卡片上工具步骤里显示的参数（模型写的，还没检查过）：前 30 个字。
+ * 整段像有密钥、手机号、身份证号的不显示：卡片群里人人看得到，起草时这些要等 normalizeDraft 才拦下
+ */
 function preview(value: unknown): string {
-  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  const raw = typeof value === "string" ? value : "";
+  const text = raw.replace(/\s+/g, " ").trim();
+  // 原样和合成一行的都看：分行写的（YAML 块）合成一行就认不出来了
+  if (findSensitive(raw) !== undefined || findSensitive(text) !== undefined) {
+    return "（像是有密钥或个人信息，不显示）";
+  }
   return text.length > 30 ? `${text.slice(0, 30)}…` : text;
 }
 
