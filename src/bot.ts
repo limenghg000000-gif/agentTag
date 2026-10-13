@@ -4,7 +4,7 @@ import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { imageKeysOf } from "./feishu.js";
-import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf } from "./history.js";
+import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
@@ -691,10 +691,11 @@ async function readImages(
  * 自动查经验库用的文字：这次的提问，话题里最近几轮提问（新的在前），最后是话题的第一个问题。
  * 两个库都只取前面一段去查（LOOKUP_QUERY_CHARS），所以这次的提问放最前面；拼起来不超过那一段，第一个问题不会被挤出去：
  * 这次的提问很长（追问时贴了一大段日志）就截短，中间几轮每轮限长，放得下几轮放几轮。
- * 只追问一句「怎么修？」时，上一轮给的错误码、服务名也能带上
+ * 只追问一句「怎么修？」时，上一轮给的错误码、服务名也能带上。
+ * 上文里每句话前面标的发言人去掉：名字对查经验没用，也不该发给 aiops、记进它的调用日志
  */
 function lookupQuery(asked: string, history: readonly ChatMessage[]): string {
-  const asks = history.flatMap((m) => (m.role === "user" ? [m.content] : []));
+  const asks = history.flatMap((m) => (m.role === "user" ? [unlabelUserMessage(m.content)] : []));
   if (asks.length === 0) {
     return asked;
   }

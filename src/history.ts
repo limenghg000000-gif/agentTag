@@ -189,6 +189,11 @@ export function labelUserMessage(name: string | undefined, content: string): str
   return `[${name || "群成员"}] ${content}`;
 }
 
+/** 去掉 labelUserMessage 标的发言人，拿回原话。名字里带「]」也认得：取到第一个「] 」为止 */
+export function unlabelUserMessage(content: string): string {
+  return content.replace(/^\[[^\n]*?\] /, "");
+}
+
 /**
  * 把话题消息整理成对话：机器人的回复是 assistant，其他人的消息是 user 并标上发言人；
  * 机器人连续发的几条（长回答被拆开）合成一条。超出字数上限时省略较早的消息，但保留话题第一条。

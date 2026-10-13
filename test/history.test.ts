@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { FeishuApi, ThreadMessage } from "../src/feishu.js";
-import { MAX_HISTORY_CHARS, ThreadContextLoader, toChatMessages } from "../src/history.js";
+import { labelUserMessage, MAX_HISTORY_CHARS, ThreadContextLoader, toChatMessages, unlabelUserMessage } from "../src/history.js";
 
 function message(extra: Partial<NormalizedMessage> = {}): NormalizedMessage {
   return {
@@ -58,6 +58,14 @@ test("话题消息整理成对话：标上发言人，机器人连续发的几�
     { role: "assistant", content: "第一段\n第二段" },
     { role: "user", content: "[群成员] 我觉得还行" },
   ]);
+});
+
+test("去掉标的发言人拿回原话：名字里带「]」、原话里带「] 」都不会去多去少", () => {
+  assert.equal(unlabelUserMessage(labelUserMessage("张三", "gateway-api 报 code=8")), "gateway-api 报 code=8");
+  assert.equal(unlabelUserMessage(labelUserMessage(undefined, "怎么修？")), "怎么修？");
+  assert.equal(unlabelUserMessage(labelUserMessage("A]B", "看下 [x] 这一项")), "看下 [x] 这一项");
+  assert.equal(unlabelUserMessage(labelUserMessage("张三", "[x] 已勾选")), "[x] 已勾选");
+  assert.equal(unlabelUserMessage("（中间较早的 3 条消息已省略）"), "（中间较早的 3 条消息已省略）");
 });
 
 test("超出字数上限时省略较早的消息，但保留话题第一条", () => {

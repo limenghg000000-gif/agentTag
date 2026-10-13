@@ -477,7 +477,9 @@ test("回答前先查经验库：查到的写进提示词，进度卡片多一�
   ]);
   // 追问放前面：第一个问题很长时两个库只取前面一段，追问不能被截掉
   assert.match(queries[1], /^那现在修好了吗\n/);
-  assert.match(queries[1], /\[张三\] gateway-api 报 code=8$/);
+  // 上文里机器人给每句话标的发言人去掉：名字对查经验没用，不发给 aiops
+  assert.match(queries[1], /\ngateway-api 报 code=8$/);
+  assert.doesNotMatch(queries[1], /张三/);
 
   respond = async () => ({ text: "", ids: [] });
   const none = await ask("今天中午吃什么");
@@ -517,11 +519,12 @@ test("话题里第三轮以后的追问：查经验库带上最近几轮提问�
   const lines = queries[0].split("\n");
   // 这次的提问在最前，然后是最近的一轮，再往前一轮，最后是第一个问题
   assert.equal(lines[0], "怎么修？");
-  assert.match(lines[1], /^\[李四\] 日志很长/);
+  assert.match(lines[1], /^日志很长/);
   assert.equal(lines[1].length, 200, "中间几轮每轮限长");
-  assert.equal(lines[2], "[张三] 报错是 code=8 ResourceExhausted，服务 gateway-api");
-  assert.equal(lines[3], "[张三] 帮我看下这个线上报警");
+  assert.equal(lines[2], "报错是 code=8 ResourceExhausted，服务 gateway-api");
+  assert.equal(lines[3], "帮我看下这个线上报警");
   assert.equal(lines.length, 4);
+  assert.doesNotMatch(queries[0], /张三|李四/, "发言人的名字不发给经验库");
 });
 
 test("追问时贴了一大段日志：查经验库的文字截短到两个库都查得到的长度，第一个问题照样带上，中间几轮放得下几轮放几轮", async () => {
@@ -545,7 +548,7 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   const query = queries[0];
   assert.ok(query.length <= 800, `查的文字有 ${query.length} 字，aiops 只取前 800 字`);
   assert.match(query, /^日志如下：ERROR upstream timeout/);
-  assert.match(query, /\n\[张三\] gateway-api 报 code=8，帮我看看$/, "第一个问题在两个库取的那一段里");
+  assert.match(query, /\ngateway-api 报 code=8，帮我看看$/, "第一个问题在两个库取的那一段里");
 
   // 话题里有一轮写着密钥：整轮不截短，免得截掉 </password> 以后经验库认不出来、把前半截发给 aiops
   const secret = ["Correct", "Horse", "Battery", "Staple9!"].join("");
@@ -557,11 +560,13 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
     },
     tools: () => [],
   };
-  const head = "[张三] gateway-api 报 code=8，配置文件是这样的 ";
+  const head = "gateway-api 报 code=8，配置文件是这样的 ";
   const firstTurn = `${head}${"a".repeat(163 - head.length)}<password>${secret}</password>`;
-  await setup({ model, knowledge: secretKnowledge, context: fakeContext({ history: [{ role: "user", content: firstTurn }, { role: "assistant", content: "收到" }], source: "feishu" }).source }).handle(
-    message("怎么修？"),
-  );
+  await setup({
+    model,
+    knowledge: secretKnowledge,
+    context: fakeContext({ history: [{ role: "user", content: `[张三] ${firstTurn}` }, { role: "assistant", content: "收到" }], source: "feishu" }).source,
+  }).handle(message("怎么修？"));
   // 截到 200 字时密码整个留着、</password> 截掉了：只看截短的认不出来
   assert.equal(firstTurn.indexOf("</password>"), 200);
   assert.ok(!containsSecret(firstTurn.slice(0, 200)));
@@ -573,8 +578,8 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   await handle(message("怎么修？"));
   const lines = queries[0].split("\n");
   assert.equal(lines[0], "怎么修？");
-  assert.match(lines[1], /^\[张三\] 上一轮的说明/);
-  assert.equal(lines[2], "[张三] gateway-api 报 code=8，帮我看看");
+  assert.match(lines[1], /^上一轮的说明/);
+  assert.equal(lines[2], "gateway-api 报 code=8，帮我看看");
   assert.equal(lines.length, 3);
 });
 
