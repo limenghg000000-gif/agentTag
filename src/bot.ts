@@ -7,7 +7,17 @@ import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type Th
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
-import { type AnswerSegment, hasUiBlocks, keepVerified, mislabeledBytes, NumberEvidence, segmentsAsText, splitAnswer } from "./rich-ui.js";
+import {
+  type AnswerSegment,
+  describeBlockProblem,
+  hasUiBlocks,
+  keepVerified,
+  mislabeledBytes,
+  NumberEvidence,
+  reviewUiBlocks,
+  segmentsAsText,
+  splitAnswer,
+} from "./rich-ui.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import {
   answerFitsCard,
@@ -397,6 +407,8 @@ async function runTask(
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
       ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
       reviewByteUnits(evidence),
+      // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
+      ...(streaming ? [reviewUiBlocks] : []),
     ];
     const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
     // 卡片上显示思考、不是用英文问的（群里一般说中文）：每次查完、下一轮要思考之前，提醒模型用中文想。
@@ -606,7 +618,7 @@ function verifiedSegments(answer: string, evidence: readonly ToolEvidence[], log
   }
   const { segments, invalid } = splitAnswer(answer);
   if (invalid.length > 0) {
-    logger.warn(`回答里的 ${invalid.join("、")} 块格式不对，没画 message=${messageId}`);
+    logger.warn(`回答里的代码块格式不对，没画 message=${messageId}：${invalid.map(describeBlockProblem).join("；")}`);
   }
   if (!hasUiBlocks(segments)) {
     return segments;
