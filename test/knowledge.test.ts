@@ -309,6 +309,18 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     ["curl -sSb 'sid", "CorrectHorse9xyz' https://api.example"].join("="),
     ["curl \\\n  -b \\\n  \"sid", "CorrectHorse9xyz\" https://api.example"].join("="),
     `{"Cookie": "connect.sid=${"s%3ACorrectHorseBattery.abc123"}"}`,
+    // 不在 Cookie 头里、单独写的会话 Cookie：日志里的、JSON 里的（转义的也算）、地址里的、nginx 变量名前缀的，各框架固定的名字
+    `GET /api/order 500 JSESSIONID=${"8F14E45FCEEA167A".concat("5C9A2D71B3E04F68")}`,
+    `PHPSESSID=${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4t5")} 登录后 500`,
+    `connect.sid=${"s%3ACorrectHorseBattery".concat(".Xk9pQ2wLr8")}`,
+    `laravel_session=${"eyJpdiI6IkNvcnJl".concat("Y3RIb3JzZSJ9")}`,
+    `{"PHPSESSID":"${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4t5")}"}`,
+    `\\"JSESSIONID\\":\\"${"8F14E45FCEEA167A".concat("5C9A2D71")}\\"`,
+    `/app;jsessionid=${"8F14E45FCEEA167A".concat("5C9A2D71B3E04F68")}?x=1`,
+    `cookie_PHPSESSID=${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4t5")} upstream 502`,
+    `ASP.NET_SessionId=${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4")}`,
+    `sessionid=${"k3j4h5g6f7d8s9a0".concat("q1w2e3r4t5")}`,
+    `_gitlab_session=${"8f14e45fceea167a".concat("5c9a2d71b3e04f68")}`,
     // PostgreSQL 的 .pgpass：主机像主机的、端口是 5432 的、提到了 pgpass 的；密码里转义的冒号、反斜杠
     ["db.example.com:5432:prod:svc", "CorrectHorseBatteryStaple9"].join(":"),
     ["postgres:5432:app:app", "correcthorsebatterystaple"].join(":"),
@@ -500,6 +512,9 @@ test("草稿里有密钥、密码时不让存，错误信息里不复述密钥�
     // Cookie 没带上的报错、打了码的、变量、cookie 文件、属性、很短的
     "Cookie: 没带上登录态；Set-Cookie: sessionid=******; Path=/; Domain=.example.com; Expires=Wed, 21 Oct 2026 07:28:00 GMT；curl -b cookies.txt https://x；cookie: session=${SESSION_ID}；Cookie: lang=zh-CN",
     "curl -bcookies.txt https://x；curl -sSb ~/.cookies https://x；curl -b 'sid=${SESSION_ID}' https://x",
+    // 单独写的会话 Cookie 是报错词、打码、占位、变量、很短的，名字不是框架固定的（sessionId 多半是业务里的会话编号）
+    "JSESSIONID=expired_session_value；PHPSESSID=******；JSESSIONID=<session-id>；JSESSIONID=${SESSION_ID}；PHPSESSID=xxxxxxxxxxxxxxxx；JSESSIONID=8F14E45F 过期；PHPSESSID 没带上",
+    `sessionId=${"8f14e45fceea167a".concat("5c9a2d71b3e04f68")}；user_session=${"8f14e45fceea167a".concat("5c9a2d71")}；JSESSIONID: 每次请求都变`,
     // Redis 的 key 也是几段冒号；.pgpass 里密码是变量、打码的；Azure 的 AccountKey 是变量的
     "order:1001:item:detail:summary；user:10086:coupon:list:available；db.example.com:5432:prod:svc:${PGPASSWORD}；*:*:*:*:******；AccountName=prod;AccountKey=${AZURE_STORAGE_KEY}",
     "<!-- 说明 --><password>${DB_PASSWORD}</password>",
@@ -3238,6 +3253,8 @@ test("回答前检索：提问里像是有密钥时不拿去查 aiops（会发�
   // 带签名的临时访问地址也一样（拿到就能下载）
   await desk.lookup(`gateway-api 报 code=8，日志在 https://bucket.s3.amazonaws.com/k?X-Amz-Expires=300&X-Amz-Signature=${"0123456789abcdef".repeat(4)}`, task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Cookie: sessionid", "CorrectHorseBatteryStaple9"].join("="), task);
+  // 日志里单独写的会话 Cookie 也一样
+  await desk.lookup(`gateway-api 报 code=8，日志里 JSESSIONID=${"8F14E45FCEEA167A".concat("5C9A2D71B3E04F68")}`, task);
   await desk.lookup(["gateway-api 报 code=8，请求头带了 Authorization: SSWS 00QCjAl4MlV-WPXM", "-ABCDEFGHIJKLMNOPQRSTUVWX"].join(""), task);
   await desk.lookup(`gateway-api 报 code=8，kubeconfig 里 client-key-data: ${base64(ecKeys.privateKey.export({ type: "sec1", format: "pem" }))}`, task);
   await desk.lookup(`gateway-api 报 code=8，Secret 是这样的：\nkind: Secret\ndata:\n  DATABASE_URL: ${base64(dbUrl)}`, task);

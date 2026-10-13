@@ -1035,22 +1035,35 @@ const CURL_COOKIE = new RegExp(
 );
 /** Set-Cookie 里的属性，不是 Cookie 本身 */
 const COOKIE_ATTRIBUTES = new Set(["expires", "max-age", "domain", "path", "samesite", "priority", "partitioned", "secure", "httponly"]);
+/**
+ * 不在 Cookie 头里、单独写的登录态 Cookie：日志里的 JSESSIONID=…、"PHPSESSID":"…"、地址里的 ;jsessionid=…、nginx 的 cookie_PHPSESSID=…。
+ * 名字是各框架固定的会话 Cookie（Java、PHP、ASP、ASP.NET、Express、Koa、Laravel、CodeIgniter、Play、Django 的 sessionid、Rails 的 _xxx_session），
+ * 看到就是会话；值不短于 16 个字符（这些框架的会话号都比这长），到空白、引号、分隔符、括号、中文为止。第 1 组是名字，第 2 组是值
+ */
+const SESSION_COOKIE = new RegExp(
+  String.raw`(?<![\w.$-])(?:cookie[_.:-])?\\?["']?(JSESSIONID(?:SSO)?|PHPSESSID|ASPSESSIONID[A-Z]{8}|ASP\.NET_SessionId|\.ASPXAUTH|\.AspNetCore\.(?:Session|Cookies|Identity\.Application)|connect\.sid|koa[.:]sess|laravel_session|ci_session|PLAY_SESSION|sessionid|_session_id|_[a-z0-9]+(?:_[a-z0-9]+)*_session)\\?["']?[^\S\r\n]*[=:][^\S\r\n]*\\?["']?([^\s"'\`,;&?#|\\<>()[\]{}\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{16,})`,
+  "gi",
+);
 
 /**
- * Cookie 里的值：登录态（sessionid、PHPSESSID、laravel_session、connect.sid…）拿到就能冒充登录的人。名字五花八门，
- * 不按名字挑，不短于 8 个字符的都算；值里不能有空白、逗号、引号、中文（RFC 6265），到这些为止，后面是说明
+ * Cookie 里的值：登录态（sessionid、PHPSESSID、laravel_session、connect.sid…）拿到就能冒充登录的人。Cookie 头里的名字五花八门，
+ * 不按名字挑，不短于 8 个字符的都算；值里不能有空白、逗号、引号、中文（RFC 6265），到这些为止，后面是说明。
+ * 单独写的按名字认（SESSION_COOKIE）；sessionid 只认 Django 的小写写法，sessionId 多半是业务里的会话编号
  */
 function cookieValues(text: string): string[] {
   const lists = [
     ...[...text.matchAll(COOKIE_HEADER)].map(([, list]) => list),
     ...[...text.matchAll(CURL_COOKIE)].map(([, double, single, bare]) => double ?? single ?? bare),
   ];
-  return lists.flatMap((list) =>
-    list.split(";").flatMap((pair) => {
-      const match = /^\s*([^=\s]+)=\s*"?([^\s",;\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]*)/.exec(pair);
-      return match && !COOKIE_ATTRIBUTES.has(match[1].toLowerCase()) && match[2].length >= 8 ? [match[2]] : [];
-    }),
-  );
+  return [
+    ...lists.flatMap((list) =>
+      list.split(";").flatMap((pair) => {
+        const match = /^\s*([^=\s]+)=\s*"?([^\s",;\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]*)/.exec(pair);
+        return match && !COOKIE_ATTRIBUTES.has(match[1].toLowerCase()) && match[2].length >= 8 ? [match[2]] : [];
+      }),
+    ),
+    ...[...text.matchAll(SESSION_COOKIE)].flatMap(([, name, value]) => (/^sessionid$/i.test(name) && name !== "sessionid" ? [] : [value])),
+  ];
 }
 /**
  * 名字以 auth 结尾的配置项：Docker config.json 的 "auth"、.npmrc 的 _auth、basicAuth 这些，值是「用户名:密码」的 base64；
