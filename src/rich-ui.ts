@@ -345,13 +345,15 @@ export function unitFactors(raw: string | undefined): UnitFactors | undefined {
   if (/%|百分(?!位)/.test(text)) {
     return { any: [1, 100], cores: [], bytes: [] };
   }
-  const bytes = /(?<![A-Za-z])(?:([KMGT])i?B?|([kmgt])B|bytes?)(?![A-Za-z])|字节/.exec(text);
+  const bytes = /(?<![A-Za-z])(?:([KMGT])(i)?B?|([kmgt])B|bytes?)(?![A-Za-z])|字节/.exec(text);
   if (bytes) {
-    // PromQL 查回来的字节数只认写出来的这一级（MiB 和 MB 常混着写，两种都认）；
+    // PromQL 查回来的字节数只认写出来的这一级：MB、GB 常被当成 MiB、GiB 用，两种都认；
+    // 写明 MiB、GiB 的只认按 1024 换算（2026-10-13 测试群：字节除以 100 万写成了「153.2 MiB」）。
     // 别的工具结果里的数不知道是哪一级（「256Mi」「1228 KiB」都有），哪级换过来都认
-    const prefix = (bytes[1] ?? bytes[2])?.toUpperCase();
+    const prefix = (bytes[1] ?? bytes[3])?.toUpperCase();
     const power = prefix ? "KMGT".indexOf(prefix) + 1 : 0;
-    return { any: BYTE_FACTORS, cores: [], bytes: power === 0 ? [1] : [1000 ** -power, 1024 ** -power] };
+    const factors = power === 0 ? [1] : bytes[2] ? [1024 ** -power] : [1000 ** -power, 1024 ** -power];
+    return { any: BYTE_FACTORS, cores: [], bytes: factors };
   }
   // 2026-10-12 测试群：模型把查到的核数 ×1000 写成「0.06 mCPU」，认不出 mCPU 就只认原数，对的数也被拦下
   if (/(?<![A-Za-z])m(?:CPU|cpu)?(?![A-Za-z])|毫核|millicores?/.test(text)) {
