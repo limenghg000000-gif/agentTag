@@ -534,15 +534,23 @@ export class NumberEvidence {
     if (!Number.isFinite(v) || !Number.isFinite(half)) {
       return false;
     }
+    return (["any", "cores", "bytes"] as const).some((kind) =>
+      factors[kind].some((factor) => this.near(kind, v, factor, half) !== undefined),
+    );
+  }
+
+  /** kind 里换算（× factor）以后按写出来的精度能四舍五入成 v 的一个原数，没有就是 undefined */
+  near(kind: keyof UnitFactors, v: number, factor: number, half = halfStep(v)): number | undefined {
+    if (!Number.isFinite(v) || !Number.isFinite(half)) {
+      return undefined;
+    }
     // 浮点误差只放几个 ulp，远小于半格：0 不能当成 1e-12 的证据
     const slack = 8 * Number.EPSILON * Math.abs(v);
-    return (["any", "cores", "bytes"] as const).some((kind) =>
-      factors[kind].some((factor) => within(this.values[kind], (v - half - slack) / factor, (v + half + slack) / factor)),
-    );
+    return within(this.values[kind], (v - half - slack) / factor, (v + half + slack) / factor);
   }
 }
 
-function within(values: Float64Array, lo: number, hi: number): boolean {
+function within(values: Float64Array, lo: number, hi: number): number | undefined {
   let left = 0;
   let right = values.length;
   while (left < right) {
@@ -553,7 +561,7 @@ function within(values: Float64Array, lo: number, hi: number): boolean {
       right = mid;
     }
   }
-  return left < values.length && values[left] <= hi;
+  return left < values.length && values[left] <= hi ? values[left] : undefined;
 }
 
 /**
@@ -668,6 +676,48 @@ export function keepVerified(segments: AnswerSegment[], evidence: NumberEvidence
     kept.push(segment);
   }
   return { segments: kept, dropped };
+}
+
+/** 写成 MiB、GiB 这种按 1024 算的字节单位的数 */
+const BINARY_BYTES = /(?<![\w.,])(\d+(?:\.\d+)?)(\s*)([KMGT])i(?=B?(?![A-Za-z]))/g;
+
+/** 写成 MiB、GiB，查到的字节数却只有按 1000 换算才对得上的一个数 */
+export interface MislabeledBytes {
+  /** 回答里写的，如「153.2 MiB」 */
+  readonly written: string;
+  /** 对上的那个查到的字节数 */
+  readonly raw: number;
+  /** 这个字节数按 1024 换算、按写出来的精度，如「146.1 MiB」 */
+  readonly binary: string;
+}
+
+/**
+ * 回答正文、表格里写成 MiB、GiB 的数，PromQL 查回来的字节数按 1000 换算才对得上（按 1024 对不上，别的工具结果里也没有这个数）：
+ * 多半是把 MB 标成了 MiB。代码里的不算。不直接改数：模型自己算的平均值、合计可能碰巧和某个字节数按 1000 换算对上，交给模型核对。
+ * 2026-10-13 测试群：2v7gp 的 144,949,248 → 153,182,208 字节写成了「144.9 MiB 跳到 153.2 MiB」，应为 138.2 → 146.1 MiB
+ */
+export function mislabeledBytes(text: string, evidence: NumberEvidence): MislabeledBytes[] {
+  const found = new Map<string, MislabeledBytes>();
+  const prose = halfWidth(text).split(/(```[\s\S]*?```|`[^`\n]*`)/).filter((_, i) => i % 2 === 0);
+  for (const part of prose) {
+    for (const match of part.matchAll(BINARY_BYTES)) {
+      const [, digits, , prefix] = match;
+      const power = "KMGT".indexOf(prefix) + 1;
+      const n = Number(digits);
+      const half = writtenHalf(digits);
+      const binary = 1024 ** -power;
+      if (evidence.near("bytes", n, binary, half) !== undefined || evidence.near("any", n, 1, half) !== undefined || evidence.near("any", n, binary, half) !== undefined) {
+        continue;
+      }
+      const raw = evidence.near("bytes", n, 1000 ** -power, half);
+      const unit = `${prefix}iB`;
+      const written = `${digits} ${unit}`;
+      if (raw !== undefined && !found.has(written)) {
+        found.set(written, { written, raw, binary: `${(raw * binary).toFixed((digits.split(".")[1] ?? "").length)} ${unit}` });
+      }
+    }
+  }
+  return [...found.values()];
 }
 
 const LEVEL_COLOR: Record<NonNullable<KpiItem["level"]>, string> = { danger: "red", warn: "orange", ok: "green" };

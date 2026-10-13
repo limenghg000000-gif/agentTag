@@ -5,6 +5,7 @@ import {
   type AnswerSegment,
   type ChartBlock,
   keepVerified,
+  mislabeledBytes,
   NumberEvidence,
   segmentElements,
   segmentsAsText,
@@ -554,4 +555,36 @@ test("2026-10-13 union：字节除以 100 万的数标成 MiB、GiB 不画；标
   assert.ok(!kpi("153.5 MiB"));
   // 别的工具写的 MiB（不知道单位的数）照旧哪级换过来都认
   assert.ok(new NumberEvidence(["memory 153.5 MB"]).has(153.5, unitFactors("MiB")));
+});
+
+test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算才对得上查到的字节数时认出来；对得上的、算出来的、代码里的不算", () => {
+  const memory = JSON.stringify({
+    query: 'sum by (pod) (container_memory_working_set_bytes{namespace="prod", pod=~"union-.*", container!=""})',
+    data: { resultType: "matrix", result: [
+      { metric: { pod: "union-2v7gp" }, values: [[1760279400, "144949248"], [1760281200, "153182208"]] },
+      { metric: { pod: "union-sxllq" }, values: [[1760279400, "188430745"], [1760281200, "188430745"]] },
+    ] },
+  });
+  const evidence = new NumberEvidence([memory, "limits memory 256Mi"]);
+  const found = (text: string) => mislabeledBytes(text, evidence);
+
+  // 测试群里的原话
+  assert.deepEqual(found("2v7gp 在 10-12 21:50~22:20 之间从 144.9 MiB 一次性跳到 153.2 MiB（+8 MiB），之后 11 小时完全不动"), [
+    { written: "144.9 MiB", raw: 144949248, binary: "138.2 MiB" },
+    { written: "153.2 MiB", raw: 153182208, binary: "146.1 MiB" },
+  ]);
+  // 按 1024 算对的、别的工具里本来就是这个数的、算出来的差值不算
+  assert.deepEqual(found("sxllq 179.7 MiB，距 limit 256 MiB 还有约 76 MiB"), []);
+  // GiB、Mi 写法、表格里、全角数字也一样；写成 MB 的不算
+  assert.deepEqual(found("| 2v7gp | 0.153 GiB |"), [{ written: "0.153 GiB", raw: 153182208, binary: "0.143 GiB" }]);
+  assert.deepEqual(found("当前 153.2Mi"), [{ written: "153.2 MiB", raw: 153182208, binary: "146.1 MiB" }]);
+  assert.equal(found("当前 １５３.２ MiB").length, 1);
+  assert.deepEqual(found("当前 153.2 MB"), []);
+  // 同一个数写两遍只算一次；代码里的不算；精度太粗、两种换算都对得上的不算
+  assert.equal(found("153.2 MiB，还是 153.2 MiB").length, 1);
+  assert.deepEqual(found("`153.2 MiB` 和\n```\n153.2 MiB\n```"), []);
+  assert.deepEqual(found("大约 0.1 GiB"), []);
+  // 认不出单位的查询（算过的）里的字节数不算：不知道它是不是字节
+  const unknown = new NumberEvidence([JSON.stringify({ query: "sum(container_memory_working_set_bytes) / 2", data: { result: [{ metric: {}, value: [1, "153182208"] }] } })]);
+  assert.deepEqual(mislabeledBytes("153.2 MiB", unknown), []);
 });

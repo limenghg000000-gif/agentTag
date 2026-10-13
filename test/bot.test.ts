@@ -2985,6 +2985,39 @@ test("卡片即回答：建卡片实体按 card_id 发到话题里，思考和�
   assert.deepEqual(answers.saved, [{ chatId: "oc_1", threadKey: "om_1", messageId: "om_reply_1", answer: "今天**周一**" }]);
 });
 
+test("回答里把 MB 写成了 MiB：打回时点名是哪个数、按 1024 应该是多少，改过来以后照常发出；写对的不打回", async () => {
+  // 2026-10-13 测试群：2v7gp 的 144,949,248 → 153,182,208 字节写成了「144.9 MiB 跳到 153.2 MiB」，表格里最高才 146.4 MiB
+  const metrics: Tool = {
+    spec: { name: "aiops_query_metrics_range", description: "查指标", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查指标",
+    run: async () =>
+      JSON.stringify({
+        query: 'sum by (pod) (container_memory_working_set_bytes{namespace="prod", pod=~"union-.*", container!=""})',
+        data: { resultType: "matrix", result: [{ metric: { pod: "union-2v7gp" }, values: [[1760279400, "144949248"], [1760281200, "153182208"]] }] },
+      }),
+  };
+  const call: ChatResult = { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_metrics_range", arguments: "{}" }] };
+  const run = async (answers: string[]) => {
+    const results: ChatResult[] = [call, ...answers.map((text): ChatResult => ({ text, finish: "stop" }))];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined } });
+    await handle(message("prod union 最近 24 小时内存趋势"));
+    return { requests, sent };
+  };
+
+  const wrong = await run(["2v7gp 从 144.9 MiB 跳到 153.2 MiB", "2v7gp 从 138.2 MiB 跳到 146.1 MiB"]);
+  assert.equal(wrong.requests.length, 3);
+  assert.match(
+    wrong.requests[2].messages.at(-1)!.content,
+    /144\.9 MiB（查到的 144949248 字节按 1024 换算是 138\.2 MiB）、153\.2 MiB（查到的 153182208 字节按 1024 换算是 146\.1 MiB）/,
+  );
+  assert.deepEqual(markdowns(wrong.sent), ["2v7gp 从 138.2 MiB 跳到 146.1 MiB"]);
+
+  const right = await run(["2v7gp 从 138.2 MiB 跳到 146.1 MiB，涨了约 8 MiB"]);
+  assert.equal(right.requests.length, 2);
+  assert.deepEqual(markdowns(right.sent), ["2v7gp 从 138.2 MiB 跳到 146.1 MiB，涨了约 8 MiB"]);
+});
+
 test("卡片即回答：回答没通过检查时卡片里换成重做说明，重做的回答写出来以后替换它", async () => {
   const kit = fakeCardKit();
   const queryLogs: Tool = {
