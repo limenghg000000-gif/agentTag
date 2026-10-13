@@ -7,6 +7,7 @@ import {
   keepVerified,
   mislabeledBytes,
   NumberEvidence,
+  reviewUiBlocks,
   segmentElements,
   segmentsAsText,
   splitAnswer,
@@ -18,13 +19,15 @@ import {
 
 const chartJson = '{"type":"line","title":"CPU","unit":"%","x":["19:00","19:05"],"series":[{"name":"pod-a","data":[41.2,39]}]}';
 const kpiJson = '[{"label":"CPU 最高","value":"41%","level":"ok"},{"label":"重启","value":"0 次"}]';
+/** 画不出来的是哪几种块 */
+const langs = (answer: string) => splitAnswer(answer).invalid.map((item) => item.lang);
 
 test("拆回答：```chart、```kpi 换成图和数字卡片，别的代码块、格式不对的、没写完的不当图", () => {
   const answer = ["结论：没有风险", "```kpi", kpiJson, "```", "", "```chart", chartJson, "```", "说明", "```json", '{"a":1}', "```", "```chart", "{坏的", "```"].join("\n");
   const { segments, invalid } = splitAnswer(answer);
   assert.deepEqual(
     segments.map((s) => s.kind),
-    ["markdown", "kpi", "chart", "markdown"],
+    ["markdown", "kpi", "chart", "markdown", "markdown"],
   );
   assert.deepEqual(segments[0], { kind: "markdown", text: "结论：没有风险" });
   assert.deepEqual(segments[1], {
@@ -36,10 +39,12 @@ test("拆回答：```chart、```kpi 换成图和数字卡片，别的代码块�
   });
   assert.deepEqual(segments[2], { kind: "chart", type: "line", title: "CPU", unit: "%", x: ["19:00", "19:05"], series: [{ name: "pod-a", data: [41.2, 39] }] });
   assert.equal((segments[3] as { text: string }).text, '说明\n```json\n{"a":1}\n```');
-  assert.deepEqual(invalid, ["chart"]);
+  // 画不出来的图在原处说一句，不悄悄丢掉
+  assert.deepEqual(segments[4], { kind: "markdown", text: "📊 有一张图没画出来：JSON 没写完整。" });
+  assert.deepEqual(invalid, [{ lang: "chart", problem: "JSON 没写完整" }]);
 
   // JSON 没写完的块不算，长代码块里的 ```chart 不算
-  assert.deepEqual(splitAnswer("开头\n```chart\n{\"type\":\"li").invalid, ["chart"]);
+  assert.deepEqual(langs("开头\n```chart\n{\"type\":\"li"), ["chart"]);
   const nested = "````md\n```chart\n" + chartJson + "\n```\n````";
   assert.deepEqual(splitAnswer(nested).segments, [{ kind: "markdown", text: nested }]);
   // 数据和横轴对不上、饼图多个系列、点太多：不要
@@ -49,8 +54,62 @@ test("拆回答：```chart、```kpi 换成图和数字卡片，别的代码块�
     '{"type":"area","title":"t","x":["a"],"series":[{"name":"s","data":[1]}]}',
     JSON.stringify({ type: "line", title: "t", x: Array.from({ length: 201 }, (_, i) => String(i)), series: [{ name: "s", data: Array(201).fill(1) }] }),
   ]) {
-    assert.deepEqual(splitAnswer("```chart\n" + bad + "\n```").invalid, ["chart"], bad);
+    assert.deepEqual(langs("```chart\n" + bad + "\n```"), ["chart"], bad);
   }
+});
+
+test("画不出来的图在原处说明哪张图、为什么；打回给模型时点名是哪一块；按钮写错了、长代码块里的例子不打回", () => {
+  // 按半小时取 24 小时的数、横轴只写时分时，头尾都是 13:20
+  const x = Array.from({ length: 49 }, (_, i) => {
+    const minutes = (13 * 60 + 20 + i * 30) % 1440;
+    return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+  });
+  const day = { type: "line", title: "CPU 占总 limit", unit: "%", x, series: [{ name: "CPU", data: x.map((_, i) => 13 + (i % 20)) }] };
+  const answer = ["**CPU**", "```chart", JSON.stringify(day), "```", "24 小时在 13%～32% 之间"].join("\n");
+  assert.deepEqual(splitAnswer(answer), {
+    segments: [
+      { kind: "markdown", text: "**CPU**" },
+      { kind: "markdown", text: "📊 图「CPU 占总 limit」没画出来：横轴有重复的值「13:20」。" },
+      { kind: "markdown", text: "24 小时在 13%～32% 之间" },
+    ],
+    invalid: [{ lang: "chart", problem: "横轴有重复的值「13:20」", title: "CPU 占总 limit" }],
+  });
+  const review = reviewUiBlocks(answer);
+  assert.match(review ?? "", /```chart「CPU 占总 limit」：横轴有重复的值「13:20」/);
+  assert.match(review ?? "", /时间跨天要带上日期，如 10-12 13:20/);
+  // 带上日期就画得出来
+  const dated = { ...day, x: x.map((value, i) => `${i < 22 ? "10-12" : "10-13"} ${value}`) };
+  assert.equal(splitAnswer("```chart\n" + JSON.stringify(dated) + "\n```").segments[0].kind, "chart");
+  assert.equal(reviewUiBlocks("```chart\n" + JSON.stringify(dated) + "\n```"), undefined);
+
+  // 各种原因
+  const problem = (json: unknown) => splitAnswer("```chart\n" + JSON.stringify(json) + "\n```").invalid[0]?.problem;
+  const line = (extra: object) => ({ type: "line", title: "t", x: ["a", "b"], series: [{ name: "s", data: [1, 2] }], ...extra });
+  assert.equal(problem(line({ type: "area" })), "type 只能是 line、bar 或 pie");
+  assert.equal(problem(line({ title: "" })), "没写 title");
+  assert.equal(problem(line({ series: [{ name: "s", data: [1] }] })), "「s」的 data 有 1 个数，x 有 2 个，要一一对应");
+  assert.equal(problem(line({ series: [{ name: "s", data: [1, null] }] })), "「s」的 data 里有不是数的值");
+  assert.equal(problem(line({ series: [{ name: "s", data: [1, 2] }, { data: [1, 2] }] })), "有几个系列时每个都要写 name");
+  assert.equal(problem(line({ series: [{ name: "s", data: [1, 2] }, { name: "s", data: [3, 4] }] })), "有重名的系列「s」");
+  assert.equal(problem(line({ series: Array.from({ length: 9 }, (_, i) => ({ name: `s${i}`, data: [1, 2] })) })), "有 9 个系列，最多 8 个");
+  const pods = Array.from({ length: 49 }, (_, i) => `t${i}`);
+  assert.equal(
+    problem(line({ x: pods, series: Array.from({ length: 6 }, (_, i) => ({ name: `pod-${i}`, data: pods.map(() => 1) })) })),
+    "点太多：6 个系列 × 49 个点是 294 个，最多 200 个",
+  );
+  assert.equal(problem({ type: "pie", title: "t", x: ["a", "a"], series: [{ name: "s", data: [1, 2] }] }), "各块的名字有重复的值「a」");
+  assert.equal(problem(line({ series: [{ name: "s", data: [1, 2] }, { name: "u", data: [3, 4] }], type: "pie" })), "饼图只能有一个系列");
+  assert.equal(splitAnswer("```chart\n```").invalid[0].problem, "代码块是空的");
+  assert.equal(splitAnswer('```kpi\n[{"label":"CPU"}]\n```').invalid[0].problem, "第 1 项没写 label 或 value");
+  // 漏写收尾、后面跟着正文：原因按写完的那段 JSON 说，不说成 JSON 没写完
+  const unclosed = splitAnswer(["```chart", JSON.stringify(day), "", "后面的正文"].join("\n"));
+  assert.equal(unclosed.invalid[0].problem, "横轴有重复的值「13:20」");
+  assert.equal((unclosed.segments.at(-1) as { text: string }).text, "后面的正文");
+
+  // 按钮写错了不打回；长代码块里讲写法的 ```chart 不算
+  assert.equal(reviewUiBlocks('结论\n```actions\n{"q":"x"}\n```'), undefined);
+  assert.equal(reviewUiBlocks("````md\n```chart\n" + JSON.stringify(day) + "\n```\n````"), undefined);
+  assert.equal(reviewUiBlocks("结论：没有风险"), undefined);
 });
 
 test("生成中的回答：图和数字卡片的代码块换成一行说明", () => {
@@ -231,7 +290,7 @@ test("图：横轴写成数的值（时间戳、编号）也要查得到；系�
     { type: "bar", title: "t", x: ["x".repeat(50) + "1", "x".repeat(50) + "1"], series: [{ name: "a", data: [1, 2] }] },
     { type: "line", title: "t", x: ["19:00", "19:00"], series: [{ name: "a", data: [1, 2] }] },
   ]) {
-    assert.deepEqual(splitAnswer("```chart\n" + JSON.stringify(bad) + "\n```").invalid, ["chart"], JSON.stringify(bad));
+    assert.deepEqual(langs("```chart\n" + JSON.stringify(bad) + "\n```"), ["chart"], JSON.stringify(bad));
   }
 });
 
@@ -282,12 +341,22 @@ test("漏写了收尾 ``` 的图、数字卡片块不吞掉后面的正文：JSO
 
   // 被截断：JSON 没写完，后面的截断说明留着
   const cut = splitAnswer('```chart\n{"type":"line","ti\n\n（回答太长，后面被截断了）');
-  assert.deepEqual(cut, { segments: [{ kind: "markdown", text: "（回答太长，后面被截断了）" }], invalid: ["chart"] });
+  assert.deepEqual(cut, {
+    segments: [
+      { kind: "markdown", text: "📊 有一张图没画出来：JSON 没写完整。" },
+      { kind: "markdown", text: "（回答太长，后面被截断了）" },
+    ],
+    invalid: [{ lang: "chart", problem: "JSON 没写完整" }],
+  });
 
-  // JSON 不对、写了收尾的块：和原来一样整块不要
+  // JSON 不对、写了收尾的块：整块不要，原处说一句
   assert.deepEqual(splitAnswer("开头\n```kpi\n{坏的\n```\n结尾"), {
-    segments: [{ kind: "markdown", text: "开头\n结尾" }],
-    invalid: ["kpi"],
+    segments: [
+      { kind: "markdown", text: "开头" },
+      { kind: "markdown", text: "📌 关键数字没显示出来：JSON 没写完整。" },
+      { kind: "markdown", text: "结尾" },
+    ],
+    invalid: [{ lang: "kpi", problem: "JSON 没写完整" }],
   });
 });
 
@@ -333,8 +402,9 @@ test("「接着查」按钮：```actions 里的问题尖括号换成全角、合
     kind: "actions",
     questions: ["查 CPU ＞ 80% 的 Pod", "延迟 ＜ 500ms 的接口"],
   });
-  assert.deepEqual(splitAnswer('```actions\n{"q":"x"}\n```').invalid, ["actions"]);
-  assert.deepEqual(splitAnswer('```actions\n["很' + "很".repeat(40) + '"]\n```').invalid, ["actions"]);
+  // 按钮写错了不画，也不在卡片上说
+  assert.deepEqual(splitAnswer('```actions\n{"q":"x"}\n```'), { segments: [], invalid: [{ lang: "actions", problem: "内容要是 JSON 数组" }] });
+  assert.deepEqual(langs('```actions\n["很' + "很".repeat(40) + '"]\n```'), ["actions"]);
 
   // 生成时不占位
   assert.equal(streamingAnswer(["结论", "```actions", actions, "```"].join("\n")), "结论");

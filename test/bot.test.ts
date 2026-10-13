@@ -3565,6 +3565,55 @@ test("卡片即回答：回答里的图和关键数字按查到的数画出来�
   assert.deepEqual(plain.warnings, []);
 });
 
+test("卡片上画图时图的代码块格式不对（横轴头尾都是 13:20）：打回让模型改一次，改好了照常画，还不对就在卡片上说哪张图为什么没画；不用卡片时不打回", async () => {
+  // 2026-10-13 测试群问商品转链服务 24 小时的 CPU 和内存趋势：两张图的代码块格式不对，悄悄没了
+  const metrics: Tool = {
+    spec: { name: "aiops_query_metrics_range", description: "查指标趋势", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查指标趋势",
+    run: async () => '{"series":[{"pod":"pod-a","values":[["10-12 13:20","0.412"],["10-13 13:20","0.39"]]}]}',
+  };
+  const chart = (x: string[]) =>
+    `结论：CPU 正常\n\`\`\`chart\n${JSON.stringify({ type: "line", title: "pod-a CPU", unit: "%", x, series: [{ name: "pod-a", data: [41.2, 39] }] })}\n\`\`\``;
+  const broken = chart(["13:20", "13:20"]);
+  const fixed = chart(["10-12 13:20", "10-13 13:20"]);
+  const run = async (answers: string[], withCard: boolean) => {
+    const kit = fakeCardKit();
+    const warnings: string[] = [];
+    const results: ChatResult[] = [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_metrics_range", arguments: "{}" }] },
+      ...answers.map((text): ChatResult => ({ text, finish: "stop" })),
+    ];
+    const { model, requests } = fakeModel(() => results.shift()!);
+    const { sent, handle } = setup({
+      model,
+      ...(withCard ? { cardKit: kit.api } : {}),
+      streamIntervalMs: 0,
+      mcp: { names: ["aiops"], tools: () => [metrics], prompt: () => undefined },
+      logger: { ...quiet, warn: (text: string) => void warnings.push(text) },
+    });
+    await handle(message("pod-a 最近 24 小时 CPU 趋势"));
+    return { card: JSON.stringify(kit.last()), requests, sent, warnings };
+  };
+
+  const redone = await run([broken, fixed], true);
+  assert.equal(redone.requests.length, 3);
+  assert.match(redone.requests[2].messages.at(-1)!.content, /```chart「pod-a CPU」：横轴有重复的值「13:20」/);
+  assert.match(redone.card, /"tag":"chart"/);
+  assert.doesNotMatch(redone.card, /没画出来/);
+  assert.match(redone.warnings.join("\n"), /已让模型重做/);
+  assert.doesNotMatch(redone.warnings.join("\n"), /没画/);
+
+  const still = await run([broken, broken], true);
+  assert.equal(still.requests.length, 3);
+  assert.doesNotMatch(still.card, /"tag":"chart"/);
+  assert.match(still.card, /📊 图「pod-a CPU」没画出来：横轴有重复的值「13:20」。/);
+  assert.match(still.warnings.join("\n"), /代码块格式不对，没画 .*：```chart「pod-a CPU」：横轴有重复的值「13:20」/);
+
+  const plain = await run([broken], false);
+  assert.equal(plain.requests.length, 2);
+  assert.deepEqual(markdowns(plain.sent), [broken]);
+});
+
 test("记忆工具结果里的数是模型自己写的，不算查到的数：先记「CPU 99%」再画 99% 的数字卡片不行", async () => {
   const kit = fakeCardKit();
   const warnings: string[] = [];

@@ -37,6 +37,13 @@ export interface ActionsBlock {
 
 export type AnswerSegment = { kind: "markdown"; text: string } | ChartBlock | KpiBlock | ActionsBlock;
 
+/** 画不出来的块：哪种块、哪里不对（写日志、打回给模型、卡片上说一句），图有标题时带上标题 */
+export interface BlockProblem {
+  lang: string;
+  problem: string;
+  title?: string;
+}
+
 /** 一次回答最多几张图、几个数字卡片，每张图最多几条线、几个点（卡片最大 30 KB，图的数据占地方） */
 export const MAX_CHARTS = 3;
 const MAX_SERIES = 8;
@@ -63,12 +70,14 @@ function uiLang(line: string): string | undefined {
 }
 
 /**
- * 把回答拆成几段：普通的 Markdown 和 ```chart、```kpi 块。块里的 JSON 不对、格式不对的不要（记在 invalid 里）。
+ * 把回答拆成几段：普通的 Markdown 和 ```chart、```kpi 块。块里的 JSON 不对、格式不对的不画（记在 invalid 里），
+ * 图和关键数字在原处换成一句说明，不悄悄丢掉：2026-10-13 测试群问商品转链服务 24 小时的 CPU 和内存趋势，
+ * 两张图的代码块格式不对，整张没画，卡片上一个字没说。
  * 漏写了收尾 ``` 的块（模型忘了写，或者回答被截断）不能把后面的正文吞掉：见 blockEnd
  */
-export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid: string[] } {
+export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid: BlockProblem[] } {
   const segments: AnswerSegment[] = [];
-  const invalid: string[] = [];
+  const invalid: BlockProblem[] = [];
   let markdown: string[] = [];
   let block: { lang: string; lines: string[] } | undefined;
   let fence: string | undefined;
@@ -87,7 +96,13 @@ export function splitAnswer(text: string): { segments: AnswerSegment[]; invalid:
       flushMarkdown();
       segments.push(end.parsed);
     } else {
-      invalid.push(lang);
+      const problem = blockProblem(lang, body);
+      invalid.push(problem);
+      const note = problemNote(problem);
+      if (note) {
+        flushMarkdown();
+        segments.push({ kind: "markdown", text: note });
+      }
     }
     const rest = body.slice(end.used);
     // 块在 used 那里就完了：收尾的 ``` 属于后面的正文（多半是后面别的代码块的收尾）
@@ -147,10 +162,10 @@ function blockEnd(lang: string, body: string[]): { parsed?: ReturnType<typeof pa
 
 /** 前面拆好的（加上还没放进去的正文 markdown）接上后面接着拆的 */
 function joinSplits(
-  head: { segments: AnswerSegment[]; invalid: string[] },
+  head: { segments: AnswerSegment[]; invalid: BlockProblem[] },
   markdown: string[],
-  tail: { segments: AnswerSegment[]; invalid: string[] },
-): { segments: AnswerSegment[]; invalid: string[] } {
+  tail: { segments: AnswerSegment[]; invalid: BlockProblem[] },
+): { segments: AnswerSegment[]; invalid: BlockProblem[] } {
   const pending = markdown.join("\n");
   const segments = [...head.segments];
   if (pending.trim()) {
@@ -187,21 +202,75 @@ export function streamingAnswer(text: string): string {
 }
 
 function parseBlock(lang: string, body: string): ChartBlock | KpiBlock | ActionsBlock | undefined {
+  const read = readBlock(lang, body);
+  return read && !("problem" in read) ? read : undefined;
+}
+
+/** 块里的内容：不是完整的 JSON 是 undefined；是 JSON、格式不对的是哪里不对 */
+function readBlock(lang: string, body: string): ChartBlock | KpiBlock | ActionsBlock | Omit<BlockProblem, "lang"> | undefined {
   let json: unknown;
   try {
     json = JSON.parse(body);
   } catch {
     return undefined;
   }
-  return lang === "chart" ? parseChart(json) : lang === "kpi" ? parseKpi(json) : parseActions(json);
+  const block = lang === "chart" ? parseChart(json) : lang === "kpi" ? parseKpi(json) : parseActions(json);
+  if (typeof block !== "string") {
+    return block;
+  }
+  const title = lang === "chart" && json && typeof json === "object" ? text((json as Record<string, unknown>).title, 60) : undefined;
+  return { problem: block, ...(title ? { title } : {}) };
 }
 
-function parseActions(json: unknown): ActionsBlock | undefined {
-  if (!Array.isArray(json)) {
+/** 块为什么画不出来：块里第一段能拼成完整 JSON 的内容哪里不对（漏写收尾时后面还跟着正文）；拼不成的是 JSON 没写完 */
+function blockProblem(lang: string, body: string[]): BlockProblem {
+  if (body.every((line) => !line.trim())) {
+    return { lang, problem: "代码块是空的" };
+  }
+  for (let k = 1; k <= body.length; k++) {
+    const read = readBlock(lang, body.slice(0, k).join("\n"));
+    if (read && "problem" in read) {
+      return { lang, ...read };
+    }
+  }
+  return { lang, problem: "JSON 没写完整" };
+}
+
+/** 卡片上原处说一句：图、关键数字没画出来和原因。按钮可有可无，不说 */
+function problemNote({ lang, problem, title }: BlockProblem): string | undefined {
+  if (lang === "chart") {
+    return `📊 ${title ? `图「${title}」` : "有一张图"}没画出来：${problem}。`;
+  }
+  return lang === "kpi" ? `📌 关键数字没显示出来：${problem}。` : undefined;
+}
+
+/** 日志、打回时说的哪一块：```chart「CPU 趋势」：横轴有重复的值「13:20」 */
+export function describeBlockProblem({ lang, problem, title }: BlockProblem): string {
+  return `\`\`\`${lang}${title ? `「${title}」` : ""}：${problem}`;
+}
+
+/**
+ * 图、关键数字的代码块画不出来时打回，让模型改好这几块（重做只有一次，还不对就在卡片上说一句）。
+ * 按钮写错了不打回：可有可无，不值得多等一轮
+ */
+export function reviewUiBlocks(answer: string): string | undefined {
+  const problems = splitAnswer(answer).invalid.filter((item) => item.lang !== "actions");
+  if (problems.length === 0) {
     return undefined;
   }
+  return (
+    `回答里这几个代码块画不出来：${problems.map(describeBlockProblem).join("；")}。` +
+    "照系统提示词里的格式改好这几块（横轴的值不能重复，时间跨天要带上日期，如 10-12 13:20；系列数乘点数不超过 200，点多了就加大查询的 step 重新查，或者少画几条线），" +
+    "其余内容不用改，重新给出完整的回答。"
+  );
+}
+
+function parseActions(json: unknown): ActionsBlock | string {
+  if (!Array.isArray(json)) {
+    return "内容要是 JSON 数组";
+  }
   const questions = [...new Set(json.map(actionQuestion))].filter((item): item is string => item !== undefined);
-  return questions.length === 0 ? undefined : { kind: "actions", questions: questions.slice(0, MAX_ACTIONS) };
+  return questions.length === 0 ? `没有能用的问题（每句不超过 ${MAX_ACTION_CHARS} 个字）` : { kind: "actions", questions: questions.slice(0, MAX_ACTIONS) };
 }
 
 /**
@@ -244,59 +313,99 @@ function label(value: unknown, max = MAX_LABEL_CHARS): string | undefined {
   return `${chars.slice(0, max - 1 - tail).join("")}…${chars.slice(-tail).join("")}`;
 }
 
-function parseChart(json: unknown): ChartBlock | undefined {
-  if (!json || typeof json !== "object") {
-    return undefined;
+/** 图的 JSON：画得出来的是图，画不出来的是哪里不对（打回给模型、卡片上说一句） */
+function parseChart(json: unknown): ChartBlock | string {
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    return "内容要是 JSON 对象";
   }
   const raw = json as Record<string, unknown>;
   const type = raw.type === "line" || raw.type === "bar" || raw.type === "pie" ? raw.type : undefined;
   const title = text(raw.title, 60);
-  if (!type || !title || !Array.isArray(raw.x) || !Array.isArray(raw.series)) {
-    return undefined;
+  if (!type) {
+    return "type 只能是 line、bar 或 pie";
   }
+  if (!title) {
+    return "没写 title";
+  }
+  if (!Array.isArray(raw.x) || !Array.isArray(raw.series)) {
+    return "x 和 series 要是数组";
+  }
+  const axis = type === "pie" ? "各块的名字" : "横轴";
   const x = raw.x.map((value) => label(value));
+  if (x.length === 0 || x.some((value) => value === undefined)) {
+    return `${axis}是空的或者有空的值`;
+  }
   // 横轴的值重了（掐短以后一样也算）：几个点会叠在一起
-  if (x.length === 0 || x.some((value) => value === undefined) || new Set(x).size !== x.length) {
-    return undefined;
+  const repeated = firstRepeat(x as string[]);
+  if (repeated !== undefined) {
+    return `${axis}有重复的值「${repeated}」`;
   }
   const series: ChartBlock["series"] = [];
   for (const item of raw.series) {
     if (!item || typeof item !== "object") {
-      return undefined;
+      return "series 里每项要是 {name, data}";
     }
     const { name, data } = item as Record<string, unknown>;
     const seriesName = label(name) ?? (raw.series.length === 1 ? title : undefined);
-    if (!seriesName || !Array.isArray(data) || data.length !== x.length || !data.every((n) => typeof n === "number" && Number.isFinite(n))) {
-      return undefined;
+    if (!seriesName) {
+      return "有几个系列时每个都要写 name";
+    }
+    if (!Array.isArray(data) || data.length !== x.length) {
+      return `「${seriesName}」的 data 有 ${Array.isArray(data) ? data.length : 0} 个数，x 有 ${x.length} 个，要一一对应`;
+    }
+    if (!data.every((n) => typeof n === "number" && Number.isFinite(n))) {
+      return `「${seriesName}」的 data 里有不是数的值`;
     }
     series.push({ name: seriesName, data: data as number[] });
   }
-  if (series.length === 0 || series.length > MAX_SERIES || series.length * x.length > MAX_POINTS_PER_CHART || (type === "pie" && series.length !== 1)) {
-    return undefined;
+  if (series.length === 0) {
+    return "series 是空的";
+  }
+  if (series.length > MAX_SERIES) {
+    return `有 ${series.length} 个系列，最多 ${MAX_SERIES} 个`;
+  }
+  if (series.length * x.length > MAX_POINTS_PER_CHART) {
+    return `点太多：${series.length} 个系列 × ${x.length} 个点是 ${series.length * x.length} 个，最多 ${MAX_POINTS_PER_CHART} 个`;
+  }
+  if (type === "pie" && series.length !== 1) {
+    return "饼图只能有一个系列";
   }
   // 系列名重了（掐短以后一样也算）：几条线会画成一条，图例也分不清
-  if (new Set(series.map((item) => item.name)).size !== series.length) {
-    return undefined;
+  const sameName = firstRepeat(series.map((item) => item.name));
+  if (sameName !== undefined) {
+    return `有重名的系列「${sameName}」`;
   }
   const unit = text(raw.unit, 12);
   return { kind: "chart", type, title, ...(unit ? { unit } : {}), x: x as string[], series };
 }
 
-function parseKpi(json: unknown): KpiBlock | undefined {
+/** 第一个重复出现的值 */
+function firstRepeat(values: string[]): string | undefined {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) {
+      return value;
+    }
+    seen.add(value);
+  }
+  return undefined;
+}
+
+function parseKpi(json: unknown): KpiBlock | string {
   if (!Array.isArray(json) || json.length === 0) {
-    return undefined;
+    return "内容要是 JSON 数组，每项是 {label, value}";
   }
   const items: KpiItem[] = [];
   for (const item of json.slice(0, MAX_KPIS)) {
     if (!item || typeof item !== "object") {
-      return undefined;
+      return "每项要是 {label, value}";
     }
     const raw = item as Record<string, unknown>;
     // 标签里会带上服务、Pod 名（「CPU 占 limit 最高 · user-rpc」），字号小，可以长一点
     const label = text(raw.label, 32);
     const value = text(raw.value, 16);
     if (!label || !value) {
-      return undefined;
+      return `第 ${items.length + 1} 项没写 label 或 value`;
     }
     const level = raw.level === "danger" || raw.level === "warn" || raw.level === "ok" ? raw.level : undefined;
     items.push({ label, value, ...(level ? { level } : {}) });
