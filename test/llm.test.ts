@@ -247,6 +247,24 @@ test("requireTool 时带 tool_choice: required（有工具才带）；服务不�
   assert.match(warnings[0], /不支持强制调用工具/);
 });
 
+test("报错里提到 required、去掉 tool_choice 后照样报错的（工具参数写错了）不算不认强制调用，之后照样带", async () => {
+  const warnings: string[] = [];
+  const forced = createOpenAICompatibleModel(
+    { baseURL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/compatible-mode/v1`, apiKey: "sk-test", model: "qwen3.8-max" },
+    (message) => warnings.push(message),
+  );
+  const tool = { name: "fetch_url", description: "读网页", parameters: { type: "object", properties: {}, required: "url" } };
+  const send = () => forced.chat({ system: "s", messages: [{ role: "user", content: "查" }], tools: [tool], requireTool: true });
+  const schemaError = { status: 400, body: { error: { code: "invalid_parameter_error", message: "tools[0].function.parameters: 'required' must be an array" } } };
+  responses.push(schemaError, schemaError, completion("好"));
+
+  await assert.rejects(send, (err) => err instanceof LlmError && err.kind === "api");
+  assert.deepEqual(requests.slice(-2).map((r) => r.body.tool_choice), ["required", undefined]);
+  await send();
+  assert.equal(requests.at(-1)!.body.tool_choice, "required");
+  assert.deepEqual(warnings, []);
+});
+
 test("按配置传 enable_thinking；模型不支持时去掉重试并提示一次", async () => {
   const warnings: string[] = [];
   const noThink = createOpenAICompatibleModel(

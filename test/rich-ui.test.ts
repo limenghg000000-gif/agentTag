@@ -602,6 +602,8 @@ test("2026-10-13 union：正文里写成 MiB、GiB 的数只有按 1000 换算�
   // 全角的「～～～」「｀」显示出来不是代码，照样查
   assert.equal(found("～～～\n当前 153.2 MiB").length, 1);
   assert.equal(found("｀153.2 MiB｀").length, 1);
+  // 转义了的反引号显示出来不是代码
+  assert.equal(found("\\`153.2 MiB\\`").length, 1);
   // PromQL 的时间戳（1760281200 秒按 1024³ 换算是 1.64）不能把写成 1.6 GiB 的放过去
   const timed = new NumberEvidence([
     JSON.stringify({ query: "sum(container_memory_working_set_bytes)", data: { result: [{ metric: {}, values: [[1760281200, "1600000000"]] }] } }),

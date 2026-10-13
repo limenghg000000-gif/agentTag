@@ -123,25 +123,32 @@ export function createOpenAICompatibleModel(config: LlmConfig, warn: (message: s
     wanted: Pick<ChatRequest, "thinking" | "requireTool">,
     send: (request: Body & Extra) => Promise<T>,
   ): Promise<T> => {
+    // 强制调工具被 400 拒了：这次先去掉重试，去掉后成功了才算服务不认，之后都不再带。
+    // 报错里提到 required 的不一定是它（工具参数的 JSON Schema 写错了也会说 required），去掉后照样报错的不算
+    let toolChoiceRejected: string | undefined;
     for (let attempt = 0; ; attempt++) {
       const thinking = thinkingSupported ? (wanted.thinking ?? config.thinking) : undefined;
       const budget = thinking && budgetSupported ? config.thinkingBudget : undefined;
       const request: Body & Extra = {
         ...body,
         ...(body.tools && parallelToolCalls ? { parallel_tool_calls: true } : {}),
-        ...(body.tools && wanted.requireTool && toolChoiceSupported ? { tool_choice: "required" as const } : {}),
+        ...(body.tools && wanted.requireTool && toolChoiceSupported && toolChoiceRejected === undefined ? { tool_choice: "required" as const } : {}),
         ...(thinking !== undefined ? { enable_thinking: thinking } : {}),
         ...(budget !== undefined ? { thinking_budget: budget } : {}),
       };
       try {
-        return await send(request);
+        const result = await send(request);
+        if (toolChoiceRejected !== undefined && toolChoiceSupported) {
+          warn(`模型 ${config.model} 不支持强制调用工具（${toolChoiceRejected}），之后不再传 tool_choice`);
+          toolChoiceSupported = false;
+        }
+        return result;
       } catch (err) {
         // 输入太长的报错里可能也提到思考（「思考模式下最大输入…」），不能因此当成不认 enable_thinking
         if (attempt < 4 && err instanceof OpenAI.BadRequestError && !isTooLong(err)) {
           // 先看这一条：不认强制调用的报错里可能也提到思考（「思考模式下不支持…」），不能因此当成不认 enable_thinking
           if (request.tool_choice !== undefined && /tool_choice|\brequired\b/i.test(err.message)) {
-            warn(`模型 ${config.model} 不支持强制调用工具（${err.message}），之后不再传 tool_choice`);
-            toolChoiceSupported = false;
+            toolChoiceRejected = err.message;
             continue;
           }
           if (request.parallel_tool_calls && /parallel_tool_calls/i.test(err.message)) {
