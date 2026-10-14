@@ -4118,6 +4118,10 @@ test("功能卡片发不出去时改发文字版；按钮问的、带了别的�
   await asked.handle(message("你能做什么？帮我查下 gateway 最近的报错"));
   await asked.handle(message("你能做什么", { messageId: "om_2" }), { readOnly: true });
   assert.equal(requests.length, 2);
+  // 跟聊判断是对它说的、没 @ 的「你是干什么的」也回卡片，不问模型
+  await asked.handle(message("你是干什么的", { messageId: "om_3", rootId: "om_root" }), { unaddressed: true });
+  assert.equal(requests.length, 2);
+  assert.ok("card" in asked.sent.at(-1)!.input);
   // 交给模型时提示词里是这次用得上的功能清单
   assert.match(requests[0]!.system, /功能清单：\n- \*\*问问题、查资料\*\*/);
   assert.doesNotMatch(requests[0]!.system, /查代码、改代码/);
