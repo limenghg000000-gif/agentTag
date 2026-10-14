@@ -242,6 +242,8 @@ export function createMessageHandler(deps: BotDeps) {
 export interface TaskOptions {
   /** 只给读的工具（点「接着查」按钮问的） */
   readOnly?: boolean;
+  /** 没 @ 机器人、跟聊判断是对它说的：不给改文档、改代码的工具 */
+  unaddressed?: boolean;
 }
 
 /** 流式卡片最近一次建不了以后，到什么时候之前先不用 */
@@ -435,7 +437,10 @@ async function runTask(
     const chatDropped = ambient && CHANGE_REQUEST.test(question);
     const ambientOnly = ambient && !chatDropped;
     const modelHistory = chatDropped ? history.filter((m) => !isChatContext(m)) : history;
-    const readOnly = noPermission || followUp || ambientOnly;
+    // 跟聊接过来的、没 @ 机器人的话：话题里谁都能写字，写权限名单里的人随口说一句没 @ 的话，
+    // 不能让模型借他的权限照着话题里别人埋的话去改文档、改代码。要改就 @ 机器人直接说
+    const unaddressed = hasWrites && !noPermission && !followUp && options.unaddressed === true;
+    const readOnly = noPermission || followUp || ambientOnly || unaddressed;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter(
@@ -453,6 +458,9 @@ async function runTask(
       logger.info(`带上了群聊、提问没说要改东西，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (chatDropped) {
       logger.info(`提问说了要改东西，这次不带群聊 message=${msg.messageId} sender=${msg.senderId}`);
+    }
+    if (unaddressed) {
+      logger.info(`没 @ 机器人的跟聊，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
@@ -507,6 +515,7 @@ async function runTask(
         readOnly: noPermission,
         ...(ambientOnly ? { ambientOnly: true } : {}),
         ...(chatDropped ? { chatDropped: true } : {}),
+        ...(unaddressed ? { unaddressed: true } : {}),
         followUp,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,

@@ -154,7 +154,8 @@ const follower = config.followThreads
       botName: () => channel.botIdentity?.name,
       botOpenId: () => channel.botIdentity?.openId,
       busy: (threadKey) => tasks.busy(threadKey),
-      handle: (msg) => handleMessage(msg),
+      // 没 @ 的话不给改文档、改代码的工具：要改就 @ 机器人直接说
+      handle: (msg) => handleMessage(msg, { unaddressed: true }),
       reply: replyInThread,
     })
   : undefined;

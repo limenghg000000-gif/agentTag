@@ -18,6 +18,8 @@ export interface PromptContext {
   ambientOnly?: boolean;
   /** 提问说了要改文档或代码，群里刚才的聊天这次没带上 */
   chatDropped?: boolean;
+  /** 这句没 @ 机器人（跟聊接过来的），没给改文档、改代码的工具 */
+  unaddressed?: boolean;
   /** 这次是点「接着查」按钮问的，只给了读的工具 */
   followUp?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
@@ -47,7 +49,7 @@ const RICH_TEXT_RULES = [
   "- 结论、表格和「要注意的点」里的数不会被核对，要自己对齐：同一个量在这些地方和图、关键数字里要写成一样的数、一样的单位。字节换 MiB 要除以 1048576（1024×1024），换 GiB 要除以 1073741824，不要挪小数点除以 100 万：188436070 字节是 179.7 MiB，不是 188.4 MiB。",
 ];
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, ambientOnly, chatDropped, followUp, extra, showThinking, richText, knowledge }: PromptContext): string {
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, ambientOnly, chatDropped, unaddressed, followUp, extra, showThinking, richText, knowledge }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -81,6 +83,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, a
   if (chatDropped) {
     lines.push(
       "- 这次提问说了要改文档或代码，所以没带上群里刚才的聊天。提问说到「上面」「刚才」的内容你看不到：请他把要写进去的内容或要改的地方直接写在 @ 你的话里，不要猜。",
+    );
+  }
+  if (unaddressed) {
+    lines.push(
+      "- 这句话没 @ 你，是你在跟这个话题、判断是对你说的，所以这次没有新建或修改文档、改代码、开合并请求的工具。可以查、可以回答；他要改东西的话，请他 @ 你直接说改哪篇文档或哪段代码，不要假装已经改了。",
     );
   }
   if (followUp) {

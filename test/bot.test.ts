@@ -1266,6 +1266,37 @@ test("带上了群聊时，群聊和改文档、改代码的工具不同时给�
   assert.deepEqual(plain.requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"]);
 });
 
+test("跟聊接过来的没 @ 的话不给改文档、改代码的工具（写权限名单里的人也一样），提示词请他 @ 了再改；「停止」照样管用", async () => {
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_edit", true)];
+  const logs: string[] = [];
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, taskTools, writeAllowed: new Set(["ou_admin"]), logger: { ...quiet, info: (line: string) => logs.push(line) } });
+
+  await handle(message("把周报文档改一下", { senderId: "ou_admin", rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read"]);
+  assert.match(requests[0].system, /这句话没 @ 你/);
+  assert.doesNotMatch(requests[0].system, /WRITE_ALLOWED_USERS|「接着查」按钮/);
+  assert.match(logs.join("\n"), /没 @ 机器人的跟聊，这次只给读的工具 message=om_1 sender=ou_admin/);
+  // 不是按钮问的，不要求先调工具
+  assert.equal(requests[0].requireTool, undefined);
+
+  // @ 了的照常给（换一句话：同一个人几秒内说同一句会当成「同时发送到群」的副本跳过）
+  await handle(message("把周报文档里那段删掉", { messageId: "om_2", senderId: "ou_admin", rootId: "om_root" }));
+  assert.deepEqual(requests[1].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"]);
+  assert.doesNotMatch(requests[1].system, /这句话没 @ 你/);
+
+  // 跟聊接过来的「停止」照样停
+  await handle(message("停止", { messageId: "om_3", senderId: "ou_admin", rootId: "om_root" }), { unaddressed: true });
+  assert.match(logs.join("\n"), /停止指令 message=om_3/);
+  assert.equal(requests.length, 2);
+});
+
 test("点「接着查」按钮问的只给读的工具（写权限名单里的人也一样），提示词说明是按钮问的", async () => {
   const tool = (name: string, writes = false): Tool => ({
     ...(writes ? { writes: true } : {}),
