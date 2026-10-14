@@ -100,6 +100,8 @@ const knowledge = config.knowledge
       updateCard: (messageId, card) => channel.updateCard(messageId, card),
       ...(config.feishu.writeAllowedUsers ? { approvers: config.feishu.writeAllowedUsers } : {}),
       allowedChatIds: config.feishu.allowedChatIds,
+      // 群记忆和经验库说法对不上时发冲突卡片，选好以哪边为准后两边一起改
+      memory,
     })
   : undefined;
 // 提问里的截图先交给看图模型转成文字
