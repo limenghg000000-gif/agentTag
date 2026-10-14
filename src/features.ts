@@ -33,6 +33,8 @@ export interface FeatureList {
 
 /** 清单里的「需要：看图」：机器人配了看图的模型 */
 export const VISION_FEATURE = "看图";
+/** 清单里的「需要：智能卡片」：回答写在流式卡片里（STREAM_CARD 开着），能画表格、图表、指标卡和「接着查」按钮 */
+export const RICH_UI_FEATURE = "智能卡片";
 
 const LIMITS_HEADING = "现在还做不了的";
 const EXAMPLES_LABEL = /^这么问[:：]\s*$/;

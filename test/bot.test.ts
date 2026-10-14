@@ -3814,6 +3814,8 @@ const FEATURE_LIST = {
     { name: "问问题、查资料", summary: "联网搜最新信息。", how: ["直接问。"], examples: [{ text: "Node 24 有哪些不兼容的改动", tryable: true }], needs: ["web_search"] },
     { name: "查代码、改代码", summary: "读公司的仓库。", how: [], examples: [{ text: "这段逻辑在哪", tryable: true }], needs: ["code_"] },
     { name: "查线上问题", summary: "查日志、告警。", how: [], examples: [{ text: "现在有哪些告警", tryable: true }], needs: ["aiops_"] },
+    { name: "沉淀经验", summary: "存进经验库。", how: [], examples: [{ text: "沉淀到经验库", tryable: false }], needs: ["knowledge_propose"] },
+    { name: "智能卡片", summary: "表格、图表。", how: [], examples: [{ text: "画成折线图", tryable: false }], needs: ["智能卡片"] },
     { name: "想仔细点、停下", summary: "深度思考；随时停。", how: [], examples: [{ text: "停止", tryable: false }], needs: [] },
   ],
   limits: ["私聊不回。"],
@@ -3823,13 +3825,15 @@ function namedTool(name: string): Tool {
   return { spec: { name, description: name, parameters: { type: "object", properties: {} } }, describe: () => name, run: async () => "" };
 }
 
-test("只问「你能做什么」：不问模型，直接在话题里回功能卡片，只列配了工具的功能，文字版记进话题历史", async () => {
+test("只问「你能做什么」：不问模型，直接在话题里回功能卡片，只列用得上的功能，文字版记进话题历史", async () => {
   const { model, requests } = fakeModel(() => ({ text: "不该问到模型", finish: "stop" }));
   const saved: string[][] = [];
+  const context = fakeContext();
   const { sent, handle } = setup({
     model,
+    context: context.source,
     tools: [namedTool("web_search")],
-    mcp: { names: ["aiops"], tools: () => [], prompt: () => undefined },
+    mcp: { names: ["aiops"], tools: () => [namedTool("aiops_get_active_alerts")], prompt: () => undefined },
     about: { featuresLink: "https://example.feishu.cn/page/x", features: FEATURE_LIST },
     cardAnswers: {
       async save(chatId, threadKey, messageId, answer) {
@@ -3850,11 +3854,31 @@ test("只问「你能做什么」：不问模型，直接在话题里回功能�
   assert.match(text, /查线上问题/);
   assert.match(text, /想仔细点、停下/);
   assert.doesNotMatch(text, /查代码、改代码/, "没配代码仓库，不列这一项");
+  assert.doesNotMatch(text, /沉淀经验/, "没配经验库，不列这一项");
+  assert.doesNotMatch(text, /智能卡片/, "没开流式卡片，不列这一项");
   assert.match(text, /试一试：现在有哪些告警/);
   assert.match(text, /产品功能说明/);
   assert.equal(saved.length, 1);
   assert.deepEqual(saved[0]!.slice(0, 3), ["oc_1", "om_1", "om_reply_1"]);
   assert.match(saved[0]![3]!, /1\. \*\*问问题、查资料\*\*/);
+  // 本地记的上文也记一份：飞书读不到话题历史、退回本地记录时也接得上
+  assert.deepEqual(context.remembered, [{ question: "[群成员] 你能做什么？", answer: saved[0]![3]! }]);
+});
+
+test("功能卡片看的是现在用得上的工具：aiops 没连上不列查线上，经验库没有起草工具不列沉淀经验，开着流式卡片才列智能卡片", async () => {
+  const draft = namedTool("knowledge_propose");
+  const shown = async (overrides: Partial<BotDeps>) => {
+    const { sent, handle } = setup({ tools: [namedTool("web_search")], about: { features: FEATURE_LIST }, ...overrides });
+    await handle(message("你能做什么"));
+    return cardText(cards(sent)[0]);
+  };
+  const knowledge = (tools: Tool[]): NonNullable<BotDeps["knowledge"]> => ({ lookup: async () => ({ hits: [] }) as any, tools: () => tools });
+  const cardKit = { create: async () => "card_1", update: async () => {}, settings: async () => {} } as unknown as CardKitApi;
+
+  assert.doesNotMatch(await shown({ mcp: { names: ["aiops"], tools: () => [], prompt: () => undefined } }), /查线上问题/);
+  assert.doesNotMatch(await shown({ knowledge: knowledge([namedTool("knowledge_search")]) }), /沉淀经验/);
+  assert.match(await shown({ knowledge: knowledge([namedTool("knowledge_search"), draft]) }), /沉淀经验/);
+  assert.match(await shown({ cardKit }), /智能卡片/);
 });
 
 test("功能卡片发不出去时改发文字版；按钮问的、带了别的事的照常交给模型", async () => {

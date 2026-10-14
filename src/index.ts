@@ -129,7 +129,9 @@ const handleMessage = createMessageHandler({
   ...(images ? { images } : {}),
   showThinking: config.showThinking,
   about: aboutBot(),
-  ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient), cardAnswers } : {}),
+  ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient) } : {}),
+  // 卡片里的回答飞书读不出来，记下来读话题历史时用：流式卡片的回答、功能卡片（不开流式卡片也会回）
+  cardAnswers,
   botName: () => channel.botIdentity?.name,
   context: new ThreadContextLoader(feishuApi, console, undefined, cardAnswers),
   recentThreads,
