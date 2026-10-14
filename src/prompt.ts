@@ -1,3 +1,5 @@
+import { type FeatureList, featurePromptLines } from "./features.js";
+
 const TIME_FORMAT = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
   dateStyle: "full",
@@ -43,6 +45,8 @@ export interface PromptContext {
 export interface AboutBot {
   featuresLink?: string;
   latest?: { version: string; date?: string; notes: string };
+  /** 产品功能清单（FEATURES.md），只放这次用得上的几项 */
+  features?: FeatureList;
 }
 
 /** 回答写在卡片里时的排版：卡片能画表格、小标题和彩色标签 */
@@ -61,10 +65,19 @@ const RICH_TEXT_RULES = [
 /** 有人问「你能做什么」「看全部功能」「最近更新了什么」时怎么答 */
 function aboutLines(about: AboutBot | undefined): string[] {
   const link = about?.featuresLink ? `[产品功能说明](${about.featuresLink})` : undefined;
-  const lines = [
-    "- 有人问你能做什么、有哪些功能、怎么用你，或者想看全部功能时：用几句话按这次给你的工具说能做的几类事，每类带一句提问的例子（没给你的工具不要提）" +
-      (link ? `，再附上 ${link} 的链接，里面有全部功能和提问的例子，不用把它整篇抄进回答。` : "。"),
-  ];
+  const features = about?.features?.features.length ? featurePromptLines(about.features) : [];
+  const lines =
+    features.length > 0
+      ? [
+          "- 有人问你能做什么、有哪些功能、怎么用你，或者想看全部功能时：按下面的「功能清单」说，顺序和功能名照清单写，每项一行（功能名加粗、一句话、一个提问的例子）；清单里没有的不说，也不写工具名、仓库路径这类技术词" +
+            (link ? `；最后附上 ${link} 的链接，里面有每一项的详细用法。` : "。"),
+          "功能清单：",
+          ...features,
+        ]
+      : [
+          "- 有人问你能做什么、有哪些功能、怎么用你，或者想看全部功能时：用几句话按这次给你的工具说能做的几类事，每类带一句提问的例子（没给你的工具不要提）" +
+            (link ? `，再附上 ${link} 的链接，里面有全部功能和提问的例子，不用把它整篇抄进回答。` : "。"),
+        ];
   if (about?.latest) {
     const { version, date, notes } = about.latest;
     lines.push(

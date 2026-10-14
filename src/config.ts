@@ -212,6 +212,8 @@ const PROMPTS_DIR = fileURLToPath(new URL("../prompts/mcp/", import.meta.url));
 export const RELEASE_NOTES_FILE = fileURLToPath(new URL("../RELEASE_NOTES.md", import.meta.url));
 /** 技术版更新日志，同一版本的内容折叠放在通知卡片的「技术说明」里 */
 export const CHANGELOG_FILE = fileURLToPath(new URL("../CHANGELOG.md", import.meta.url));
+/** 产品功能清单：有人问「你能做什么」时回的功能卡片就按它画 */
+export const FEATURES_FILE = fileURLToPath(new URL("../FEATURES.md", import.meta.url));
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
