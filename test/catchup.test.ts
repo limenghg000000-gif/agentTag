@@ -188,7 +188,7 @@ test("话题里跟聊：没 @ 机器人的话题消息，跟聊要跟的也补�
   assert.deepEqual(considered, ["om_follow"]);
   assert.deepEqual(handledIds, ["om_mention"]);
   assert.deepEqual(asked, ["om_follow", "om_to_others", "om_app app"]);
-  assert.match(logs.join("\n"), /补漏：话题里没 @ 机器人的消息事件没送到，由轮询补上 chat=oc_1 message=om_follow/);
+  assert.match(logs.join("\n"), /补漏：没 @ 机器人的消息事件没送到，由轮询补上 chat=oc_1 message=om_follow/);
   // 补过的不再补
   assert.equal(await poller.pollOnce(), 0);
 });

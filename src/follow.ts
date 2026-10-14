@@ -56,16 +56,67 @@ interface Followed {
 }
 
 /**
+ * 判断排队：同时最多 MAX_JUDGING 条，最多排 MAX_WAITING 条，再多的不判断。
+ * 事件断了一阵、补漏轮询一次补上很多条时，别把模型的并发占满，耽误正常回答
+ */
+export class JudgeQueue {
+  private judging = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(
+    private readonly maxJudging = MAX_JUDGING,
+    private readonly maxWaiting = MAX_WAITING,
+  ) {}
+
+  /** 满了时返回 undefined（没跑） */
+  async run<T>(task: () => Promise<T>): Promise<{ value: T } | undefined> {
+    if (this.judging >= this.maxJudging && this.waiting.length >= this.maxWaiting) {
+      return undefined;
+    }
+    await this.acquire();
+    try {
+      return { value: await task() };
+    } finally {
+      this.release();
+    }
+  }
+
+  get load(): string {
+    return `${this.judging} 条在判断、${this.waiting.length} 条在排队`;
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.judging < this.maxJudging) {
+      this.judging++;
+      return;
+    }
+    // 名额由 release 直接转给排队的，judging 不变
+    await new Promise<void>((resolve) => this.waiting.push(resolve));
+  }
+
+  private release(): void {
+    const next = this.waiting.shift();
+    if (next) {
+      next();
+    } else {
+      this.judging--;
+    }
+  }
+}
+
+/**
  * 话题里跟聊：机器人回答过的话题里，群成员接着说的话不 @ 它也可能是对它说的。
  * 没 @ 的消息先让模型看一眼话题最近几条，判断是不是在跟机器人说话，是的才当成提问处理；
- * 群成员之间说话、表态（好的、收到）不回。只跟话题，群里没 @ 它的消息一律不回。
+ * 群成员之间说话、表态（好的、收到）不回。只跟话题，群主界面没 @ 它的消息归主动接话（见 ProactiveReplier）。
+ * 同一个话题里的消息按收到的顺序一条一条判断、交给处理函数，先说的先排进任务队列（「停止」不会跑到前面那句的前面）
  */
 export class ThreadFollower {
   private readonly threads = new Map<string, Followed>();
   /** 说过「只在 @ 我时回」的话题：机器人运行期间一直记着，不随跟聊过期 */
   private readonly muted = new Set<string>();
-  private judging = 0;
-  private readonly waiting: Array<() => void> = [];
+  /** 每个话题最后一条在判断的消息「判断完、交出去」的 Promise：同一话题里后来的等它 */
+  private readonly turns = new Map<string, Promise<void>>();
+  private readonly queue = new JudgeQueue();
   private readonly logger: Logger;
   private readonly now: () => number;
 
@@ -117,18 +168,30 @@ export class ThreadFollower {
    * 没 @ 它时，只认它在跟着的话题里说的
    */
   async muteIfAsked(msg: NormalizedMessage): Promise<boolean> {
-    if (!this.opts.allowedChatIds.has(msg.chatId) || !MUTE_COMMAND.test(msg.content.trim())) {
+    const replied = this.mute(msg);
+    if (!replied) {
       return false;
     }
+    await replied;
+    return true;
+  }
+
+  /**
+   * 同 muteIfAsked，不是这句话时同步返回 undefined，是的话马上静音、返回回那一句的 Promise。
+   * 给消息处理函数用：不是开关的话时不多等一拍，处理函数照样当场排进任务队列
+   */
+  mute(msg: NormalizedMessage): Promise<void> | undefined {
+    if (!this.opts.allowedChatIds.has(msg.chatId) || !MUTE_COMMAND.test(msg.content.trim())) {
+      return undefined;
+    }
     if (!msg.mentionedBot && !this.wants(msg)) {
-      return false;
+      return undefined;
     }
     const key = threadKeyOf(msg);
     this.threads.delete(key);
     remember(this.muted, key);
     this.logger.info(`跟聊：话题里说了只在 @ 时回，这个话题不再跟聊 chat=${msg.chatId} thread=${key} message=${msg.messageId}`);
-    await this.opts.reply(msg, MUTED_REPLY);
-    return true;
+    return this.opts.reply(msg, MUTED_REPLY).then(() => undefined);
   }
 
   /**
@@ -136,60 +199,62 @@ export class ThreadFollower {
    * 说的是「只在 @ 我时回」的直接静音；机器人正在做事时说「停止」的直接交给处理函数停任务，都不用判断
    */
   async consider(msg: NormalizedMessage): Promise<void> {
-    if (await this.muteIfAsked(msg)) {
-      return;
+    const key = threadKeyOf(msg);
+    const previous = this.turns.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => (release = resolve));
+    this.turns.set(key, turn);
+    let started: { done: Promise<void> } | undefined;
+    try {
+      // 等同一话题里先收到的那条判断完、交出去（处理函数同步排进任务队列），再判断这条
+      await previous;
+      started = await this.decide(msg, key);
+    } finally {
+      release();
+      if (this.turns.get(key) === turn) {
+        this.turns.delete(key);
+      }
     }
-    const busy = this.opts.busy?.(threadKeyOf(msg)) ?? false;
+    // 任务本身不挡后面的判断：后面的消息照样判断，要回的在任务队列里排在这个后面
+    await started?.done;
+  }
+
+  /** 判断这一条，要回的交给处理函数，返回它的 Promise（包一层：不在这里等任务做完） */
+  private async decide(msg: NormalizedMessage, key: string): Promise<{ done: Promise<void> } | undefined> {
+    const muting = this.mute(msg);
+    if (muting) {
+      await muting;
+      return undefined;
+    }
+    const busy = this.opts.busy?.(key) ?? false;
     // 机器人正在做这个话题里的事，有人说「停止」：不用判断，交给处理函数停掉。没在做时可能是对别人说的，照常判断
     if (busy && STOP_COMMAND.test(msg.content.trim())) {
       this.track(msg);
-      await this.opts.handle(msg);
-      return;
+      return { done: this.opts.handle(msg) };
     }
-    if (this.judging >= MAX_JUDGING && this.waiting.length >= MAX_WAITING) {
-      this.logger.warn(`跟聊：要判断的消息太多（${MAX_JUDGING} 条在判断、${this.waiting.length} 条在排队），这条不判断、不回 message=${msg.messageId}`);
-      return;
-    }
-    await this.acquire();
     const startedAt = this.now();
     let answer: boolean;
     try {
-      answer = await this.judge(msg, busy);
+      const judged = await this.queue.run(() => this.judge(msg, busy));
+      if (!judged) {
+        this.logger.warn(`跟聊：要判断的消息太多（${this.queue.load}），这条不判断、不回 message=${msg.messageId}`);
+        return undefined;
+      }
+      answer = judged.value;
     } catch (err) {
       // 拿不准就不回：判断失败时宁可漏回一句，也不在别人说话时插嘴
       this.logger.warn(`跟聊：判断失败，这条不回 message=${msg.messageId}：${err instanceof Error ? err.message : String(err)}`);
-      return;
-    } finally {
-      this.release();
+      return undefined;
     }
     this.logger.info(
       `跟聊：没 @ 的话题消息${answer ? "是对机器人说的，接着回" : "不是对机器人说的，不回"} chat=${msg.chatId} thread=${msg.rootId} ` +
         `message=${msg.messageId} 用时=${this.now() - startedAt}ms`,
     );
     if (!answer) {
-      return;
+      return undefined;
     }
     this.track(msg);
-    await this.opts.handle(msg);
-  }
-
-  /** 占一个判断的名额，满了就排队 */
-  private async acquire(): Promise<void> {
-    if (this.judging < MAX_JUDGING) {
-      this.judging++;
-      return;
-    }
-    // 名额由 release 直接转给排队的，judging 不变
-    await new Promise<void>((resolve) => this.waiting.push(resolve));
-  }
-
-  private release(): void {
-    const next = this.waiting.shift();
-    if (next) {
-      next();
-    } else {
-      this.judging--;
-    }
+    return { done: this.opts.handle(msg) };
   }
 
   private async judge(msg: NormalizedMessage, busy: boolean): Promise<boolean> {
@@ -219,7 +284,7 @@ export class ThreadFollower {
 }
 
 /** 记进 Map 或 Set：先删再加，最近的排到最后，超出 MAX_THREADS 时删掉最早的 */
-function remember<V>(store: Map<string, V> | Set<string>, key: string, value?: V): void {
+export function remember<V>(store: Map<string, V> | Set<string>, key: string, value?: V): void {
   store.delete(key);
   if (store instanceof Map) {
     store.set(key, value as V);

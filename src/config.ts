@@ -62,6 +62,17 @@ export interface Config {
   followThreads: boolean;
   /** 带上群里刚才的聊天（CHAT_CONTEXT，默认 on）：在群里直接 @ 时，把这之前半小时内的群聊一起给模型 */
   chatContext: boolean;
+  /** 主动接话（PROACTIVE_CHAT_IDS，默认没有群）：这些群里没 @ 的群消息，机器人看情况接一句 */
+  proactive: {
+    /** 打开了主动接话的群（只算群白名单里的） */
+    chatIds: ReadonlySet<string>;
+    /** PROACTIVE_CHAT_IDS 里不在群白名单的，不生效，启动时日志里提醒 */
+    ignored: string[];
+    /** 每个群每小时最多主动回几次（PROACTIVE_MAX_PER_HOUR，默认 3） */
+    maxPerHour: number;
+    /** 群里说「别主动插话」后记在这个文件里，重启后照样停着 */
+    stateFile: string;
+  };
   /** 卡片即回答时记下卡片里的回答的目录（每个群一个 JSON 文件），读话题历史时用 */
   cardAnswersDir: string;
   /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
@@ -98,6 +109,8 @@ export const DEFAULT_EMBEDDING_MODEL = "text-embedding-v4";
 export const DEFAULT_THINKING_BUDGET = 4000;
 /** 数据目录，相对路径按启动时的工作目录算 */
 export const DEFAULT_DATA_DIR = "data";
+/** 每个群每小时最多主动接几次话（PROACTIVE_MAX_PER_HOUR 不填时） */
+export const DEFAULT_PROACTIVE_MAX_PER_HOUR = 3;
 /** 补漏轮询默认每 10 秒一次 */
 export const DEFAULT_CATCHUP_INTERVAL_SECONDS = 10;
 /** 群记忆备份默认保留 14 天 */
@@ -244,6 +257,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`CHAT_CONTEXT 只能是 on 或 off，当前为 ${env.CHAT_CONTEXT}`);
   }
 
+  const proactiveMax = Number(env.PROACTIVE_MAX_PER_HOUR?.trim() || DEFAULT_PROACTIVE_MAX_PER_HOUR);
+  if (!Number.isInteger(proactiveMax) || proactiveMax < 1 || proactiveMax > 60) {
+    throw new Error(`PROACTIVE_MAX_PER_HOUR 要填 1～60 的整数，当前为 ${env.PROACTIVE_MAX_PER_HOUR}`);
+  }
+
   const code = loadCodeConfig(env);
   const knowledgeEnv = env.KNOWLEDGE?.trim().toLowerCase();
   if (knowledgeEnv && !["on", "off"].includes(knowledgeEnv)) {
@@ -261,14 +279,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`FEISHU_DOMAIN 只能是 feishu 或 lark，当前为 ${env.FEISHU_DOMAIN}`);
   }
 
+  const allowedChatIds = new Set((env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+  const proactiveChatIds = [...new Set((env.PROACTIVE_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean))];
+
   return {
     feishu: {
       appId: env.FEISHU_APP_ID!,
       appSecret: env.FEISHU_APP_SECRET!,
       domain: domainName === "lark" ? Domain.Lark : Domain.Feishu,
-      allowedChatIds: new Set(
-        (env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean),
-      ),
+      allowedChatIds,
       ...(writers.length > 0 ? { writeAllowedUsers: new Set(writers) } : {}),
     },
     llm: {
@@ -294,6 +313,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     streamCard: streamCard === "on",
     followThreads: followThreads === "on",
     chatContext: chatContext === "on",
+    proactive: {
+      chatIds: new Set(proactiveChatIds.filter((id) => allowedChatIds.has(id))),
+      ignored: proactiveChatIds.filter((id) => !allowedChatIds.has(id)),
+      maxPerHour: proactiveMax,
+      stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "proactive.json"),
+    },
     cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),

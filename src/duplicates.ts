@@ -35,7 +35,7 @@ export class DuplicateAsks {
   check(msg: NormalizedMessage): DuplicateVerdict {
     const now = this.now();
     this.prune(now);
-    const key = `${msg.chatId}\u0000${msg.senderId}\u0000${msg.content.replace(/\s+/g, " ").trim()}`;
+    const key = keyOf(msg);
     const entry: Seen = {
       messageId: msg.messageId,
       threadKey: threadKeyOf(msg),
@@ -59,6 +59,14 @@ export class DuplicateAsks {
     return { action: "skip", duplicateOf: twin.messageId };
   }
 
+  /** 这条（群里的）消息后来又收到了话题里的同一句：它是「同时发送到群」的副本，话题里那条已经交给别处处理 */
+  hasThreadTwin(msg: NormalizedMessage): boolean {
+    const sentAt = msg.createTime || this.now();
+    return (this.seen.get(keyOf(msg)) ?? []).some(
+      (s) => s.inThread && s.messageId !== msg.messageId && Math.abs(s.sentAt - sentAt) <= DUPLICATE_WINDOW_MS,
+    );
+  }
+
   private prune(now: number): void {
     for (const [key, list] of this.seen) {
       const kept = list.filter((s) => now - s.seenAt <= KEEP_MS);
@@ -69,4 +77,8 @@ export class DuplicateAsks {
       }
     }
   }
+}
+
+function keyOf(msg: NormalizedMessage): string {
+  return `${msg.chatId}\u0000${msg.senderId}\u0000${msg.content.replace(/\s+/g, " ").trim()}`;
 }

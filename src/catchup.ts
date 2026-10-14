@@ -46,7 +46,7 @@ export interface CatchUpOptions {
   handled: HandledMessages;
   /** 补上的消息交给它处理，和事件走同一个处理函数 */
   handle: (msg: NormalizedMessage) => Promise<void>;
-  /** 话题里跟聊（见 ThreadFollower）：没 @ 机器人的话题消息，它要跟的也补上，交给它判断要不要回 */
+  /** 跟聊和主动接话（见 ThreadFollower、ProactiveReplier）：没 @ 机器人的消息，它们要看的也补上，交给它们判断要不要回 */
   follow?: {
     wants(msg: NormalizedMessage, fromApp?: boolean): boolean;
     consider(msg: NormalizedMessage): Promise<void>;
@@ -167,7 +167,7 @@ export class CatchUpPoller {
 
   private pickUp(message: NormalizedMessage, fromBot: boolean, fromApp: boolean, from: number, until: number): number {
     // 和事件那边的规则一致：只处理白名单群里 @ 了机器人的消息，@所有人 不算；
-    // 没 @ 的只补跟聊要跟的（机器人回答过的话题里的追问），由跟聊判断要不要回
+    // 没 @ 的只补跟聊要跟的（机器人回答过的话题里的追问）和主动接话要看的（打开了的群主界面的消息），由它们判断要不要回
     if (fromBot || message.mentionAll || !this.chatIds.has(message.chatId)) {
       return 0;
     }
@@ -179,7 +179,7 @@ export class CatchUpPoller {
       return 0;
     }
     this.logger.info(
-      `补漏：${follow ? "话题里没 @ 机器人的消息" : ""}事件没送到，由轮询补上 chat=${message.chatId} message=${message.messageId}`,
+      `补漏：${follow ? "没 @ 机器人的消息" : ""}事件没送到，由轮询补上 chat=${message.chatId} message=${message.messageId}`,
     );
     this.watch(message);
     // 不等任务做完，任务可能要跑一两分钟，别耽误下一轮轮询

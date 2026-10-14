@@ -114,6 +114,11 @@ export interface BotDeps {
   taskTools?: (task: TaskToolContext) => readonly Tool[];
   /** 只在这些群里响应。为空时不响应任何群。 */
   allowedChatIds: ReadonlySet<string>;
+  /**
+   * 开关类的话（「只在 @ 我时回」「别主动插话」）：去重、停止之后，当成提问之前先给它看。是的话它马上处理、返回回复的 Promise，
+   * 不是的话同步返回 undefined（不多等一拍，提问照样当场排进任务队列）。放在去重之后，「同时发送到群」的两份只处理一份、只回一句
+   */
+  command?: (msg: NormalizedMessage) => Promise<void> | undefined;
   /** 机器人在飞书里的名字（连上长连接后才拿得到），写进提示词 */
   botName: () => string | undefined;
   context: ThreadContextSource;
@@ -201,6 +206,11 @@ export function createMessageHandler(deps: BotDeps) {
       const stopped = msg.rootId ? tasks.stopThread(threadKeyOf(msg)) : tasks.stopChat(msg.chatId);
       logger.info(`停止指令 message=${msg.messageId} 停止了 ${stopped} 个任务`);
       await reply(stopped > 0 ? "好的，已停止。" : "现在没有进行中的任务。");
+      return;
+    }
+    const command = options.readOnly ? undefined : deps.command?.(msg);
+    if (command) {
+      await command;
       return;
     }
     if (!question && !msg.rootId) {

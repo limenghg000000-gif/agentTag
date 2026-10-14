@@ -124,24 +124,13 @@ export class ThreadContextLoader {
     };
   }
 
-  /** 群里在这条 @ 之前 CHAT_CONTEXT_MS 内的聊天（不含机器人自己发的、不含这条和被引用的那条），从早到晚 */
+  /** 群里在这条 @ 之前的聊天，见 recentChat */
   private async loadChat(msg: NormalizedMessage): Promise<ThreadMessage[]> {
     if (!this.chatContext || !this.api.listChatMessages) {
       return [];
     }
     try {
-      const all = await this.api.listChatMessages(msg.chatId, msg.createTime - CHAT_CONTEXT_MS, msg.createTime, CHAT_CONTEXT_MESSAGES + 1);
-      return all
-        .filter(
-          (m) =>
-            !m.fromBot &&
-            m.messageId !== msg.messageId &&
-            m.messageId !== msg.replyToMessageId &&
-            m.createTime !== 0 &&
-            m.createTime <= msg.createTime &&
-            m.content.trim() !== "",
-        )
-        .slice(-CHAT_CONTEXT_MESSAGES);
+      return await recentChat(this.api as Pick<FeishuApi, "listChatMessages">, msg);
     } catch (err) {
       if (!this.chatWarned) {
         this.chatWarned = true;
@@ -236,6 +225,26 @@ export class ThreadContextLoader {
  */
 function askerNameOf(msg: NormalizedMessage, own: ThreadMessage | undefined): string | undefined {
   return own && !own.fromBot ? own.senderName : msg.senderName;
+}
+
+/** 群里在这条消息之前 CHAT_CONTEXT_MS 内的聊天（不含机器人自己发的、不含这条和被引用的那条），从早到晚，最多 limit 条 */
+export async function recentChat(
+  api: Pick<FeishuApi, "listChatMessages">,
+  msg: NormalizedMessage,
+  limit = CHAT_CONTEXT_MESSAGES,
+): Promise<ThreadMessage[]> {
+  const all = await api.listChatMessages(msg.chatId, msg.createTime - CHAT_CONTEXT_MS, msg.createTime, limit + 1);
+  return all
+    .filter(
+      (m) =>
+        !m.fromBot &&
+        m.messageId !== msg.messageId &&
+        m.messageId !== msg.replyToMessageId &&
+        m.createTime !== 0 &&
+        m.createTime <= msg.createTime &&
+        m.content.trim() !== "",
+    )
+    .slice(-limit);
 }
 
 /** 群里刚才的聊天合成一段：开头说明不是对它说的，每条标上发言人和时间；太长时省略较早的 */

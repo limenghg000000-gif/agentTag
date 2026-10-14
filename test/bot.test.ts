@@ -919,6 +919,44 @@ test("勾了「同时发送到群」时群里多出的那份一样的提问跳�
   assert.match(logs.join("\n"), /跳过重复的提问 message=om_g：和 om_t/);
 });
 
+test("开关类的话（「只在 @ 我时回」这类）先交给 command：处理了就不当成提问；「同时发送到群」的副本跳过，只处理一次", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "答案", finish: "stop" }));
+  const commands: string[] = [];
+  const { sent, handle } = setup({
+    model,
+    command: (msg) => {
+      if (msg.content !== "别插话") {
+        return undefined;
+      }
+      commands.push(msg.messageId);
+      return Promise.resolve();
+    },
+  });
+
+  await handle(message("别插话", { messageId: "om_t", rootId: "om_root", threadId: "omt_1" }));
+  await handle(message("别插话", { messageId: "om_g" }));
+  assert.deepEqual(commands, ["om_t"]);
+  assert.equal(requests.length, 0);
+  assert.equal(sent.length, 0);
+
+  // 不是开关的话照常回答；点「接着查」按钮问的（只读）不当成开关
+  await handle(message("今天周几？", { messageId: "om_2" }));
+  await handle(message("别插话", { messageId: "om_3", rootId: "om_root2", threadId: "omt_2", createTime: Date.now() + 60_000 }), { readOnly: true });
+  assert.deepEqual(commands, ["om_t"]);
+  assert.equal(requests.length, 2);
+});
+
+test("不是开关的话时，提问当场排进任务队列（不多等一拍）", async () => {
+  const tasks = new TaskRegistry();
+  const { model, running } = blockingModel();
+  const { handle } = setup({ tasks, model, command: () => undefined });
+  const done = handle(message("查一下 gateway 报错", { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(tasks.busy("om_root"), true);
+  await running;
+  tasks.stopAll();
+  await done;
+});
+
 test("群里那份副本先到时，停掉它的任务，改为回答话题里那条", async () => {
   let calls = 0;
   let started!: () => void;

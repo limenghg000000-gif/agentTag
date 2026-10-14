@@ -58,3 +58,15 @@ test("没有发送时间时按收到的时间比；记录几分钟后清掉", ()
   now += 10 * 60_000;
   assert.equal(asks.check(msg("om_3", "你好", { createTime: 0 })).action, "handle");
 });
+
+test("群里的副本先到、后来收到话题里那条：hasThreadTwin 认得出副本", () => {
+  const asks = new DuplicateAsks(() => 0);
+  const copy = msg("om_g", "那换成按小时看呢", { mentionedBot: false });
+  asks.check(copy);
+  assert.equal(asks.hasThreadTwin(copy), false);
+  asks.check(msg("om_t", "那换成按小时看呢", { mentionedBot: false, rootId: "om_root", createTime: 1_000_300 }));
+  assert.equal(asks.hasThreadTwin(copy), true);
+  // 别人说的同一句、隔得久的不算
+  assert.equal(asks.hasThreadTwin(msg("om_x", "那换成按小时看呢", { senderId: "ou_2" })), false);
+  assert.equal(asks.hasThreadTwin(msg("om_y", "那换成按小时看呢", { createTime: 1_000_000 + 60_000 })), false);
+});
