@@ -198,17 +198,86 @@ test("话题里不 @ 说「只在 @ 我时回」：回一句，之后这个话�
   assert.equal(t.follower.wants(msg("om_5")), false);
 });
 
-test("@ 机器人说「别插话」也算，没跟着的话题也记下；群里直接说的、不像静音的话不算", async () => {
+test("@ 机器人说「别插话」也算，没跟着的话题也记下；不像静音的话、没 @ 也不在跟着的话题里说的不算", async () => {
   const t = setup();
   assert.equal(await t.follower.muteIfAsked(msg("om_2", { mentionedBot: true, content: "别插话" })), true);
   assert.deepEqual(t.replies, [`om_2 ${MUTED_REPLY}`]);
   t.follower.track(msg("om_3", { mentionedBot: true }));
   assert.equal(t.follower.wants(msg("om_4")), false);
 
-  assert.equal(await t.follower.muteIfAsked(msg("om_5", { mentionedBot: true, rootId: undefined, threadId: undefined, content: "别插话" })), false);
   assert.equal(await t.follower.muteIfAsked(msg("om_6", { mentionedBot: true, rootId: "om_x", content: "不用回滚了，先看日志" })), false);
   // 没 @、也不在跟着的话题里说的，不归它管
   assert.equal(await t.follower.muteIfAsked(msg("om_7", { rootId: "om_y", content: "闭嘴" })), false);
+});
+
+test("在群里直接 @ 它说「只在 @ 我时回」：它回复这条时开的话题也不跟", async () => {
+  const t = setup();
+  const top = msg("om_top", { mentionedBot: true, rootId: undefined, threadId: undefined, content: "只在 @ 你时回" });
+  assert.equal(await t.follower.muteIfAsked(top), true);
+  assert.deepEqual(t.replies, [`om_top ${MUTED_REPLY}`]);
+  t.follower.track(msg("om_2", { mentionedBot: true, rootId: "om_top" }));
+  assert.equal(t.follower.wants(msg("om_3", { rootId: "om_top" })), false);
+});
+
+test("静音的话题过了 2 小时再 @ 它，也不会重新跟（机器人运行期间一直记着）", async () => {
+  const t = setup();
+  t.follower.track(asked);
+  await t.follower.consider(msg("om_2", { content: "别插话" }));
+  t.advance(FOLLOW_WINDOW_MS + 1000);
+  assert.equal(t.follower.wants(msg("om_3", { createTime: START + FOLLOW_WINDOW_MS })), false);
+  t.follower.track(msg("om_4", { mentionedBot: true, createTime: START + FOLLOW_WINDOW_MS }));
+  assert.equal(t.follower.wants(msg("om_5", { createTime: START + FOLLOW_WINDOW_MS + 1000 })), false);
+});
+
+test("开始跟之前发的消息不跟：补漏轮询回看时翻出 @ 之前没 @ 的消息，不拿来判断", () => {
+  const t = setup();
+  t.follower.track({ ...asked, rootId: "om_root", messageId: "om_at", createTime: START + 60_000 });
+  assert.equal(t.follower.wants(msg("om_before", { createTime: START + 30_000 })), false);
+  assert.equal(t.follower.wants(msg("om_after", { createTime: START + 90_000 })), true);
+  // 跟着期间再 @ 一次，起点不往后挪：两次 @ 之间的追问照样跟
+  t.advance(120_000);
+  t.follower.track({ ...asked, rootId: "om_root", messageId: "om_at2", createTime: START + 120_000 });
+  assert.equal(t.follower.wants(msg("om_between", { createTime: START + 100_000 })), true);
+});
+
+test("同时最多判断 3 条，多的排队；排队的太多时新来的不判断", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let inFlight = 0;
+  let peak = 0;
+  const logs: string[] = [];
+  const handled: string[] = [];
+  const follower = new ThreadFollower({
+    allowedChatIds: new Set(["oc_1"]),
+    context: { load: async () => ({ history: [], source: "none" }) },
+    model: {
+      model: "fake",
+      async chat() {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await gate;
+        inFlight--;
+        return { text: "是", finish: "stop" };
+      },
+    },
+    botName: () => "飞书 CLI",
+    botOpenId: () => BOT,
+    handle: async (m) => {
+      handled.push(m.messageId);
+    },
+    reply: async () => {},
+    logger: { info() {}, warn: (line: string) => logs.push(line), error() {} },
+    now: () => START,
+  });
+  follower.track(asked);
+  const runs = Array.from({ length: 24 }, (_, i) => follower.consider(msg(`om_${i}`)));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(peak, 3);
+  release();
+  await Promise.all(runs);
+  assert.equal(peak, 3);
+  assert.equal(handled.length, 23);
+  assert.match(logs.join("\n"), /跟聊：要判断的消息太多（3 条在判断、20 条在排队），这条不判断、不回 message=om_23/);
 });
 
 test("静音的说法：整句是这个意思才算", () => {

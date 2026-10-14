@@ -5,8 +5,12 @@ import type { ChatModel } from "./llm.js";
 
 /** 话题里最后一次 @ 机器人（或机器人接着回过）之后，跟多久 */
 export const FOLLOW_WINDOW_MS = 2 * 60 * 60_000;
-/** 最多同时跟多少个话题，超出时先忘掉最早的 */
+/** 最多同时跟多少个话题、记多少个静音的话题，超出时先忘掉最早的 */
 const MAX_THREADS = 2000;
+/** 最多同时判断几条，多的排队（事件断了一阵、补漏轮询一次补上很多条时，别把模型的并发占满） */
+const MAX_JUDGING = 3;
+/** 排队等判断的最多几条，再多的不判断了（多半是事件断了很久，补上来的都是旧消息） */
+const MAX_WAITING = 20;
 /** 判断时看话题里最近几条 */
 const JUDGE_MESSAGES = 8;
 /** 判断时每条最多看多少字 */
@@ -45,9 +49,10 @@ export interface ThreadFollowerOptions {
 }
 
 interface Followed {
+  /** 从哪条消息起跟（开始跟的那条 @ 的发送时间）：在它之前发的不跟，补漏轮询回看时不会把开始跟之前的消息翻出来回 */
+  since: number;
+  /** 最后一次 @ 它或它接着回的时间 */
   lastAt: number;
-  /** 有人说了「只在 @ 我时回」 */
-  muted: boolean;
 }
 
 /**
@@ -57,6 +62,10 @@ interface Followed {
  */
 export class ThreadFollower {
   private readonly threads = new Map<string, Followed>();
+  /** 说过「只在 @ 我时回」的话题：机器人运行期间一直记着，不随跟聊过期 */
+  private readonly muted = new Set<string>();
+  private judging = 0;
+  private readonly waiting: Array<() => void> = [];
   private readonly logger: Logger;
   private readonly now: () => number;
 
@@ -71,13 +80,10 @@ export class ThreadFollower {
       return;
     }
     const key = threadKeyOf(msg);
-    const muted = this.threads.get(key)?.muted ?? false;
-    // Map 按插入顺序：先删再加，最近有动静的排到最后，超出上限时删掉最早的
-    this.threads.delete(key);
-    this.threads.set(key, { lastAt: this.now(), muted });
-    if (this.threads.size > MAX_THREADS) {
-      this.threads.delete(this.threads.keys().next().value!);
-    }
+    const now = this.now();
+    const followed = this.threads.get(key);
+    const since = followed && now - followed.lastAt <= FOLLOW_WINDOW_MS ? followed.since : msg.createTime || now;
+    remember(this.threads, key, { since, lastAt: now });
   }
 
   /**
@@ -95,30 +101,31 @@ export class ThreadFollower {
       return false;
     }
     const followed = this.threads.get(msg.rootId);
-    if (!followed) {
+    if (!followed || this.muted.has(msg.rootId)) {
       return false;
     }
     if (this.now() - followed.lastAt > FOLLOW_WINDOW_MS) {
       this.threads.delete(msg.rootId);
       return false;
     }
-    return !followed.muted;
+    return msg.createTime >= followed.since;
   }
 
   /**
-   * 话题里说「只在 @ 我时回」（@ 不 @ 它都算）：这个话题不再跟聊，回一句。返回 true 表示是这句话、已经处理了。
-   * 没 @ 它时，只认它在跟着的话题里说的；群里直接说的不算（群里本来就只在 @ 它时回）
+   * 说「只在 @ 我时回」：这个话题不再跟聊（机器人运行期间一直不跟），回一句。返回 true 表示是这句话、已经处理了。
+   * @ 了它说的都算，在群里直接 @ 它说的，就是它回复这条时开的那个话题；
+   * 没 @ 它时，只认它在跟着的话题里说的
    */
   async muteIfAsked(msg: NormalizedMessage): Promise<boolean> {
-    if (!msg.rootId || !this.opts.allowedChatIds.has(msg.chatId) || !MUTE_COMMAND.test(msg.content.trim())) {
+    if (!this.opts.allowedChatIds.has(msg.chatId) || !MUTE_COMMAND.test(msg.content.trim())) {
       return false;
     }
     if (!msg.mentionedBot && !this.wants(msg)) {
       return false;
     }
-    const key = msg.rootId;
+    const key = threadKeyOf(msg);
     this.threads.delete(key);
-    this.threads.set(key, { lastAt: this.now(), muted: true });
+    remember(this.muted, key);
     this.logger.info(`跟聊：话题里说了只在 @ 时回，这个话题不再跟聊 chat=${msg.chatId} thread=${key} message=${msg.messageId}`);
     await this.opts.reply(msg, MUTED_REPLY);
     return true;
@@ -139,6 +146,11 @@ export class ThreadFollower {
       await this.opts.handle(msg);
       return;
     }
+    if (this.judging >= MAX_JUDGING && this.waiting.length >= MAX_WAITING) {
+      this.logger.warn(`跟聊：要判断的消息太多（${MAX_JUDGING} 条在判断、${this.waiting.length} 条在排队），这条不判断、不回 message=${msg.messageId}`);
+      return;
+    }
+    await this.acquire();
     const startedAt = this.now();
     let answer: boolean;
     try {
@@ -147,6 +159,8 @@ export class ThreadFollower {
       // 拿不准就不回：判断失败时宁可漏回一句，也不在别人说话时插嘴
       this.logger.warn(`跟聊：判断失败，这条不回 message=${msg.messageId}：${err instanceof Error ? err.message : String(err)}`);
       return;
+    } finally {
+      this.release();
     }
     this.logger.info(
       `跟聊：没 @ 的话题消息${answer ? "是对机器人说的，接着回" : "不是对机器人说的，不回"} chat=${msg.chatId} thread=${msg.rootId} ` +
@@ -157,6 +171,25 @@ export class ThreadFollower {
     }
     this.track(msg);
     await this.opts.handle(msg);
+  }
+
+  /** 占一个判断的名额，满了就排队 */
+  private async acquire(): Promise<void> {
+    if (this.judging < MAX_JUDGING) {
+      this.judging++;
+      return;
+    }
+    // 名额由 release 直接转给排队的，judging 不变
+    await new Promise<void>((resolve) => this.waiting.push(resolve));
+  }
+
+  private release(): void {
+    const next = this.waiting.shift();
+    if (next) {
+      next();
+    } else {
+      this.judging--;
+    }
   }
 
   private async judge(msg: NormalizedMessage, busy: boolean): Promise<boolean> {
@@ -182,6 +215,19 @@ export class ThreadFollower {
       signal: timeout,
     });
     return /^[「"'*\s]*是/.test(result.text);
+  }
+}
+
+/** 记进 Map 或 Set：先删再加，最近的排到最后，超出 MAX_THREADS 时删掉最早的 */
+function remember<V>(store: Map<string, V> | Set<string>, key: string, value?: V): void {
+  store.delete(key);
+  if (store instanceof Map) {
+    store.set(key, value as V);
+  } else {
+    store.add(key);
+  }
+  if (store.size > MAX_THREADS) {
+    store.delete(store.keys().next().value!);
   }
 }
 

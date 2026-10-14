@@ -130,7 +130,7 @@ export class ThreadContextLoader {
       return [];
     }
     try {
-      const all = await this.api.listChatMessages(msg.chatId, msg.createTime - CHAT_CONTEXT_MS, CHAT_CONTEXT_MESSAGES + 1);
+      const all = await this.api.listChatMessages(msg.chatId, msg.createTime - CHAT_CONTEXT_MS, msg.createTime, CHAT_CONTEXT_MESSAGES + 1);
       return all
         .filter(
           (m) =>

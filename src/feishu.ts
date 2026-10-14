@@ -39,8 +39,8 @@ export interface FeishuApi {
    * sinceMs 只对群有效（飞书的话题列表不支持按时间过滤），调用方自己再按 createTime 筛一遍。
    */
   listRecentMessages(container: "chat" | "thread", id: string, limit: number, sinceMs?: number): Promise<RecentMessage[]>;
-  /** 群主界面里 sinceMs 之后的消息（带发言人名字），按时间从早到晚，最多取最近 limit 条 */
-  listChatMessages(chatId: string, sinceMs: number, limit: number): Promise<ThreadMessage[]>;
+  /** 群主界面里 sinceMs 到 untilMs 之间的消息（带发言人名字），按时间从早到晚，最多取离 untilMs 最近的 limit 条 */
+  listChatMessages(chatId: string, sinceMs: number, untilMs: number, limit: number): Promise<ThreadMessage[]>;
   /** 下载消息里的一张图片（获取消息中的资源文件）。机器人得在这条消息所在的群里 */
   downloadImage(messageId: string, imageKey: string): Promise<DownloadedImage>;
 }
@@ -208,7 +208,7 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       );
     },
 
-    async listChatMessages(chatId, sinceMs, limit) {
+    async listChatMessages(chatId, sinceMs, untilMs, limit) {
       const res = (await client.im.v1.message.list({
         params: {
           container_id_type: "chat",
@@ -216,6 +216,8 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
           sort_type: "ByCreateTimeDesc",
           page_size: Math.min(50, limit),
           start_time: String(Math.floor(sinceMs / 1000)),
+          // 截到这一秒为止：群里很热闹、或者补漏晚了几秒时，最新的一页全是 @ 之后的消息，就拿不到之前的了
+          end_time: String(Math.ceil(untilMs / 1000)),
           with_sender_name: true,
         },
       })) as ApiResponse<{ items?: ApiItem[] }>;
