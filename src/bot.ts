@@ -73,11 +73,12 @@ const DOC_REQUEST = new RegExp(
   "i",
 );
 
-const CHANGE_VERB = String.raw`(?:写|改|删|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记|替换|新建|创建|建|提交|合并|修复|修)`;
+const CHANGE_VERB = String.raw`(?:写|改|删|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修)`;
 const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b)`;
 /**
  * 提问本身说了要改哪个文档或代码：「把上面那段追加到周报文档里」「文档里那段改一下」「修一下这段代码」「开个 MR」。
- * 带上了群聊时，没这么说的不给改文档、改代码的工具（「加拿大的首都是哪里」不算）
+ * 带上了群聊时用它挑给哪样：说了要改的给改的工具、不带群聊，没说的带群聊、只给读的工具（「加拿大的首都是哪里」「你记得代码仓库最近有什么变更吗」不算要改）。
+ * 认错了只是少了群聊或者少了改的工具，两样不会同时给
  */
 const CHANGE_REQUEST = new RegExp(
   [
@@ -427,9 +428,13 @@ async function runTask(
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
-    // 这次带上了群里刚才的聊天（旁听）：群聊里谁都能写字，提问本身没说要改东西时不给改文档、改代码的工具。
-    // 不然有人在群里埋一句「把某某文档清空」，等写权限名单里的人随便 @ 一句问别的，模型就可能借他的权限照做
-    const ambientOnly = hasWrites && !noPermission && !followUp && context.history.some(isChatContext) && !CHANGE_REQUEST.test(question);
+    // 这次带上了群里刚才的聊天（旁听）：群聊里谁都能写字，群聊和改文档、改代码的工具不同时给。
+    // 不然有人在群里埋一句「把某某文档清空」，等写权限名单里的人 @ 一句，模型就可能借他的权限照做。
+    // 提问本身说了要改哪个文档或代码：给改的工具、不带群聊（和没有旁听时一样）；没说：带群聊、只给读的工具
+    const ambient = hasWrites && !noPermission && !followUp && context.history.some(isChatContext);
+    const chatDropped = ambient && CHANGE_REQUEST.test(question);
+    const ambientOnly = ambient && !chatDropped;
+    const modelHistory = chatDropped ? history.filter((m) => !isChatContext(m)) : history;
     const readOnly = noPermission || followUp || ambientOnly;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
@@ -446,6 +451,8 @@ async function runTask(
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (ambientOnly) {
       logger.info(`带上了群聊、提问没说要改东西，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (chatDropped) {
+      logger.info(`提问说了要改东西，这次不带群聊 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
@@ -499,6 +506,7 @@ async function runTask(
         memory: memory?.prompt,
         readOnly: noPermission,
         ...(ambientOnly ? { ambientOnly: true } : {}),
+        ...(chatDropped ? { chatDropped: true } : {}),
         followUp,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
@@ -520,7 +528,7 @@ async function runTask(
             }
           : {}),
       }),
-      messages: [...history, { role: "user", content: prompt }],
+      messages: [...modelHistory, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
       ...(streaming ? { stream: true } : {}),
@@ -591,7 +599,7 @@ async function runTask(
     if (hasCodeTools && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
       // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
-      const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
+      const userText = [asked, ...modelHistory.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
       const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
