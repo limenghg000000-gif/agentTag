@@ -473,6 +473,25 @@ test("冲突卡片：存新经验没成功时另发一张确认卡片，写权�
   }
 });
 
+test("冲突卡片：存新经验没成功、另发的确认卡片太大时不发，结果里不说另发了卡片", async () => {
+  const s = await setup();
+  try {
+    // 旧经验别的字段写得很长：冲突卡片上不列它们，整条草稿的确认卡片超过卡片大小
+    const long = "很长的排查过程说明".repeat(220);
+    Object.assign(s.backend.entries[0], { scope: long, question: long, basis: long, keywords: long });
+    await s.tool().run({ conflicts: [s.both[0]] }, { signal });
+    await s.pick(0, "memory");
+    s.backend.failAdd = new Error("飞书接口限流");
+    await s.apply();
+    assert.equal(s.sent.filter((one) => (one.input as { card?: any }).card?.header?.title?.content === "存进经验库？").length, 0, "没发确认卡片");
+    assert.match(text(s.card()), /经验 K1 没改成：飞书接口限流。/);
+    assert.doesNotMatch(text(s.card()), /另发了一张确认卡片/);
+    assert.equal(s.card().header.title.content, "群记忆和经验库没全同步成");
+  } finally {
+    await s.cleanup();
+  }
+});
+
 test("冲突卡片：没存成另发的确认卡片上点保存前，群记忆改过了就不存", async () => {
   const s = await setup();
   try {

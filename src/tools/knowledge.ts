@@ -655,8 +655,14 @@ export class KnowledgeDesk {
 
   /** 冲突卡片上没做完的那条经验：登记成一张确认卡片发到话题里，之后按普通的确认卡片处理。发不出去时返回 false */
   private async attach(proposal: SaveProposal, replyTo: string): Promise<boolean> {
+    // 冲突卡片上只列了结论和怎么处理，确认卡片要列整条草稿：旧经验其他字段很长时可能超过卡片大小，发不出去就不发
+    const card = renderProposalCard(proposal);
+    if (!cardFits(card) || !draftFits(proposal.draft)) {
+      this.logger.warn(`冲突卡片 没做完的经验卡片太大，没发 proposal=${proposal.id}`);
+      return false;
+    }
     try {
-      const { messageId } = await this.options.send(proposal.chatId, { card: renderProposalCard(proposal) }, { replyTo, replyInThread: true });
+      const { messageId } = await this.options.send(proposal.chatId, { card }, { replyTo, replyInThread: true });
       proposal.cardMessageId = messageId;
       this.proposals.set(proposal.id, proposal);
       return true;
