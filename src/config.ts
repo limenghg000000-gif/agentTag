@@ -62,18 +62,22 @@ export interface Config {
   cardAnswersDir: string;
   /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
   recentThreadsDir: string;
+  /** 产品功能说明的链接（ANNOUNCE_LINK）：通知卡片上的按钮用，有人问「你能做什么」时回答里也附上。更新通知关掉时也有 */
+  featuresLink?: string;
   /** 更新通知（ANNOUNCE，默认 on）：部署新版本后把产品更新说明 RELEASE_NOTES.md 里新版本的说明发到群里。关掉时为空 */
   announce?: {
     /** 发到这些群：ANNOUNCE_CHAT_IDS，不填就是白名单里的所有群 */
     chatIds: string[];
     /** chatIds 是从哪个配置来的，启动日志里写明 */
     chatIdsFrom: "ANNOUNCE_CHAT_IDS" | "FEISHU_ALLOWED_CHAT_IDS";
-    /** 通知卡片上「看全部功能」按钮的链接（ANNOUNCE_LINK） */
+    /** 通知卡片上「产品功能说明」按钮的链接（ANNOUNCE_LINK） */
     link?: string;
     /** 每个群发到哪一版记在这个文件里 */
     stateFile: string;
     /** 发到群里的产品更新说明 */
     notesFile: string;
+    /** 技术版更新日志，同一版本的内容折叠放在卡片的「技术说明」里 */
+    changelogFile: string;
   };
 }
 
@@ -187,8 +191,10 @@ function isSecretParam(param: string): boolean {
 
 /** 使用说明文件默认放在项目的 prompts/mcp/<服务名>.md（src 和 dist 都在项目根目录下一层） */
 const PROMPTS_DIR = fileURLToPath(new URL("../prompts/mcp/", import.meta.url));
-/** 产品更新说明在项目根目录，部署时跟着 git pull 更新（技术版的 CHANGELOG.md 不发群里） */
+/** 产品更新说明在项目根目录，部署时跟着 git pull 更新 */
 export const RELEASE_NOTES_FILE = fileURLToPath(new URL("../RELEASE_NOTES.md", import.meta.url));
+/** 技术版更新日志，同一版本的内容折叠放在通知卡片的「技术说明」里 */
+export const CHANGELOG_FILE = fileURLToPath(new URL("../CHANGELOG.md", import.meta.url));
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -258,7 +264,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const allowedChatIds = new Set((env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
-  const announce = loadAnnounceConfig(env, allowedChatIds);
+  const featuresLink = loadFeaturesLink(env);
+  const announce = loadAnnounceConfig(env, allowedChatIds, featuresLink);
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
@@ -297,12 +304,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),
+    ...(featuresLink ? { featuresLink } : {}),
     ...(announce ? { announce } : {}),
   };
 }
 
-/** ANNOUNCE=off 关掉；ANNOUNCE_CHAT_IDS 只能是白名单里的群；ANNOUNCE_LINK 要是 https 地址 */
-function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<string>): Config["announce"] {
+/** ANNOUNCE_LINK：产品功能说明的链接，要是 https 地址 */
+function loadFeaturesLink(env: NodeJS.ProcessEnv): string | undefined {
+  const link = env.ANNOUNCE_LINK?.trim();
+  if (!link) {
+    return undefined;
+  }
+  let url: URL | undefined;
+  try {
+    url = new URL(link);
+  } catch {
+    url = undefined;
+  }
+  if (url?.protocol !== "https:") {
+    throw new Error(`ANNOUNCE_LINK 要写成 https://… 这样的完整地址，当前为 ${link}`);
+  }
+  return link;
+}
+
+/** ANNOUNCE=off 关掉；ANNOUNCE_CHAT_IDS 只能是白名单里的群 */
+function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<string>, link: string | undefined): Config["announce"] {
   const switchEnv = (env.ANNOUNCE?.trim() || "on").toLowerCase();
   if (switchEnv !== "on" && switchEnv !== "off") {
     throw new Error(`ANNOUNCE 只能是 on 或 off，当前为 ${env.ANNOUNCE}`);
@@ -315,24 +341,13 @@ function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<
   if (outside) {
     throw new Error(`ANNOUNCE_CHAT_IDS 里的群 ${outside} 不在 FEISHU_ALLOWED_CHAT_IDS 里：更新通知只发白名单里的群`);
   }
-  const link = env.ANNOUNCE_LINK?.trim();
-  if (link) {
-    let url: URL | undefined;
-    try {
-      url = new URL(link);
-    } catch {
-      url = undefined;
-    }
-    if (url?.protocol !== "https:") {
-      throw new Error(`ANNOUNCE_LINK 要写成 https://… 这样的完整地址，当前为 ${link}`);
-    }
-  }
   return {
     chatIds: listed.length > 0 ? [...new Set(listed)] : [...allowedChatIds],
     chatIdsFrom: listed.length > 0 ? "ANNOUNCE_CHAT_IDS" : "FEISHU_ALLOWED_CHAT_IDS",
     ...(link ? { link } : {}),
     stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "announce", "state.json"),
     notesFile: RELEASE_NOTES_FILE,
+    changelogFile: CHANGELOG_FILE,
   };
 }
 
