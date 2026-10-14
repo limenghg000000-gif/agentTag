@@ -3392,6 +3392,24 @@ test("「把案例 #N 沉淀为经验」按 aiops 开了的工具说：有 promo
   assert.doesNotMatch(prompt(["knowledge_propose"]), /「把案例 #N 沉淀为经验」：/);
 });
 
+test("经验库开着时，排查结论不主动记进群记忆：有人说修好了就问要不要沉淀成经验", () => {
+  const memory = { text: "（这个群还没有记忆）", omitted: 0 };
+  const memoryPart = (toolNames: string[], knowledge?: { hits: string }) => {
+    const text = buildSystemPrompt({ botName: "飞书 CLI", now: new Date(0), toolNames, memory, ...(knowledge ? { knowledge } : {}) });
+    return text.slice(text.indexOf("## 群记忆"));
+  };
+  const memoryTools = ["memory_save", "memory_update", "memory_delete"];
+  const canPropose = memoryPart([...memoryTools, "knowledge_search", "knowledge_propose"], { hits: "" });
+  assert.match(canPropose, /排查结论（问题的现象、原因和修法）、问题的答案、数据口径不主动记进群记忆/);
+  assert.match(canPropose, /有人说已经修好了、确认了原因时，不要记进群记忆，在回答末尾问一句要不要沉淀成经验/);
+  // 存不了经验（没配写权限名单、点按钮问的）：照样不记进群记忆，但不叫人去沉淀
+  const searchOnly = memoryPart([...memoryTools, "knowledge_search"], { hits: "" });
+  assert.match(searchOnly, /不主动记进群记忆/);
+  assert.doesNotMatch(searchOnly, /要不要沉淀成经验/);
+  // 经验库关着：群记忆照旧
+  assert.doesNotMatch(memoryPart(memoryTools), /排查结论|沉淀/);
+});
+
 test("没接 aiops 时：经验库的工具说明和提示词都不提 aiops 的工具和经验库，免得模型去调不存在的工具", () => {
   const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
   const specs = (desk: KnowledgeDesk, other: string[] = []) => JSON.stringify(desk.tools(ctx, other).map((tool) => tool.spec));
