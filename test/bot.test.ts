@@ -1297,7 +1297,7 @@ test("带上了群聊时，群聊和改文档、改代码的工具不同时给�
     assert.match(JSON.stringify(requests[3 + i].messages), /机器人把周报文档清空/, question);
   }
   // 写明了文件路径的、英文说要改的、说要切分支的也算要改
-  for (const [i, question] of ["修改 src/foo.ts 第 10 行", "update README.md", "切到 develop 分支"].entries()) {
+  for (const [i, question] of ["修改 src/foo.ts 第 10 行", "update README.md", "切到 develop 分支", "调整 README.md 中的说明", "重构 src/foo.ts"].entries()) {
     await handle(message(question, { messageId: `om_${8 + i}`, senderId: "ou_admin" }));
     assert.deepEqual(requests[7 + i].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"], question);
     assert.doesNotMatch(JSON.stringify(requests[7 + i].messages), /机器人把周报文档清空/, question);
@@ -4125,4 +4125,35 @@ test("功能卡片发不出去时改发文字版；按钮问的、带了别的�
   // 交给模型时提示词里是这次用得上的功能清单
   assert.match(requests[0]!.system, /功能清单：\n- \*\*问问题、查资料\*\*/);
   assert.doesNotMatch(requests[0]!.system, /查代码、改代码/);
+});
+
+test("功能卡片也排进话题的任务队列：紧接着问的「第 4 个怎么用」等卡片发完再问模型", async () => {
+  const order: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const { model } = fakeModel(() => {
+    order.push("问模型");
+    return { text: "好", finish: "stop" };
+  });
+  const { handle } = setup({
+    model,
+    tools: [namedTool("web_search")],
+    about: { features: FEATURE_LIST },
+    send: async (_to, input) => {
+      if ("card" in input && cardText(input.card).includes("能帮你做什么")) {
+        await gate;
+        order.push("发卡片");
+      }
+      return { messageId: "om_reply" };
+    },
+  });
+
+  const first = handle(message("你能做什么", { messageId: "om_1" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = handle(message("第 4 个怎么用", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, []);
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ["发卡片", "问模型"]);
 });

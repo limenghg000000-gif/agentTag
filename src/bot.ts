@@ -74,7 +74,7 @@ const DOC_REQUEST = new RegExp(
   "i",
 );
 
-const CHANGE_VERB = String.raw`(?:写|改|删|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修|切(?:换|到)?)`;
+const CHANGE_VERB = String.raw`(?:写|改|删|调整|重构|移除|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修|切(?:换|到)?)`;
 /** 写明了的文件路径：src/bot.ts、README.md、docs/a/b、飞书文档链接 */
 const CHANGE_PATH = String.raw`(?:(?:[\w.-]+\/)+[\w.-]+|\b[\w-]+\.(?:tsx?|jsx?|mjs|cjs|go|php|py|java|kt|rb|rs|cpp|cc|c|h|hpp|cs|swift|vue|md|json|ya?ml|toml|ini|env|sql|sh|html|css|scss|xml|proto|txt|conf|gradle|lock)\b)`;
 const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b|${CHANGE_PATH})`;
@@ -254,8 +254,16 @@ export function createMessageHandler(deps: BotDeps) {
       return;
     }
     // 只问「你能做什么」这类话：不问模型，直接回功能卡片。按钮问的不算（按钮上的话是模型写的）
+    // 也排进这个话题的任务队列：紧接着问的「第 4 个怎么用」等卡片发完、记进上文再答，说「停止」也停得掉
     if (!options.readOnly && deps.about?.features && asksForFeatures(question)) {
-      await sendFeatures(deps, msg, question, deps.about.features);
+      const task = tasks.create(msg.chatId, threadKeyOf(msg));
+      try {
+        if (await task.waitTurn()) {
+          await sendFeatures(deps, msg, question, deps.about.features);
+        }
+      } finally {
+        tasks.finish(task);
+      }
       return;
     }
 
