@@ -250,7 +250,7 @@ const followUp = createFollowUp({
     // 和收到的消息一样记进补漏轮询：点按钮可能让一个已经不再跟踪的话题又活了，后面的 @ 漏了事件还能补上
     catchUp.watch(msg);
     // 和 @ 的消息一样排在同一话题里还在判断的消息后面，之后跟着这个话题
-    return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options)) : handleMessage(msg, options);
+    return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options), false) : handleMessage(msg, options);
   },
 });
 channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) }));

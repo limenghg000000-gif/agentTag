@@ -70,6 +70,8 @@ interface PausedState {
  */
 export class ProactiveReplier {
   private paused = new Map<string, { by: string; at: number }>();
+  /** 群 id → 说「可以主动说话」那条消息的时间：停着的时候群里说的话，打开以后补漏轮询再看到也不判断 */
+  private readonly resumedAt = new Map<string, number>();
   private readonly replies = new Map<string, number[]>();
   private readonly judged = new Map<string, number[]>();
   /** 每个群上一次因为到了上限而跳过时记的日志，一小时只记一次 */
@@ -145,6 +147,9 @@ export class ProactiveReplier {
     if (msg.mentionedBot || msg.mentionAll || fromApp || msg.threadId || !this.active(msg.chatId)) {
       return false;
     }
+    if (msg.createTime && msg.createTime < (this.resumedAt.get(msg.chatId) ?? 0)) {
+      return false;
+    }
     if (!msg.senderId.startsWith("ou_") || msg.senderId === this.opts.botOpenId() || msg.mentions.length > 0) {
       return false;
     }
@@ -189,6 +194,7 @@ export class ProactiveReplier {
       this.paused.set(msg.chatId, { by: msg.senderId, at: this.now() });
     } else {
       this.paused.delete(msg.chatId);
+      this.resumedAt.set(msg.chatId, msg.createTime || this.now());
     }
     this.logger.info(`主动接话：${pause ? "停了" : "打开了"} chat=${msg.chatId} sender=${msg.senderId}`);
     return this.saveAndReply(msg, pause);

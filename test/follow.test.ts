@@ -367,20 +367,37 @@ test("@ 了机器人的消息也排在同一话题里还在判断的消息后面
   await Promise.all([first, asking]);
   assert.deepEqual(handled, ["把这个结论写进周报文档", "顺便查下 union"]);
 
-  // 「@机器人 停止」：还在判断的那句判断完也不交出去，排着的不再判断
+  // 「@机器人 停止」马上处理，不等正在判断的那句；那句判断完也不交出去，排着的（没 @ 的、@ 了的）都作废
   const writing = follower.consider(msg("om_4", { content: "再追加一段到周报文档" }));
   const queued = follower.consider(msg("om_5", { content: "还有这段也加上" }));
+  const queuedAsk = msg("om_5b", { content: "顺便改下文档", mentionedBot: true });
+  const queuedAsking = follower.answerInTurn(queuedAsk, async () => {
+    handled.push(queuedAsk.content);
+  });
   await tick();
   assert.equal(gates.length, 1, "第一句在判断");
   const stop = msg("om_6", { content: "停止", mentionedBot: true });
-  const stopping = follower.answerInTurn(stop, async () => {
+  await follower.answerInTurn(stop, async () => {
     handled.push(stop.content);
   });
-  await tick();
+  assert.deepEqual(handled.slice(2), ["停止"], "不等判断就停");
   gates.shift()!();
-  await Promise.all([writing, queued, stopping]);
+  await Promise.all([writing, queued, queuedAsking]);
   assert.deepEqual(handled.slice(2), ["停止"]);
   assert.equal(gates.length, 0, "排着的那句没再判断");
+
+  // 点按钮问的（commands=false）按钮上写着「停止」也只是普通的一条：排在正在判断的那句后面，也不让它作废
+  const judging = follower.consider(msg("om_6c", { content: "再查一下" }));
+  await tick();
+  const button = msg("om_6b", { content: "停止", mentionedBot: true });
+  const pressing = follower.answerInTurn(button, async () => {
+    handled.push("按钮");
+  }, false);
+  await tick();
+  assert.equal(handled.at(-1), "停止");
+  gates.shift()!();
+  await Promise.all([judging, pressing]);
+  assert.deepEqual(handled.slice(-2), ["再查一下", "按钮"]);
 
   // 没有在判断的消息时马上处理，处理的这个话题之后也跟着
   const other = msg("om_7", { content: "看下 union", mentionedBot: true, rootId: "om_root_2", threadId: "omt_2" });
@@ -391,7 +408,7 @@ test("@ 了机器人的消息也排在同一话题里还在判断的消息后面
   assert.equal(follower.wants(msg("om_8", { rootId: "om_root_2", threadId: "omt_2" })), true);
 });
 
-test("排队的时候有人说了「只在 @ 我时回」：轮到后面那条时不再判断；同一个话题里最多排 5 条", async () => {
+test("同一个话题里最多排 5 条；排满了说「只在 @ 我时回」也马上静音，排着的不再判断、判断完的也不交出去", async () => {
   const gates: Array<() => void> = [];
   const judged: string[] = [];
   const logs: string[] = [];
@@ -409,30 +426,62 @@ test("排队的时候有人说了「只在 @ 我时回」：轮到后面那条�
     },
     botName: () => "飞书 CLI",
     botOpenId: () => BOT,
-    handle: async () => {},
+    handle: async (m) => {
+      handled.push(m.messageId);
+    },
     reply: async (_m, markdown) => {
       replies.push(markdown);
     },
     logger: { info() {}, warn: (line: string) => logs.push(line), error() {} },
     now: () => START,
   });
+  const handled: string[] = [];
   follower.track(asked);
-  const runs = [
-    follower.consider(msg("om_2", { content: "第一句" })),
-    follower.consider(msg("om_3", { content: "别插话" })),
-    follower.consider(msg("om_4", { content: "第三句" })),
-    follower.consider(msg("om_5", { content: "第四句" })),
-    follower.consider(msg("om_6", { content: "第五句" })),
-    follower.consider(msg("om_7", { content: "第六句" })),
-  ];
+  const runs = ["第一句", "第二句", "第三句", "第四句", "第五句", "第六句"].map((content, i) => follower.consider(msg(`om_${2 + i}`, { content })));
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.match(logs.join("\n"), /跟聊：这个话题里还有 5 条没判断完，这条不判断、不回 thread=om_root message=om_7/);
+  // 排满了，静音照样马上生效，不用等第一句判断完
+  await follower.consider(msg("om_8", { content: "别插话" }));
+  assert.deepEqual(replies, [MUTED_REPLY]);
   gates.shift()!();
   await Promise.all(runs);
-  // 只判断了第一句；静音以后排着的都不判断
+  // 只判断了第一句，判断是对它说的也不交出去；静音以后排着的都不判断
   assert.equal(judged.length, 1);
   assert.match(judged[0], /第一句/);
-  assert.deepEqual(replies, [MUTED_REPLY]);
+  assert.deepEqual(handled, []);
+});
+
+test("机器人在做事时，排满了说「停止」也马上交给处理函数停任务；排着的作废", async () => {
+  const gates: Array<() => void> = [];
+  const handled: string[] = [];
+  const follower = new ThreadFollower({
+    allowedChatIds: new Set(["oc_1"]),
+    context: { load: async () => ({ history: [], source: "none" }) },
+    model: {
+      model: "fake",
+      chat: async () => {
+        await new Promise<void>((resolve) => gates.push(resolve));
+        return { text: "是", finish: "stop" };
+      },
+    },
+    botName: () => "飞书 CLI",
+    botOpenId: () => BOT,
+    busy: () => true,
+    handle: async (m) => {
+      handled.push(m.messageId);
+    },
+    reply: async () => {},
+    logger: { info() {}, warn() {}, error() {} },
+    now: () => START,
+  });
+  follower.track(asked);
+  const runs = ["第一句", "第二句", "第三句", "第四句", "第五句"].map((content, i) => follower.consider(msg(`om_${2 + i}`, { content })));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await follower.consider(msg("om_9", { content: "停止" }));
+  assert.deepEqual(handled, ["om_9"]);
+  gates.shift()!();
+  await Promise.all(runs);
+  assert.deepEqual(handled, ["om_9"]);
 });
 
 test("同一个话题里后面的判断不等前面的任务做完", async () => {

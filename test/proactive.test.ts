@@ -335,8 +335,11 @@ test("群里 @ 机器人说「别主动插话」就停，「可以主动说话�
     await restarted.init();
     assert.equal(restarted.active("oc_1"), false);
 
-    assert.equal(await restarted.toggleIfAsked(msg("om_3", { mentionedBot: true, content: "可以主动说话了" })), true);
+    assert.equal(await restarted.toggleIfAsked(msg("om_3", { mentionedBot: true, content: "可以主动说话了", createTime: START + 60_000 })), true);
     assert.equal(restarted.active("oc_1"), true);
+    // 停着的时候群里说的话，打开以后补漏轮询再看到也不判断；打开以后说的照常
+    assert.equal(restarted.wants(msg("om_4", { content: "测试环境数据库是哪个来着", createTime: START + 30_000 })), false);
+    assert.equal(restarted.wants(msg("om_5", { content: "测试环境数据库是哪个来着", createTime: START + 90_000 })), true);
     assert.match(t.replies[1], /会看情况主动接一句.*每小时最多 3 次/);
     const again = t.make();
     await again.init();

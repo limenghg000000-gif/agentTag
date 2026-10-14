@@ -207,6 +207,20 @@ export class ThreadFollower {
    */
   async consider(msg: NormalizedMessage): Promise<void> {
     const key = threadKeyOf(msg);
+    const text = msg.content.trim();
+    // 「只在 @ 我时回」、机器人正在做事时的「停止」不排队、不受下面的上限挡：排在前面的不再判断、不交出去，这条马上处理。
+    // 排满了的时候正是最需要停的时候
+    if (MUTE_COMMAND.test(text) || (STOP_COMMAND.test(text) && (this.opts.busy?.(key) ?? false))) {
+      remember(this.cancelledBefore, key, ++this.seq);
+      const muting = this.mute(msg);
+      if (muting) {
+        await muting;
+        return;
+      }
+      this.track(msg);
+      await this.opts.handle(msg);
+      return;
+    }
     const pending = this.pending.get(key) ?? 0;
     if (pending >= MAX_PENDING_PER_THREAD) {
       this.logger.warn(`跟聊：这个话题里还有 ${pending} 条没判断完，这条不判断、不回 thread=${key} message=${msg.messageId}`);
@@ -230,16 +244,25 @@ export class ThreadFollower {
 
   /**
    * @ 了机器人的消息也按顺序交给处理函数：同一话题里前面没 @ 的还在判断时，等它判断完、交出去再处理这条。
-   * 不然「改一下文档」还在判断，后说的「@机器人 停止」先到，没有任务可停，前面那句判断完又开始改
+   * 「@机器人 停止」「@机器人 只在 @ 我时回」不排队：前面排着的（没 @ 的判断、@ 了还没交出去的）都作废，这条马上处理，
+   * 不用干等正在判断的那条（最多 20 秒）。不然「改一下文档」还在判断，后说的停止先处理了，前面那句判断完又开始改。
+   * commands 是 false 时（点「接着查」按钮问的，按钮上的话是模型写的）不当成停止、静音
    */
-  async answerInTurn(msg: NormalizedMessage, handle: () => Promise<void>): Promise<void> {
+  async answerInTurn(msg: NormalizedMessage, handle: () => Promise<void>, commands = true): Promise<void> {
     const key = threadKeyOf(msg);
     const text = msg.content.trim();
-    // 「@机器人 停止」「@机器人 只在 @ 我时回」：前面还在排队判断的没 @ 的消息不再判断、不交出去，这条不用干等它们
-    if (STOP_COMMAND.test(text) || MUTE_COMMAND.test(text)) {
+    if (commands && (STOP_COMMAND.test(text) || MUTE_COMMAND.test(text))) {
       remember(this.cancelledBefore, key, ++this.seq);
+      this.track(msg);
+      await handle();
+      return;
     }
+    const order = ++this.seq;
     await this.inTurn(key, async () => {
+      if (this.cancelled(key, order)) {
+        this.logger.info(`跟聊：排着的时候话题里有人 @ 机器人说了停止或只在 @ 时回，这条不处理了 message=${msg.messageId}`);
+        return undefined;
+      }
       this.track(msg);
       return { done: handle() };
     });
