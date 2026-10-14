@@ -228,7 +228,9 @@ export class ProactiveReplier {
       this.logCap(chatId, `这一小时已经判断了 ${MAX_JUDGED_PER_HOUR} 条`);
       return;
     }
-    push(this.judged, chatId, this.now());
+    // 先占上一次判断的名额（几条同时来时不超过上限）；排不上队、排队时停了的没问模型，退回来
+    const judgedAt = this.now();
+    push(this.judged, chatId, judgedAt);
     const startedAt = this.now();
     let said: string | undefined;
     let paused = false;
@@ -242,10 +244,12 @@ export class ProactiveReplier {
         return this.judge(msg);
       });
       if (paused) {
+        unpush(this.judged, chatId, judgedAt);
         this.logger.info(`主动接话：排队的这会儿群里说了别主动插话，这条不判断 chat=${chatId} message=${msg.messageId}`);
         return;
       }
       if (!judged) {
+        unpush(this.judged, chatId, judgedAt);
         this.logger.warn(`主动接话：要判断的消息太多（${this.queue.load}），这条不判断 message=${msg.messageId}`);
         return;
       }

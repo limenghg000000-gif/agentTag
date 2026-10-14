@@ -233,6 +233,28 @@ test("每个群每小时最多判断 120 条，后面的不问模型", async () 
   }
 });
 
+test("排不上队、排队时停了的没问模型，不占每小时判断的名额", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const t = await setup({ judge: () => gate.then(() => "不接") });
+  try {
+    // 同时 3 条在判断、20 条排队，后面 10 条排不上
+    const pending = Array.from({ length: 33 }, (_, i) => t.replier.consider(msg(`om_${i}`)));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    release();
+    await Promise.all(pending);
+    assert.equal(t.requests.length, 23);
+    // 120 条的名额只用了 23 条：再来 97 条照样判断，第 98 条才到上限
+    for (let i = 0; i < 98; i++) {
+      await t.replier.consider(msg(`om_more_${i}`));
+    }
+    assert.equal(t.requests.length, 23 + 97);
+    assert.match(t.logs.join("\n"), new RegExp(`这一小时已经判断了 ${MAX_JUDGED_PER_HOUR} 条`));
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("判断的时候有人说了「别主动插话」：判断完不回", async () => {
   let release!: (text: string) => void;
   const t = await setup({ judge: () => new Promise<string>((resolve) => (release = resolve)) });

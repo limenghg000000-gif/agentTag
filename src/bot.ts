@@ -96,6 +96,9 @@ const CHANGE_REQUEST = new RegExp(
   "i",
 );
 
+/** 提问本身让机器人记住、忘掉或改群记忆：「记住发版在周三」「忘掉 #3」「把第 2 条记忆改成…」 */
+const MEMORY_REQUEST = /记住|记下|记一下|忘掉|忘记|别记|不用记|(?:删|改|更新)[^，。,.!?！？\n]{0,8}记忆|记忆[^，。,.!?！？\n]{0,8}(?:删|改|更新)/;
+
 /**
  * 这次要不要新建文档。也看话题里刚说的：上一条回答在问话（「要整理成飞书文档吗？」「标题叫什么？」），
  * 而这条回答或者它前面那条提问说到了写文档，接着回的「好，建吧」「叫周报」也算。上一条回答已经建好了文档（不是在问话）就不算
@@ -456,12 +459,17 @@ async function runTask(
     // 不能让模型借他的权限照着话题里别人埋的话去改文档、改代码。要改就 @ 机器人直接说
     const unaddressed = hasWrites && !noPermission && !followUp && options.unaddressed === true;
     const readOnly = noPermission || followUp || ambientOnly || unaddressed;
+    // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
+    // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
+    const memoryLocked =
+      !followUp && (modelHistory.some(isChatContext) || options.unaddressed === true) && !MEMORY_REQUEST.test(question);
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter(
       (tool) =>
         !(readOnly && tool.writes) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
+        !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
     toolCount = taskTools.length;
@@ -531,6 +539,7 @@ async function runTask(
         ...(ambientOnly ? { ambientOnly: true } : {}),
         ...(chatDropped ? { chatDropped: true } : {}),
         ...(unaddressed ? { unaddressed: true } : {}),
+        ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
