@@ -378,9 +378,13 @@ async function runTask(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
-          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支
-          if (followUp && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
-            throw new Error("这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数");
+          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支：按钮问的、没 @ 的跟聊都不能切
+          if ((followUp || options.unaddressed) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+            throw new Error(
+              followUp
+                ? "这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
+                : "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数",
+            );
           }
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
           if (tool.instructionsOnly) {

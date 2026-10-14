@@ -1387,6 +1387,15 @@ test("点「接着查」按钮问的不能切分支：code_branches 只能列，
   await handle(message("dev 分支上 union 的配置"), { readOnly: true });
   assert.deepEqual(runs, [{}]);
   assert.match(JSON.stringify(requests[1].messages.at(-1)), /只能查，不能切换分支/);
+
+  // 没 @ 的跟聊也不能切（切了以后这个话题里 @ 了再改代码、开合并请求都用那个分支）
+  results.push(
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c3", name: "code_branches", arguments: '{"switch_to":"dev"}' }] },
+    { text: "好", finish: "stop" },
+  );
+  await handle(message("切到 dev 分支看看", { messageId: "om_2", rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(runs, [{}]);
+  assert.match(JSON.stringify(requests[4].messages.at(-1)), /这句没 @ 你，只能查，不能切换分支/);
 });
 
 test("点「接着查」按钮：交给 followUp，不等它跑完；白名单外的群、没配 followUp 时不处理", async () => {
