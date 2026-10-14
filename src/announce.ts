@@ -100,19 +100,42 @@ export interface AnnouncementOptions {
   firstTime?: boolean;
 }
 
-/** 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前 */
-export function renderAnnouncementCard(versions: readonly ChangelogVersion[], options: AnnouncementOptions = {}): object {
-  const name = options.botName || "机器人";
+/**
+ * 一条通知里列哪几个版本（卡片和退回的文字一样）：最多 MAX_ANNOUNCED_VERSIONS 个、说明加起来不超过 MAX_NOTES_CHARS 字，
+ * 后面的只说还有几个。第一个版本再长也要列，太长就按行截短
+ */
+function shownVersions(versions: readonly ChangelogVersion[]): ChangelogVersion[] {
   const shown: ChangelogVersion[] = [];
   let chars = 0;
   for (const v of versions) {
-    // 第一个版本再长也要列出来，后面的放不下就只说还有几个
     if (shown.length >= MAX_ANNOUNCED_VERSIONS || (shown.length > 0 && chars + v.notes.length > MAX_NOTES_CHARS)) {
       break;
     }
-    shown.push(v);
+    shown.push(v.notes.length > MAX_NOTES_CHARS ? { ...v, notes: truncateNotes(v.notes) } : v);
     chars += v.notes.length;
   }
+  return shown;
+}
+
+/** 按行截到 MAX_NOTES_CHARS 字以内，末尾说一句没列全；第一行就超了按字截 */
+function truncateNotes(notes: string): string {
+  const kept: string[] = [];
+  let chars = 0;
+  for (const line of notes.split("\n")) {
+    if (chars + line.length + 1 > MAX_NOTES_CHARS) {
+      break;
+    }
+    kept.push(line);
+    chars += line.length + 1;
+  }
+  const head = kept.length > 0 ? kept.join("\n") : [...notes].slice(0, MAX_NOTES_CHARS).join("");
+  return `${head}\n…（太长了没列全，见更新日志）`;
+}
+
+/** 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前 */
+export function renderAnnouncementCard(versions: readonly ChangelogVersion[], options: AnnouncementOptions = {}): object {
+  const name = options.botName || "机器人";
+  const shown = shownVersions(versions);
   const title = `${name} 更新了 · ${versions[0]?.version ?? ""}`;
   const elements: object[] = shown.map((v) => ({
     tag: "markdown",
@@ -147,10 +170,12 @@ export function renderAnnouncementCard(versions: readonly ChangelogVersion[], op
   };
 }
 
-/** 卡片发不出去时（比如飞书客户端太旧）退回的纯文本 */
+/**
+ * 飞书说卡片格式不对时退回的文字，列的版本和卡片一样。尖括号换成全角：Markdown 里的 <at id=all></at> 也会 @所有人
+ */
 export function renderAnnouncementMarkdown(versions: readonly ChangelogVersion[], options: AnnouncementOptions = {}): string {
   const name = options.botName || "机器人";
-  const shown = versions.slice(0, MAX_ANNOUNCED_VERSIONS);
+  const shown = shownVersions(versions);
   const lines = [`**${name} 更新了 · ${versions[0]?.version ?? ""}**`];
   for (const v of shown) {
     if (versions.length > 1) {
@@ -166,7 +191,7 @@ export function renderAnnouncementMarkdown(versions: readonly ChangelogVersion[]
   if (options.link) {
     lines.push("", `全部功能：${options.link}`);
   }
-  return lines.join("\n");
+  return lines.join("\n").replace(/</g, "＜").replace(/>/g, "＞");
 }
 
 interface AnnounceState {

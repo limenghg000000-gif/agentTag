@@ -10,6 +10,7 @@ import {
   parseChangelog,
   pendingVersions,
   renderAnnouncementCard,
+  renderAnnouncementMarkdown,
   UpdateAnnouncer,
 } from "../src/announce.js";
 
@@ -105,6 +106,26 @@ test("通知卡片最多列几个版本，更早的只说还有几个", () => {
   const json = JSON.stringify(renderAnnouncementCard(versions));
   assert.match(json, /还有 2 个更早的版本没列出来/);
   assert.ok(!json.includes(`第 ${20 - MAX_ANNOUNCED_VERSIONS} 版`));
+});
+
+test("退回的文字和卡片列一样多的版本、一样的字数上限，尖括号换成全角", () => {
+  const long = Array.from({ length: 200 }, (_, i) => `- 第 ${i} 条很长很长很长很长很长很长的说明`).join("\n");
+  const versions = [
+    { version: "0.12.0", notes: `${long}\n- 能 <at id=all></at> 了` },
+    { version: "0.11.0", notes: "- 上一版" },
+  ];
+  const text = renderAnnouncementMarkdown(versions, { botName: "飞书 CLI" });
+  assert.ok(!text.includes("<"), "Markdown 里的 <at> 也会 @所有人");
+  assert.ok(text.length < 3500, `退回的文字太长：${text.length} 字`);
+  assert.match(text, /太长了没列全/);
+  // 第一版已经占满字数，第二版只说还有几个，和卡片一样
+  assert.match(text, /还有 1 个更早的版本没列出来/);
+  assert.ok(!text.includes("上一版"));
+  const card = JSON.stringify(renderAnnouncementCard(versions, { botName: "飞书 CLI" }));
+  assert.match(card, /还有 1 个更早的版本没列出来/);
+  assert.match(card, /太长了没列全/);
+
+  assert.match(renderAnnouncementMarkdown([{ version: "0.1.0", notes: "- 能 <at id=all></at> 了" }]), /＜at id=all＞＜\/at＞/);
 });
 
 async function setup(chatIds = ["oc_a", "oc_b"]) {
