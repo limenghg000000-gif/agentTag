@@ -248,6 +248,10 @@ export class KnowledgeDesk {
         memory: options.memory,
         knowledge: {
           activeEntry: (id) => this.activeEntry(id),
+          unchanged: async (seen) => {
+            const current = await options.base.current(seen);
+            return current !== undefined && current.status === "active" && usable(current) && sameContent(current, seen);
+          },
           replace: (request) => this.replaceFromConflict(request),
           location: () => options.base.location(),
         },
@@ -589,9 +593,10 @@ export class KnowledgeDesk {
   /**
    * 冲突卡片上选了以群记忆为准、写权限名单里的人点了同步：按卡片上列的新内容取代旧经验，和点「保存」走一样的流程
    * （存新的、排查经验同步 aiops、归档旧的；卡片发出后旧的在表格里改过就不取代）。返回做完的几行。
-   * 后面的步骤没做完、或者第一步就没存成时，在冲突卡片下面另发一张确认卡片，写权限名单里的人在那张上点「再试一次」「保存」接着做
+   * 后面的步骤没做完、或者第一步就没存成时，在冲突卡片下面另发一张确认卡片，写权限名单里的人在那张上点「再试一次」「保存」接着做；
+   * 这两种和旧的改过了（没取代）都算没做完（ok 为 false）
    */
-  private async replaceFromConflict(request: ReplaceRequest): Promise<string[]> {
+  private async replaceFromConflict(request: ReplaceRequest): Promise<{ lines: string[]; ok: boolean }> {
     const withAiops = this.options.aiops !== undefined && !this.options.aiops.lacksWriteTools;
     const proposal: SaveProposal = {
       kind: "save",
@@ -613,25 +618,31 @@ export class KnowledgeDesk {
       outcome = await this.save(proposal, request.operator.name ?? request.operator.openId, task);
     } catch (err) {
       if (err instanceof StaleProposalError) {
-        return [err.message];
+        return { lines: [err.message], ok: false };
       }
       this.logger.warn(`冲突卡片 取代经验 ${request.replaces.id} 没存成 proposal=${proposal.id}`, err);
       proposal.state = "pending";
       proposal.note = `冲突卡片上点的同步没存成：${describe(err)}。可以在这张卡片上再点「保存」`;
       const attached = await this.attach(proposal, request.replyTo);
-      return [`经验 ${request.replaces.id} 没改成：${describe(err)}。${attached ? "话题里另发了一张确认卡片，可以在那张上再点「保存」" : ""}`];
+      return {
+        lines: [`经验 ${request.replaces.id} 没改成：${describe(err)}。${attached ? "话题里另发了一张确认卡片，可以在那张上再点「保存」" : ""}`],
+        ok: false,
+      };
     }
     // 表格链接冲突卡片上统一列一次
     const done = outcome.done.filter((line) => !line.startsWith("经验库表格："));
     if (outcome.unfinished.length === 0) {
-      return done;
+      return { lines: done, ok: true };
     }
     proposal.state = "partial";
     proposal.result = outcome.done;
     proposal.unfinished = outcome.unfinished;
     this.logger.warn(`冲突卡片 取代经验有步骤没做成 proposal=${proposal.id}：${outcome.unfinished.join("；")}`);
     const attached = await this.attach(proposal, request.replyTo);
-    return [...done, attached ? "还有没做成的，见话题里另发的确认卡片，可以在那张上点「再试一次」" : `还有没做成的：${outcome.unfinished.join("；")}`];
+    return {
+      lines: [...done, attached ? "还有没做成的，见话题里另发的确认卡片，可以在那张上点「再试一次」" : `还有没做成的：${outcome.unfinished.join("；")}`],
+      ok: false,
+    };
   }
 
   /** 冲突卡片上没做完的那条经验：登记成一张确认卡片发到话题里，之后按普通的确认卡片处理。发不出去时返回 false */

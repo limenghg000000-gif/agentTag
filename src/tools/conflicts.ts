@@ -60,9 +60,12 @@ interface ConflictRow {
   pick: ConflictSide;
   /** 同步后这一处的结果 */
   result?: string[];
+  /** 同步时这一处没做成（没改、没改完、要另一张卡片接着做） */
+  failed?: boolean;
 }
 
-type ConflictState = "pending" | "working" | "done" | "cancelled" | "superseded";
+/** partial：点了同步，但有的地方没改成 */
+type ConflictState = "pending" | "working" | "done" | "partial" | "cancelled" | "superseded";
 
 interface ConflictCard {
   id: string;
@@ -99,8 +102,10 @@ export interface ReplaceRequest {
 export interface ConflictKnowledge {
   /** 一条有效、能列在卡片上的经验；没有、已归档、用不了时抛错 */
   activeEntry(id: string): Promise<KnowledgeEntry>;
-  /** 取代旧经验，返回做完的和没做完的几行（没做完的另发一张确认卡片接着做） */
-  replace(request: ReplaceRequest): Promise<string[]>;
+  /** 卡片上列的这条经验在表格里还是这样（有效、内容没改过）；读不了表格时抛错 */
+  unchanged(seen: KnowledgeEntry): Promise<boolean>;
+  /** 取代旧经验，返回结果的几行和是不是都做完了（没做完的另发一张确认卡片接着做） */
+  replace(request: ReplaceRequest): Promise<{ lines: string[]; ok: boolean }>;
   /** 经验库表格的链接 */
   location(): Promise<string | undefined>;
 }
@@ -164,7 +169,10 @@ export class ConflictDesk {
                     description: "选「以经验库为准」时这条群记忆改成什么：整条替换，写成一句能独立看懂的话，和经验库的说法一致；这条群记忆整条都过时了就填空字符串，表示删掉它",
                   },
                   knowledge_conclusion: { type: "string", description: "选「以群记忆为准」时这条经验的「结论」改成什么：整段替换，和群记忆的说法一致" },
-                  knowledge_handling: { type: "string", description: "选「以群记忆为准」时「怎么处理」也要跟着改才填（整段替换），不用改不填" },
+                  knowledge_handling: {
+                    type: "string",
+                    description: "选「以群记忆为准」时「怎么处理」也要跟着改才填（整段替换）；要去掉它填空字符串；不用改不填",
+                  },
                 },
                 required: ["memory_id", "knowledge_id", "topic", "memory_fix", "knowledge_conclusion"],
               },
@@ -422,11 +430,20 @@ export class ConflictDesk {
         continue;
       }
       if (row.pick === "knowledge") {
-        row.result = [await this.syncMemory(card, row, operator)];
+        const { line, ok } = await this.syncMemory(card, row, operator);
+        row.result = [line];
+        row.failed = !ok;
         continue;
       }
       try {
-        row.result = await this.options.knowledge.replace({
+        // 赢的那边（群记忆）卡片发出后改过、删了：卡片上的新结论是按旧的写的，不拿它去改经验库
+        const current = (await this.options.memory.list(card.chatId)).find((entry) => entry.id === row.memory.id);
+        if (current?.content !== row.memory.content) {
+          row.result = [`群记忆 #${row.memory.id} 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 ${row.knowledge.id}`];
+          row.failed = true;
+          continue;
+        }
+        const { lines, ok } = await this.options.knowledge.replace({
           chatId: card.chatId,
           threadKey: card.threadKey,
           replyTo: card.cardMessageId ?? card.sourceMessageId,
@@ -436,15 +453,21 @@ export class ConflictDesk {
           draft: row.knowledgeDraft,
           replaces: row.knowledge,
         });
+        row.result = lines;
+        row.failed = !ok;
         changedKnowledge = true;
       } catch (err) {
         this.logger.warn(`冲突卡片 经验 ${row.knowledge.id} 没改成 card=${card.id}`, err);
         row.result = [`经验 ${row.knowledge.id} 没改成：${describe(err)}`];
+        row.failed = true;
       }
     }
-    card.state = "done";
+    const failed = card.rows.filter((row) => row.failed).length;
+    card.state = failed > 0 ? "partial" : "done";
     this.cards.delete(card.id);
-    card.result = `${confirmer}点了「按选择同步」`;
+    card.result =
+      `${confirmer}点了「按选择同步」` +
+      (failed > 0 ? `，有 ${failed} 处没同步成（见每处的结果），需要的话改好后在话题里再说一次「查一下群记忆和经验库有没有冲突」` : "");
     if (changedKnowledge) {
       const location = await this.options.knowledge.location().catch(() => undefined);
       if (location) {
@@ -459,22 +482,28 @@ export class ConflictDesk {
       .catch((err: unknown) => this.logger.warn("冲突卡片：结果没能发到话题里", err));
   }
 
-  /** 以经验库为准：群记忆改成和经验库一样（或者删掉）。卡片发出后这条群记忆改过、删了就不动它 */
-  private async syncMemory(card: ConflictCard, row: ConflictRow, operator: Person): Promise<string> {
+  /**
+   * 以经验库为准：群记忆改成和经验库一样（或者删掉）。卡片发出后这条群记忆改过、删了不动它；
+   * 赢的那边（经验）在表格里改过、归档了也不动：卡片上群记忆要改成的内容是按旧的经验写的
+   */
+  private async syncMemory(card: ConflictCard, row: ConflictRow, operator: Person): Promise<{ line: string; ok: boolean }> {
     const { id } = row.memory;
     try {
+      if (!(await this.options.knowledge.unchanged(row.knowledge))) {
+        return { line: `经验 ${row.knowledge.id} 在卡片发出后在表格里改过或者归档了，卡片上群记忆要改成的是按旧的写的，没改群记忆 #${id}`, ok: false };
+      }
       const outcome = await this.options.memory.replaceIf(card.chatId, id, row.memory.content, row.memoryFix, {
         ...(operator.name ? { name: operator.name } : {}),
         openId: operator.openId,
         messageId: card.sourceMessageId,
       });
       if (outcome === "changed") {
-        return `群记忆 #${id} 在卡片发出后改过或者删了，没动它`;
+        return { line: `群记忆 #${id} 在卡片发出后改过或者删了，没动它`, ok: false };
       }
-      return outcome === "removed" ? `以经验库为准，已删掉群记忆 #${id}` : `以经验库为准，群记忆 #${id} 已改成：${row.memoryFix}`;
+      return { line: outcome === "removed" ? `以经验库为准，已删掉群记忆 #${id}` : `以经验库为准，群记忆 #${id} 已改成：${row.memoryFix}`, ok: true };
     } catch (err) {
       this.logger.warn(`冲突卡片 群记忆 #${id} 没改成 card=${card.id}`, err);
-      return `群记忆 #${id} 没改成：${describe(err)}`;
+      return { line: `群记忆 #${id} 没改成：${describe(err)}`, ok: false };
     }
   }
 
@@ -499,6 +528,7 @@ const HEADERS: Record<ConflictState, { title: (n: number) => string; template: s
   pending: { title: (n) => `群记忆和经验库有 ${n} 处对不上`, template: "orange" },
   working: { title: () => "正在同步群记忆和经验库…", template: "blue" },
   done: { title: () => "群记忆和经验库已同步", template: "green" },
+  partial: { title: () => "群记忆和经验库没全同步成", template: "orange" },
   cancelled: { title: () => "已取消", template: "grey" },
   superseded: { title: () => "已换成新的卡片", template: "grey" },
 };
@@ -605,7 +635,8 @@ function replacementDraft(entry: KnowledgeEntry, args: Record<string, unknown>, 
       scope: old.scope,
       question: old.question,
       conclusion: args.knowledge_conclusion,
-      handling: typeof args.knowledge_handling === "string" && args.knowledge_handling.trim() ? args.knowledge_handling : old.handling,
+      // 填了空字符串就是去掉「怎么处理」；不填照旧
+      handling: typeof args.knowledge_handling === "string" ? args.knowledge_handling : old.handling,
       basis: old.basis,
       keywords: old.keywords,
       error_codes: old.errorCodes,

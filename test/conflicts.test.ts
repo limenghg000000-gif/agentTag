@@ -65,7 +65,7 @@ async function setup({ approvers = new Set(["ou_admin"]), memory = true }: { app
   const dir = await mkdtemp(path.join(tmpdir(), "conflicts-"));
   const backend = new TableBackend();
   backend.entries.push(structuredClone(release), structuredClone(alarm));
-  const base = new KnowledgeBase(backend, { logger: quiet, cacheMs: 0 });
+  const base = new KnowledgeBase(backend, { logger: quiet, cacheMs: -1 });
   let clock = Date.parse("2026-10-05T06:00:00.000Z");
   const store = new MemoryStore(dir, quiet, () => new Date(clock));
   // 群记忆 #1 是 10 月 5 日记的（比 K1 旧、比 K2 新），#2 也是
@@ -384,6 +384,50 @@ test("冲突卡片：卡片发出后群记忆、经验改过的不动它们", as
     assert.equal(s.backend.entries[1].status, "active");
     assert.match(text(s.card()), /群记忆 #1 在卡片发出后改过或者删了，没动它/);
     assert.match(text(s.card()), /经验 K2 在卡片发出后在表格里改过/);
+    // 没改成的不能说已同步
+    assert.equal(s.card().header.title.content, "群记忆和经验库没全同步成");
+    assert.match(text(s.card()), /ML点了「按选择同步」，有 2 处没同步成（见每处的结果）/);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("冲突卡片：赢的那边卡片发出后改过时，不拿卡片上按旧内容写的去改另一边", async () => {
+  const s = await setup();
+  try {
+    await s.tool().run({ conflicts: s.both }, { signal });
+    // 第 1 处以群记忆为准，但群记忆 #1 后来改了；第 2 处以经验库为准，但 K2 后来在表格里改了
+    await s.pick(0, "memory");
+    await s.pick(1, "knowledge");
+    await s.store.update("oc_1", 1, { content: "发版固定在每周五" });
+    s.backend.entries[1].conclusion = "先查短信通道的回执";
+    await s.apply();
+    assert.equal(s.backend.entries.length, 2, "没按旧的群记忆去取代 K1");
+    assert.equal(s.backend.entries[0].status, "active");
+    assert.deepEqual(
+      (await s.store.list("oc_1")).map((m) => m.id),
+      [1, 2],
+      "没按旧的 K2 删掉群记忆 #2",
+    );
+    assert.match(text(s.card()), /群记忆 #1 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 K1/);
+    assert.match(text(s.card()), /经验 K2 在卡片发出后在表格里改过或者归档了，卡片上群记忆要改成的是按旧的写的，没改群记忆 #2/);
+    assert.equal(s.card().header.title.content, "群记忆和经验库没全同步成");
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("冲突卡片：knowledge_handling 填空字符串时新经验去掉「怎么处理」，不填照旧", async () => {
+  const s = await setup();
+  try {
+    await s.tool().run({ conflicts: [{ ...s.both[0], knowledge_handling: "" }] }, { signal });
+    assert.match(text(s.card()), /结论改成「发版固定在每周三」，去掉怎么处理，其他照旧/);
+    await s.pick(0, "memory");
+    await s.apply();
+    const added = s.backend.entries.at(-1)!;
+    assert.equal(added.conclusion, "发版固定在每周三");
+    assert.equal(added.handling, undefined);
+    assert.equal(s.card().header.title.content, "群记忆和经验库已同步");
   } finally {
     await s.cleanup();
   }
@@ -397,6 +441,7 @@ test("冲突卡片：存新经验没成功时另发一张确认卡片，写权�
     s.backend.failAdd = new Error("飞书接口限流");
     await s.apply();
     assert.match(text(s.card()), /经验 K1 没改成：飞书接口限流。话题里另发了一张确认卡片，可以在那张上再点「保存」/);
+    assert.equal(s.card().header.title.content, "群记忆和经验库没全同步成");
     const retry = s.sent.find((one) => (one.input as { card?: any }).card?.header?.title?.content === "存进经验库？")!;
     assert.ok(retry, "另发了一张确认卡片");
     assert.deepEqual(retry.opts, { replyTo: "om_card_1", replyInThread: true });
