@@ -3,6 +3,7 @@ import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendRe
 import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
+import { asksForFeatures, availableFeatures, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, VISION_FEATURE } from "./features.js";
 import { imageKeysOf } from "./feishu.js";
 import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
@@ -130,7 +131,10 @@ export interface BotDeps {
   cardIntervalMs?: number;
   /** 进度卡片上显示模型每轮的思考（SHOW_THINKING）。不传时显示 */
   showThinking?: boolean;
-  /** 有人问「你能做什么」「最近更新了什么」时用：产品功能说明的链接、最新一版的更新说明 */
+  /**
+   * 有人问「你能做什么」「最近更新了什么」时用：产品功能说明的链接、最新一版的更新说明、产品功能清单。
+   * 有功能清单时，只问「你能做什么」这类话直接回功能卡片，不问模型
+   */
   about?: AboutBot;
   /**
    * 卡片即回答（STREAM_CARD）：进度卡片用飞书卡片实体，思考和回答边生成边写进卡片，回答不再另外发。
@@ -209,6 +213,11 @@ export function createMessageHandler(deps: BotDeps) {
       await reply("在的，@ 我的时候带上问题或要做的事就行。");
       return;
     }
+    // 只问「你能做什么」这类话：不问模型，直接回功能卡片。按钮问的不算（按钮上的话是模型写的）
+    if (!options.readOnly && deps.about?.features && asksForFeatures(question)) {
+      await sendFeatures(deps, msg, deps.about.features);
+      return;
+    }
 
     await runTask(deps, msg, question, reply, cardKit, options);
   };
@@ -217,6 +226,42 @@ export function createMessageHandler(deps: BotDeps) {
 export interface TaskOptions {
   /** 只给读的工具（点「接着查」按钮问的） */
   readOnly?: boolean;
+}
+
+/**
+ * 回功能卡片：产品功能清单里机器人现在配了工具的那几项。卡片发不出去时改发文字版（重复一条说明不要紧，总比没回强）；
+ * 文字版记进话题历史，话题里接着问「第 4 个怎么用」时模型看得到（飞书读不出卡片里的字）
+ */
+async function sendFeatures(deps: BotDeps, msg: NormalizedMessage, list: FeatureList): Promise<void> {
+  const { send, logger = console } = deps;
+  const shown = availableFeatures(list, configuredTools(deps, msg));
+  const options = { botName: deps.botName() || FALLBACK_BOT_NAME, ...(deps.about?.featuresLink ? { link: deps.about.featuresLink } : {}) };
+  const text = renderFeaturesMarkdown(shown, options);
+  const to = { replyTo: msg.messageId, replyInThread: true };
+  let messageId: string;
+  try {
+    ({ messageId } = await send(msg.chatId, { card: renderFeaturesCard(shown, options) }, to));
+  } catch (err) {
+    logger.error(`功能卡片发不出去，改发文字 message=${msg.messageId}`, err);
+    ({ messageId } = await send(msg.chatId, { markdown: text }, to));
+  }
+  logger.info(`问能做什么，回了功能卡片（${shown.features.length} 项） message=${msg.messageId}`);
+  await deps.cardAnswers?.save(msg.chatId, threadKeyOf(msg), messageId, text).catch((err: unknown) => {
+    logger.warn(`功能卡片的文字版没记下来，话题里接着问时模型看不到 message=${msg.messageId}`, err);
+  });
+}
+
+/** 机器人配了哪些工具：工具名，MCP、群记忆、经验库只写开头（aiops_、memory_、knowledge_）；配了看图的模型时加上「看图」 */
+function configuredTools(deps: BotDeps, msg: NormalizedMessage): string[] {
+  const task: TaskToolContext = { chatId: msg.chatId, threadKey: threadKeyOf(msg), senderId: msg.senderId, messageId: msg.messageId };
+  return [
+    ...[...deps.tools, ...(deps.taskTools?.(task) ?? [])].map((tool) => tool.spec.name),
+    ...(deps.mcp?.names ?? []).map((name) => `${name}_`),
+    ...(deps.memory ? ["memory_"] : []),
+    ...(deps.knowledge ? ["knowledge_"] : []),
+    ...(deps.recentThreads ? [RECENT_THREADS_TOOL] : []),
+    ...(deps.images ? [VISION_FEATURE] : []),
+  ];
 }
 
 /** 流式卡片最近一次建不了以后，到什么时候之前先不用 */
@@ -473,7 +518,13 @@ async function runTask(
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
-        ...(deps.about ? { about: deps.about } : {}),
+        ...(deps.about
+          ? {
+              about: deps.about.features
+                ? { ...deps.about, features: availableFeatures(deps.about.features, [...toolNames, ...(deps.images ? [VISION_FEATURE] : [])]) }
+                : deps.about,
+            }
+          : {}),
         ...(deps.knowledge
           ? {
               knowledge: {
