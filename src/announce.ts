@@ -284,13 +284,20 @@ export class UpdateAnnouncer {
     }, retryMs);
   }
 
-  /** 先发卡片，卡片发不出去再发一次纯文本。都失败返回 false */
+  /**
+   * 先发卡片，飞书说卡片格式不对（format_error）时改发一次纯文本。超时、限流、没权限这类不改发文字：
+   * 超时的卡片可能其实发出去了，再发文字群里就有两条，交给过一阵再试。发不出去返回 false
+   */
   private async sendTo(chatId: string, versions: ChangelogVersion[], options: AnnouncementOptions): Promise<boolean> {
     try {
       await this.opts.send(chatId, { card: renderAnnouncementCard(versions, options) });
       return true;
     } catch (err) {
-      this.logger.warn(`更新通知：卡片发不到群 ${chatId}，改发文字`, err);
+      if ((err as { code?: unknown } | undefined)?.code !== "format_error") {
+        this.logger.warn(`更新通知：卡片发不到群 ${chatId}`, err);
+        return false;
+      }
+      this.logger.warn(`更新通知：飞书说卡片格式不对，改发文字到群 ${chatId}`, err);
     }
     try {
       await this.opts.send(chatId, { markdown: renderAnnouncementMarkdown(versions, options) });

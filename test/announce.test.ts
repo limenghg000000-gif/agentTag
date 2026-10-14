@@ -114,15 +114,17 @@ async function setup(chatIds = ["oc_a", "oc_b"]) {
   await writeFile(changelogFile, CHANGELOG);
   const sent: { to: string; input: SendInput }[] = [];
   const scheduled: (() => void)[] = [];
-  let fail: (to: string, input: SendInput) => boolean = () => false;
+  let fail: (to: string, input: SendInput) => boolean | string = () => false;
   const make = () =>
     new UpdateAnnouncer({
       changelogFile,
       stateFile,
       chatIds,
       send: async (to, input) => {
-        if (fail(to, input)) {
-          throw new Error("飞书报错");
+        const failure = fail(to, input);
+        if (failure) {
+          // 飞书 SDK 的 LarkChannelError 带 code：format_error、send_timeout、rate_limited……
+          throw Object.assign(new Error("飞书报错"), { code: typeof failure === "string" ? failure : "unknown" });
         }
         sent.push({ to, input });
         return { messageId: `om_${sent.length}`, chatId: to } as never;
@@ -198,15 +200,29 @@ test("一直发不出去时最多试 6 次", async () => {
   await assert.rejects(t.state());
 });
 
-test("卡片发不出去时改发文字", async () => {
+test("飞书说卡片格式不对时改发文字", async () => {
   const t = await setup(["oc_a"]);
-  t.setFail((_, input) => "card" in input);
+  t.setFail((_, input) => ("card" in input ? "format_error" : false));
   await t.make().run();
   assert.equal(t.sent.length, 1);
   const input = t.sent[0]!.input as { markdown: string };
   assert.match(input.markdown, /飞书 CLI 更新了 · 0\.10\.0/);
   assert.match(input.markdown, /新功能 A/);
   assert.deepEqual((await t.state()).chats, { oc_a: "0.10.0" });
+});
+
+test("卡片超时、限流时不改发文字（卡片可能已经发出去了），过一阵再发卡片", async () => {
+  const t = await setup(["oc_a"]);
+  t.setFail((_, input) => ("card" in input ? "send_timeout" : false));
+  await t.make().run();
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.scheduled.length, 1);
+
+  t.setFail(() => false);
+  t.scheduled.shift()!();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(t.sent.length, 1);
+  assert.ok("card" in t.sent[0]!.input);
 });
 
 test("读不到 CHANGELOG 或者里面没有版本时不发", async () => {

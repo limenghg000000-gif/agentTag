@@ -32,3 +32,9 @@ test("CHANGELOG.md 的版本从新到旧排、不重复，每一版都有要发�
     assert.ok(v.date && /^\d{4}-\d{2}-\d{2}$/.test(v.date), `${v.version} 的标题要写日期：## ${v.version} — 2026-10-14`);
   }
 });
+
+test("程序里的版本号（MCP 握手、启动日志用）就是 package.json 的版本号", async () => {
+  const { VERSION } = await import("../src/version.js");
+  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+  assert.equal(VERSION, pkg.version);
+});

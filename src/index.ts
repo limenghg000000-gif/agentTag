@@ -28,6 +28,7 @@ import { KnowledgeDesk } from "./tools/knowledge.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
 import { createWebSearchTool } from "./tools/web-search.js";
+import { VERSION } from "./version.js";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -181,7 +182,7 @@ try {
   process.exit(1);
 }
 console.log(
-  `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
+  `飞书长连接已建立，版本 ${VERSION}，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
     `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, ...(workspaces ? CODE_TOOL_NAMES : [])].join(", ")}，` +
     `群记忆存放在 ${config.memoryDir}`,
 );
