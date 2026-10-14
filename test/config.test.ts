@@ -274,3 +274,26 @@ test("团队经验库：默认打开，表记在 data/knowledge 下，百炼上�
   // knowledge_ 是经验库工具的前缀，MCP 服务不能叫这个名字
   assert.throws(() => loadConfig({ ...base, MCP_SERVERS: "knowledge=https://kb.example.com/mcp", MCP_KNOWLEDGE_TOOLS: "*" }), /和内置工具的前缀/);
 });
+
+test("更新通知：默认开，发到白名单里的所有群；ANNOUNCE_CHAT_IDS 只能是白名单里的群", () => {
+  const allowed = { ...base, FEISHU_ALLOWED_CHAT_IDS: "oc_a, oc_b" };
+  const config = loadConfig(allowed);
+  assert.deepEqual(config.announce?.chatIds, ["oc_a", "oc_b"]);
+  assert.equal(config.announce?.link, undefined);
+  assert.equal(config.announce?.stateFile, path.resolve("data", "announce", "state.json"));
+  assert.ok(existsSync(config.announce!.changelogFile), "CHANGELOG.md 在项目根目录");
+
+  assert.deepEqual(loadConfig({ ...allowed, ANNOUNCE_CHAT_IDS: "oc_b,oc_b" }).announce?.chatIds, ["oc_b"]);
+  assert.throws(() => loadConfig({ ...allowed, ANNOUNCE_CHAT_IDS: "oc_b,oc_x" }), /ANNOUNCE_CHAT_IDS 里的群 oc_x 不在 FEISHU_ALLOWED_CHAT_IDS 里/);
+  assert.equal(loadConfig({ ...allowed, ANNOUNCE: "off" }).announce, undefined);
+  assert.equal(loadConfig({ ...allowed, ANNOUNCE: " OFF ", ANNOUNCE_CHAT_IDS: "oc_x" }).announce, undefined);
+  assert.throws(() => loadConfig({ ...allowed, ANNOUNCE: "no" }), /ANNOUNCE 只能是 on 或 off/);
+  // 白名单为空时没有群可发
+  assert.deepEqual(loadConfig(base).announce?.chatIds, []);
+});
+
+test("更新通知的「看全部功能」链接要是 https 地址", () => {
+  assert.equal(loadConfig({ ...base, ANNOUNCE_LINK: " https://docs.example.com/agenttag " }).announce?.link, "https://docs.example.com/agenttag");
+  assert.throws(() => loadConfig({ ...base, ANNOUNCE_LINK: "http://docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
+  assert.throws(() => loadConfig({ ...base, ANNOUNCE_LINK: "docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
+});
