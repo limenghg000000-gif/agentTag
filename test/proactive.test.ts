@@ -249,6 +249,25 @@ test("判断的时候有人说了「别主动插话」：判断完不回", async
   }
 });
 
+test("排队等判断的时候有人说了「别主动插话」：轮到时不再问模型", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const t = await setup({ judge: () => gate.then(() => "不接") });
+  try {
+    // 同时最多判断 3 条，第 4 条排队
+    const pending = ["om_1", "om_2", "om_3", "om_4"].map((id) => t.replier.consider(msg(id)));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(t.requests.length, 3);
+    assert.equal(await t.replier.toggleIfAsked(msg("om_5", { mentionedBot: true, content: "别主动插话" })), true);
+    release();
+    await Promise.all(pending);
+    assert.equal(t.requests.length, 3);
+    assert.match(t.logs.join("\n"), /主动接话：排队的这会儿群里说了别主动插话，这条不判断 chat=oc_1 message=om_4/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("判断完发现是话题里「同时发送到群」的副本：不回（话题里那份归跟聊）", async () => {
   const t = await setup({ judge: "接：要我帮忙查一下吗？", superseded: (m) => m.messageId === "om_copy" });
   try {

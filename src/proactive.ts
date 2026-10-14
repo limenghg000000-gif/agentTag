@@ -231,8 +231,20 @@ export class ProactiveReplier {
     push(this.judged, chatId, this.now());
     const startedAt = this.now();
     let said: string | undefined;
+    let paused = false;
     try {
-      const judged = await this.queue.run(() => this.judge(msg));
+      // 在判断队列里排着的这会儿可能有人说了「别主动插话」：轮到时再看一遍，停了就不再把这条发给模型
+      const judged = await this.queue.run(() => {
+        if (!this.wants(msg)) {
+          paused = true;
+          return Promise.resolve(undefined);
+        }
+        return this.judge(msg);
+      });
+      if (paused) {
+        this.logger.info(`主动接话：排队的这会儿群里说了别主动插话，这条不判断 chat=${chatId} message=${msg.messageId}`);
+        return;
+      }
       if (!judged) {
         this.logger.warn(`主动接话：要判断的消息太多（${this.queue.load}），这条不判断 message=${msg.messageId}`);
         return;

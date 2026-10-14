@@ -148,10 +148,11 @@ export class ThreadFollower {
 
   /**
    * 这条没 @ 机器人的消息要不要判断：白名单群里、在跟着的话题里（没静音、没过期）、
-   * 是人发的（发言人是 ou_ 开头的用户，不是机器人或应用）、没 @ 别人（@ 了别人就是对别人说的）、不是 @所有人
+   * 是人发的（发言人是 ou_ 开头的用户，不是机器人或应用）、没 @ 别人（@ 了别人就是对别人说的）、不是 @所有人。
+   * 要真在话题里（rootId 和 threadId 都有）：群主界面引用回复话题第一条的，只有 rootId，那是群主界面的消息，不归跟聊
    */
   wants(msg: NormalizedMessage, fromApp = false): boolean {
-    if (msg.mentionedBot || msg.mentionAll || fromApp || !msg.rootId || !this.opts.allowedChatIds.has(msg.chatId)) {
+    if (msg.mentionedBot || msg.mentionAll || fromApp || !msg.rootId || !msg.threadId || !this.opts.allowedChatIds.has(msg.chatId)) {
       return false;
     }
     if (!msg.senderId.startsWith("ou_") || msg.senderId === this.opts.botOpenId()) {
@@ -310,7 +311,19 @@ export class ThreadFollower {
     const startedAt = this.now();
     let answer: boolean;
     try {
-      const judged = await this.queue.run(() => this.judge(msg, busy));
+      // 在全局判断队列里排着的这会儿也可能有人说了「只在 @ 我时回」「停止」：轮到时再看一遍，不再把这条发给模型
+      let dropped = false;
+      const judged = await this.queue.run(() => {
+        if (this.cancelled(key, order) || !this.wants(msg)) {
+          dropped = true;
+          return Promise.resolve(false);
+        }
+        return this.judge(msg, busy);
+      });
+      if (dropped) {
+        this.logger.info(`跟聊：排队判断的这会儿话题里有人说了停止或只在 @ 时回，这条不判断了 message=${msg.messageId}`);
+        return undefined;
+      }
       if (!judged) {
         this.logger.warn(`跟聊：要判断的消息太多（${this.queue.load}），这条不判断、不回 message=${msg.messageId}`);
         return undefined;

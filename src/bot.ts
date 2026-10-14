@@ -73,10 +73,15 @@ const DOC_REQUEST = new RegExp(
   "i",
 );
 
-const CHANGE_VERB = String.raw`(?:写|改|删|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修)`;
-const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b)`;
+const CHANGE_VERB = String.raw`(?:写|改|删|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修|切(?:换|到)?)`;
+/** 写明了的文件路径：src/bot.ts、README.md、docs/a/b、飞书文档链接 */
+const CHANGE_PATH = String.raw`(?:(?:[\w.-]+\/)+[\w.-]+|\b[\w-]+\.(?:tsx?|jsx?|mjs|cjs|go|php|py|java|kt|rb|rs|cpp|cc|c|h|hpp|cs|swift|vue|md|json|ya?ml|toml|ini|env|sql|sh|html|css|scss|xml|proto|txt|conf|gradle|lock)\b)`;
+const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b|${CHANGE_PATH})`;
+const CHANGE_VERB_EN = String.raw`\b(?:update|edit|modify|change|fix|add|append|write|create|delete|remove|rename|refactor|replace|switch|checkout)\b`;
+const CHANGE_TARGET_EN = String.raw`(?:${CHANGE_TARGET}|\b(?:docs?|document|file|code|readme|repo|branch)\b)`;
 /**
- * 提问本身说了要改哪个文档或代码：「把上面那段追加到周报文档里」「文档里那段改一下」「修一下这段代码」「开个 MR」。
+ * 提问本身说了要改哪个文档或代码：「把上面那段追加到周报文档里」「文档里那段改一下」「修一下这段代码」「开个 MR」「修改 src/bot.ts」
+ * 「update README.md」「切到 develop 分支」。
  * 带上了群聊时用它挑给哪样：说了要改的给改的工具、不带群聊，没说的带群聊、只给读的工具（「加拿大的首都是哪里」「你记得代码仓库最近有什么变更吗」不算要改）。
  * 认错了只是少了群聊或者少了改的工具，两样不会同时给
  */
@@ -84,6 +89,7 @@ const CHANGE_REQUEST = new RegExp(
   [
     String.raw`${CHANGE_VERB}[^，。,.!?！？\n]{0,15}?${CHANGE_TARGET}`,
     String.raw`${CHANGE_TARGET}[^，。,.!?！？\n]{0,8}?${CHANGE_VERB}`,
+    String.raw`${CHANGE_VERB_EN}[^\n]{0,30}?${CHANGE_TARGET_EN}`,
     String.raw`开\s*(?:个|一个)?\s*(?:MR|PR|合并请求)`,
     String.raw`\b(?:commit|push|merge)\b`,
   ].join("|"),
@@ -380,12 +386,15 @@ async function runTask(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
-          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支：按钮问的、没 @ 的跟聊都不能切
-          if ((followUp || options.unaddressed) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支：按钮问的、没 @ 的跟聊、
+          // 带上了群聊只给读的工具的都不能切（不然群里埋一句「切到某某分支」，后面有写权限的人 @ 了再改代码就用了那个分支）
+          if ((followUp || options.unaddressed || ambientOnly) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
             throw new Error(
               followUp
                 ? "这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
-                : "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数",
+                : options.unaddressed
+                  ? "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数"
+                  : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
             );
           }
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据

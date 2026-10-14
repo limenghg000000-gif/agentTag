@@ -90,6 +90,8 @@ test("回答过的话题里，没 @ 的人发的消息要判断；没回答过�
   // 别的话题、群里直接说的（不在话题里）
   assert.equal(t.follower.wants(msg("om_3", { rootId: "om_other", threadId: "omt_2" })), false);
   assert.equal(t.follower.wants(msg("om_4", { rootId: undefined, threadId: undefined })), false);
+  // 群主界面引用回复话题第一条的：只有 rootId、没有 threadId，是群主界面的消息，不归跟聊
+  assert.equal(t.follower.wants(msg("om_5", { threadId: undefined })), false);
 });
 
 test("@ 了别人、@所有人、机器人和应用发的、白名单外的群、只发了空消息的不跟", () => {
@@ -313,6 +315,47 @@ test("同时最多判断 3 条，多的排队；排队的太多时新来的不�
   assert.equal(peak, 3);
   assert.equal(handled.length, 23);
   assert.match(logs.join("\n"), /跟聊：要判断的消息太多（3 条在判断、20 条在排队），这条不判断、不回 message=om_23/);
+});
+
+test("排队等判断的时候话题里有人说了「只在 @ 我时回」：轮到时不再问模型、不回", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let calls = 0;
+  const logs: string[] = [];
+  const handled: string[] = [];
+  const follower = new ThreadFollower({
+    allowedChatIds: new Set(["oc_1"]),
+    context: { load: async () => ({ history: [], source: "none" }) },
+    model: {
+      model: "fake",
+      async chat() {
+        calls++;
+        await gate;
+        return { text: "是", finish: "stop" };
+      },
+    },
+    botName: () => "飞书 CLI",
+    botOpenId: () => BOT,
+    handle: async (m) => {
+      handled.push(m.messageId);
+    },
+    reply: async () => {},
+    logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error() {} },
+    now: () => START,
+  });
+  // 4 个话题，同时最多判断 3 条，第 4 个话题的那条排队
+  const runs = Array.from({ length: 4 }, (_, i) => {
+    follower.track({ ...asked, messageId: `om_root_${i}` });
+    return follower.consider(msg(`om_${i}`, { rootId: `om_root_${i}`, threadId: `omt_${i}` }));
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(calls, 3);
+  await follower.consider(msg("om_mute", { rootId: "om_root_3", threadId: "omt_3", content: "只在 @ 我时回" }));
+  release();
+  await Promise.all(runs);
+  assert.equal(calls, 3);
+  assert.deepEqual(handled.sort(), ["om_0", "om_1", "om_2"]);
+  assert.match(logs.join("\n"), /跟聊：排队判断的这会儿话题里有人说了停止或只在 @ 时回，这条不判断了 message=om_3/);
 });
 
 test("同一个话题里按收到的顺序判断、交给处理函数：后说的「停止」不会跑到前面那句前面", async () => {
