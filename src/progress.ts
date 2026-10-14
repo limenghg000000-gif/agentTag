@@ -1,5 +1,5 @@
 import { stripThinkTags } from "./llm.js";
-import { nextFence, richCardLine, splitTables, stripRichTags } from "./markdown.js";
+import { escapeCardMarkdown, nextFence, richCardLine, splitTables, stripRichTags } from "./markdown.js";
 import { type AnswerSegment, hasUiBlocks, MAX_TABLES, segmentElements, segmentsAsText, splitAnswer, streamingAnswer, tableElement } from "./rich-ui.js";
 
 /** 卡片上停止按钮回传的值 */
@@ -303,7 +303,7 @@ function timeline(steps: ProgressStep[], thoughts: ProgressThought[], omitted: n
 }
 
 function thoughtElement(title: string, text: string): object {
-  return { tag: "markdown", text_size: "notation", content: `**${title}**\n${escapeMarkdown(text)}` };
+  return { tag: "markdown", text_size: "notation", content: `**${title}**\n${escapeCardMarkdown(text)}` };
 }
 
 function roundLabel(thought: ProgressThought): string {
@@ -370,18 +370,13 @@ function stepLines(steps: ProgressStep[], limit = MAX_VISIBLE_STEPS): string[] {
   const icon = { running: "▶️", ok: "✔️", error: "❌" };
   return [
     ...(hidden > 0 ? [`…前面还有 ${hidden} 步`] : []),
-    ...steps.slice(hidden).map((step) => `${icon[step.status]} ${escapeMarkdown(step.label)}`),
+    ...steps.slice(hidden).map((step) => `${icon[step.status]} ${escapeCardMarkdown(step.label)}`),
   ];
 }
 
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
-}
-
-/** 步骤说明里的尖括号会被卡片当成标签（如 <at>、<font>），转成实体 */
-function escapeMarkdown(text: string): string {
-  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export type PatchCard = (card: object) => Promise<void>;

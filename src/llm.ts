@@ -8,7 +8,8 @@ export interface ToolCall {
 }
 
 export type ChatMessage =
-  | { role: "user"; content: string }
+  /** full：截短前的全文（截短了才有），只给程序自己核对用（查经验前认密钥），不发给模型 */
+  | { role: "user"; content: string; full?: string }
   | { role: "assistant"; content: string; toolCalls?: ToolCall[] }
   | { role: "tool"; toolCallId: string; content: string };
 
@@ -383,6 +384,28 @@ export function createOpenAICompatibleVisionModel(config: Pick<LlmConfig, "baseU
           }
           throw toLlmError(err);
         }
+      }
+    },
+  };
+}
+
+/** 把文字转成向量的模型，团队经验库按意思检索时用 */
+export interface EmbeddingModel {
+  readonly model: string;
+  embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]>;
+}
+
+/** OpenAI 兼容接口（/embeddings）的向量模型，百炼的 text-embedding-v4 等都提供这种接口 */
+export function createOpenAICompatibleEmbedder(config: Pick<LlmConfig, "baseURL" | "apiKey" | "model">): EmbeddingModel {
+  const client = new OpenAI({ baseURL: config.baseURL, apiKey: config.apiKey });
+  return {
+    model: config.model,
+    async embed(texts, signal) {
+      try {
+        const res = await client.embeddings.create({ model: config.model, input: [...texts], encoding_format: "float" }, { signal });
+        return [...res.data].sort((a, b) => a.index - b.index).map((item) => item.embedding);
+      } catch (err) {
+        throw toLlmError(err);
       }
     },
   };
