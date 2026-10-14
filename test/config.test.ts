@@ -283,6 +283,7 @@ test("更新通知：默认开，发到白名单里的所有群；ANNOUNCE_CHAT_
   assert.equal(config.announce?.stateFile, path.resolve("data", "announce", "state.json"));
   assert.equal(config.announce?.chatIdsFrom, "FEISHU_ALLOWED_CHAT_IDS");
   assert.ok(existsSync(config.announce!.notesFile), "RELEASE_NOTES.md 在项目根目录");
+  assert.ok(existsSync(config.announce!.changelogFile), "CHANGELOG.md 在项目根目录");
 
   const listed = loadConfig({ ...allowed, ANNOUNCE_CHAT_IDS: "oc_b,oc_b" }).announce;
   assert.deepEqual(listed?.chatIds, ["oc_b"]);
@@ -295,7 +296,7 @@ test("更新通知：默认开，发到白名单里的所有群；ANNOUNCE_CHAT_
   assert.deepEqual(loadConfig(base).announce?.chatIds, []);
 });
 
-test("更新通知的「看全部功能」链接要是 https 地址", () => {
+test("更新通知的「产品功能说明」链接要是 https 地址", () => {
   assert.equal(loadConfig({ ...base, ANNOUNCE_LINK: " https://docs.example.com/agenttag " }).announce?.link, "https://docs.example.com/agenttag");
   assert.throws(() => loadConfig({ ...base, ANNOUNCE_LINK: "http://docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
   assert.throws(() => loadConfig({ ...base, ANNOUNCE_LINK: "docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);

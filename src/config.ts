@@ -68,12 +68,14 @@ export interface Config {
     chatIds: string[];
     /** chatIds 是从哪个配置来的，启动日志里写明 */
     chatIdsFrom: "ANNOUNCE_CHAT_IDS" | "FEISHU_ALLOWED_CHAT_IDS";
-    /** 通知卡片上「看全部功能」按钮的链接（ANNOUNCE_LINK） */
+    /** 通知卡片上「产品功能说明」按钮的链接（ANNOUNCE_LINK） */
     link?: string;
     /** 每个群发到哪一版记在这个文件里 */
     stateFile: string;
     /** 发到群里的产品更新说明 */
     notesFile: string;
+    /** 技术版更新日志，同一版本的内容折叠放在卡片的「技术说明」里 */
+    changelogFile: string;
   };
 }
 
@@ -187,8 +189,10 @@ function isSecretParam(param: string): boolean {
 
 /** 使用说明文件默认放在项目的 prompts/mcp/<服务名>.md（src 和 dist 都在项目根目录下一层） */
 const PROMPTS_DIR = fileURLToPath(new URL("../prompts/mcp/", import.meta.url));
-/** 产品更新说明在项目根目录，部署时跟着 git pull 更新（技术版的 CHANGELOG.md 不发群里） */
+/** 产品更新说明在项目根目录，部署时跟着 git pull 更新 */
 export const RELEASE_NOTES_FILE = fileURLToPath(new URL("../RELEASE_NOTES.md", import.meta.url));
+/** 技术版更新日志，同一版本的内容折叠放在通知卡片的「技术说明」里 */
+export const CHANGELOG_FILE = fileURLToPath(new URL("../CHANGELOG.md", import.meta.url));
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -333,6 +337,7 @@ function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<
     ...(link ? { link } : {}),
     stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "announce", "state.json"),
     notesFile: RELEASE_NOTES_FILE,
+    changelogFile: CHANGELOG_FILE,
   };
 }
 
