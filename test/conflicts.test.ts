@@ -16,6 +16,8 @@ const signal = new AbortController().signal;
 class TableBackend implements KnowledgeBackend {
   entries: KnowledgeEntry[] = [];
   failAdd?: Error;
+  /** 存进去之后马上调：模拟存完、归档旧的之前有人在表格里改了 */
+  onAdd?: () => void;
 
   async location() {
     return "https://example.feishu.cn/base/app1?table=tbl1";
@@ -30,6 +32,7 @@ class TableBackend implements KnowledgeBackend {
       throw this.failAdd;
     }
     this.entries.push(structuredClone(entry));
+    this.onAdd?.();
   }
 
   async update(row: Pick<KnowledgeEntry, "id">, changes: Partial<KnowledgeEntry>) {
@@ -458,6 +461,46 @@ test("冲突卡片：存新经验没成功时另发一张确认卡片，写权�
     assert.equal(s.backend.entries.length, 3);
     assert.equal(s.backend.entries[2].conclusion, "发版固定在每周三");
     assert.equal(s.backend.entries[0].status, "archived");
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("冲突卡片：没存成另发的确认卡片上点保存前，群记忆改过了就不存", async () => {
+  const s = await setup();
+  try {
+    await s.tool().run({ conflicts: [s.both[0]] }, { signal });
+    await s.pick(0, "memory");
+    s.backend.failAdd = new Error("飞书接口限流");
+    await s.apply();
+    s.backend.failAdd = undefined;
+    const retry = s.sent.find((one) => (one.input as { card?: any }).card?.header?.title?.content === "存进经验库？")!;
+    const save = (retry.input as { card: any }).card.body.elements.find((e: any) => e.tag === "button" && e.behaviors[0].value.op === "save").behaviors[0].value;
+    const messageId = `om_card_${s.sent.indexOf(retry) + 1}`;
+    await s.store.update("oc_1", 1, { content: "发版固定在每周五" });
+    await s.desk.handleCardAction(s.event(save, "ou_admin", "ML", {}, messageId));
+    await s.desk.idle();
+    assert.equal(s.backend.entries.length, 2, "没按旧的群记忆存新经验");
+    assert.equal(s.backend.entries[0].status, "active");
+    assert.match(text(s.updates.findLast((one) => one.messageId === messageId)!.card), /群记忆 #1 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 K1/);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("冲突卡片：新经验存好后旧的在表格里改了、没归档它时，这一处算没同步成", async () => {
+  const s = await setup();
+  try {
+    await s.tool().run({ conflicts: [s.both[0]] }, { signal });
+    await s.pick(0, "memory");
+    s.backend.onAdd = () => {
+      s.backend.entries[0].conclusion = "发版改到每周五";
+    };
+    await s.apply();
+    assert.equal(s.backend.entries.length, 3);
+    assert.equal(s.backend.entries[0].status, "active", "改过的旧经验没归档");
+    assert.match(text(s.card()), /旧的经验 K1 在卡片发出后在表格里改过/);
+    assert.equal(s.card().header.title.content, "群记忆和经验库没全同步成");
   } finally {
     await s.cleanup();
   }

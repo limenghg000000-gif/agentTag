@@ -96,6 +96,8 @@ export interface ReplaceRequest {
   operator: Person;
   draft: KnowledgeDraft;
   replaces: KnowledgeEntry;
+  /** 存新经验之前再核对一次赢的那边（群记忆）：卡片发出后改过、删了时返回原因，不存 */
+  precheck: () => Promise<string | undefined>;
 }
 
 /** 冲突卡片要用的经验库操作（KnowledgeDesk 提供） */
@@ -436,10 +438,16 @@ export class ConflictDesk {
         continue;
       }
       try {
-        // 赢的那边（群记忆）卡片发出后改过、删了：卡片上的新结论是按旧的写的，不拿它去改经验库
-        const current = (await this.options.memory.list(card.chatId)).find((entry) => entry.id === row.memory.id);
-        if (current?.content !== row.memory.content) {
-          row.result = [`群记忆 #${row.memory.id} 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 ${row.knowledge.id}`];
+        // 赢的那边（群记忆）卡片发出后改过、删了：卡片上的新结论是按旧的写的，不拿它去改经验库。没存成另发的确认卡片上点保存前也再核对一次
+        const precheck = async (): Promise<string | undefined> => {
+          const current = (await this.options.memory.list(card.chatId)).find((entry) => entry.id === row.memory.id);
+          return current?.content === row.memory.content
+            ? undefined
+            : `群记忆 #${row.memory.id} 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 ${row.knowledge.id}`;
+        };
+        const stale = await precheck();
+        if (stale) {
+          row.result = [stale];
           row.failed = true;
           continue;
         }
@@ -452,6 +460,7 @@ export class ConflictDesk {
           operator,
           draft: row.knowledgeDraft,
           replaces: row.knowledge,
+          precheck,
         });
         row.result = lines;
         row.failed = !ok;

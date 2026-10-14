@@ -159,6 +159,8 @@ interface SaveProposal extends ProposalBase {
    * 之后那一行在表格里改了、删了、编号给了别的行都不影响，按记下的编号归档 aiops 里那条（见 archivedOriginal）
    */
   replacedArchived?: ArchivedRow;
+  /** 冲突卡片上没做完、另发的这张：还没存新经验时，点保存前再核对一次群记忆，返回不该存的原因（卡片上的新结论是按当时的群记忆写的） */
+  precheck?: () => Promise<string | undefined>;
 }
 
 /** 卡片上已经在表格里归档了的那一行：当时的编号和它记的 aiops 编号 */
@@ -192,6 +194,8 @@ type Proposal = SaveProposal | ArchiveProposal;
 interface Outcome {
   done: string[];
   unfinished: string[];
+  /** 新的存好了，旧的卡片发出后在表格里改过、没归档它（再试也一样，不算没做完）：冲突卡片上这一处算没同步成 */
+  replacedKept?: boolean;
 }
 
 export interface KnowledgeDeskOptions {
@@ -593,8 +597,8 @@ export class KnowledgeDesk {
   /**
    * 冲突卡片上选了以群记忆为准、写权限名单里的人点了同步：按卡片上列的新内容取代旧经验，和点「保存」走一样的流程
    * （存新的、排查经验同步 aiops、归档旧的；卡片发出后旧的在表格里改过就不取代）。返回做完的几行。
-   * 后面的步骤没做完、或者第一步就没存成时，在冲突卡片下面另发一张确认卡片，写权限名单里的人在那张上点「再试一次」「保存」接着做；
-   * 这两种和旧的改过了（没取代）都算没做完（ok 为 false）
+   * 后面的步骤没做完、或者第一步就没存成时，在冲突卡片下面另发一张确认卡片，写权限名单里的人在那张上点「再试一次」「保存」接着做
+   * （还没存新经验的，点保存前再核对一次群记忆）；这两种和旧的改过了（存了新的、旧的没取代）都算没做完（ok 为 false）
    */
   private async replaceFromConflict(request: ReplaceRequest): Promise<{ lines: string[]; ok: boolean }> {
     const withAiops = this.options.aiops !== undefined && !this.options.aiops.lacksWriteTools;
@@ -611,6 +615,7 @@ export class KnowledgeDesk {
       sourceMessageId: request.sourceMessageId,
       createdAt: this.now(),
       state: "working",
+      ...(request.precheck ? { precheck: request.precheck } : {}),
     };
     const task: McpTaskContext = { chatId: request.chatId, senderId: request.operator.openId, messageId: request.sourceMessageId };
     let outcome: Outcome;
@@ -632,7 +637,7 @@ export class KnowledgeDesk {
     // 表格链接冲突卡片上统一列一次
     const done = outcome.done.filter((line) => !line.startsWith("经验库表格："));
     if (outcome.unfinished.length === 0) {
-      return { lines: done, ok: true };
+      return { lines: done, ok: !outcome.replacedKept };
     }
     proposal.state = "partial";
     proposal.result = outcome.done;
@@ -664,6 +669,10 @@ export class KnowledgeDesk {
     const confirmedBy = operator.name ?? operator.openId;
     let outcome: Outcome;
     try {
+      const stale = proposal.kind === "save" && proposal.precheck && proposal.savedId === undefined ? await proposal.precheck() : undefined;
+      if (stale) {
+        throw new StaleProposalError(stale);
+      }
       outcome = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
     } catch (err) {
       if (err instanceof StaleProposalError) {
@@ -1177,6 +1186,7 @@ export class KnowledgeDesk {
           out.done.push(
             `旧的经验 ${old.id} 在卡片发出后在表格里改过，卡片上确认取代的不是现在这条，没有归档它，aiops 里同步的那条也没动。要归档的话请按现在的内容另外起草归档。`,
           );
+          out.replacedKept = true;
           return;
         }
         out.unfinished.push(`旧的经验 ${old.id} 没能归档：${describe(err)}。不归档的话新旧两条都会被检索到`);
