@@ -18,6 +18,8 @@ class TableBackend implements KnowledgeBackend {
   failAdd?: Error;
   /** 存进去之后马上调：模拟存完、归档旧的之前有人在表格里改了 */
   onAdd?: () => void;
+  /** 存之前等它：模拟一次取代存得慢，后面的排着队 */
+  addGate?: Promise<void>;
 
   async location() {
     return "https://example.feishu.cn/base/app1?table=tbl1";
@@ -28,6 +30,7 @@ class TableBackend implements KnowledgeBackend {
   }
 
   async add(entry: KnowledgeEntry) {
+    await this.addGate;
     if (this.failAdd) {
       throw this.failAdd;
     }
@@ -95,6 +98,7 @@ async function setup({ approvers = new Set(["ou_admin"]), memory = true }: { app
   });
   const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
   const tool = () => desk.tools(ctx).find((t) => t.spec.name === CONFLICT_TOOL)!;
+  const propose = () => desk.tools(ctx).find((t) => t.spec.name === "knowledge_propose")!;
   /** 最新的冲突卡片：改过的按最后一次改的，没改过的按发出去的 */
   const card = () => updates.findLast((one) => one.messageId === "om_card_1")?.card ?? (sent[0].input as { card: any }).card;
   const elements = (c: any): any[] => c.body.elements;
@@ -131,6 +135,7 @@ async function setup({ approvers = new Set(["ou_admin"]), memory = true }: { app
     sent,
     updates,
     tool,
+    propose,
     card,
     elements,
     selects,
@@ -299,7 +304,7 @@ test("冲突卡片：只改群记忆时群里谁都能点同步；以经验库�
     assert.equal(memories[1].content, "收不到验证码先让用户重启手机", "先不动的不改");
     assert.equal(s.backend.entries.length, 2, "经验库没动");
     const card = s.card();
-    assert.equal(card.header.title.content, "群记忆和经验库已同步");
+    assert.equal(card.header.title.content, "已按选择同步，有 1 处先不动", "先不动的那处还对不上，不说都同步了");
     assert.equal(s.selects(card).length, 0);
     assert.doesNotMatch(text(card), /"tag":"button"/);
     assert.match(text(card), /以经验库为准，群记忆 #1 已改成：发版固定在每周四下午/);
@@ -450,6 +455,8 @@ test("冲突卡片：存新经验没成功时另发一张确认卡片，写权�
     assert.deepEqual(retry.opts, { replyTo: "om_card_1", replyInThread: true });
     assert.match(text((retry.input as { card: any }).card), /冲突卡片上点的同步没存成：飞书接口限流/);
     s.backend.failAdd = undefined;
+    // 同一个话题里再起草一条别的经验：这张不是它的旧版本，不作废
+    await s.propose().run({ category: "answer", title: "登录失败先看什么", question: "用户说登录失败", conclusion: "先看网关日志" }, { signal });
     const save = (retry.input as { card: any }).card.body.elements.find((e: any) => e.tag === "button" && e.behaviors[0].value.op === "save").behaviors[0].value;
     const messageId = `om_card_${s.sent.indexOf(retry) + 1}`;
     // 不在写权限名单里的人点了不算
@@ -483,6 +490,32 @@ test("冲突卡片：没存成另发的确认卡片上点保存前，群记忆�
     assert.equal(s.backend.entries.length, 2, "没按旧的群记忆存新经验");
     assert.equal(s.backend.entries[0].status, "active");
     assert.match(text(s.updates.findLast((one) => one.messageId === messageId)!.card), /群记忆 #1 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 K1/);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("冲突卡片：排在别的取代后面等着存时群记忆改了，轮到时不存", async () => {
+  const s = await setup();
+  try {
+    // 第一张（第 2 处，默认以群记忆为准）存得慢；第二张在另一个话题（第 1 处，选以群记忆为准）排在它后面
+    await s.tool().run({ conflicts: [s.both[1]] }, { signal });
+    const other = s.desk.tools({ chatId: "oc_1", threadKey: "om_root2", senderId: "ou_1", askerName: "张三", messageId: "om_2" }).find((t) => t.spec.name === CONFLICT_TOOL)!;
+    await other.run({ conflicts: [s.both[0]] }, { signal });
+    const second = () => s.updates.findLast((one) => one.messageId === "om_card_2")?.card ?? (s.sent[1].input as { card: any }).card;
+    await s.desk.handleCardAction(s.event(s.selects(second())[0].behaviors[0].value, "ou_admin", "ML", { tag: "select_static", option: "memory" }, "om_card_2"));
+    let release!: () => void;
+    s.backend.addGate = new Promise((resolve) => (release = resolve));
+    await s.desk.handleCardAction(s.event(s.buttonValue(s.card(), "apply"), "ou_admin", "ML"));
+    await s.desk.handleCardAction(s.event(s.buttonValue(second(), "apply"), "ou_admin", "ML", {}, "om_card_2"));
+    await s.store.update("oc_1", 1, { content: "发版固定在每周五" });
+    release();
+    await s.desk.idle();
+    assert.equal(s.backend.entries.length, 3, "只存了第一张的那条");
+    assert.equal(s.backend.entries[0].status, "active", "K1 没被按旧的群记忆取代");
+    assert.equal(s.backend.entries[1].status, "archived");
+    assert.match(text(second()), /群记忆 #1 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 K1/);
+    assert.equal(second().header.title.content, "群记忆和经验库没全同步成");
   } finally {
     await s.cleanup();
   }

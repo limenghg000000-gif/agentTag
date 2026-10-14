@@ -438,19 +438,14 @@ export class ConflictDesk {
         continue;
       }
       try {
-        // 赢的那边（群记忆）卡片发出后改过、删了：卡片上的新结论是按旧的写的，不拿它去改经验库。没存成另发的确认卡片上点保存前也再核对一次
+        // 赢的那边（群记忆）卡片发出后改过、删了：卡片上的新结论是按旧的写的，不拿它去改经验库。
+        // 经验库存新经验前（排在别的取代后面也是轮到时）、没存成另发的确认卡片上点保存时都再核对一次
         const precheck = async (): Promise<string | undefined> => {
           const current = (await this.options.memory.list(card.chatId)).find((entry) => entry.id === row.memory.id);
           return current?.content === row.memory.content
             ? undefined
             : `群记忆 #${row.memory.id} 在卡片发出后改过或者删了，卡片上的新结论是按旧的写的，没改经验 ${row.knowledge.id}`;
         };
-        const stale = await precheck();
-        if (stale) {
-          row.result = [stale];
-          row.failed = true;
-          continue;
-        }
         const { lines, ok } = await this.options.knowledge.replace({
           chatId: card.chatId,
           threadKey: card.threadKey,
@@ -533,10 +528,17 @@ export class ConflictDesk {
   }
 }
 
-const HEADERS: Record<ConflictState, { title: (n: number) => string; template: string }> = {
-  pending: { title: (n) => `群记忆和经验库有 ${n} 处对不上`, template: "orange" },
+const HEADERS: Record<ConflictState, { title: (card: ConflictCard) => string; template: string }> = {
+  pending: { title: (card) => `群记忆和经验库有 ${card.rows.length} 处对不上`, template: "orange" },
   working: { title: () => "正在同步群记忆和经验库…", template: "blue" },
-  done: { title: () => "群记忆和经验库已同步", template: "green" },
+  // 选了「先不动」的那几处两边还是对不上，不能说都同步了
+  done: {
+    title: (card) => {
+      const skipped = card.rows.filter((row) => row.pick === "skip").length;
+      return skipped > 0 ? `已按选择同步，有 ${skipped} 处先不动` : "群记忆和经验库已同步";
+    },
+    template: "green",
+  },
   partial: { title: () => "群记忆和经验库没全同步成", template: "orange" },
   cancelled: { title: () => "已取消", template: "grey" },
   superseded: { title: () => "已换成新的卡片", template: "grey" },
@@ -613,7 +615,7 @@ export function renderConflictCard(card: ConflictCard): object {
       button("取消", "default", { action: CONFLICT_ACTION, card: card.id, op: "cancel" }),
     );
   }
-  const title = HEADERS[card.state].title(card.rows.length);
+  const title = HEADERS[card.state].title(card);
   return {
     schema: "2.0",
     config: { update_multi: true, summary: { content: title } },

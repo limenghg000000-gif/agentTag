@@ -159,7 +159,10 @@ interface SaveProposal extends ProposalBase {
    * 之后那一行在表格里改了、删了、编号给了别的行都不影响，按记下的编号归档 aiops 里那条（见 archivedOriginal）
    */
   replacedArchived?: ArchivedRow;
-  /** 冲突卡片上没做完、另发的这张：还没存新经验时，点保存前再核对一次群记忆，返回不该存的原因（卡片上的新结论是按当时的群记忆写的） */
+  /**
+   * 冲突卡片来的：存新经验之前（排队轮到时、另发的确认卡片上点保存时）再核对一次群记忆，返回不该存的原因（新结论是按当时的群记忆写的）。
+   * 另发的确认卡片有它，同一个话题里再起草别的经验时不作废这张
+   */
   precheck?: () => Promise<string | undefined>;
 }
 
@@ -669,10 +672,6 @@ export class KnowledgeDesk {
     const confirmedBy = operator.name ?? operator.openId;
     let outcome: Outcome;
     try {
-      const stale = proposal.kind === "save" && proposal.precheck && proposal.savedId === undefined ? await proposal.precheck() : undefined;
-      if (stale) {
-        throw new StaleProposalError(stale);
-      }
       outcome = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
     } catch (err) {
       if (err instanceof StaleProposalError) {
@@ -738,6 +737,11 @@ export class KnowledgeDesk {
       }
       entry = saved;
     } else {
+      // 冲突卡片来的：轮到存的时候再核对一次群记忆（前面可能排着别的取代，等了一会儿）
+      const stale = await proposal.precheck?.();
+      if (stale) {
+        throw new StaleProposalError(stale);
+      }
       // 上次存的结果没传回来时草稿编号一样，已经写进去的直接返回那一行
       entry = await base.save(draft, {
         proposedBy: proposal.proposer.name ?? proposal.proposer.openId,
@@ -1360,7 +1364,10 @@ export class KnowledgeDesk {
       await this.render(proposal);
       signal.throwIfAborted();
     }
-    const replaced = [...this.proposals.values()].filter((old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending");
+    // 冲突卡片没做完另发的确认卡片不是草稿的旧版本，不作废：作废了那一处就没地方接着点了
+    const replaced = [...this.proposals.values()].filter(
+      (old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending" && !(old.kind === "save" && old.precheck),
+    );
     for (const old of replaced) {
       old.state = "superseded";
       old.result = ["已换成新的草稿，以下面的卡片为准"];
