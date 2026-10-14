@@ -281,9 +281,12 @@ test("更新通知：默认开，发到白名单里的所有群；ANNOUNCE_CHAT_
   assert.deepEqual(config.announce?.chatIds, ["oc_a", "oc_b"]);
   assert.equal(config.announce?.link, undefined);
   assert.equal(config.announce?.stateFile, path.resolve("data", "announce", "state.json"));
-  assert.ok(existsSync(config.announce!.changelogFile), "CHANGELOG.md 在项目根目录");
+  assert.equal(config.announce?.chatIdsFrom, "FEISHU_ALLOWED_CHAT_IDS");
+  assert.ok(existsSync(config.announce!.notesFile), "RELEASE_NOTES.md 在项目根目录");
 
-  assert.deepEqual(loadConfig({ ...allowed, ANNOUNCE_CHAT_IDS: "oc_b,oc_b" }).announce?.chatIds, ["oc_b"]);
+  const listed = loadConfig({ ...allowed, ANNOUNCE_CHAT_IDS: "oc_b,oc_b" }).announce;
+  assert.deepEqual(listed?.chatIds, ["oc_b"]);
+  assert.equal(listed?.chatIdsFrom, "ANNOUNCE_CHAT_IDS");
   assert.throws(() => loadConfig({ ...allowed, ANNOUNCE_CHAT_IDS: "oc_b,oc_x" }), /ANNOUNCE_CHAT_IDS 里的群 oc_x 不在 FEISHU_ALLOWED_CHAT_IDS 里/);
   assert.equal(loadConfig({ ...allowed, ANNOUNCE: "off" }).announce, undefined);
   assert.equal(loadConfig({ ...allowed, ANNOUNCE: " OFF ", ANNOUNCE_CHAT_IDS: "oc_x" }).announce, undefined);

@@ -62,15 +62,18 @@ export interface Config {
   cardAnswersDir: string;
   /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
   recentThreadsDir: string;
-  /** 更新通知（ANNOUNCE，默认 on）：部署新版本后把 CHANGELOG.md 里新版本的说明发到群里。关掉时为空 */
+  /** 更新通知（ANNOUNCE，默认 on）：部署新版本后把产品更新说明 RELEASE_NOTES.md 里新版本的说明发到群里。关掉时为空 */
   announce?: {
     /** 发到这些群：ANNOUNCE_CHAT_IDS，不填就是白名单里的所有群 */
     chatIds: string[];
+    /** chatIds 是从哪个配置来的，启动日志里写明 */
+    chatIdsFrom: "ANNOUNCE_CHAT_IDS" | "FEISHU_ALLOWED_CHAT_IDS";
     /** 通知卡片上「看全部功能」按钮的链接（ANNOUNCE_LINK） */
     link?: string;
     /** 每个群发到哪一版记在这个文件里 */
     stateFile: string;
-    changelogFile: string;
+    /** 发到群里的产品更新说明 */
+    notesFile: string;
   };
 }
 
@@ -184,8 +187,8 @@ function isSecretParam(param: string): boolean {
 
 /** 使用说明文件默认放在项目的 prompts/mcp/<服务名>.md（src 和 dist 都在项目根目录下一层） */
 const PROMPTS_DIR = fileURLToPath(new URL("../prompts/mcp/", import.meta.url));
-/** 更新日志在项目根目录，部署时跟着 git pull 更新 */
-export const CHANGELOG_FILE = fileURLToPath(new URL("../CHANGELOG.md", import.meta.url));
+/** 产品更新说明在项目根目录，部署时跟着 git pull 更新（技术版的 CHANGELOG.md 不发群里） */
+export const RELEASE_NOTES_FILE = fileURLToPath(new URL("../RELEASE_NOTES.md", import.meta.url));
 
 /** 从环境变量读取配置。密钥只从环境变量来，不写进代码和仓库。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -326,9 +329,10 @@ function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<
   }
   return {
     chatIds: listed.length > 0 ? [...new Set(listed)] : [...allowedChatIds],
+    chatIdsFrom: listed.length > 0 ? "ANNOUNCE_CHAT_IDS" : "FEISHU_ALLOWED_CHAT_IDS",
     ...(link ? { link } : {}),
     stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "announce", "state.json"),
-    changelogFile: CHANGELOG_FILE,
+    notesFile: RELEASE_NOTES_FILE,
   };
 }
 

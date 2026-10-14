@@ -4,8 +4,8 @@ import { writeAtomically } from "./file-store.js";
 import type { Logger } from "./history.js";
 import { escapeCardMarkdown } from "./markdown.js";
 
-/** CHANGELOG.md 里的一个版本 */
-export interface ChangelogVersion {
+/** 产品更新说明（RELEASE_NOTES.md）里的一个版本 */
+export interface ReleaseNotesVersion {
   version: string;
   /** 标题行版本号后面写的日期，没写时为空 */
   date?: string;
@@ -22,7 +22,8 @@ export const ANNOUNCE_RETRY_MS = 10 * 60_000;
 /** 一个群一次部署最多试这么多次，还发不出去就等下次重启 */
 export const ANNOUNCE_MAX_ATTEMPTS = 6;
 
-const VERSION_HEADING = /^##\s+v?(\d+)\.(\d+)\.(\d+)(?:\s*[—–-]+\s*(.*?))?\s*$/;
+/** 版本标题：「## 0.8.0 — 2026-10-14」，也认开源项目常用的「## [0.8.0] - 2026-10-14」 */
+const VERSION_HEADING = /^##\s+\[?v?(\d+)\.(\d+)\.(\d+)\]?(?:\s*[—–-]+\s*(.*?))?\s*$/;
 /** 二级标题（「## 」开头），不含「### 」 */
 const H2 = /^##\s/;
 const H3 = /^###\s/;
@@ -30,11 +31,11 @@ const H3 = /^###\s/;
 const PR_REFS = /\s*[（(]\s*#\d+(?:\s*[、，,]\s*#\d+)*\s*[）)]/g;
 
 /**
- * 读 CHANGELOG.md：每个「## 0.8.0 — 2026-10-14」开头的段是一个版本，按文件里的先后返回（最新的在最上面）。
- * 「## 未发布」这类没有版本号的段跳过。每段只取 ### 小标题之前的部分，### 下面（比如「### 管理员」）是不发群里的说明
+ * 读产品更新说明（RELEASE_NOTES.md）：每个「## 0.8.0 — 2026-10-14」开头的段是一个版本，按文件里的先后返回（最新的在最上面）。
+ * 「## 未发布」这类没有版本号的段跳过。每段只取 ### 小标题之前的部分，结尾的 PR 号去掉
  */
-export function parseChangelog(text: string): ChangelogVersion[] {
-  const versions: ChangelogVersion[] = [];
+export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
+  const versions: ReleaseNotesVersion[] = [];
   let current: { version: string; date?: string; lines: string[]; cut: boolean } | undefined;
   const flush = () => {
     if (current) {
@@ -81,7 +82,7 @@ export function compareVersions(a: string, b: string): number {
  * 这个群要发哪几个版本（新的在前）。没发过（lastAnnounced 为空）只发最新的一版，免得把以前的全倒进群里；
  * 发过就发比上次新的所有版本。回退到旧版本时什么都不发
  */
-export function pendingVersions(versions: readonly ChangelogVersion[], lastAnnounced: string | undefined): ChangelogVersion[] {
+export function pendingVersions(versions: readonly ReleaseNotesVersion[], lastAnnounced: string | undefined): ReleaseNotesVersion[] {
   const sorted = [...versions].sort((a, b) => compareVersions(b.version, a.version));
   if (sorted.length === 0) {
     return [];
@@ -104,8 +105,8 @@ export interface AnnouncementOptions {
  * 一条通知里列哪几个版本（卡片和退回的文字一样）：最多 MAX_ANNOUNCED_VERSIONS 个、说明加起来不超过 MAX_NOTES_CHARS 字，
  * 后面的只说还有几个。第一个版本再长也要列，太长就按行截短
  */
-function shownVersions(versions: readonly ChangelogVersion[]): ChangelogVersion[] {
-  const shown: ChangelogVersion[] = [];
+function shownVersions(versions: readonly ReleaseNotesVersion[]): ReleaseNotesVersion[] {
+  const shown: ReleaseNotesVersion[] = [];
   let chars = 0;
   for (const v of versions) {
     if (shown.length >= MAX_ANNOUNCED_VERSIONS || (shown.length > 0 && chars + v.notes.length > MAX_NOTES_CHARS)) {
@@ -129,11 +130,11 @@ function truncateNotes(notes: string): string {
     chars += line.length + 1;
   }
   const head = kept.length > 0 ? kept.join("\n") : [...notes].slice(0, MAX_NOTES_CHARS).join("");
-  return `${head}\n…（太长了没列全，见更新日志）`;
+  return `${head}\n…（太长了没列全，见更新说明）`;
 }
 
 /** 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前 */
-export function renderAnnouncementCard(versions: readonly ChangelogVersion[], options: AnnouncementOptions = {}): object {
+export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): object {
   const name = options.botName || "机器人";
   const shown = shownVersions(versions);
   const title = `${name} 更新了 · ${versions[0]?.version ?? ""}`;
@@ -147,7 +148,7 @@ export function renderAnnouncementCard(versions: readonly ChangelogVersion[], op
   }));
   const rest = versions.length - shown.length;
   const footer = [
-    ...(rest > 0 ? [`还有 ${rest} 个更早的版本没列出来，见更新日志。`] : []),
+    ...(rest > 0 ? [`还有 ${rest} 个更早的版本没列出来，见更新说明。`] : []),
     options.firstTime
       ? `我是${escapeCardMarkdown(name)}，在群里 @ 我就能提问、派活。以后每次更新，我都会在这里说一声。`
       : "有问题、想让我做什么，照常在群里 @ 我。",
@@ -173,7 +174,7 @@ export function renderAnnouncementCard(versions: readonly ChangelogVersion[], op
 /**
  * 飞书说卡片格式不对时退回的文字，列的版本和卡片一样。尖括号换成全角：Markdown 里的 <at id=all></at> 也会 @所有人
  */
-export function renderAnnouncementMarkdown(versions: readonly ChangelogVersion[], options: AnnouncementOptions = {}): string {
+export function renderAnnouncementMarkdown(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): string {
   const name = options.botName || "机器人";
   const shown = shownVersions(versions);
   const lines = [`**${name} 更新了 · ${versions[0]?.version ?? ""}**`];
@@ -186,7 +187,7 @@ export function renderAnnouncementMarkdown(versions: readonly ChangelogVersion[]
     lines.push(v.notes);
   }
   if (versions.length > shown.length) {
-    lines.push("", `还有 ${versions.length - shown.length} 个更早的版本没列出来，见更新日志。`);
+    lines.push("", `还有 ${versions.length - shown.length} 个更早的版本没列出来，见更新说明。`);
   }
   if (options.link) {
     lines.push("", `全部功能：${options.link}`);
@@ -200,8 +201,8 @@ interface AnnounceState {
 }
 
 export interface UpdateAnnouncerOptions {
-  /** CHANGELOG.md 的位置 */
-  changelogFile: string;
+  /** 产品更新说明 RELEASE_NOTES.md 的位置 */
+  notesFile: string;
   /** 记每个群发到哪一版的文件 */
   stateFile: string;
   /** 发到这些群 */
@@ -217,7 +218,7 @@ export interface UpdateAnnouncerOptions {
 }
 
 /**
- * 更新通知：机器人启动时（部署新版本要重启）把 CHANGELOG.md 里这个群还没收到过的版本发到群里，
+ * 更新通知：机器人启动时（部署新版本要重启）把产品更新说明 RELEASE_NOTES.md 里这个群还没收到过的版本发到群里，
  * 发到了就记下这个群收到了哪一版，以后重启不再发。发不出去的群过 10 分钟再试，最多试 6 次
  */
 export class UpdateAnnouncer {
@@ -255,14 +256,14 @@ export class UpdateAnnouncer {
     }
     let text: string;
     try {
-      text = await readFile(this.opts.changelogFile, "utf8");
+      text = await readFile(this.opts.notesFile, "utf8");
     } catch (err) {
-      this.logger.warn(`更新通知：读不到 ${this.opts.changelogFile}，这次不发`, err);
+      this.logger.warn(`更新通知：读不到 ${this.opts.notesFile}，这次不发`, err);
       return;
     }
-    const versions = parseChangelog(text);
+    const versions = parseReleaseNotes(text);
     if (versions.length === 0) {
-      this.logger.warn(`更新通知：${this.opts.changelogFile} 里没有「## x.y.z」这样的版本，这次不发`);
+      this.logger.warn(`更新通知：${this.opts.notesFile} 里没有「## x.y.z」这样的版本，这次不发`);
       return;
     }
     const state = await this.loadState();
@@ -313,7 +314,7 @@ export class UpdateAnnouncer {
    * 先发卡片，飞书说卡片格式不对（format_error）时改发一次纯文本。超时、限流、没权限这类不改发文字：
    * 超时的卡片可能其实发出去了，再发文字群里就有两条，交给过一阵再试。发不出去返回 false
    */
-  private async sendTo(chatId: string, versions: ChangelogVersion[], options: AnnouncementOptions): Promise<boolean> {
+  private async sendTo(chatId: string, versions: ReleaseNotesVersion[], options: AnnouncementOptions): Promise<boolean> {
     try {
       await this.opts.send(chatId, { card: renderAnnouncementCard(versions, options) });
       return true;

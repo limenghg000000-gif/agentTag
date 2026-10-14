@@ -243,7 +243,7 @@ if (backup) {
   backup.start();
   console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
 }
-// 部署新版本要重启：连上飞书后把 CHANGELOG.md 里各群还没收到过的版本发过去，在后台做
+// 部署新版本要重启：连上飞书后把 RELEASE_NOTES.md 里各群还没收到过的版本发过去，在后台做
 const announcer =
   config.announce && config.announce.chatIds.length > 0
     ? new UpdateAnnouncer({
@@ -254,9 +254,13 @@ const announcer =
     : undefined;
 if (announcer) {
   void announcer.run();
+  const { chatIds, chatIdsFrom } = config.announce!;
   console.log(
-    `更新通知：新版本部署后，把 CHANGELOG.md 里还没发过的版本发到 ${config.announce!.chatIds.length} 个群` +
-      `（ANNOUNCE_CHAT_IDS 可以只发其中几个，ANNOUNCE=off 关掉）`,
+    `更新通知：新版本部署后，把 RELEASE_NOTES.md 里还没发过的版本发到 ${chatIds.length} 个群 ${chatIds.join(", ")}` +
+      (chatIdsFrom === "ANNOUNCE_CHAT_IDS"
+        ? "（按 ANNOUNCE_CHAT_IDS）"
+        : "（没配 ANNOUNCE_CHAT_IDS，发白名单里的所有群）") +
+      "，ANNOUNCE=off 关掉",
   );
 } else if (!config.announce) {
   console.log("更新通知：已关闭（ANNOUNCE=off）");

@@ -7,7 +7,7 @@ import type { SendInput } from "@larksuiteoapi/node-sdk";
 import {
   compareVersions,
   MAX_ANNOUNCED_VERSIONS,
-  parseChangelog,
+  parseReleaseNotes,
   pendingVersions,
   renderAnnouncementCard,
   renderAnnouncementMarkdown,
@@ -16,7 +16,7 @@ import {
 
 const quiet = { info() {}, warn() {}, error() {} };
 
-const CHANGELOG = `# 更新日志
+const NOTES = `# 产品更新说明
 
 说明文字，不属于任何版本。
 
@@ -48,8 +48,8 @@ const CHANGELOG = `# 更新日志
 - 新功能 D（#47, #48）
 `;
 
-test("读 CHANGELOG：版本、日期、### 之前的说明，去掉 PR 号；没有版本号的段跳过", () => {
-  const versions = parseChangelog(CHANGELOG);
+test("读产品更新说明：版本、日期、### 之前的说明，去掉 PR 号；没有版本号的段跳过", () => {
+  const versions = parseReleaseNotes(NOTES);
   assert.deepEqual(
     versions.map((v) => [v.version, v.date]),
     [
@@ -64,6 +64,17 @@ test("读 CHANGELOG：版本、日期、### 之前的说明，去掉 PR 号；�
   assert.ok(versions.every((v) => !v.notes.includes("不发")));
 });
 
+test("也认开源项目常用的「## [0.9.0] - 日期」标题", () => {
+  const versions = parseReleaseNotes("## [Unreleased]\n\n- 不发\n\n## [0.9.0] - 2026-10-15\n\n- 新功能（#47）\n\n## [0.8.0]\n\n- 旧功能\n");
+  assert.deepEqual(
+    versions.map((v) => [v.version, v.date, v.notes]),
+    [
+      ["0.9.0", "2026-10-15", "- 新功能"],
+      ["0.8.0", undefined, "- 旧功能"],
+    ],
+  );
+});
+
 test("版本号按数字比较，0.10.0 比 0.9.1 新", () => {
   assert.ok(compareVersions("0.10.0", "0.9.1") > 0);
   assert.ok(compareVersions("0.9.0", "0.9.1") < 0);
@@ -71,7 +82,7 @@ test("版本号按数字比较，0.10.0 比 0.9.1 新", () => {
 });
 
 test("要发哪几版：没发过只发最新的一版；发过就发比上次新的，新的在前；回退或已是最新时不发", () => {
-  const versions = parseChangelog(CHANGELOG);
+  const versions = parseReleaseNotes(NOTES);
   assert.deepEqual(pendingVersions(versions, undefined).map((v) => v.version), ["0.10.0"]);
   assert.deepEqual(pendingVersions(versions, "0.9.0").map((v) => v.version), ["0.10.0", "0.9.1"]);
   assert.deepEqual(pendingVersions(versions, "0.10.0"), []);
@@ -130,15 +141,15 @@ test("退回的文字和卡片列一样多的版本、一样的字数上限，�
 
 async function setup(chatIds = ["oc_a", "oc_b"]) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "agenttag-announce-"));
-  const changelogFile = path.join(dir, "CHANGELOG.md");
+  const notesFile = path.join(dir, "RELEASE_NOTES.md");
   const stateFile = path.join(dir, "announce", "state.json");
-  await writeFile(changelogFile, CHANGELOG);
+  await writeFile(notesFile, NOTES);
   const sent: { to: string; input: SendInput }[] = [];
   const scheduled: (() => void)[] = [];
   let fail: (to: string, input: SendInput) => boolean | string = () => false;
   const make = () =>
     new UpdateAnnouncer({
-      changelogFile,
+      notesFile,
       stateFile,
       chatIds,
       send: async (to, input) => {
@@ -157,7 +168,7 @@ async function setup(chatIds = ["oc_a", "oc_b"]) {
       },
     });
   return {
-    changelogFile,
+    notesFile,
     stateFile,
     sent,
     scheduled,
@@ -180,7 +191,7 @@ test("第一次启动每个群只发最新的一版并记下来，再启动不�
   await t.make().run();
   assert.equal(t.sent.length, 2, "重启不重发");
 
-  await writeFile(t.changelogFile, CHANGELOG.replace("## 未发布", "## 0.11.0 — 2026-10-17\n\n- 新功能 E（#53）\n\n## 未发布"));
+  await writeFile(t.notesFile, NOTES.replace("## 未发布", "## 0.11.0 — 2026-10-17\n\n- 新功能 E（#53）\n\n## 未发布"));
   await t.make().run();
   assert.equal(t.sent.length, 4);
   const card = JSON.stringify(t.sent[2]!.input);
@@ -246,14 +257,14 @@ test("卡片超时、限流时不改发文字（卡片可能已经发出去了�
   assert.ok("card" in t.sent[0]!.input);
 });
 
-test("读不到 CHANGELOG 或者里面没有版本时不发", async () => {
+test("读不到产品更新说明或者里面没有版本时不发", async () => {
   const t = await setup();
-  await writeFile(t.changelogFile, "# 更新日志\n\n## 未发布\n\n- 还在做\n");
+  await writeFile(t.notesFile, "# 产品更新说明\n\n## 未发布\n\n- 还在做\n");
   await t.make().run();
   assert.equal(t.sent.length, 0);
 
   const missing = new UpdateAnnouncer({
-    changelogFile: path.join(path.dirname(t.changelogFile), "nope.md"),
+    notesFile: path.join(path.dirname(t.notesFile), "nope.md"),
     stateFile: t.stateFile,
     chatIds: ["oc_a"],
     send: async () => {
