@@ -133,6 +133,16 @@ function truncateNotes(notes: string): string {
   return `${head}\n…（太长了没列全，见更新说明）`;
 }
 
+/** 卡片和退回的文字末尾都有的几句：还有几个版本没列、第一次收到通知时介绍一句自己 */
+function footerLines(name: string, rest: number, firstTime: boolean | undefined): string[] {
+  return [
+    ...(rest > 0 ? [`还有 ${rest} 个更早的版本没列出来，见更新说明。`] : []),
+    firstTime
+      ? `我是${name}，在群里 @ 我就能提问、派活。以后每次更新，我都会在这里说一声。`
+      : "有问题、想让我做什么，照常在群里 @ 我。",
+  ];
+}
+
 /** 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前 */
 export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): object {
   const name = options.botName || "机器人";
@@ -146,13 +156,7 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
       escapeCardMarkdown(v.notes),
     ].join("\n"),
   }));
-  const rest = versions.length - shown.length;
-  const footer = [
-    ...(rest > 0 ? [`还有 ${rest} 个更早的版本没列出来，见更新说明。`] : []),
-    options.firstTime
-      ? `我是${escapeCardMarkdown(name)}，在群里 @ 我就能提问、派活。以后每次更新，我都会在这里说一声。`
-      : "有问题、想让我做什么，照常在群里 @ 我。",
-  ];
+  const footer = footerLines(escapeCardMarkdown(name), versions.length - shown.length, options.firstTime);
   elements.push({ tag: "markdown", content: footer.map((line) => `<font color='grey'>${line}</font>`).join("\n") });
   if (options.link) {
     elements.push({
@@ -172,7 +176,7 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
 }
 
 /**
- * 飞书说卡片格式不对时退回的文字，列的版本和卡片一样。尖括号换成全角：Markdown 里的 <at id=all></at> 也会 @所有人
+ * 飞书说卡片格式不对时退回的文字，列的版本和末尾的几句都和卡片一样。尖括号换成全角：Markdown 里的 <at id=all></at> 也会 @所有人
  */
 export function renderAnnouncementMarkdown(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): string {
   const name = options.botName || "机器人";
@@ -186,9 +190,7 @@ export function renderAnnouncementMarkdown(versions: readonly ReleaseNotesVersio
     }
     lines.push(v.notes);
   }
-  if (versions.length > shown.length) {
-    lines.push("", `还有 ${versions.length - shown.length} 个更早的版本没列出来，见更新说明。`);
-  }
+  lines.push("", ...footerLines(name, versions.length - shown.length, options.firstTime));
   if (options.link) {
     lines.push("", `全部功能：${options.link}`);
   }

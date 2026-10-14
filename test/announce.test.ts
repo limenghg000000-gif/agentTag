@@ -139,6 +139,17 @@ test("退回的文字和卡片列一样多的版本、一样的字数上限，�
   assert.match(renderAnnouncementMarkdown([{ version: "0.1.0", notes: "- 能 <at id=all></at> 了" }]), /＜at id=all＞＜\/at＞/);
 });
 
+test("退回的文字末尾也和卡片一样：第一次收到时介绍一句自己，以后说照常 @ 我", () => {
+  const versions = [{ version: "0.8.0", notes: "- 新功能" }];
+  const first = renderAnnouncementMarkdown(versions, { botName: "飞书 CLI", firstTime: true });
+  assert.match(first, /我是飞书 CLI，在群里 @ 我就能提问、派活。以后每次更新，我都会在这里说一声。/);
+  const later = renderAnnouncementMarkdown(versions, { botName: "飞书 CLI" });
+  assert.match(later, /有问题、想让我做什么，照常在群里 @ 我。/);
+  assert.ok(!later.includes("我是飞书 CLI"));
+  // 机器人名字里的尖括号也换成全角
+  assert.match(renderAnnouncementMarkdown(versions, { botName: "<at id=all></at>", firstTime: true }), /我是＜at id=all＞＜\/at＞/);
+});
+
 async function setup(chatIds = ["oc_a", "oc_b"]) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "agenttag-announce-"));
   const notesFile = path.join(dir, "RELEASE_NOTES.md");
