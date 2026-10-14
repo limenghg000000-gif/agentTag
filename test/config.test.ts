@@ -300,4 +300,9 @@ test("更新通知的「产品功能说明」链接要是 https 地址", () => {
   assert.equal(loadConfig({ ...base, ANNOUNCE_LINK: " https://docs.example.com/agenttag " }).announce?.link, "https://docs.example.com/agenttag");
   assert.throws(() => loadConfig({ ...base, ANNOUNCE_LINK: "http://docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
   assert.throws(() => loadConfig({ ...base, ANNOUNCE_LINK: "docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
+  // 更新通知关掉时，有人问「你能做什么」照样附这个链接
+  const off = loadConfig({ ...base, ANNOUNCE: "off", ANNOUNCE_LINK: "https://docs.example.com/agenttag" });
+  assert.equal(off.announce, undefined);
+  assert.equal(off.featuresLink, "https://docs.example.com/agenttag");
+  assert.throws(() => loadConfig({ ...base, ANNOUNCE: "off", ANNOUNCE_LINK: "http://docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
 });

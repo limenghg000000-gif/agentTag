@@ -62,6 +62,8 @@ export interface Config {
   cardAnswersDir: string;
   /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
   recentThreadsDir: string;
+  /** 产品功能说明的链接（ANNOUNCE_LINK）：通知卡片上的按钮用，有人问「你能做什么」时回答里也附上。更新通知关掉时也有 */
+  featuresLink?: string;
   /** 更新通知（ANNOUNCE，默认 on）：部署新版本后把产品更新说明 RELEASE_NOTES.md 里新版本的说明发到群里。关掉时为空 */
   announce?: {
     /** 发到这些群：ANNOUNCE_CHAT_IDS，不填就是白名单里的所有群 */
@@ -262,7 +264,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const allowedChatIds = new Set((env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
-  const announce = loadAnnounceConfig(env, allowedChatIds);
+  const featuresLink = loadFeaturesLink(env);
+  const announce = loadAnnounceConfig(env, allowedChatIds, featuresLink);
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
@@ -301,12 +304,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),
+    ...(featuresLink ? { featuresLink } : {}),
     ...(announce ? { announce } : {}),
   };
 }
 
-/** ANNOUNCE=off 关掉；ANNOUNCE_CHAT_IDS 只能是白名单里的群；ANNOUNCE_LINK 要是 https 地址 */
-function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<string>): Config["announce"] {
+/** ANNOUNCE_LINK：产品功能说明的链接，要是 https 地址 */
+function loadFeaturesLink(env: NodeJS.ProcessEnv): string | undefined {
+  const link = env.ANNOUNCE_LINK?.trim();
+  if (!link) {
+    return undefined;
+  }
+  let url: URL | undefined;
+  try {
+    url = new URL(link);
+  } catch {
+    url = undefined;
+  }
+  if (url?.protocol !== "https:") {
+    throw new Error(`ANNOUNCE_LINK 要写成 https://… 这样的完整地址，当前为 ${link}`);
+  }
+  return link;
+}
+
+/** ANNOUNCE=off 关掉；ANNOUNCE_CHAT_IDS 只能是白名单里的群 */
+function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<string>, link: string | undefined): Config["announce"] {
   const switchEnv = (env.ANNOUNCE?.trim() || "on").toLowerCase();
   if (switchEnv !== "on" && switchEnv !== "off") {
     throw new Error(`ANNOUNCE 只能是 on 或 off，当前为 ${env.ANNOUNCE}`);
@@ -318,18 +340,6 @@ function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<
   const outside = listed.find((id) => !allowedChatIds.has(id));
   if (outside) {
     throw new Error(`ANNOUNCE_CHAT_IDS 里的群 ${outside} 不在 FEISHU_ALLOWED_CHAT_IDS 里：更新通知只发白名单里的群`);
-  }
-  const link = env.ANNOUNCE_LINK?.trim();
-  if (link) {
-    let url: URL | undefined;
-    try {
-      url = new URL(link);
-    } catch {
-      url = undefined;
-    }
-    if (url?.protocol !== "https:") {
-      throw new Error(`ANNOUNCE_LINK 要写成 https://… 这样的完整地址，当前为 ${link}`);
-    }
   }
   return {
     chatIds: listed.length > 0 ? [...new Set(listed)] : [...allowedChatIds],

@@ -28,6 +28,13 @@ export interface PromptContext {
   showThinking?: boolean;
   /** 回答写在飞书卡片（JSON 2.0）里：能画表格、用小标题和彩色标签 */
   richText?: boolean;
+  /** 介绍自己用的：产品功能说明的链接（ANNOUNCE_LINK）、产品更新说明里最新的一版 */
+  about?: AboutBot;
+}
+
+export interface AboutBot {
+  featuresLink?: string;
+  latest?: { version: string; date?: string; notes: string };
 }
 
 /** 回答写在卡片里时的排版：卡片能画表格、小标题和彩色标签 */
@@ -43,7 +50,25 @@ const RICH_TEXT_RULES = [
   "- 结论、表格和「要注意的点」里的数不会被核对，要自己对齐：同一个量在这些地方和图、关键数字里要写成一样的数、一样的单位。字节换 MiB 要除以 1048576（1024×1024），换 GiB 要除以 1073741824，不要挪小数点除以 100 万：188436070 字节是 179.7 MiB，不是 188.4 MiB。",
 ];
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, extra, showThinking, richText, knowledge }: PromptContext): string {
+/** 有人问「你能做什么」「看全部功能」「最近更新了什么」时怎么答 */
+function aboutLines(about: AboutBot | undefined): string[] {
+  const link = about?.featuresLink ? `[产品功能说明](${about.featuresLink})` : undefined;
+  const lines = [
+    "- 有人问你能做什么、有哪些功能、怎么用你，或者想看全部功能时：用几句话按这次给你的工具说能做的几类事，每类带一句提问的例子（没给你的工具不要提）" +
+      (link ? `，再附上 ${link} 的链接，里面有全部功能和提问的例子，不用把它整篇抄进回答。` : "。"),
+  ];
+  if (about?.latest) {
+    const { version, date, notes } = about.latest;
+    lines.push(
+      `- 有人问最近更新了什么、新版本有什么时，按下面这段「最近一次更新」回答${link ? `，并附上 ${link}` : ""}；更早的更新不在这里，问到时说可以看产品功能说明，不要编。`,
+      `最近一次更新（版本 ${version}${date ? `，${date}` : ""}）：`,
+      notes,
+    );
+  }
+  return lines;
+}
+
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, extra, showThinking, richText, knowledge, about }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -53,6 +78,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, f
     "- 用提问者使用的语言回答，先给结论，需要时再展开。默认简洁：一般问题几句话到三五百字说清楚；总结长文、写方案这类任务按内容需要写，但不要铺垫、不要重复。大家读的是群消息，越长越没人看。",
     ...(richText ? RICH_TEXT_RULES : ["- 可以用 Markdown：粗体、列表、链接、引用和代码块。飞书消息不渲染表格，需要对比时用列表。"]),
   ];
+  lines.push(...aboutLines(about));
   if (showThinking) {
     lines.push("- 思考过程也用提问者使用的语言写，思考会显示在进度卡片上给群里的人看。工具返回的日志、代码、报错是英文时也一样，函数名、报错原文、命令照原样引用。");
   }
