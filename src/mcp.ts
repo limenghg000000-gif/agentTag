@@ -16,6 +16,7 @@ import { findSensitive } from "./knowledge.js";
 import { RESULT_NOTES } from "./mcp-notes.js";
 import { COMMON_SUFFIX, compactText, formatToolResult, MCP_RESULT_LIMIT, resultText } from "./mcp-result.js";
 import type { Tool } from "./tools/tool.js";
+import { VERSION } from "./version.js";
 
 /** 普通工具的超时。个别工具在配置里单独定，如 aiops 的 diagnose_service 两分钟 */
 export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
@@ -691,7 +692,7 @@ class McpConnection {
   ) {}
 
   async sync(): Promise<SyncResult> {
-    const client = new Client({ name: "agenttag", version: "0.1.0" });
+    const client = new Client({ name: "agenttag", version: VERSION });
     // 传输层的后台错误（比如服务端推送用的 SSE 流断了）不影响调用，只记日志
     client.onerror = (err) => {
       if (err.message !== this.lastError) {

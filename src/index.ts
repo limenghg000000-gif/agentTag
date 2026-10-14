@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { MissedEventAlarm } from "./alarm.js";
+import { UpdateAnnouncer } from "./announce.js";
 import { MemoryBackup } from "./backup.js";
 import { createCardActionHandler, createMessageHandler } from "./bot.js";
 import { CardAnswerStore } from "./card-answers.js";
@@ -30,6 +31,7 @@ import { KnowledgeDesk } from "./tools/knowledge.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
 import { createWebSearchTool } from "./tools/web-search.js";
+import { VERSION } from "./version.js";
 
 if (existsSync(".env")) {
   process.loadEnvFile(".env");
@@ -263,7 +265,7 @@ try {
   process.exit(1);
 }
 console.log(
-  `飞书长连接已建立，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
+  `飞书长连接已建立，版本 ${VERSION}，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
     `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, ...(workspaces ? CODE_TOOL_NAMES : [])].join(", ")}，` +
     `群记忆存放在 ${config.memoryDir}`,
 );
@@ -346,6 +348,28 @@ if (backup) {
   backup.start();
   console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
 }
+// 部署新版本要重启：连上飞书后把 RELEASE_NOTES.md 里各群还没收到过的版本发过去，在后台做
+const announcer =
+  config.announce && config.announce.chatIds.length > 0
+    ? new UpdateAnnouncer({
+        ...config.announce,
+        send: (to, input) => channel.send(to, input),
+        botName: () => channel.botIdentity?.name,
+      })
+    : undefined;
+if (announcer) {
+  void announcer.run();
+  const { chatIds, chatIdsFrom } = config.announce!;
+  console.log(
+    `更新通知：新版本部署后，把 RELEASE_NOTES.md 里还没发过的版本发到 ${chatIds.length} 个群 ${chatIds.join(", ")}` +
+      (chatIdsFrom === "ANNOUNCE_CHAT_IDS"
+        ? "（按 ANNOUNCE_CHAT_IDS）"
+        : "（没配 ANNOUNCE_CHAT_IDS，发白名单里的所有群）") +
+      "，ANNOUNCE=off 关掉",
+  );
+} else if (!config.announce) {
+  console.log("更新通知：已关闭（ANNOUNCE=off）");
+}
 if (config.feishu.allowedChatIds.size === 0) {
   console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");
 } else {
@@ -356,6 +380,8 @@ const shutdown = async () => {
   // 停掉进行中的任务，让它们把卡片更新成「已停止」再退出
   await catchUp.stop();
   await backup?.stop();
+  // 正在发的更新通知发完再退出（最多等 5 秒），没发完的下次启动再发
+  await Promise.race([announcer?.stop(), new Promise((resolve) => setTimeout(resolve, 5_000))]);
   tasks.stopAll();
   await tasks.idle(5000);
   // 已经点了确认、正在写经验库的，写完再退出（最多等 10 秒）
