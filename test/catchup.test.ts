@@ -142,6 +142,57 @@ test("机器人回复过的消息变成话题后，也盯着话题里的追问",
   assert.equal(t.poller.watchedThreads, 1);
 });
 
+test("话题里跟聊：没 @ 机器人的话题消息，跟聊要跟的也补上，交给跟聊判断；不要的、应用发的照样不补", async () => {
+  const considered: string[] = [];
+  const handledIds: string[] = [];
+  const asked: string[] = [];
+  const logs: string[] = [];
+  const handled = new HandledMessages();
+  handled.claim("om_root");
+  const thread = (id: string, at: number, extra: Partial<NormalizedMessage> = {}) =>
+    msg(id, at, { rootId: "om_root", threadId: "omt_1", mentionedBot: false, ...extra });
+  const poller = new CatchUpPoller({
+    api: {
+      async listRecentMessages(container) {
+        if (container === "chat") {
+          return [user(msg("om_root", START + 10_000, { threadId: "omt_1" }))];
+        }
+        return [
+          user(thread("om_follow", START + 50_000)),
+          user(thread("om_to_others", START + 51_000, { content: "张三你看下" })),
+          { message: thread("om_app", START + 52_000), fromBot: false, fromApp: true },
+          user(thread("om_mention", START + 53_000, { mentionedBot: true })),
+        ];
+      },
+    },
+    chatIds: new Set(["oc_1"]),
+    handled,
+    handle: async (m) => {
+      handledIds.push(m.messageId);
+    },
+    follow: {
+      wants(m, fromApp) {
+        asked.push(`${m.messageId}${fromApp ? " app" : ""}`);
+        return !fromApp && m.messageId === "om_follow";
+      },
+      async consider(m) {
+        considered.push(m.messageId);
+      },
+    },
+    logger: { ...quiet, info: (line: string) => logs.push(line) },
+    now: () => START + 60_000,
+    since: START,
+  });
+
+  assert.equal(await poller.pollOnce(), 2);
+  assert.deepEqual(considered, ["om_follow"]);
+  assert.deepEqual(handledIds, ["om_mention"]);
+  assert.deepEqual(asked, ["om_follow", "om_to_others", "om_app app"]);
+  assert.match(logs.join("\n"), /补漏：话题里没 @ 机器人的消息事件没送到，由轮询补上 chat=oc_1 message=om_follow/);
+  // 补过的不再补
+  assert.equal(await poller.pollOnce(), 0);
+});
+
 test("事件收到的话题消息也开始盯这个话题；很久没动静的话题不再盯", async () => {
   const t = setup();
   t.poller.watch(msg("om_1", START, { rootId: "om_root", threadId: "omt_1" }));

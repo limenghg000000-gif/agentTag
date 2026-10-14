@@ -9,6 +9,7 @@ import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { loadConfig } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { createFeishuApi } from "./feishu.js";
+import { ThreadFollower } from "./follow.js";
 import { createFollowUp } from "./follow-up.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
@@ -39,8 +40,8 @@ const channel = createLarkChannel({
   appSecret: config.feishu.appSecret,
   domain: config.feishu.domain,
   loggerLevel: LoggerLevel.info,
-  // 群里只响应 @ 机器人的消息，@所有人 不响应；单聊暂不开
-  policy: { requireMention: true, dmMode: "disabled" },
+  // 群里没 @ 机器人的消息也交过来，由下面按跟聊的规则筛（FOLLOW_THREADS=off 时一律不管）；@所有人 不响应；单聊暂不开
+  policy: { requireMention: false, dmMode: "disabled" },
   // 关掉按群排队合并：同一个群里几个人同时 @，各自独立处理。同一话题里的任务由 TaskRegistry 排队
   safety: { chatQueue: { enabled: false } },
 });
@@ -107,8 +108,11 @@ const images = config.vision
       vision: createOpenAICompatibleVisionModel({ baseURL: config.llm.baseURL, apiKey: config.llm.apiKey, ...config.vision }),
     })
   : undefined;
+const model = createOpenAICompatibleModel(config.llm);
+// 在群里直接 @ 时带上群里刚才的聊天（CHAT_CONTEXT）
+const context = new ThreadContextLoader(feishuApi, console, undefined, cardAnswers, config.chatContext);
 const handleMessage = createMessageHandler({
-  model: createOpenAICompatibleModel(config.llm),
+  model,
   tools,
   // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分
   taskTools: ({ chatId, senderId, threadKey, askerName }) => [
@@ -126,13 +130,35 @@ const handleMessage = createMessageHandler({
   showThinking: config.showThinking,
   ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient), cardAnswers } : {}),
   botName: () => channel.botIdentity?.name,
-  context: new ThreadContextLoader(feishuApi, console, undefined, cardAnswers),
+  context,
   recentThreads,
   memory,
   tasks,
   send: (to, input, opts) => channel.send(to, input, opts),
   updateCard: (messageId, card) => channel.updateCard(messageId, card),
 });
+
+// 话题里跟聊：机器人回答过的话题里，没 @ 它的追问先判断是不是对它说的，是才回
+const follower = config.followThreads
+  ? new ThreadFollower({
+      allowedChatIds: config.feishu.allowedChatIds,
+      context,
+      model,
+      botName: () => channel.botIdentity?.name,
+      botOpenId: () => channel.botIdentity?.openId,
+      busy: (threadKey) => tasks.busy(threadKey),
+      handle: (msg) => handleMessage(msg),
+      reply: (msg, markdown) => channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true }),
+    })
+  : undefined;
+/** @ 了机器人的消息：话题里说「只在 @ 我时回」的停掉跟聊，别的照常回答，之后跟着这个话题 */
+const answerMention = async (msg: NormalizedMessage) => {
+  if (await follower?.muteIfAsked(msg)) {
+    return;
+  }
+  follower?.track(msg);
+  await handleMessage(msg);
+};
 
 // 事件和补漏轮询可能拿到同一条消息，谁先认领谁处理
 const handled = new HandledMessages();
@@ -146,11 +172,21 @@ const catchUp = new CatchUpPoller({
   handled,
   handle: (msg) => {
     alarm.record(msg);
-    return handleMessage(msg);
+    return answerMention(msg);
   },
+  ...(follower ? { follow: follower } : {}),
   intervalMs: config.catchUpIntervalMs || undefined,
 });
 channel.on("message", async (msg: NormalizedMessage) => {
+  if (!msg.mentionedBot) {
+    // 没 @ 机器人的：只看跟聊在跟的话题里的，别的（包括白名单外的群）一律不管，也不记日志
+    if (!follower?.wants(msg) || !handled.claim(msg.messageId)) {
+      return;
+    }
+    catchUp.watch(msg);
+    await follower.consider(msg);
+    return;
+  }
   if (!handled.claim(msg.messageId)) {
     // 轮询已经补上了这条：事件只是晚到，不是被别处分走
     alarm.arrivedLate(msg.messageId);
@@ -158,7 +194,7 @@ channel.on("message", async (msg: NormalizedMessage) => {
     return;
   }
   catchUp.watch(msg);
-  await handleMessage(msg);
+  await answerMention(msg);
 });
 // 回答下面的「接着查」按钮：机器人替点的人在话题里发一句，再当成他问的处理（只给读的工具）
 const followUp = createFollowUp({
@@ -167,6 +203,7 @@ const followUp = createFollowUp({
   handle: (msg, options) => {
     // 和收到的消息一样记进补漏轮询：点按钮可能让一个已经不再跟踪的话题又活了，后面的 @ 漏了事件还能补上
     catchUp.watch(msg);
+    follower?.track(msg);
     return handleMessage(msg, options);
   },
 });
@@ -197,6 +234,16 @@ console.log(
   config.streamCard
     ? "卡片即回答：思考和回答边生成边写进进度卡片（要开 cardkit:card:write 权限，建不了卡片时自动退回原来的方式），STREAM_CARD=off 可以关掉"
     : "卡片即回答没开（STREAM_CARD=off）：进度卡片只显示进度，回答另外发",
+);
+console.log(
+  follower
+    ? "话题里跟聊：回答过的话题里，没 @ 的追问先判断是不是对机器人说的，是才回；话题里说「只在 @ 我时回」就不跟了（FOLLOW_THREADS=off 可以关掉）"
+    : "话题里跟聊没开（FOLLOW_THREADS=off）：只回 @ 机器人的消息",
+);
+console.log(
+  config.chatContext
+    ? "群里直接 @ 时带上之前半小时内的群聊（最多 20 条），「看下上面那个报错」接得上（CHAT_CONTEXT=off 可以关掉）"
+    : "群里直接 @ 时不带群聊（CHAT_CONTEXT=off）",
 );
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();

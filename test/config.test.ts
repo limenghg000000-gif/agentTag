@@ -185,6 +185,15 @@ test("SHOW_THINKING：默认在进度卡片上显示思考，off 关掉，写错
   assert.throws(() => loadConfig({ ...base, SHOW_THINKING: "yes" }), /SHOW_THINKING 只能是 on 或 off/);
 });
 
+test("FOLLOW_THREADS、CHAT_CONTEXT：默认开，off 关掉，写错时报错", () => {
+  assert.equal(loadConfig(base).followThreads, true);
+  assert.equal(loadConfig(base).chatContext, true);
+  assert.equal(loadConfig({ ...base, FOLLOW_THREADS: " OFF " }).followThreads, false);
+  assert.equal(loadConfig({ ...base, CHAT_CONTEXT: "off" }).chatContext, false);
+  assert.throws(() => loadConfig({ ...base, FOLLOW_THREADS: "yes" }), /FOLLOW_THREADS 只能是 on 或 off/);
+  assert.throws(() => loadConfig({ ...base, CHAT_CONTEXT: "1" }), /CHAT_CONTEXT 只能是 on 或 off/);
+});
+
 test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开 20 个只读工具（含 promote_case），令牌从 MCP_AIOPS_TOKEN 读", () => {
   assert.deepEqual(loadConfig(base).mcp, []);
   const [aiops, ...rest] = loadConfig({ ...base, MCP_SERVERS: " aiops=https://aiops.example.com/mcp ", MCP_AIOPS_TOKEN: " t0k " }).mcp;

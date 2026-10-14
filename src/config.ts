@@ -58,6 +58,10 @@ export interface Config {
   showThinking: boolean;
   /** 卡片即回答（STREAM_CARD，默认 on）：思考和回答边生成边写进进度卡片，回答不再另外发 */
   streamCard: boolean;
+  /** 话题里跟聊（FOLLOW_THREADS，默认 on）：机器人回答过的话题里，追问不用再 @ */
+  followThreads: boolean;
+  /** 带上群里刚才的聊天（CHAT_CONTEXT，默认 on）：在群里直接 @ 时，把这之前半小时内的群聊一起给模型 */
+  chatContext: boolean;
   /** 卡片即回答时记下卡片里的回答的目录（每个群一个 JSON 文件），读话题历史时用 */
   cardAnswersDir: string;
   /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
@@ -230,6 +234,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`STREAM_CARD 只能是 on 或 off，当前为 ${env.STREAM_CARD}`);
   }
 
+  const followThreads = (env.FOLLOW_THREADS?.trim() || "on").toLowerCase();
+  if (followThreads !== "on" && followThreads !== "off") {
+    throw new Error(`FOLLOW_THREADS 只能是 on 或 off，当前为 ${env.FOLLOW_THREADS}`);
+  }
+
+  const chatContext = (env.CHAT_CONTEXT?.trim() || "on").toLowerCase();
+  if (chatContext !== "on" && chatContext !== "off") {
+    throw new Error(`CHAT_CONTEXT 只能是 on 或 off，当前为 ${env.CHAT_CONTEXT}`);
+  }
+
   const code = loadCodeConfig(env);
   const knowledgeEnv = env.KNOWLEDGE?.trim().toLowerCase();
   if (knowledgeEnv && !["on", "off"].includes(knowledgeEnv)) {
@@ -278,6 +292,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mcp: loadMcpConfig(env),
     showThinking: showThinking === "on",
     streamCard: streamCard === "on",
+    followThreads: followThreads === "on",
+    chatContext: chatContext === "on",
     cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),

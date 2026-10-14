@@ -27,7 +27,7 @@ import {
   unverifiedOpsAnswer,
   writtenInEnglish,
 } from "../src/bot.js";
-import type { ImageRef, ThreadContext } from "../src/history.js";
+import { CHAT_CONTEXT_HEADER, type ImageRef, type ThreadContext } from "../src/history.js";
 import { UNREAD_IMAGE } from "../src/images.js";
 import { type ChatMessage, type ChatModel, type ChatRequest, type ChatResult, LlmError } from "../src/llm.js";
 import { compactText } from "../src/mcp-result.js";
@@ -525,6 +525,23 @@ test("话题里第三轮以后的追问：查经验库带上最近几轮提问�
   assert.equal(lines[3], "帮我看下这个线上报警");
   assert.equal(lines.length, 4);
   assert.doesNotMatch(queries[0], /张三|李四/, "发言人的名字不发给经验库");
+});
+
+test("群里直接 @ 时带上的群聊交给模型，但不拿去查经验库", async () => {
+  const queries: string[] = [];
+  const knowledge = {
+    async lookup(query: string) {
+      queries.push(query);
+      return { text: "", ids: [] };
+    },
+    tools: () => [],
+  };
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const chat = `${CHAT_CONTEXT_HEADER}\n[张三 10:21] 我的手机号 13812345678，gateway 又报 code=8 了`;
+  const { handle } = setup({ model, knowledge, context: fakeContext({ history: [{ role: "user", content: chat }], source: "chat" }).source });
+  await handle(message("看下上面那个报错"));
+  assert.deepEqual(queries, ["看下上面那个报错"]);
+  assert.match(JSON.stringify(requests[0].messages), /gateway 又报 code=8 了/);
 });
 
 test("追问时贴了一大段日志：查经验库的文字截短到两个库都查得到的长度，第一个问题照样带上，中间几轮放得下几轮放几轮", async () => {

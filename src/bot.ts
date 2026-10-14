@@ -4,7 +4,7 @@ import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { imageKeysOf } from "./feishu.js";
-import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
+import { CARD_DONE_NOTICE, type ImageRef, isChatContext, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
@@ -54,7 +54,7 @@ const NOTIFY_AFTER_MS = 60_000;
 /** 连长连接之前还不知道机器人名字时用这个 */
 const FALLBACK_BOT_NAME = "AI 助手";
 /** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
-const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
+export const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
 /** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
 export const DEEP_THINKING = /深度思考|仔细(想|思考|分析)|认真(想|思考|分析)/;
 // 只说「知识库」「经验库」指的是团队经验库（knowledge_propose 起草、确认后存进多维表格），说「飞书知识库」才是飞书文档
@@ -755,7 +755,8 @@ async function readImages(
  * 每轮用截短前的全文（asked 也是）；secret 是用到的几轮里有没有像密钥的
  */
 function lookupQuery(asked: string, history: readonly ChatMessage[]): { query: string; secret: boolean } {
-  const asks = history.flatMap((m) => (m.role === "user" ? [unlabelUserMessage(m.full ?? m.content)] : []));
+  // 群里直接 @ 时带上的群聊不是提问，不拿去查（也不发到 aiops）
+  const asks = history.flatMap((m) => (m.role === "user" && !isChatContext(m) ? [unlabelUserMessage(m.full ?? m.content)] : []));
   const recent = asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse();
   // 截短前先用每轮的全文认密钥、给手机号身份证号打码：截在一半就认不出来了（<password>… 的结尾截掉了、号码只剩半截），会发到 aiops。
   // 给模型看的上文早就截短了（长消息、长的图片文字），截掉的后半段可能正是认出前面是密钥的那部分（data 在前、kind: Secret 在后的 Secret），所以用全文

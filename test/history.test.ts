@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { FeishuApi, ThreadMessage } from "../src/feishu.js";
-import { labelUserMessage, MAX_HISTORY_CHARS, ThreadContextLoader, toChatMessages, unlabelUserMessage } from "../src/history.js";
+import {
+  CHAT_CONTEXT_CHARS,
+  CHAT_CONTEXT_HEADER,
+  CHAT_CONTEXT_MS,
+  isChatContext,
+  labelUserMessage,
+  MAX_HISTORY_CHARS,
+  renderChat,
+  ThreadContextLoader,
+  toChatMessages,
+  unlabelUserMessage,
+} from "../src/history.js";
 
 function message(extra: Partial<NormalizedMessage> = {}): NormalizedMessage {
   return {
@@ -194,6 +205,90 @@ test("在群里直接 @ 时没有上文；用「回复」引用消息时带上�
   assert.deepEqual(await loader.load(message()), { history: [], source: "none" });
   const quoted = await loader.load(message({ rootId: "om_quoted", replyToMessageId: "om_quoted" }));
   assert.deepEqual(quoted.history, [{ role: "user", content: "[张三] 明天下午开会" }]);
+});
+
+/** 北京时间 2026-10-14 10:30 */
+const AT = Date.UTC(2026, 9, 14, 2, 30);
+const minutesBefore = (n: number) => AT - n * 60_000;
+
+function chatApi(chat: ThreadMessage[] | Error, single: Record<string, ThreadMessage> = {}) {
+  const { api, calls } = fakeApi([], single);
+  return {
+    calls,
+    api: {
+      ...api,
+      async listChatMessages(chatId: string, sinceMs: number, limit: number) {
+        calls.push(`chat ${chatId} since=${sinceMs} limit=${limit}`);
+        if (chat instanceof Error) {
+          throw chat;
+        }
+        return chat;
+      },
+    },
+  };
+}
+
+test("在群里直接 @ 时带上之前半小时内的群聊：标上发言人和北京时间，不带机器人发的、这条之后的、这条本身", async () => {
+  const { api, calls } = chatApi([
+    item("om_c1", { senderName: "张三", content: "gateway 又报 code=8 了", createTime: minutesBefore(9) }),
+    item("om_card", { fromBot: true, msgType: "interactive", content: "进度卡片", createTime: minutesBefore(8) }),
+    item("om_c2", { senderName: "李四", content: "![image](img_1)", images: ["img_1"], createTime: minutesBefore(8) }),
+    item("om_3", { senderName: "王五", content: "看下上面那个报错", createTime: AT }),
+    item("om_later", { senderName: "张三", content: "我先去吃饭", createTime: AT + 1000 }),
+  ]);
+  const loader = new ThreadContextLoader(api, quiet, undefined, undefined, true);
+  const context = await loader.load(message({ content: "看下上面那个报错", createTime: AT }));
+
+  assert.equal(calls[0], `chat oc_1 since=${AT - CHAT_CONTEXT_MS} limit=21`);
+  assert.deepEqual(context.history, [
+    { role: "user", content: `${CHAT_CONTEXT_HEADER}\n[张三 10:21] gateway 又报 code=8 了\n[李四 10:22] ![image](img_1)` },
+  ]);
+  assert.equal(isChatContext(context.history[0]), true);
+  assert.deepEqual(context.images, [{ messageId: "om_c2", imageKey: "img_1" }]);
+  assert.equal(context.source, "chat");
+  assert.equal(context.chatMessages, 2);
+});
+
+test("群聊和「回复」引用的消息一起带上时，被引用的那条不在群聊里重复", async () => {
+  const quoted = item("om_quoted", { senderName: "张三", content: "明天下午开会", createTime: minutesBefore(5) });
+  const { api } = chatApi([quoted, item("om_c1", { senderName: "李四", content: "收到", createTime: minutesBefore(4) })], { om_quoted: quoted });
+  const loader = new ThreadContextLoader(api, quiet, undefined, undefined, true);
+  const context = await loader.load(message({ createTime: AT, rootId: "om_quoted", replyToMessageId: "om_quoted" }));
+
+  assert.deepEqual(context.history, [
+    { role: "user", content: `${CHAT_CONTEXT_HEADER}\n[李四 10:26] 收到` },
+    { role: "user", content: "[张三] 明天下午开会" },
+  ]);
+  assert.equal(context.source, "local");
+});
+
+test("没开 CHAT_CONTEXT、在话题里 @ 的都不读群聊；读群聊失败时只提示一次，照常回答", async () => {
+  const off = chatApi([item("om_c1", { createTime: minutesBefore(1) })]);
+  assert.deepEqual(await new ThreadContextLoader(off.api, quiet).load(message({ createTime: AT })), { history: [], source: "none" });
+  assert.ok(!off.calls.some((call) => call.startsWith("chat")));
+
+  const inThread = chatApi([item("om_c1", { createTime: minutesBefore(1) })]);
+  await new ThreadContextLoader(inThread.api, quiet, undefined, undefined, true).load(message({ createTime: AT, threadId: "omt_1", rootId: "om_1" }));
+  assert.ok(!inThread.calls.some((call) => call.startsWith("chat")));
+
+  const warnings: string[] = [];
+  const failing = chatApi(new Error("no permission"));
+  const loader = new ThreadContextLoader(failing.api, { ...quiet, warn: (line: string) => warnings.push(line) }, undefined, undefined, true);
+  assert.deepEqual(await loader.load(message({ createTime: AT })), { history: [], source: "none" });
+  await loader.load(message({ createTime: AT }));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /读取群里刚才的聊天失败，这次只看提问本身：no permission/);
+});
+
+test("群聊太长时省略较早的，单条太长的截短", () => {
+  const long = "很".repeat(2000);
+  const messages = Array.from({ length: 10 }, (_, i) => item(`om_${i}`, { senderName: `人${i}`, content: long, createTime: minutesBefore(10 - i) }));
+  const text = renderChat(messages);
+  assert.ok(text.length <= CHAT_CONTEXT_CHARS + CHAT_CONTEXT_HEADER.length + 40);
+  assert.match(text, /^（下面是群里在这次 @ 你之前的聊天/);
+  assert.match(text, /（更早的 \d+ 条省略）/);
+  assert.match(text, /\[人9 10:29\] 很+…（后面省略）$/);
+  assert.ok(!text.includes("[人0 "));
 });
 
 test("卡片即回答：机器人的卡片记过回答的换成回答，没记过的（进度卡片）照样去掉", async () => {
