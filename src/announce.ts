@@ -11,12 +11,16 @@ export interface ReleaseNotesVersion {
   date?: string;
   /** 发到群里的说明：标题行之后、第一个 ### 小标题之前的部分，去掉了 PR 号 */
   notes: string;
+  /** 技术版 CHANGELOG.md 里同一版本的内容，卡片上折叠放在「技术说明」里；没有时为空 */
+  tech?: string;
 }
 
 /** 一张通知卡片最多列几个版本，更早的只说还有几个 */
 export const MAX_ANNOUNCED_VERSIONS = 5;
 /** 一张通知卡片里说明的总字数上限，超了后面的版本只说还有几个 */
 const MAX_NOTES_CHARS = 3000;
+/** 一个版本的技术说明最多放多少字；一张卡片里技术说明加起来也不超过 MAX_NOTES_CHARS，超了后面的版本不放 */
+const MAX_TECH_CHARS = 1500;
 /** 发失败的群过一阵再试 */
 export const ANNOUNCE_RETRY_MS = 10 * 60_000;
 /** 一个群一次部署最多试这么多次，还发不出去就等下次重启 */
@@ -65,6 +69,37 @@ export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
   return versions;
 }
 
+/**
+ * 读技术版更新日志（CHANGELOG.md）：版本号 → 这一版的全部内容（「### 新增」这类分类小标题换成加粗），
+ * 放进通知卡片折叠的「技术说明」里。没有版本号的段跳过
+ */
+export function parseChangelogTech(text: string): Map<string, string> {
+  const sections = new Map<string, string>();
+  let current: { version: string; lines: string[] } | undefined;
+  const flush = () => {
+    if (current && !sections.has(current.version)) {
+      const body = current.lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+      if (body) {
+        sections.set(current.version, body);
+      }
+    }
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (H2.test(line)) {
+      flush();
+      const match = VERSION_HEADING.exec(line);
+      current = match ? { version: `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`, lines: [] } : undefined;
+      continue;
+    }
+    if (current) {
+      const h3 = /^###\s+(.+?)\s*$/.exec(line);
+      current.lines.push(h3 ? `**${h3[1]}**` : line.trimEnd());
+    }
+  }
+  flush();
+  return sections;
+}
+
 /** 按数字比较两个 x.y.z 版本号：a 新返回正数，一样返回 0 */
 export function compareVersions(a: string, b: string): number {
   const pa = a.split(".").map(Number);
@@ -95,7 +130,7 @@ export function pendingVersions(versions: readonly ReleaseNotesVersion[], lastAn
 
 export interface AnnouncementOptions {
   botName?: string;
-  /** 「看全部功能」按钮打开的链接 */
+  /** 「产品功能说明」按钮打开的链接 */
   link?: string;
   /** 这个群第一次收到更新通知：末尾介绍一句自己 */
   firstTime?: boolean;
@@ -112,25 +147,46 @@ function shownVersions(versions: readonly ReleaseNotesVersion[]): ReleaseNotesVe
     if (shown.length >= MAX_ANNOUNCED_VERSIONS || (shown.length > 0 && chars + v.notes.length > MAX_NOTES_CHARS)) {
       break;
     }
-    shown.push(v.notes.length > MAX_NOTES_CHARS ? { ...v, notes: truncateNotes(v.notes) } : v);
+    shown.push(v.notes.length > MAX_NOTES_CHARS ? { ...v, notes: truncateText(v.notes, MAX_NOTES_CHARS, "见更新说明") } : v);
     chars += v.notes.length;
   }
-  return shown;
+  // 技术说明另算一份字数：每版最多 MAX_TECH_CHARS 字，加起来超了 MAX_NOTES_CHARS 后面的版本就不放
+  let techChars = 0;
+  return shown.map((v) => {
+    if (!v.tech) {
+      return v;
+    }
+    const tech = v.tech.length > MAX_TECH_CHARS ? truncateText(v.tech, MAX_TECH_CHARS, "见 CHANGELOG.md") : v.tech;
+    if (techChars + tech.length > MAX_NOTES_CHARS) {
+      const { tech: _dropped, ...rest } = v;
+      return rest;
+    }
+    techChars += tech.length;
+    return { ...v, tech };
+  });
 }
 
-/** 按行截到 MAX_NOTES_CHARS 字以内，末尾说一句没列全；第一行就超了按字截 */
-function truncateNotes(notes: string): string {
+/** 按行截短，连同末尾「没列全」那句不超过 max 字；第一行就超了按字截 */
+function truncateText(text: string, max: number, seeAlso: string): string {
+  const tail = `\n…（太长了没列全，${seeAlso}）`;
+  const room = max - tail.length;
   const kept: string[] = [];
   let chars = 0;
-  for (const line of notes.split("\n")) {
-    if (chars + line.length + 1 > MAX_NOTES_CHARS) {
+  for (const line of text.split("\n")) {
+    if (chars + line.length + 1 > room) {
       break;
     }
     kept.push(line);
     chars += line.length + 1;
   }
-  const head = kept.length > 0 ? kept.join("\n") : [...notes].slice(0, MAX_NOTES_CHARS).join("");
-  return `${head}\n…（太长了没列全，见更新说明）`;
+  const head = kept.length > 0 ? kept.join("\n") : [...text].slice(0, room).join("");
+  return `${head}${tail}`;
+}
+
+/** 每个版本说明上面的一行：只有一个版本时是「本次更新了什么」，几个版本时写明是哪一版 */
+function versionHeading(v: ReleaseNotesVersion, single: boolean, date: (text: string) => string): string {
+  const when = [`版本 ${v.version}`, ...(v.date ? [v.date] : [])].join(" · ");
+  return single ? `**本次更新了什么**　${date(when)}` : `**${v.version} 更新了什么**${v.date ? `　${date(v.date)}` : ""}`;
 }
 
 /** 卡片和退回的文字末尾都有的几句：还有几个版本没列、第一次收到通知时介绍一句自己 */
@@ -148,20 +204,32 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
   const name = options.botName || "机器人";
   const shown = shownVersions(versions);
   const title = `${name} 更新了 · ${versions[0]?.version ?? ""}`;
-  const elements: object[] = shown.map((v) => ({
-    tag: "markdown",
-    // 只有一个版本时标题里已经有版本号了，不再写一遍
-    content: [
-      ...(versions.length > 1 ? [`**${v.version}**${v.date ? ` <font color='grey'>${escapeCardMarkdown(v.date)}</font>` : ""}`] : []),
-      escapeCardMarkdown(v.notes),
-    ].join("\n"),
-  }));
+  const grey = (text: string) => `<font color='grey'>${escapeCardMarkdown(text)}</font>`;
+  const elements: object[] = shown.flatMap((v) => [
+    { tag: "markdown", content: [versionHeading(v, versions.length === 1, grey), escapeCardMarkdown(v.notes)].join("\n") },
+    // 技术说明给开发同事看，默认收起
+    ...(v.tech
+      ? [
+          {
+            tag: "collapsible_panel",
+            expanded: false,
+            header: {
+              title: { tag: "markdown", content: `<font color='grey'>技术说明（${escapeCardMarkdown(v.version)}，给开发看）</font>` },
+              icon: { tag: "standard_icon", token: "down-small-ccm_outlined", size: "16px 16px" },
+              icon_position: "right",
+              icon_expanded_angle: -180,
+            },
+            elements: [{ tag: "markdown", content: escapeCardMarkdown(v.tech) }],
+          },
+        ]
+      : []),
+  ]);
   const footer = footerLines(escapeCardMarkdown(name), versions.length - shown.length, options.firstTime);
   elements.push({ tag: "markdown", content: footer.map((line) => `<font color='grey'>${line}</font>`).join("\n") });
   if (options.link) {
     elements.push({
       tag: "button",
-      text: { tag: "plain_text", content: "看全部功能" },
+      text: { tag: "plain_text", content: "产品功能说明" },
       type: "primary",
       size: "small",
       behaviors: [{ type: "open_url", default_url: options.link }],
@@ -176,23 +244,19 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
 }
 
 /**
- * 飞书说卡片格式不对时退回的文字，列的版本和末尾的几句都和卡片一样。尖括号换成全角：Markdown 里的 <at id=all></at> 也会 @所有人
+ * 飞书说卡片格式不对时退回的文字，列的版本和末尾的几句都和卡片一样，技术说明不放（文字消息放不下那么长）。
+ * 尖括号换成全角：Markdown 里的 <at id=all></at> 也会 @所有人
  */
 export function renderAnnouncementMarkdown(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): string {
   const name = options.botName || "机器人";
   const shown = shownVersions(versions);
   const lines = [`**${name} 更新了 · ${versions[0]?.version ?? ""}**`];
   for (const v of shown) {
-    if (versions.length > 1) {
-      lines.push("", `**${v.version}**${v.date ? ` ${v.date}` : ""}`);
-    } else {
-      lines.push("");
-    }
-    lines.push(v.notes);
+    lines.push("", versionHeading(v, versions.length === 1, (text) => text), v.notes);
   }
   lines.push("", ...footerLines(name, versions.length - shown.length, options.firstTime));
   if (options.link) {
-    lines.push("", `全部功能：${options.link}`);
+    lines.push("", `产品功能说明：${options.link}`);
   }
   return lines.join("\n").replace(/</g, "＜").replace(/>/g, "＞");
 }
@@ -205,6 +269,8 @@ interface AnnounceState {
 export interface UpdateAnnouncerOptions {
   /** 产品更新说明 RELEASE_NOTES.md 的位置 */
   notesFile: string;
+  /** 技术版 CHANGELOG.md 的位置，同一版本的内容折叠放在卡片的「技术说明」里；读不到就不放 */
+  changelogFile?: string;
   /** 记每个群发到哪一版的文件 */
   stateFile: string;
   /** 发到这些群 */
@@ -263,11 +329,13 @@ export class UpdateAnnouncer {
       this.logger.warn(`更新通知：读不到 ${this.opts.notesFile}，这次不发`, err);
       return;
     }
-    const versions = parseReleaseNotes(text);
-    if (versions.length === 0) {
+    const notes = parseReleaseNotes(text);
+    if (notes.length === 0) {
       this.logger.warn(`更新通知：${this.opts.notesFile} 里没有「## x.y.z」这样的版本，这次不发`);
       return;
     }
+    const tech = await this.loadTech();
+    const versions = notes.map((v) => (tech.has(v.version) ? { ...v, tech: tech.get(v.version)! } : v));
     const state = await this.loadState();
     const failed: string[] = [];
     for (const chatId of chatIds) {
@@ -333,6 +401,19 @@ export class UpdateAnnouncer {
     } catch (err) {
       this.logger.warn(`更新通知：发不到群 ${chatId}`, err);
       return false;
+    }
+  }
+
+  /** 技术版更新日志里每个版本的内容；没配或读不到时为空，通知照发，只是不带技术说明 */
+  private async loadTech(): Promise<Map<string, string>> {
+    if (!this.opts.changelogFile) {
+      return new Map();
+    }
+    try {
+      return parseChangelogTech(await readFile(this.opts.changelogFile, "utf8"));
+    } catch (err) {
+      this.logger.warn(`更新通知：读不到 ${this.opts.changelogFile}，这次不带技术说明`, err);
+      return new Map();
     }
   }
 

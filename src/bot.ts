@@ -32,7 +32,7 @@ import {
   STOP_ACTION,
   visibleThought,
 } from "./progress.js";
-import { buildSystemPrompt } from "./prompt.js";
+import { type AboutBot, buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
@@ -152,6 +152,8 @@ export interface BotDeps {
   cardIntervalMs?: number;
   /** 进度卡片上显示模型每轮的思考（SHOW_THINKING）。不传时显示 */
   showThinking?: boolean;
+  /** 有人问「你能做什么」「最近更新了什么」时用：产品功能说明的链接、最新一版的更新说明 */
+  about?: AboutBot;
   /**
    * 卡片即回答（STREAM_CARD）：进度卡片用飞书卡片实体，思考和回答边生成边写进卡片，回答不再另外发。
    * 不传、或者卡片实体建不了时，和以前一样：进度卡片只显示进度，回答另外发
@@ -524,6 +526,7 @@ async function runTask(
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
+        ...(deps.about ? { about: deps.about } : {}),
         ...(deps.knowledge
           ? {
               knowledge: {

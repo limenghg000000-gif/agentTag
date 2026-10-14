@@ -30,7 +30,8 @@
 - **中途停止**：点卡片上的「停止」按钮，或在话题里 @ 机器人说「停止」（机器人在跟的话题里不 @ 也行）。
 - **不重复处理「同时发送到群」**：在话题里 @ 机器人时勾了「同时发送到群」，群里会多出一条一样的消息。同一个人 10 秒内发的同一句话只处理一次（话题里那条优先），写文档这类操作不会做两遍，日志里记一行「跳过重复的提问」。
 - **知道自己叫什么**：机器人在飞书里的名字（比如「飞书 CLI」）会写进提示词。
-- **更新通知**：部署新版本重启后，机器人把产品更新说明 [RELEASE_NOTES.md](RELEASE_NOTES.md) 里各群还没收到过的版本发到群里（一张「飞书 CLI 更新了」的卡片）。发到哪些群看 `.env`：配了 `ANNOUNCE_CHAT_IDS` 就只发这几个群，没配就发 `FEISHU_ALLOWED_CHAT_IDS` 里的所有群，启动日志里会列出来。每个群收到哪一版记在 `data/announce/state.json`，重启不会重发；新加的群第一次只收到最新的一版。技术版的更新日志 [CHANGELOG.md](CHANGELOG.md) 不发群里。
+- **更新通知**：部署新版本重启后，机器人把产品更新说明 [RELEASE_NOTES.md](RELEASE_NOTES.md) 里各群还没收到过的版本发到群里（一张「飞书 CLI 更新了」的卡片）。发到哪些群看 `.env`：配了 `ANNOUNCE_CHAT_IDS` 就只发这几个群，没配就发 `FEISHU_ALLOWED_CHAT_IDS` 里的所有群，启动日志里会列出来。每个群收到哪一版记在 `data/announce/state.json`，重启不会重发；新加的群第一次只收到最新的一版。卡片上每个版本先写「本次更新了什么」（产品版的大白话），下面折叠一个「技术说明」，放技术版更新日志 [CHANGELOG.md](CHANGELOG.md) 里同一版本的内容，点开才看得到。
+- **问「你能做什么」**：有人 @ 机器人问能做什么、想看全部功能、最近更新了什么，它按自己现在有的工具简单介绍几类事，附上产品功能说明的链接（`ANNOUNCE_LINK`）；最近更新了什么按 `RELEASE_NOTES.md` 最新一版回答。
 
 长连接模式只需要能访问公网，不需要公网地址，内网服务器或本地电脑都能跑。
 
@@ -201,7 +202,7 @@ npm start
 | `KNOWLEDGE_EMBEDDING_MODEL` | 否 | 经验库按意思检索用的向量模型，和主模型用同一个服务和 Key。百炼默认 `text-embedding-v4`，别家服务不配时只按关键词检索，填 `off` 也只按关键词 |
 | `ANNOUNCE` | 否 | 更新通知，`on`（默认）或 `off`。部署新版本重启后，把 `RELEASE_NOTES.md` 里还没发过的版本发到群里 |
 | `ANNOUNCE_CHAT_IDS` | 否 | 更新通知只发这几个群（chat_id，逗号分隔，要在 `FEISHU_ALLOWED_CHAT_IDS` 里）。不填就发白名单里的所有群 |
-| `ANNOUNCE_LINK` | 否 | 更新通知卡片上「看全部功能」按钮打开的链接，要是 `https://` 地址，比如功能说明或文档中心。不填就没有按钮 |
+| `ANNOUNCE_LINK` | 否 | 产品功能说明的链接，要是 `https://` 地址。更新通知卡片上「产品功能说明」按钮打开它；有人 @ 机器人问「你能做什么」「想看全部功能」时，回答里也附上它（`ANNOUNCE=off` 时也附）。不填就没有按钮，回答里也不附链接 |
 | `DATA_DIR` | 否 | 数据目录，默认启动目录下的 `data`。群记忆存在 `<DATA_DIR>/memory/<chat_id>.json`，卡片里的回答按话题记在 `<DATA_DIR>/card-answers/<chat_id>/<话题第一条消息 id>.json`（每个话题最近 60 条，读话题历史用；半年没再记新回答的话题文件自动删掉），每个群最近 30 个话题的问答记在 `<DATA_DIR>/recent-threads/<chat_id>.json`（`chat_recent_threads` 用） |
 
 **换模型**：百炼上的其他模型（千问其他型号，以及 Kimi、GLM、DeepSeek 等第三方模型）只需改 `MODEL_ID`，模型 ID 在百炼控制台的模型列表里查。要换到别家的 OpenAI 兼容接口，再改 `MODEL_BASE_URL` 和 `MODEL_API_KEY`。

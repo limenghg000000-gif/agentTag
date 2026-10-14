@@ -1,13 +1,13 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { MissedEventAlarm } from "./alarm.js";
-import { UpdateAnnouncer } from "./announce.js";
+import { parseReleaseNotes, UpdateAnnouncer } from "./announce.js";
 import { MemoryBackup } from "./backup.js";
 import { createCardActionHandler, createMessageHandler } from "./bot.js";
 import { CardAnswerStore } from "./card-answers.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, RELEASE_NOTES_FILE } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { createFeishuApi } from "./feishu.js";
@@ -137,6 +137,7 @@ const handleMessage = createMessageHandler({
   ...(knowledge ? { knowledge } : {}),
   ...(images ? { images } : {}),
   showThinking: config.showThinking,
+  about: aboutBot(),
   ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient), cardAnswers } : {}),
   botName: () => channel.botIdentity?.name,
   context,
@@ -392,6 +393,17 @@ const shutdown = async () => {
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+
+/** 有人问「你能做什么」「最近更新了什么」时用：产品功能说明的链接、产品更新说明里最新的一版（部署新版本要重启，启动时读一次就够） */
+function aboutBot(): { featuresLink?: string; latest?: ReturnType<typeof parseReleaseNotes>[number] } {
+  let latest: ReturnType<typeof parseReleaseNotes>[number] | undefined;
+  try {
+    latest = parseReleaseNotes(readFileSync(RELEASE_NOTES_FILE, "utf8"))[0];
+  } catch (err) {
+    console.warn(`读不到 ${RELEASE_NOTES_FILE}，被问到最近更新了什么时答不上来`, err);
+  }
+  return { ...(config.featuresLink ? { featuresLink: config.featuresLink } : {}), ...(latest ? { latest } : {}) };
+}
 
 /** 启动时逐个检查令牌能不能访问配置的仓库，结果写进日志，免得配错了要等到群里用时才发现 */
 async function checkRepos(workspaces: CodeWorkspaces): Promise<void> {

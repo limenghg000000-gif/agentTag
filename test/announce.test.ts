@@ -7,6 +7,7 @@ import type { SendInput } from "@larksuiteoapi/node-sdk";
 import {
   compareVersions,
   MAX_ANNOUNCED_VERSIONS,
+  parseChangelogTech,
   parseReleaseNotes,
   pendingVersions,
   renderAnnouncementCard,
@@ -90,7 +91,7 @@ test("要发哪几版：没发过只发最新的一版；发过就发比上次�
   assert.deepEqual(pendingVersions([], undefined), []);
 });
 
-test("通知卡片：标题带最新版本号，几个版本各列一段，转义尖括号，按钮打开配置的链接", () => {
+test("通知卡片：标题带最新版本号，几个版本各写「x.y.z 更新了什么」，转义尖括号，按钮打开配置的链接", () => {
   const versions = [
     { version: "0.10.0", date: "2026-10-16", notes: "**第十版**\n- 能 <at id=all></at> 了" },
     { version: "0.9.1", notes: "- 修好了" },
@@ -98,18 +99,51 @@ test("通知卡片：标题带最新版本号，几个版本各列一段，转�
   const card = renderAnnouncementCard(versions, { botName: "飞书 CLI", link: "https://docs.example.com/agenttag", firstTime: true });
   const json = JSON.stringify(card);
   assert.match(json, /飞书 CLI 更新了 · 0\.10\.0/);
-  assert.match(json, /\*\*0\.10\.0\*\*/);
-  assert.match(json, /\*\*0\.9\.1\*\*/);
+  assert.match(json, /\*\*0\.10\.0 更新了什么\*\*/);
+  assert.match(json, /\*\*0\.9\.1 更新了什么\*\*/);
+  assert.ok(!json.includes("本次更新了什么"));
   assert.ok(!json.includes("<at"), "说明里的 <at> 不能真的 @ 人");
   assert.match(json, /&lt;at id=all&gt;/);
   assert.match(json, /我是飞书 CLI/);
   assert.match(json, /"default_url":"https:\/\/docs\.example\.com\/agenttag"/);
+  assert.match(json, /产品功能说明/);
 
-  // 只有一个版本时标题里有版本号，正文不再写；没配链接时没有按钮
-  const single = JSON.stringify(renderAnnouncementCard([versions[1]!], { botName: "飞书 CLI" }));
-  assert.ok(!single.includes("**0.9.1**"));
+  // 只有一个版本时写「本次更新了什么」和版本号、日期；没配链接时没有按钮
+  const single = JSON.stringify(renderAnnouncementCard([versions[0]!], { botName: "飞书 CLI" }));
+  assert.match(single, /\*\*本次更新了什么\*\*.*版本 0\.10\.0 · 2026-10-16/);
   assert.ok(!single.includes("button"));
   assert.ok(!single.includes("我是"));
+  assert.match(JSON.stringify(renderAnnouncementCard([versions[1]!])), /版本 0\.9\.1(?! ·)/);
+});
+
+test("读技术版更新日志：版本号对应整段内容，分类小标题换成加粗，没有版本号的段跳过", () => {
+  const tech = parseChangelogTech(
+    "# 更新日志\n\n说明\n\n## [Unreleased]\n\n- 不要\n\n## [0.9.0] - 2026-10-15\n\n### 新增\n\n- 功能 A（#47）\n\n### 修复\n\n- 问题 B（#48）\n\n## [0.8.0] - 2026-10-14\n\n### 改进\n\n- 改进 C（#46）\n",
+  );
+  assert.deepEqual([...tech.keys()], ["0.9.0", "0.8.0"]);
+  assert.equal(tech.get("0.9.0"), "**新增**\n\n- 功能 A（#47）\n\n**修复**\n\n- 问题 B（#48）");
+  assert.equal(tech.get("0.8.0"), "**改进**\n\n- 改进 C（#46）");
+});
+
+test("通知卡片：有技术说明的版本下面放一个默认收起的「技术说明」，尖括号转义；太长的截短，加起来超了后面的不放", () => {
+  const card = renderAnnouncementCard([{ version: "0.9.0", notes: "- 新功能", tech: "**新增**\n- 支持 <at id=all></at>（#47）" }]) as {
+    body: { elements: { tag: string; expanded?: boolean; elements?: { content: string }[] }[] };
+  };
+  const panel = card.body.elements.find((e) => e.tag === "collapsible_panel");
+  assert.ok(panel, "要有折叠面板");
+  assert.equal(panel.expanded, false);
+  assert.match(panel.elements![0]!.content, /支持 &lt;at id=all&gt;&lt;\/at&gt;（#47）/);
+  assert.match(JSON.stringify(card), /技术说明（0\.9\.0，给开发看）/);
+  // 没有技术说明的版本不放面板
+  assert.ok(!JSON.stringify(renderAnnouncementCard([{ version: "0.9.0", notes: "- 新功能" }])).includes("collapsible_panel"));
+
+  const longTech = Array.from({ length: 100 }, (_, i) => `- 第 ${i} 条技术改动，写得很长很长很长`).join("\n");
+  const versions = ["0.12.0", "0.11.0", "0.10.0"].map((version) => ({ version, notes: "- 改了", tech: longTech }));
+  const json = JSON.stringify(renderAnnouncementCard(versions));
+  assert.equal(json.match(/collapsible_panel/g)?.length, 2, "每版截到 1500 字，两版就到 3000 字的上限，第三版不放");
+  assert.match(json, /太长了没列全/);
+  // 退回的文字不带技术说明
+  assert.ok(!renderAnnouncementMarkdown(versions).includes("技术改动"));
 });
 
 test("通知卡片最多列几个版本，更早的只说还有几个", () => {
@@ -266,6 +300,34 @@ test("卡片超时、限流时不改发文字（卡片可能已经发出去了�
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(t.sent.length, 1);
   assert.ok("card" in t.sent[0]!.input);
+});
+
+test("配了技术版更新日志时，卡片上带同一版本的技术说明；读不到也照发，只是不带", async () => {
+  const t = await setup(["oc_a"]);
+  const changelogFile = path.join(path.dirname(t.notesFile), "CHANGELOG.md");
+  await writeFile(changelogFile, "## [0.10.0] - 2026-10-16\n\n### 新增\n\n- 技术改动 X（#50）\n\n## [0.9.1] - 2026-10-15\n\n### 修复\n\n- 技术改动 Y（#49）\n");
+  const sent: SendInput[] = [];
+  const make = (file: string, stateFile: string) =>
+    new UpdateAnnouncer({
+      notesFile: t.notesFile,
+      changelogFile: file,
+      stateFile,
+      chatIds: ["oc_a"],
+      send: async (_to, input) => {
+        sent.push(input);
+        return { messageId: "om_1", chatId: "oc_a" } as never;
+      },
+      logger: quiet,
+    });
+  await make(changelogFile, t.stateFile).run();
+  const json = JSON.stringify(sent[0]);
+  assert.match(json, /本次更新了什么/);
+  assert.match(json, /技术改动 X（#50）/);
+  assert.ok(!json.includes("技术改动 Y"), "只放这次发的版本的技术说明");
+
+  await make(path.join(path.dirname(t.notesFile), "nope.md"), path.join(path.dirname(t.stateFile), "other.json")).run();
+  assert.equal(sent.length, 2);
+  assert.ok(!JSON.stringify(sent[1]).includes("collapsible_panel"));
 });
 
 test("读不到产品更新说明或者里面没有版本时不发", async () => {
