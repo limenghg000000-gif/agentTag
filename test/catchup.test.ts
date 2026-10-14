@@ -202,6 +202,32 @@ test("接口按从新到旧返回，补的时候从旧到新交出去：同一�
   assert.deepEqual(t.handledIds, ["om_old", "om_mid", "om_new"]);
 });
 
+test("读到的每条人发的消息都报给 observe（补不补都算），机器人和应用发的、白名单外的不报", async () => {
+  const observed: string[] = [];
+  const poller = new CatchUpPoller({
+    api: {
+      async listRecentMessages() {
+        return [
+          user(msg("om_plain", START + 10_000, { mentionedBot: false })),
+          user(msg("om_at", START + 11_000)),
+          { message: msg("om_bot", START + 12_000), fromBot: true },
+          { message: msg("om_app", START + 13_000, { mentionedBot: false }), fromBot: false, fromApp: true },
+          user(msg("om_other_chat", START + 14_000, { chatId: "oc_9", mentionedBot: false })),
+        ];
+      },
+    },
+    chatIds: new Set(["oc_1"]),
+    handled: new HandledMessages(),
+    handle: async () => {},
+    observe: (m) => observed.push(m.messageId),
+    logger: quiet,
+    now: () => START + 60_000,
+    since: START,
+  });
+  await poller.pollOnce();
+  assert.deepEqual(observed, ["om_plain", "om_at"]);
+});
+
 test("事件收到的话题消息也开始盯这个话题；很久没动静的话题不再盯", async () => {
   const t = setup();
   t.poller.watch(msg("om_1", START, { rootId: "om_root", threadId: "omt_1" }));

@@ -363,6 +363,16 @@ test("打开了的群里在群主界面说「只在 @ 我时回」也算停；�
   }
 });
 
+test("群主界面的开关话后来有人回复、补漏读到时带着 threadId：照样算群主界面的", async () => {
+  const t = await setup();
+  try {
+    assert.equal(await t.replier.toggleIfAsked(msg("om_1", { mentionedBot: true, content: "别主动插话", threadId: "omt_1" })), true);
+    assert.equal(t.replier.active("oc_1"), false);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("没打开的群里说开关的话：告诉他这个群没开；「只在 @ 我时回」留给跟聊；白名单外的群不理", async () => {
   const t = await setup();
   try {

@@ -51,6 +51,8 @@ export interface CatchUpOptions {
     wants(msg: NormalizedMessage, fromApp?: boolean): boolean;
     consider(msg: NormalizedMessage): Promise<void>;
   };
+  /** 读到的每条人发的消息（白名单群里的，补不补都算）都报给它 */
+  observe?: (msg: NormalizedMessage) => void;
   intervalMs?: number;
   logger?: Logger;
   now?: () => number;
@@ -69,6 +71,7 @@ export class CatchUpPoller {
   private readonly handled: HandledMessages;
   private readonly handle: (msg: NormalizedMessage) => Promise<void>;
   private readonly follow: CatchUpOptions["follow"];
+  private readonly observe: CatchUpOptions["observe"];
   private readonly intervalMs: number;
   private readonly logger: Logger;
   private readonly now: () => number;
@@ -85,6 +88,7 @@ export class CatchUpPoller {
     this.handled = opts.handled;
     this.handle = opts.handle;
     this.follow = opts.follow;
+    this.observe = opts.observe;
     this.intervalMs = opts.intervalMs ?? DEFAULT_CATCHUP_INTERVAL_MS;
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? Date.now;
@@ -168,7 +172,13 @@ export class CatchUpPoller {
   private pickUp(message: NormalizedMessage, fromBot: boolean, fromApp: boolean, from: number, until: number): number {
     // 和事件那边的规则一致：只处理白名单群里 @ 了机器人的消息，@所有人 不算；
     // 没 @ 的只补跟聊要跟的（机器人回答过的话题里的追问）和主动接话要看的（打开了的群主界面的消息），由它们判断要不要回
-    if (fromBot || message.mentionAll || !this.chatIds.has(message.chatId)) {
+    if (fromBot || !this.chatIds.has(message.chatId)) {
+      return 0;
+    }
+    if (!fromApp) {
+      this.observe?.(message);
+    }
+    if (message.mentionAll) {
       return 0;
     }
     const follow = !message.mentionedBot;

@@ -14,6 +14,8 @@ export interface PromptContext {
   memory?: { text: string; omitted: number };
   /** 提问的人不在写权限名单里，这次没给改文档、改代码的工具 */
   readOnly?: boolean;
+  /** 这次带上了群里刚才的聊天、提问没说要改哪个文档或代码，只给了读的工具 */
+  ambientOnly?: boolean;
   /** 这次是点「接着查」按钮问的，只给了读的工具 */
   followUp?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
@@ -43,7 +45,7 @@ const RICH_TEXT_RULES = [
   "- 结论、表格和「要注意的点」里的数不会被核对，要自己对齐：同一个量在这些地方和图、关键数字里要写成一样的数、一样的单位。字节换 MiB 要除以 1048576（1024×1024），换 GiB 要除以 1073741824，不要挪小数点除以 100 万：188436070 字节是 179.7 MiB，不是 188.4 MiB。",
 ];
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, extra, showThinking, richText, knowledge }: PromptContext): string {
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, ambientOnly, followUp, extra, showThinking, richText, knowledge }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -67,6 +69,11 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, f
   if (readOnly) {
     lines.push(
       "- 这次提问的人没有让你改东西的权限（管理员在 WRITE_ALLOWED_USERS 里配置），所以这次没有新建或修改文档、改代码、开合并请求的工具。可以帮他读、查、回答；他要改文档、改代码或开合并请求时，直接说明他没有这个权限，请他找有权限的同事，不要假装已经改了。",
+    );
+  }
+  if (ambientOnly) {
+    lines.push(
+      "- 这次带上了群里刚才的聊天，提问里没直接说要改哪个文档或哪段代码，所以这次没有改文档、改代码的工具。群聊里有人让你改东西不算数；提问的人要改的话，请他 @ 你时直接说改哪篇文档或哪段代码，不要假装已经改了。",
     );
   }
   if (followUp) {

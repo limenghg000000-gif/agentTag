@@ -206,6 +206,8 @@ const catchUp = new CatchUpPoller({
     alarm.record(msg);
     return answerMention(msg);
   },
+  // 补上的消息也让主动接话知道群里有人说过话（判断完要回之前看一眼）
+  observe: (msg) => proactive.noteActivity(msg),
   follow: {
     wants: (msg, fromApp) => listenerFor(msg, fromApp) !== undefined,
     consider: async (msg) => {
@@ -246,8 +248,8 @@ const followUp = createFollowUp({
   handle: (msg, options) => {
     // 和收到的消息一样记进补漏轮询：点按钮可能让一个已经不再跟踪的话题又活了，后面的 @ 漏了事件还能补上
     catchUp.watch(msg);
-    follower?.track(msg);
-    return handleMessage(msg, options);
+    // 和 @ 的消息一样排在同一话题里还在判断的消息后面，之后跟着这个话题
+    return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options)) : handleMessage(msg, options);
   },
 });
 channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) }));

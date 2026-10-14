@@ -15,6 +15,8 @@ const MAX_WAITING = 20;
 const JUDGE_MESSAGES = 8;
 /** 判断时每条最多看多少字 */
 const JUDGE_MESSAGE_CHARS = 500;
+/** 同一个话题里最多几条在排队判断，再多的不判断（话题里刷屏时别越积越多、判断完早就过时了） */
+const MAX_PENDING_PER_THREAD = 5;
 /** 判断最多等多久，超时算不用回 */
 const JUDGE_TIMEOUT_MS = 20_000;
 
@@ -116,6 +118,11 @@ export class ThreadFollower {
   private readonly muted = new Set<string>();
   /** 每个话题最后一条在判断的消息「判断完、交出去」的 Promise：同一话题里后来的等它 */
   private readonly turns = new Map<string, Promise<void>>();
+  /** 每个话题里排着队、还没判断完的没 @ 的消息有几条 */
+  private readonly pending = new Map<string, number>();
+  /** 交进来的顺序号；话题里 @ 机器人说「停止」「只在 @ 我时回」时记下它的号，排在它前面、还没交出去的没 @ 的消息作废 */
+  private seq = 0;
+  private readonly cancelledBefore = new Map<string, number>();
   private readonly queue = new JudgeQueue();
   private readonly logger: Logger;
   private readonly now: () => number;
@@ -200,7 +207,25 @@ export class ThreadFollower {
    */
   async consider(msg: NormalizedMessage): Promise<void> {
     const key = threadKeyOf(msg);
-    await this.inTurn(key, () => this.decide(msg, key));
+    const pending = this.pending.get(key) ?? 0;
+    if (pending >= MAX_PENDING_PER_THREAD) {
+      this.logger.warn(`跟聊：这个话题里还有 ${pending} 条没判断完，这条不判断、不回 thread=${key} message=${msg.messageId}`);
+      return;
+    }
+    this.pending.set(key, pending + 1);
+    const order = ++this.seq;
+    await this.inTurn(key, async () => {
+      try {
+        return await this.decide(msg, key, order);
+      } finally {
+        const left = (this.pending.get(key) ?? 1) - 1;
+        if (left > 0) {
+          this.pending.set(key, left);
+        } else {
+          this.pending.delete(key);
+        }
+      }
+    });
   }
 
   /**
@@ -208,7 +233,13 @@ export class ThreadFollower {
    * 不然「改一下文档」还在判断，后说的「@机器人 停止」先到，没有任务可停，前面那句判断完又开始改
    */
   async answerInTurn(msg: NormalizedMessage, handle: () => Promise<void>): Promise<void> {
-    await this.inTurn(threadKeyOf(msg), async () => {
+    const key = threadKeyOf(msg);
+    const text = msg.content.trim();
+    // 「@机器人 停止」「@机器人 只在 @ 我时回」：前面还在排队判断的没 @ 的消息不再判断、不交出去，这条不用干等它们
+    if (STOP_COMMAND.test(text) || MUTE_COMMAND.test(text)) {
+      remember(this.cancelledBefore, key, ++this.seq);
+    }
+    await this.inTurn(key, async () => {
       this.track(msg);
       return { done: handle() };
     });
@@ -235,7 +266,11 @@ export class ThreadFollower {
   }
 
   /** 判断这一条，要回的交给处理函数，返回它的 Promise（包一层：不在这里等任务做完） */
-  private async decide(msg: NormalizedMessage, key: string): Promise<{ done: Promise<void> } | undefined> {
+  private async decide(msg: NormalizedMessage, key: string, order: number): Promise<{ done: Promise<void> } | undefined> {
+    // 排队的这会儿可能有人说了「只在 @ 我时回」「停止」，或者跟聊过期了：轮到它时再看一遍
+    if (this.cancelled(key, order) || !this.wants(msg)) {
+      return undefined;
+    }
     const muting = this.mute(msg);
     if (muting) {
       await muting;
@@ -268,8 +303,16 @@ export class ThreadFollower {
     if (!answer) {
       return undefined;
     }
+    if (this.cancelled(key, order)) {
+      this.logger.info(`跟聊：判断的这会儿话题里有人 @ 机器人说了停止或只在 @ 时回，这条不接着回 message=${msg.messageId}`);
+      return undefined;
+    }
     this.track(msg);
     return { done: this.opts.handle(msg) };
+  }
+
+  private cancelled(key: string, order: number): boolean {
+    return order < (this.cancelledBefore.get(key) ?? 0);
   }
 
   private async judge(msg: NormalizedMessage, busy: boolean): Promise<boolean> {

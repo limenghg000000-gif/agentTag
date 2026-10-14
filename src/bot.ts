@@ -73,11 +73,21 @@ const DOC_REQUEST = new RegExp(
   "i",
 );
 
+const CHANGE_VERB = String.raw`(?:写|改|删|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记|替换|新建|创建|建|提交|合并|修复|修)`;
+const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b)`;
 /**
- * 提问本身说了要改东西（文档、代码）。带上了群聊时，没说的不给改文档、改代码的工具。
- * 宽一点没关系：认错了只是和没带群聊时一样
+ * 提问本身说了要改哪个文档或代码：「把上面那段追加到周报文档里」「文档里那段改一下」「修一下这段代码」「开个 MR」。
+ * 带上了群聊时，没这么说的不给改文档、改代码的工具（「加拿大的首都是哪里」不算）
  */
-const CHANGE_REQUEST = /写|改|删|加|建|追加|更新|补|提交|合并|推|修|替换|整理|记|同步|贴|放|存|发布|回滚|移|撤|commit|push|merge|\b(?:mr|pr)\b/i;
+const CHANGE_REQUEST = new RegExp(
+  [
+    String.raw`${CHANGE_VERB}[^，。,.!?！？\n]{0,15}?${CHANGE_TARGET}`,
+    String.raw`${CHANGE_TARGET}[^，。,.!?！？\n]{0,8}?${CHANGE_VERB}`,
+    String.raw`开\s*(?:个|一个)?\s*(?:MR|PR|合并请求)`,
+    String.raw`\b(?:commit|push|merge)\b`,
+  ].join("|"),
+  "i",
+);
 
 /**
  * 这次要不要新建文档。也看话题里刚说的：上一条回答在问话（「要整理成飞书文档吗？」「标题叫什么？」），
@@ -488,6 +498,7 @@ async function runTask(
         toolNames,
         memory: memory?.prompt,
         readOnly: noPermission,
+        ...(ambientOnly ? { ambientOnly: true } : {}),
         followUp,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,

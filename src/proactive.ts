@@ -121,7 +121,7 @@ export class ProactiveReplier {
     }
     const at = msg.createTime || this.now();
     const last = this.latest.get(msg.chatId);
-    if (!msg.threadId && (!last || at >= last.at)) {
+    if (!inTopic(msg) && (!last || at >= last.at)) {
       this.latest.set(msg.chatId, { messageId: msg.messageId, at });
     }
   }
@@ -170,7 +170,7 @@ export class ProactiveReplier {
    * 给消息处理函数用：不是开关的话时不多等一拍，处理函数照样当场排进任务队列
    */
   toggle(msg: NormalizedMessage): Promise<void> | undefined {
-    if (!msg.mentionedBot || msg.threadId || !this.opts.allowedChatIds.has(msg.chatId)) {
+    if (!msg.mentionedBot || inTopic(msg) || !this.opts.allowedChatIds.has(msg.chatId)) {
       return undefined;
     }
     const text = msg.content.trim();
@@ -332,6 +332,14 @@ function unpush(times: Map<string, number[]>, chatId: string, at: number): void 
   if (index >= 0) {
     times.set(chatId, [...list.slice(0, index), ...list.slice(index + 1)]);
   }
+}
+
+/**
+ * 是话题里的回复（不是群主界面的消息）。不能只看 threadId：群主界面的消息有人回复后变成话题的第一条，
+ * 补漏轮询读到它时也带着 threadId；引用回复只有 rootId
+ */
+function inTopic(msg: NormalizedMessage): boolean {
+  return Boolean(msg.rootId && msg.threadId);
 }
 
 function clip(text: string): string {
