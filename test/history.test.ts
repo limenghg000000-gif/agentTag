@@ -239,7 +239,7 @@ test("在群里直接 @ 时带上之前半小时内的群聊：标上发言人�
   const loader = new ThreadContextLoader(api, quiet, undefined, undefined, true);
   const context = await loader.load(message({ content: "看下上面那个报错", createTime: AT }));
 
-  assert.equal(calls[0], `chat oc_1 since=${AT - CHAT_CONTEXT_MS} until=${AT} limit=21`);
+  assert.equal(calls[0], `chat oc_1 since=${AT - CHAT_CONTEXT_MS} until=${AT} limit=50`);
   assert.deepEqual(context.history, [
     { role: "user", content: `${CHAT_CONTEXT_HEADER}\n[张三 10:21] gateway 又报 code=8 了\n[李四 10:22] ![image](img_1)` },
   ]);

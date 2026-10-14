@@ -175,16 +175,14 @@ const proactive = new ProactiveReplier({
   superseded: (msg) => unaddressedTwins.hasThreadTwin(msg),
 });
 await proactive.init();
-/** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题 */
-const answerMention = async (msg: NormalizedMessage) => {
-  follower?.track(msg);
-  await handleMessage(msg);
-};
+/** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
+const answerMention = (msg: NormalizedMessage): Promise<void> =>
+  follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);
 /** 没 @ 机器人的群消息归谁判断：跟着的话题里的归跟聊，群主界面的归主动接话，都不要就不管 */
 const listenerFor = (msg: NormalizedMessage, fromApp = false) =>
   follower?.wants(msg, fromApp) ? follower : proactive.wants(msg, fromApp) ? proactive : undefined;
 // 话题里勾了「同时发送到群」，没 @ 的话也会收到两份：只判断一份
-const unaddressedTwins = new DuplicateAsks();
+const unaddressedTwins = new DuplicateAsks(Date.now, true);
 const considerUnaddressed = async (msg: NormalizedMessage, listener: { consider(msg: NormalizedMessage): Promise<void> }) => {
   const verdict = unaddressedTwins.check(msg);
   if (verdict.action === "skip") {
@@ -220,6 +218,8 @@ const catchUp = new CatchUpPoller({
   intervalMs: config.catchUpIntervalMs || undefined,
 });
 channel.on("message", async (msg: NormalizedMessage) => {
+  // 主动接话判断完要回之前，看判断的这会儿群里有没有人接了话
+  proactive.noteActivity(msg);
   if (!msg.mentionedBot) {
     // 没 @ 机器人的：只看跟聊在跟的话题里的、打开了主动接话的群主界面的，别的（包括白名单外的群）一律不管，也不记日志
     const listener = listenerFor(msg);

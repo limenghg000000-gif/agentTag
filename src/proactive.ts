@@ -2,8 +2,8 @@ import { readFile } from "node:fs/promises";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { DEFAULT_PROACTIVE_MAX_PER_HOUR } from "./config.js";
 import type { FeishuApi } from "./feishu.js";
-import { writeAtomically } from "./file-store.js";
-import { JudgeQueue, MUTE_COMMAND } from "./follow.js";
+import { FileQueue, writeAtomically } from "./file-store.js";
+import { JudgeQueue, MUTE_COMMAND, remember } from "./follow.js";
 import { type Logger, recentChat } from "./history.js";
 import type { ChatModel } from "./llm.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
@@ -77,6 +77,11 @@ export class ProactiveReplier {
   /** 每个群哪天第一次主动回的：当天第一次在后面说一句怎么关 */
   private readonly hinted = new Map<string, string>();
   private readonly queue = new JudgeQueue();
+  /** 每个群群主界面最新一条人发的消息：判断完要回之前看一眼，判断的这会儿有人说话了就不接 */
+  private readonly latest = new Map<string, { messageId: string; at: number }>();
+  /** 有人回复过的消息（话题里回、引用回）：有人接了就不接 */
+  private readonly replied = new Set<string>();
+  private readonly files = new FileQueue();
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly maxPerHour: number;
@@ -104,6 +109,27 @@ export class ProactiveReplier {
     } catch (err) {
       this.logger.warn(`主动接话：${this.opts.stateFile} 格式不对，先按所有群都没停算`, err);
     }
+  }
+
+  /** 群里人发的每条消息（@ 不 @ 都算）都报给它：判断完要回之前，看判断的这会儿有没有人接了话 */
+  noteActivity(msg: NormalizedMessage): void {
+    if (!this.opts.enabledChatIds.has(msg.chatId) || !msg.senderId.startsWith("ou_") || msg.senderId === this.opts.botOpenId()) {
+      return;
+    }
+    if (msg.rootId) {
+      remember(this.replied, msg.rootId);
+    }
+    const at = msg.createTime || this.now();
+    const last = this.latest.get(msg.chatId);
+    if (!msg.threadId && (!last || at >= last.at)) {
+      this.latest.set(msg.chatId, { messageId: msg.messageId, at });
+    }
+  }
+
+  /** 这条之后群主界面又有人说了话，或者有人回复了这条 */
+  private movedOn(msg: NormalizedMessage): boolean {
+    const last = this.latest.get(msg.chatId);
+    return this.replied.has(msg.messageId) || (last !== undefined && last.messageId !== msg.messageId && last.at > msg.createTime);
   }
 
   /** 这个群现在主动接话：在 PROACTIVE_CHAT_IDS 里，也没人说过「别主动插话」 */
@@ -213,11 +239,27 @@ export class ProactiveReplier {
     if (!said || !this.active(chatId) || recent(this.replies, chatId, this.now()) >= this.maxPerHour || this.opts.superseded?.(msg)) {
       return;
     }
-    push(this.replies, chatId, this.now());
-    const today = new Date(this.now()).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
-    const hint = this.hinted.get(chatId) === today ? "" : "\n\n（没 @ 我，我看到了就接一句。不需要的话 @ 我说「别主动插话」。）";
-    this.hinted.set(chatId, today);
-    await this.opts.reply(msg, said + hint);
+    // 判断的这会儿群里又有人说话、或者有人回了这条：可能已经有人接了，判断时没看到，不接
+    if (this.movedOn(msg)) {
+      this.logger.info(`主动接话：判断的这会儿群里又有人说话了，这条不接 chat=${chatId} message=${msg.messageId}`);
+      return;
+    }
+    // 先占上这一次（几条同时判断完时不超过上限），发不出去再退回来
+    const at = this.now();
+    push(this.replies, chatId, at);
+    const today = new Date(at).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
+    const hinting = this.hinted.get(chatId) !== today;
+    const hint = hinting ? "\n\n（没 @ 我，我看到了就接一句。不需要的话 @ 我说「别主动插话」。）" : "";
+    try {
+      await this.opts.reply(msg, said + hint);
+    } catch (err) {
+      unpush(this.replies, chatId, at);
+      this.logger.warn(`主动接话：回复发不出去 chat=${chatId} message=${msg.messageId}`, err);
+      return;
+    }
+    if (hinting) {
+      this.hinted.set(chatId, today);
+    }
     this.opts.onReplied?.(msg);
   }
 
@@ -264,9 +306,12 @@ export class ProactiveReplier {
     this.logger.info(`主动接话：${reason}，这一小时后面的先不判断 chat=${chatId}`);
   }
 
+  /** 排队写：几个群同时开关时，写文件不互相覆盖（每次写的都是写的那一刻的状态） */
   private async save(): Promise<void> {
-    const state: PausedState = { paused: Object.fromEntries(this.paused) };
-    await writeAtomically(this.opts.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+    await this.files.run(this.opts.stateFile, () => {
+      const state: PausedState = { paused: Object.fromEntries(this.paused) };
+      return writeAtomically(this.opts.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+    });
   }
 }
 
@@ -279,6 +324,14 @@ function recent(times: Map<string, number[]>, chatId: string, now: number): numb
 
 function push(times: Map<string, number[]>, chatId: string, at: number): void {
   times.set(chatId, [...(times.get(chatId) ?? []), at]);
+}
+
+function unpush(times: Map<string, number[]>, chatId: string, at: number): void {
+  const list = times.get(chatId) ?? [];
+  const index = list.lastIndexOf(at);
+  if (index >= 0) {
+    times.set(chatId, [...list.slice(0, index), ...list.slice(index + 1)]);
+  }
 }
 
 function clip(text: string): string {

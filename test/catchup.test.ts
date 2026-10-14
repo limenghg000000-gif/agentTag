@@ -193,6 +193,15 @@ test("话题里跟聊：没 @ 机器人的话题消息，跟聊要跟的也补�
   assert.equal(await poller.pollOnce(), 0);
 });
 
+test("接口按从新到旧返回，补的时候从旧到新交出去：同一个话题里先说的先处理", async () => {
+  const t = setup({
+    chat: [user(msg("om_new", START + 30_000)), user(msg("om_mid", START + 20_000)), user(msg("om_old", START + 10_000))],
+  });
+  t.advance(60_000);
+  assert.equal(await t.poller.pollOnce(), 3);
+  assert.deepEqual(t.handledIds, ["om_old", "om_mid", "om_new"]);
+});
+
 test("事件收到的话题消息也开始盯这个话题；很久没动静的话题不再盯", async () => {
   const t = setup();
   t.poller.watch(msg("om_1", START, { rootId: "om_root", threadId: "omt_1" }));

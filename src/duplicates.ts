@@ -30,7 +30,14 @@ interface Seen {
 export class DuplicateAsks {
   private readonly seen = new Map<string, Seen[]>();
 
-  constructor(private readonly now: () => number = Date.now) {}
+  /**
+   * copiesOnly：只把「一条在话题里、一条在群主界面」的认成重复（「同时发送到群」的样子）。
+   * 没 @ 的短话（「继续」）同一个人在两个话题里各说一遍，不能当成重复
+   */
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly copiesOnly = false,
+  ) {}
 
   check(msg: NormalizedMessage): DuplicateVerdict {
     const now = this.now();
@@ -45,7 +52,10 @@ export class DuplicateAsks {
     };
     const list = this.seen.get(key) ?? [];
     const twin = list.find(
-      (s) => s.messageId !== entry.messageId && Math.abs(s.sentAt - entry.sentAt) <= DUPLICATE_WINDOW_MS,
+      (s) =>
+        s.messageId !== entry.messageId &&
+        Math.abs(s.sentAt - entry.sentAt) <= DUPLICATE_WINDOW_MS &&
+        (!this.copiesOnly || s.inThread !== entry.inThread),
     );
     list.push(entry);
     this.seen.set(key, list);

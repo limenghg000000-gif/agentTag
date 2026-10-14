@@ -242,6 +242,84 @@ test("判断完发现是话题里「同时发送到群」的副本：不回（�
   }
 });
 
+test("判断的这会儿群里又有人说话、或者有人回复了这条：不接", async () => {
+  let release!: (text: string) => void;
+  const t = await setup({ judge: () => new Promise<string>((resolve) => (release = resolve)) });
+  try {
+    const first = msg("om_1");
+    t.replier.noteActivity(first);
+    const pending = t.replier.consider(first);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.replier.noteActivity(msg("om_2", { senderId: "ou_2", content: "db-test-2 啊", createTime: START + 2000 }));
+    release("接：测试库是 db-test-2.internal（群记忆 #3）");
+    await pending;
+    assert.deepEqual(t.replies, []);
+    assert.match(t.logs.join("\n"), /判断的这会儿群里又有人说话了，这条不接 chat=oc_1 message=om_1/);
+
+    // 有人在这条下面开话题回了
+    const second = msg("om_3", { createTime: START + 3000 });
+    t.replier.noteActivity(second);
+    const again = t.replier.consider(second);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.replier.noteActivity(msg("om_4", { senderId: "ou_2", rootId: "om_3", threadId: "omt_3", createTime: START + 4000 }));
+    release("接：测试库是 db-test-2.internal（群记忆 #3）");
+    await again;
+    assert.deepEqual(t.replies, []);
+
+    // 机器人自己的消息、话题里别的回复不算
+    const third = msg("om_5", { createTime: START + 5000 });
+    t.replier.noteActivity(third);
+    const last = t.replier.consider(third);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.replier.noteActivity(msg("om_6", { senderId: BOT, createTime: START + 6000 }));
+    t.replier.noteActivity(msg("om_7", { senderId: "ou_2", rootId: "om_other", threadId: "omt_9", createTime: START + 6000 }));
+    release("接：测试库是 db-test-2.internal（群记忆 #3）");
+    await last;
+    assert.equal(t.replies.length, 1);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("回复发不出去：不占每小时的次数，下次照样带上怎么关", async () => {
+  let failing = true;
+  const t = await setup({ judge: "接：要我帮忙查一下吗？", maxPerHour: 1 });
+  try {
+    const replier = new ProactiveReplier({
+      ...(t.replier as unknown as { opts: ConstructorParameters<typeof ProactiveReplier>[0] }).opts,
+      reply: async (m, markdown) => {
+        if (failing) {
+          throw new Error("飞书 500");
+        }
+        t.replies.push(`${m.messageId} ${markdown}`);
+      },
+    });
+    await replier.consider(msg("om_1"));
+    assert.deepEqual(t.replies, []);
+    assert.match(t.logs.join("\n"), /回复发不出去 chat=oc_1 message=om_1/);
+    failing = false;
+    await replier.consider(msg("om_2"));
+    assert.equal(t.replies.length, 1);
+    assert.match(t.replies[0], /不需要的话 @ 我说「别主动插话」/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("几个群同时开关：存下来的状态一个不丢", async () => {
+  const t = await setup({ enabled: ["oc_1", "oc_2"] });
+  try {
+    await Promise.all([
+      t.replier.toggleIfAsked(msg("om_1", { mentionedBot: true, content: "别主动插话" })),
+      t.replier.toggleIfAsked(msg("om_2", { chatId: "oc_2", mentionedBot: true, content: "别主动插话" })),
+    ]);
+    const saved = JSON.parse(await readFile(t.stateFile, "utf8"));
+    assert.deepEqual(Object.keys(saved.paused).sort(), ["oc_1", "oc_2"]);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("群里 @ 机器人说「别主动插话」就停，「可以主动说话」再打开，重启后照样记着", async () => {
   const t = await setup();
   try {

@@ -200,15 +200,30 @@ export class ThreadFollower {
    */
   async consider(msg: NormalizedMessage): Promise<void> {
     const key = threadKeyOf(msg);
+    await this.inTurn(key, () => this.decide(msg, key));
+  }
+
+  /**
+   * @ 了机器人的消息也按顺序交给处理函数：同一话题里前面没 @ 的还在判断时，等它判断完、交出去再处理这条。
+   * 不然「改一下文档」还在判断，后说的「@机器人 停止」先到，没有任务可停，前面那句判断完又开始改
+   */
+  async answerInTurn(msg: NormalizedMessage, handle: () => Promise<void>): Promise<void> {
+    await this.inTurn(threadKeyOf(msg), async () => {
+      this.track(msg);
+      return { done: handle() };
+    });
+  }
+
+  /** 排在同一话题里前一条后面：等它判断完、交出去（处理函数同步排进任务队列），再做这一步 */
+  private async inTurn(key: string, step: () => Promise<{ done: Promise<void> } | undefined>): Promise<void> {
     const previous = this.turns.get(key) ?? Promise.resolve();
     let release!: () => void;
     const turn = new Promise<void>((resolve) => (release = resolve));
     this.turns.set(key, turn);
     let started: { done: Promise<void> } | undefined;
     try {
-      // 等同一话题里先收到的那条判断完、交出去（处理函数同步排进任务队列），再判断这条
       await previous;
-      started = await this.decide(msg, key);
+      started = await step();
     } finally {
       release();
       if (this.turns.get(key) === turn) {

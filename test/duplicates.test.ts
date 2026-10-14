@@ -70,3 +70,14 @@ test("群里的副本先到、后来收到话题里那条：hasThreadTwin 认得
   assert.equal(asks.hasThreadTwin(msg("om_x", "那换成按小时看呢", { senderId: "ou_2" })), false);
   assert.equal(asks.hasThreadTwin(msg("om_y", "那换成按小时看呢", { createTime: 1_000_000 + 60_000 })), false);
 });
+
+test("copiesOnly：只把一条在话题里、一条在群主界面的认成重复；两个话题里各说一遍「继续」不算", () => {
+  const asks = new DuplicateAsks(() => 0, true);
+  assert.deepEqual(asks.check(msg("om_a", "继续", { rootId: "om_root_a" })), { action: "handle" });
+  assert.deepEqual(asks.check(msg("om_b", "继续", { rootId: "om_root_b" })), { action: "handle" });
+  assert.deepEqual(asks.check(msg("om_g", "继续")), { action: "skip", duplicateOf: "om_a" });
+  // 不加 copiesOnly 时（@ 机器人的提问）照旧
+  const plain = new DuplicateAsks(() => 0);
+  plain.check(msg("om_a", "继续", { rootId: "om_root_a" }));
+  assert.deepEqual(plain.check(msg("om_b", "继续", { rootId: "om_root_b" })), { action: "skip", duplicateOf: "om_a" });
+});

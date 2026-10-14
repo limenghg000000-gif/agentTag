@@ -330,6 +330,49 @@ test("同一个话题里按收到的顺序判断、交给处理函数：后说�
   assert.equal(judging.length, 1);
 });
 
+test("@ 了机器人的消息也排在同一话题里还在判断的消息后面：「@机器人 停止」不会抢在前面那句之前", async () => {
+  let judged!: () => void;
+  const handled: string[] = [];
+  const follower = new ThreadFollower({
+    allowedChatIds: new Set(["oc_1"]),
+    context: { load: async () => ({ history: [], source: "none" }) },
+    model: {
+      model: "fake",
+      chat: async () => {
+        await new Promise<void>((resolve) => (judged = resolve));
+        return { text: "是", finish: "stop" };
+      },
+    },
+    botName: () => "飞书 CLI",
+    botOpenId: () => BOT,
+    handle: async (m) => {
+      handled.push(m.content);
+    },
+    reply: async () => {},
+    logger: { info() {}, warn() {}, error() {} },
+    now: () => START,
+  });
+  follower.track(asked);
+  const pending = follower.consider(msg("om_2", { content: "把这个结论写进周报文档" }));
+  const stop = msg("om_3", { content: "停止", mentionedBot: true });
+  const stopping = follower.answerInTurn(stop, async () => {
+    handled.push(stop.content);
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(handled.length, 0);
+  judged();
+  await Promise.all([pending, stopping]);
+  assert.deepEqual(handled, ["把这个结论写进周报文档", "停止"]);
+
+  // 没有在判断的消息时马上处理，处理的这个话题之后也跟着
+  const other = msg("om_4", { content: "看下 union", mentionedBot: true, rootId: "om_root_2", threadId: "omt_2" });
+  await follower.answerInTurn(other, async () => {
+    handled.push(other.content);
+  });
+  assert.equal(handled.at(-1), "看下 union");
+  assert.equal(follower.wants(msg("om_5", { rootId: "om_root_2", threadId: "omt_2" })), true);
+});
+
 test("同一个话题里后面的判断不等前面的任务做完", async () => {
   let finishTask!: () => void;
   const handled: string[] = [];

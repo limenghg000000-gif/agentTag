@@ -74,6 +74,12 @@ const DOC_REQUEST = new RegExp(
 );
 
 /**
+ * 提问本身说了要改东西（文档、代码）。带上了群聊时，没说的不给改文档、改代码的工具。
+ * 宽一点没关系：认错了只是和没带群聊时一样
+ */
+const CHANGE_REQUEST = /写|改|删|加|建|追加|更新|补|提交|合并|推|修|替换|整理|记|同步|贴|放|存|发布|回滚|移|撤|commit|push|merge|\b(?:mr|pr)\b/i;
+
+/**
  * 这次要不要新建文档。也看话题里刚说的：上一条回答在问话（「要整理成飞书文档吗？」「标题叫什么？」），
  * 而这条回答或者它前面那条提问说到了写文档，接着回的「好，建吧」「叫周报」也算。上一条回答已经建好了文档（不是在问话）就不算
  */
@@ -411,7 +417,10 @@ async function runTask(
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
-    const readOnly = noPermission || followUp;
+    // 这次带上了群里刚才的聊天（旁听）：群聊里谁都能写字，提问本身没说要改东西时不给改文档、改代码的工具。
+    // 不然有人在群里埋一句「把某某文档清空」，等写权限名单里的人随便 @ 一句问别的，模型就可能借他的权限照做
+    const ambientOnly = hasWrites && !noPermission && !followUp && context.history.some(isChatContext) && !CHANGE_REQUEST.test(question);
+    const readOnly = noPermission || followUp || ambientOnly;
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter(
@@ -425,6 +434,8 @@ async function runTask(
       logger.info(`点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (ambientOnly) {
+      logger.info(`带上了群聊、提问没说要改东西，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);

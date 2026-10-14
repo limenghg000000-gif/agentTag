@@ -121,7 +121,7 @@ export class CatchUpPoller {
     let picked = 0;
 
     for (const chatId of this.chatIds) {
-      for (const { message, fromBot, fromApp } of await this.api.listRecentMessages("chat", chatId, PAGE_SIZE, from)) {
+      for (const { message, fromBot, fromApp } of oldestFirst(await this.api.listRecentMessages("chat", chatId, PAGE_SIZE, from))) {
         // 机器人回复过的消息会变成话题的第一条，接着盯这个话题里的追问
         if (message.threadId && this.handled.has(message.messageId)) {
           this.threads.set(message.threadId, now);
@@ -134,7 +134,7 @@ export class CatchUpPoller {
         this.threads.delete(threadId);
         continue;
       }
-      for (const { message, fromBot, fromApp } of await this.api.listRecentMessages("thread", threadId, PAGE_SIZE)) {
+      for (const { message, fromBot, fromApp } of oldestFirst(await this.api.listRecentMessages("thread", threadId, PAGE_SIZE))) {
         picked += this.pickUp(message, fromBot, fromApp ?? false, from, until);
       }
     }
@@ -187,4 +187,12 @@ export class CatchUpPoller {
     void done.catch((err) => this.logger.error(`补漏处理失败 message=${message.messageId}`, err));
     return 1;
   }
+}
+
+/**
+ * 接口按从新到旧返回，补的时候从旧到新：同一个话题里先说的先交出去（跟聊按交进来的顺序判断），
+ * 不然事件断了一阵以后，后说的「停止」会排在前面那句之前，停不到它
+ */
+function oldestFirst<T extends { message: NormalizedMessage }>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) => a.message.createTime - b.message.createTime);
 }
