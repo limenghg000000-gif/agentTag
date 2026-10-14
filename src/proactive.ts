@@ -3,7 +3,7 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { DEFAULT_PROACTIVE_MAX_PER_HOUR } from "./config.js";
 import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
-import { JudgeQueue, MUTE_COMMAND, remember } from "./follow.js";
+import { JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
 import { type Logger, recentChat } from "./history.js";
 import type { ChatModel } from "./llm.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
@@ -56,6 +56,8 @@ export interface ProactiveOptions {
   maxPerHour?: number;
   logger?: Logger;
   now?: () => number;
+  /** 判断一条最多等多久（读群记忆、群聊加问模型），默认 20 秒 */
+  judgeTimeoutMs?: number;
 }
 
 interface PausedState {
@@ -270,7 +272,12 @@ export class ProactiveReplier {
   }
 
   /** 问模型接不接，接的话返回要说的那句话（尖括号换成全角：不能变成 @所有人 这类标签） */
-  private async judge(msg: NormalizedMessage): Promise<string | undefined> {
+  /** 读群记忆、群聊也算在时限里：飞书接口卡住时照样按时结束，不一直占着判断的名额 */
+  private judge(msg: NormalizedMessage): Promise<string | undefined> {
+    return withDeadline(this.opts.judgeTimeoutMs ?? JUDGE_TIMEOUT_MS, (signal) => this.judgeWithin(msg, signal));
+  }
+
+  private async judgeWithin(msg: NormalizedMessage, signal: AbortSignal): Promise<string | undefined> {
     const [memory, chat] = await Promise.all([
       this.opts.memory
         ? this.opts.memory
@@ -293,7 +300,7 @@ export class ProactiveReplier {
       system: judgePrompt(this.opts.botName() || "机器人"),
       messages: [{ role: "user", content }],
       thinking: false,
-      signal: AbortSignal.timeout(JUDGE_TIMEOUT_MS),
+      signal,
     });
     const said = /^[\s*「"']*接\s*[:：]\s*([\s\S]+)$/.exec(result.text.trim())?.[1].trim();
     if (!said) {

@@ -162,6 +162,38 @@ test("判断出错时不回：宁可漏回一句，也不在别人说话时插�
   assert.match(t.logs.join("\n"), /跟聊：判断失败，这条不回 message=om_2：百炼超时/);
 });
 
+test("读话题上文卡住也算在判断时限里：到点就不回，不一直占着判断的名额", async () => {
+  const askedRoot = asked;
+  const handled: string[] = [];
+  const logs: string[] = [];
+  let calls = 0;
+  const follower = new ThreadFollower({
+    allowedChatIds: new Set(["oc_1"]),
+    context: { load: () => new Promise(() => {}) },
+    model: {
+      model: "fake",
+      chat: async () => {
+        calls++;
+        return { text: "是", finish: "stop" };
+      },
+    },
+    botName: () => "飞书 CLI",
+    botOpenId: () => BOT,
+    handle: async (m) => {
+      handled.push(m.messageId);
+    },
+    reply: async () => {},
+    logger: { info() {}, warn: (line: string) => logs.push(line), error() {} },
+    now: () => START,
+    judgeTimeoutMs: 20,
+  });
+  follower.track(askedRoot);
+  await follower.consider(msg("om_2"));
+  assert.deepEqual(handled, []);
+  assert.equal(calls, 0);
+  assert.match(logs.join("\n"), /跟聊：判断失败，这条不回 message=om_2/);
+});
+
 test("机器人正在做这个话题里的事时说「停止」，不用判断直接交给处理函数停任务；没在做时照常判断", async () => {
   const working = setup("否", true);
   working.follower.track(asked);

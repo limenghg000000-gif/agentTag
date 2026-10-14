@@ -48,6 +48,8 @@ export interface ThreadFollowerOptions {
   reply: (msg: NormalizedMessage, markdown: string) => Promise<unknown>;
   logger?: Logger;
   now?: () => number;
+  /** 判断一条最多等多久（读话题上文加问模型），默认 20 秒 */
+  judgeTimeoutMs?: number;
 }
 
 interface Followed {
@@ -338,7 +340,12 @@ export class ThreadFollower {
     return order < (this.cancelledBefore.get(key) ?? 0);
   }
 
-  private async judge(msg: NormalizedMessage, busy: boolean): Promise<boolean> {
+  /** 读话题上文也算在时限里：飞书接口卡住时，这条判断照样按时结束，不一直占着判断的名额、挡着话题里后面的消息 */
+  private judge(msg: NormalizedMessage, busy: boolean): Promise<boolean> {
+    return withDeadline(this.opts.judgeTimeoutMs ?? JUDGE_TIMEOUT_MS, (signal) => this.judgeWithin(msg, busy, signal));
+  }
+
+  private async judgeWithin(msg: NormalizedMessage, busy: boolean, signal: AbortSignal): Promise<boolean> {
     const context = await this.opts.context.load(msg);
     const recent = context.history.slice(-JUDGE_MESSAGES).map((m) => {
       const text = m.role === "assistant" ? `[机器人] ${m.content}` : m.content;
@@ -353,14 +360,34 @@ export class ThreadFollower {
       "",
       `新消息（没有 @ 机器人）：[${asker}] ${content.length <= JUDGE_MESSAGE_CHARS ? content : `${content.slice(0, JUDGE_MESSAGE_CHARS)}…`}`,
     ].join("\n");
-    const timeout = AbortSignal.timeout(JUDGE_TIMEOUT_MS);
     const result = await this.opts.model.chat({
       system: judgePrompt(this.opts.botName() || "机器人"),
       messages: [{ role: "user", content: transcript }],
       thinking: false,
-      signal: timeout,
+      signal,
     });
     return /^[「"'*\s]*是/.test(result.text);
+  }
+}
+
+/**
+ * 限时做一件事：到点就按超时报错，同时取消 run 里用 signal 的请求（问模型）；没用 signal 的（读飞书）到点也不再等。
+ * 用自己的计时器而不是 AbortSignal.timeout：后者的计时器不拦着进程退出
+ */
+export async function withDeadline<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`超过 ${ms / 1000} 秒`);
+      controller.abort(err);
+      reject(err);
+    }, ms);
+  });
+  try {
+    return await Promise.race([run(controller.signal), expired]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 

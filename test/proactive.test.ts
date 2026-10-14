@@ -32,7 +32,14 @@ function msg(messageId: string, extra: Partial<NormalizedMessage> = {}): Normali
 }
 
 async function setup(
-  opts: { judge?: string | Error | (() => Promise<string>); enabled?: string[]; maxPerHour?: number; superseded?: (msg: NormalizedMessage) => boolean } = {},
+  opts: {
+    judge?: string | Error | (() => Promise<string>);
+    enabled?: string[];
+    maxPerHour?: number;
+    superseded?: (msg: NormalizedMessage) => boolean;
+    listChat?: () => Promise<ThreadMessage[]>;
+    judgeTimeoutMs?: number;
+  } = {},
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "proactive-"));
   const stateFile = path.join(dir, "proactive.json");
@@ -63,7 +70,7 @@ async function setup(
       allowedChatIds: new Set(["oc_1", "oc_2"]),
       enabledChatIds: new Set(opts.enabled ?? ["oc_1"]),
       stateFile,
-      api: { listChatMessages: async () => chat },
+      api: { listChatMessages: opts.listChat ?? (async () => chat) },
       memory: { list: async () => structuredClone(memoryEntries) },
       model,
       botName: () => "飞书 CLI",
@@ -74,6 +81,7 @@ async function setup(
       onReplied: (m) => replied.push(m.messageId),
       ...(opts.maxPerHour ? { maxPerHour: opts.maxPerHour } : {}),
       ...(opts.superseded ? { superseded: opts.superseded } : {}),
+      ...(opts.judgeTimeoutMs ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
       logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error: (line: string) => logs.push(line) },
       now: () => now,
     });
@@ -164,6 +172,17 @@ test("模型出错、超时、格式不对都不回", async () => {
     } finally {
       await t.cleanup();
     }
+  }
+});
+
+test("读群聊卡住也算在判断时限里：到点就不回、不问模型", async () => {
+  const t = await setup({ judge: "接：测试库是 db-test-2", listChat: () => new Promise(() => {}), judgeTimeoutMs: 20 });
+  try {
+    await t.replier.consider(msg("om_1", { content: "测试环境数据库是哪个来着" }));
+    assert.equal(t.requests.length, 0);
+    assert.deepEqual(t.replies, []);
+  } finally {
+    await t.cleanup();
   }
 });
 
