@@ -57,8 +57,11 @@ export interface CodeHost {
   getRequest?(repo: string, number: number, signal?: AbortSignal): Promise<RequestDetail>;
   /** 合并前要核对的：合并请求的状态、分支、谁开的、源分支最新的提交，机器人自己的账号，要合到的分支受不受保护。没有实现时机器人不能合并 */
   mergeCheck?(repo: string, number: number, signal?: AbortSignal): Promise<MergeCheck>;
-  /** 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并 */
-  mergeRequest?(repo: string, number: number, options: { sha: string; target: string; whenPipelineSucceeds?: boolean }, signal?: AbortSignal): Promise<MergeResult>;
+  /**
+   * 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并。
+   * requirePipeline：合之前再看一次源分支最新提交的流水线（构建），通过了才直接合，还在跑的设成通过后自动合并，没跑过、没通过的不合
+   */
+  mergeRequest?(repo: string, number: number, options: { sha: string; target: string; requirePipeline?: boolean }, signal?: AbortSignal): Promise<MergeResult>;
 }
 
 /** 合并前核对用的 */
@@ -75,8 +78,8 @@ export interface MergeCheck extends RequestInfo {
   targetProtected: boolean;
   /** 受保护的分支在平台上允许开发者合并（GitLab「允许合并」里有 Developers）；只许维护者合的是 false */
   targetDevelopersCanMerge?: boolean;
-  /** 源分支最新的流水线（构建）：状态和跑的是哪个提交；没跑过就没有 */
-  pipeline?: { status: string; sha?: string };
+  /** 源分支最新提交的流水线（构建）状态；没跑过就没有 */
+  pipelineStatus?: string;
 }
 
 /** 合并的结果：合好了，或者设成了流水线通过后自动合并 */
@@ -413,14 +416,15 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         botUsername,
         ...(fromFork ? { fromFork } : {}),
         targetProtected: branch.protected,
-        ...(request.head_pipeline?.status ? { pipeline: { status: request.head_pipeline.status, ...(request.head_pipeline.sha ? { sha: request.head_pipeline.sha } : {}) } } : {}),
+        ...(pipelineOf(request, number, request.sha) ? { pipelineStatus: pipelineOf(request, number, request.sha) } : {}),
         ...(branch.protected ? { targetDevelopersCanMerge: branch.developers_can_merge === true } : {}),
       };
     },
-    async mergeRequest(repo, number, { sha, target, whenPipelineSucceeds }, signal) {
+    async mergeRequest(repo, number, { sha, target, requirePipeline }, signal) {
       const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
-      // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），等它算完再合
+      // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），流水线也是过一会儿才建，等它们出来再合
       let status = "";
+      let pipelineStatus: string | undefined;
       for (let tries = 0; ; tries++) {
         const request = await readMergeRequest(project, number, signal);
         // 核对以后有人把合并请求改成开到别的分支（比如 master）：合并接口只核对源分支的提交，这里不核对就会合到没查过的分支上
@@ -428,7 +432,9 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
           throw new RepoError(`!${number} 要合到的分支改成了 ${request.target_branch ?? "别的分支"}（核对时是 ${target}），机器人不合，请重新说一遍`);
         }
         status = request.detailed_merge_status ?? request.merge_status ?? "";
-        if (!MERGE_CHECKING.has(status) || tries + 1 >= MERGE_CHECK_TRIES) {
+        pipelineStatus = pipelineOf(request, number, sha);
+        const waiting = MERGE_CHECKING.has(status) || (requirePipeline === true && pipelineStatus === undefined);
+        if (!waiting || tries + 1 >= MERGE_CHECK_TRIES) {
           break;
         }
         await sleep(MERGE_CHECK_WAIT_MS, signal);
@@ -437,8 +443,18 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       if (blocked) {
         throw new RepoError(`!${number} 现在合不了：${blocked}`);
       }
+      // 机器人跑不了编译：要看流水线的，就在合之前这一次读到的结果上判断，免得核对以后流水线重跑、失败了还直接合
+      if (requirePipeline) {
+        if (pipelineStatus === undefined) {
+          throw new RepoError(`!${number} 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合；请人在 GitLab 上跑一下流水线、或者审过再点合并`);
+        }
+        if (pipelineStatus !== "success" && !PIPELINE_RUNNING.has(pipelineStatus)) {
+          throw new RepoError(`!${number} 的流水线（构建）没通过（${pipelineStatus}），机器人不合，要先把问题修好`);
+        }
+      }
       // 要等流水线通过才能合的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
-      const pipeline = whenPipelineSucceeds === true || status === "ci_must_pass" || status === "ci_still_running";
+      const pipeline =
+        (requirePipeline === true && pipelineStatus !== "success") || status === "ci_must_pass" || status === "ci_still_running";
       const res = await fetchImpl(`${project}/merge_requests/${number}/merge`, {
         method: "PUT",
         headers: { "private-token": token, "content-type": "application/json" },
@@ -509,6 +525,19 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * 合并请求源分支最新提交的流水线状态。合并结果流水线（merged results）跑的是临时的合并提交，提交号对不上源分支，
+ * 按它的 ref（refs/merge-requests/编号/merge）认；别的提交号对不上的（旧提交的流水线）不算
+ */
+function pipelineOf(request: GitLabMergeRequest, number: number, sha: string | undefined): string | undefined {
+  const pipeline = request.head_pipeline;
+  if (!pipeline?.status || !sha) {
+    return undefined;
+  }
+  const mergeRef = pipeline.ref === `refs/merge-requests/${number}/merge` || pipeline.ref === `refs/merge-requests/${number}/train`;
+  return pipeline.sha === sha || mergeRef ? pipeline.status : undefined;
+}
+
 /** 流水线还在跑（还没出结果）的状态：合并请求设成流水线通过后自动合并 */
 const PIPELINE_RUNNING = new Set(["created", "waiting_for_resource", "preparing", "pending", "running", "scheduled", "waiting_for_callback"]);
 
@@ -543,7 +572,7 @@ const MERGE_BLOCKED: Record<string, string> = {
 
 interface GitLabMergeRequest extends GitLabRequest {
   sha?: string;
-  head_pipeline?: { status?: string; sha?: string } | null;
+  head_pipeline?: { status?: string; sha?: string; ref?: string } | null;
   detailed_merge_status?: string;
   merge_status?: string;
   source_project_id?: number;
@@ -1137,22 +1166,12 @@ export class Workspace {
         this.onBranch(check.target),
       );
     }
-    // 机器人跑不了编译：源分支最新的提交得有流水线（构建）通过才合，还在跑的设成通过后自动合并，没跑过、没通过的不合
-    const pipeline = check.pipeline && (check.pipeline.sha === undefined || check.pipeline.sha === check.sha) ? check.pipeline.status : undefined;
-    if (pipeline === undefined) {
-      throw new RepoError(
-        `${ref} 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合；请人在 ${this.host.name} 上跑一下流水线、或者审过再点合并：${check.url}`,
-      );
-    }
-    if (pipeline !== "success" && !PIPELINE_RUNNING.has(pipeline)) {
+    // 机器人跑不了编译：源分支最新的提交得有流水线（构建）通过才合。已经知道没通过的这里就说；没跑过、还在跑的由平台合之前再看一次
+    const pipeline = check.pipelineStatus;
+    if (pipeline !== undefined && pipeline !== "success" && !PIPELINE_RUNNING.has(pipeline)) {
       throw new RepoError(`${ref} 的流水线（构建）没通过（${pipeline}），机器人不合，要先把问题修好：${check.url}`);
     }
-    const merged = await this.host.mergeRequest(
-      this.repo,
-      number,
-      { sha: check.sha, target: check.target, ...(pipeline === "success" ? {} : { whenPipelineSucceeds: true }) },
-      signal,
-    );
+    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target, requirePipeline: true }, signal);
     const url = merged.url || check.url;
     const out = this.output();
     return (
