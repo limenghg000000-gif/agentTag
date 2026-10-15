@@ -14,6 +14,7 @@ import {
 } from "../knowledge.js";
 import { escapeCardMarkdown } from "../markdown.js";
 import { type MemoryEntry, type MemoryStore, normalizeContent } from "../memory.js";
+import { clickerName, type NameLookup } from "../operator-names.js";
 import { MAX_CARD_BYTES } from "../progress.js";
 import type { Tool } from "./tool.js";
 
@@ -120,6 +121,8 @@ export interface ConflictDeskOptions {
   /** 写权限名单：要改经验库（选了以群记忆为准）时只有名单里的人能点同步 */
   approvers: ReadonlySet<string>;
   allowedChatIds: ReadonlySet<string>;
+  /** 卡片回调里没有点的人的名字：用它找（见 createNameLookup）。不传时找不到名字的写「有人」 */
+  nameOf?: NameLookup;
   logger?: Logger;
   now?: () => number;
 }
@@ -211,7 +214,7 @@ export class ConflictDesk {
     if (!this.options.allowedChatIds.has(evt.chatId)) {
       return true;
     }
-    const operator = person(evt.operator.openId, evt.operator.name);
+    let operator = person(evt.operator.openId, evt.operator.name);
     const card = this.cards.get(value.card);
     if (!card || card.chatId !== evt.chatId) {
       this.logger.info(`冲突卡片 已失效 card=${value.card} operator=${operator.openId}`);
@@ -219,6 +222,11 @@ export class ConflictDesk {
         .updateCard(evt.messageId, expiredCard("这张卡片已经失效（机器人重启过，或者已经处理完了）。需要的话在话题里再说一次「查一下群记忆和经验库有没有冲突」"))
         .catch((err: unknown) => this.logger.warn("更新冲突卡片失败", err));
       return true;
+    }
+    // 卡片上要写是谁点的：回调里一般没有名字，去找（找不到写「有人」，不显示 open_id）。
+    // 找名字要等，放在下面看卡片状态之前：等的时候卡片可能被换掉、处理掉。选下拉框不用名字
+    if (value.op !== "pick") {
+      operator = person(operator.openId, await clickerName(evt, card.proposer, this.options.nameOf));
     }
     if (card.state !== "pending" || (card.cardMessageId && evt.messageId !== card.cardMessageId)) {
       return true;
@@ -228,7 +236,6 @@ export class ConflictDesk {
       await this.render(card, expiredCard("这张卡片超过 24 小时，已经失效。需要的话在话题里再说一次「查一下群记忆和经验库有没有冲突」"));
       return true;
     }
-    const who = operator.name ?? "有人";
     const approver = this.options.approvers.has(operator.openId);
     if (value.op === "pick") {
       const index = typeof value.row === "string" ? Number(value.row) : Number.NaN;
@@ -243,6 +250,7 @@ export class ConflictDesk {
       await this.render(card);
       return true;
     }
+    const who = operator.name ?? "有人";
     if (value.op === "cancel") {
       if (!approver && operator.openId !== card.proposer.openId) {
         card.note = `${who}点了取消：只有发起人或写权限名单里的人能取消`;
@@ -424,7 +432,7 @@ export class ConflictDesk {
 
   private async execute(card: ConflictCard, operator: Person): Promise<void> {
     await this.render(card);
-    const confirmer = operator.name ?? operator.openId;
+    const confirmer = operator.name ?? "有人";
     let changedKnowledge = false;
     for (const row of card.rows) {
       if (row.pick === "skip") {

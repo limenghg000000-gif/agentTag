@@ -38,6 +38,7 @@ import {
 import { escapeCardMarkdown } from "../markdown.js";
 import type { McpTaskContext } from "../mcp.js";
 import type { MemoryStore } from "../memory.js";
+import { clickerName, type NameLookup } from "../operator-names.js";
 import { MAX_CARD_BYTES } from "../progress.js";
 import { ConflictDesk, type ReplaceRequest } from "./conflicts.js";
 import type { Tool } from "./tool.js";
@@ -215,6 +216,8 @@ export interface KnowledgeDeskOptions {
   allowedChatIds: ReadonlySet<string>;
   /** 群记忆：给了（而且配了写权限名单）时，群记忆和经验库说法对不上可以发冲突卡片，让群里成员选以哪边为准 */
   memory?: MemoryStore;
+  /** 卡片回调里没有点的人的名字：用它找（见 createNameLookup）。不传时找不到名字的，卡片上写「有人」，确认人写「写权限名单里的同事」 */
+  nameOf?: NameLookup;
   logger?: Logger;
   now?: () => number;
   /** 回答前检索每个库最多等多久、算向量最多等多久、记 aiops 编号失败后隔多久再试（测试时调短） */
@@ -266,6 +269,7 @@ export class KnowledgeDesk {
         updateCard: options.updateCard,
         approvers: options.approvers,
         allowedChatIds: options.allowedChatIds,
+        ...(options.nameOf ? { nameOf: options.nameOf } : {}),
         logger: this.logger,
         now: this.now,
       });
@@ -507,7 +511,7 @@ export class KnowledgeDesk {
     if (!this.options.allowedChatIds.has(evt.chatId)) {
       return true;
     }
-    const operator = person(evt.operator.openId, evt.operator.name);
+    let operator = person(evt.operator.openId, evt.operator.name);
     const proposal = this.proposals.get(value.proposal);
     if (!proposal || proposal.chatId !== evt.chatId) {
       this.logger.info(`经验库卡片 已失效 proposal=${value.proposal} operator=${operator.openId}`);
@@ -516,6 +520,9 @@ export class KnowledgeDesk {
         .catch((err: unknown) => this.logger.warn("更新经验库卡片失败", err));
       return true;
     }
+    // 卡片上要写是谁点的、确认人要记名字：回调里一般没有名字，去找（找不到写「有人」，不显示 open_id）。
+    // 找名字要等，放在下面看草稿状态之前：等的时候草稿可能被换掉、处理掉
+    operator = person(operator.openId, await clickerName(evt, proposal.proposer, this.options.nameOf));
     if (proposal.state !== "pending" && proposal.state !== "partial") {
       return true;
     }
@@ -623,7 +630,7 @@ export class KnowledgeDesk {
     const task: McpTaskContext = { chatId: request.chatId, senderId: request.operator.openId, messageId: request.sourceMessageId };
     let outcome: Outcome;
     try {
-      outcome = await this.save(proposal, request.operator.name ?? request.operator.openId, task);
+      outcome = await this.save(proposal, confirmerOf(request.operator), task);
     } catch (err) {
       if (err instanceof StaleProposalError) {
         return { lines: [err.message], ok: false };
@@ -675,7 +682,8 @@ export class KnowledgeDesk {
   private async execute(proposal: Proposal, operator: Person): Promise<void> {
     await this.render(proposal);
     const task: McpTaskContext = { chatId: proposal.chatId, senderId: operator.openId, messageId: proposal.sourceMessageId };
-    const confirmedBy = operator.name ?? operator.openId;
+    const confirmedBy = confirmerOf(operator);
+    this.logger.info(`经验库卡片 确认 proposal=${proposal.id} operator=${operator.openId}`);
     let outcome: Outcome;
     try {
       outcome = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
@@ -1681,6 +1689,14 @@ function optionalInteger(value: unknown, name: string): number | undefined {
 /** 飞书里的名字会写进表格、日志，同步到 aiops：像是有密钥或手机号、身份证号的（有人把令牌、号码改成了名字）不用，只留 open_id */
 function person(openId: string, name: string | undefined): Person {
   return { openId, ...(name && !findSensitive(name) ? { name } : {}) };
+}
+
+/**
+ * 记进表格「确认人」、写在卡片上的确认人。没拿到名字时不写 open_id（群里看不懂，还会被检索出来写进回答），
+ * 能确认的只有写权限名单里的人；是谁看日志里的 operator
+ */
+function confirmerOf(operator: Person): string {
+  return operator.name ?? "写权限名单里的同事";
 }
 
 /**

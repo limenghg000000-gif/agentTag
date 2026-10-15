@@ -212,3 +212,25 @@ test("话题消息里的图片记下 image_key；下载图片读出整个文件�
   assert.equal((await download.downloadImage("om_1", "img_b")).mimeType, "image/jpeg");
   assert.equal((await download.downloadImage("om_1", "img_c")).mimeType, "image/png");
 });
+
+test("查通讯录里的名字：按 open_id 查；接口报错时抛出 FeishuApiError", async () => {
+  const calls: any[] = [];
+  const responses: object[] = [{ code: 0, data: { user: { name: "李四" } } }, { code: 0, data: { user: {} } }, { code: 41050, msg: "no user authority" }];
+  const client = {
+    contact: {
+      v3: {
+        user: {
+          get: async (payload: any) => {
+            calls.push(payload);
+            return responses.shift();
+          },
+        },
+      },
+    },
+  } as unknown as Client;
+  const api = createFeishuApi(client, "cli_app", () => bot);
+  assert.equal(await api.getUserName("ou_li"), "李四");
+  assert.deepEqual(calls[0], { path: { user_id: "ou_li" }, params: { user_id_type: "open_id" } });
+  assert.equal(await api.getUserName("ou_li"), undefined, "没有名字");
+  await assert.rejects(api.getUserName("ou_li"), (err: unknown) => err instanceof FeishuApiError && err.code === 41050);
+});
