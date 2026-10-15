@@ -21,10 +21,12 @@ import { AiopsLessons } from "./knowledge-aiops.js";
 import { BitableKnowledgeBackend, createBitableApi } from "./knowledge-bitable.js";
 import { createOpenAICompatibleEmbedder, createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "./llm.js";
 import { McpHub } from "./mcp.js";
+import { createNameLookup } from "./operator-names.js";
 import type { AboutBot } from "./prompt.js";
 import { MemoryStore } from "./memory.js";
 import { ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
+import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { createCardKitApi } from "./stream-card.js";
 import { TaskRegistry } from "./tasks.js";
@@ -105,6 +107,10 @@ const knowledge = config.knowledge
       updateCard: (messageId, card) => channel.updateCard(messageId, card),
       ...(config.feishu.writeAllowedUsers ? { approvers: config.feishu.writeAllowedUsers } : {}),
       allowedChatIds: config.feishu.allowedChatIds,
+      // 群记忆和经验库说法对不上时发冲突卡片，选好以哪边为准后两边一起改
+      memory,
+      // 卡片按钮回调里没有点的人的名字，卡片上写「谁点了」、记确认人时去话题和通讯录里找
+      nameOf: createNameLookup(feishuApi),
     })
   : undefined;
 // 提问里的截图先交给看图模型转成文字
@@ -449,7 +455,13 @@ async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promis
     return undefined;
   }
   const host = code.host.kind === "gitlab" ? createGitLabHost(code.host.url, code.host.token) : createGitHubHost(code.host.token);
-  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos, branches: code.branches });
+  const workspaces = new CodeWorkspaces({
+    root: code.workspaceDir,
+    host,
+    repos: code.repos,
+    branches: code.branches,
+    ...(code.build ? { build: createBuildChecker(code.goproxy ? { goproxy: code.goproxy } : {}) } : {}),
+  });
   // 几天没用的话题工作目录，启动时和之后每天清一次
   const sweep = () => workspaces.sweep().catch((err) => console.error("清理代码工作目录失败", err));
   void sweep();

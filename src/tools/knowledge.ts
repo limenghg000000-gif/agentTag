@@ -37,7 +37,10 @@ import {
 } from "../knowledge-aiops.js";
 import { escapeCardMarkdown } from "../markdown.js";
 import type { McpTaskContext } from "../mcp.js";
+import type { MemoryStore } from "../memory.js";
+import { clickerName, type NameLookup } from "../operator-names.js";
 import { MAX_CARD_BYTES } from "../progress.js";
+import { ConflictDesk, type ReplaceRequest } from "./conflicts.js";
 import type { Tool } from "./tool.js";
 
 /** 确认卡片上按钮回传的 action */
@@ -157,6 +160,11 @@ interface SaveProposal extends ProposalBase {
    * 之后那一行在表格里改了、删了、编号给了别的行都不影响，按记下的编号归档 aiops 里那条（见 archivedOriginal）
    */
   replacedArchived?: ArchivedRow;
+  /**
+   * 冲突卡片来的：存新经验之前（排队轮到时、另发的确认卡片上点保存时）再核对一次群记忆，返回不该存的原因（新结论是按当时的群记忆写的）。
+   * 另发的确认卡片有它，同一个话题里再起草别的经验时不作废这张
+   */
+  precheck?: () => Promise<string | undefined>;
 }
 
 /** 卡片上已经在表格里归档了的那一行：当时的编号和它记的 aiops 编号 */
@@ -190,6 +198,8 @@ type Proposal = SaveProposal | ArchiveProposal;
 interface Outcome {
   done: string[];
   unfinished: string[];
+  /** 新的存好了，旧的卡片发出后在表格里改过、没归档它（再试也一样，不算没做完）：冲突卡片上这一处算没同步成 */
+  replacedKept?: boolean;
 }
 
 export interface KnowledgeDeskOptions {
@@ -204,6 +214,10 @@ export interface KnowledgeDeskOptions {
    */
   approvers?: ReadonlySet<string>;
   allowedChatIds: ReadonlySet<string>;
+  /** 群记忆：给了（而且配了写权限名单）时，群记忆和经验库说法对不上可以发冲突卡片，让群里成员选以哪边为准 */
+  memory?: MemoryStore;
+  /** 卡片回调里没有点的人的名字：用它找（见 createNameLookup）。不传时找不到名字的，卡片上写「有人」，确认人写「写权限名单里的同事」 */
+  nameOf?: NameLookup;
   logger?: Logger;
   now?: () => number;
   /** 回答前检索每个库最多等多久、算向量最多等多久、记 aiops 编号失败后隔多久再试（测试时调短） */
@@ -225,6 +239,8 @@ export class KnowledgeDesk {
   private replacing: Promise<unknown> = Promise.resolve();
   /** 同一个话题里发确认卡片排队进行，键是群和话题 */
   private readonly publishing = new Map<string, Promise<void>>();
+  /** 群记忆和经验库的冲突卡片：没给群记忆、没配写权限名单时没有 */
+  private readonly conflicts?: ConflictDesk;
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly lookupMs: number;
@@ -237,6 +253,27 @@ export class KnowledgeDesk {
     this.lookupMs = options.lookupMs ?? LOOKUP_MS;
     this.semanticMs = options.semanticMs ?? SEMANTIC_MS;
     this.retryDelayMs = options.retryDelayMs ?? LINK_RETRY_MS;
+    if (options.memory && options.approvers) {
+      this.conflicts = new ConflictDesk({
+        memory: options.memory,
+        knowledge: {
+          activeEntry: (id) => this.activeEntry(id),
+          unchanged: async (seen) => {
+            const current = await options.base.current(seen);
+            return current !== undefined && current.status === "active" && usable(current) && sameContent(current, seen);
+          },
+          replace: (request) => this.replaceFromConflict(request),
+          location: () => options.base.location(),
+        },
+        send: options.send,
+        updateCard: options.updateCard,
+        approvers: options.approvers,
+        allowedChatIds: options.allowedChatIds,
+        ...(options.nameOf ? { nameOf: options.nameOf } : {}),
+        logger: this.logger,
+        now: this.now,
+      });
+    }
   }
 
   /**
@@ -314,8 +351,8 @@ export class KnowledgeDesk {
       spec: {
         name: "knowledge_search",
         description:
-          "在团队经验库里查相近的经验（排查经验、应答卡、数据口径、需求结论）。回答前程序已经按提问查过一次，" +
-          "查到报错原文、错误码、服务名这类新线索后，可以换个说法再查。" +
+          "在团队经验库里查相近的经验（排查经验、应答卡、数据口径、需求结论）。话题第一次提问时程序已经按提问查过一次，同一个话题里的追问不再自动查；" +
+          "查到报错原文、错误码、服务名这类新线索，或者追问里出了新问题，可以自己再查。" +
           (otherTools.includes("aiops_search_knowledge") ? "aiops 自带的经验库用 aiops_search_knowledge 查" : ""),
         parameters: {
           type: "object",
@@ -459,11 +496,14 @@ export class KnowledgeDesk {
       },
     };
     // 没配写权限名单：没人能确认，起草和归档的工具不给（提示词里会说存不了）
-    return this.options.approvers ? [search, get, propose, archive] : [search, get];
+    return this.options.approvers ? [search, get, propose, archive, ...(this.conflicts ? [this.conflicts.tool(ctx)] : [])] : [search, get];
   }
 
   /** 处理确认卡片上的按钮。不是经验库的卡片返回 false */
   async handleCardAction(evt: CardActionEvent): Promise<boolean> {
+    if (await this.conflicts?.handleCardAction(evt)) {
+      return true;
+    }
     const value = evt.action.value as { action?: unknown; proposal?: unknown; op?: unknown; v?: unknown } | undefined;
     if (value?.action !== KNOWLEDGE_ACTION || typeof value.proposal !== "string" || typeof value.op !== "string") {
       return false;
@@ -471,7 +511,7 @@ export class KnowledgeDesk {
     if (!this.options.allowedChatIds.has(evt.chatId)) {
       return true;
     }
-    const operator = person(evt.operator.openId, evt.operator.name);
+    let operator = person(evt.operator.openId, evt.operator.name);
     const proposal = this.proposals.get(value.proposal);
     if (!proposal || proposal.chatId !== evt.chatId) {
       this.logger.info(`经验库卡片 已失效 proposal=${value.proposal} operator=${operator.openId}`);
@@ -480,6 +520,9 @@ export class KnowledgeDesk {
         .catch((err: unknown) => this.logger.warn("更新经验库卡片失败", err));
       return true;
     }
+    // 卡片上要写是谁点的、确认人要记名字：回调里一般没有名字，去找（找不到写「有人」，不显示 open_id）。
+    // 找名字要等，放在下面看草稿状态之前：等的时候草稿可能被换掉、处理掉
+    operator = person(operator.openId, await clickerName(evt, proposal.proposer, this.options.nameOf));
     if (proposal.state !== "pending" && proposal.state !== "partial") {
       return true;
     }
@@ -555,15 +598,92 @@ export class KnowledgeDesk {
 
   /** 等点了确认的都执行完（测试和退出前用） */
   async idle(): Promise<void> {
+    await this.conflicts?.idle();
     while (this.running.size > 0) {
       await Promise.allSettled([...this.running]);
+    }
+  }
+
+  /**
+   * 冲突卡片上选了以群记忆为准、写权限名单里的人点了同步：按卡片上列的新内容取代旧经验，和点「保存」走一样的流程
+   * （存新的、排查经验同步 aiops、归档旧的；卡片发出后旧的在表格里改过就不取代）。返回做完的几行。
+   * 后面的步骤没做完、或者第一步就没存成时，在冲突卡片下面另发一张确认卡片，写权限名单里的人在那张上点「再试一次」「保存」接着做
+   * （还没存新经验的，点保存前再核对一次群记忆）；这两种和旧的改过了（存了新的、旧的没取代）都算没做完（ok 为 false）
+   */
+  private async replaceFromConflict(request: ReplaceRequest): Promise<{ lines: string[]; ok: boolean }> {
+    const withAiops = this.options.aiops !== undefined && !this.options.aiops.lacksWriteTools;
+    const proposal: SaveProposal = {
+      kind: "save",
+      draft: request.draft,
+      replaces: request.replaces,
+      syncAiops: request.draft.category === "incident" && withAiops,
+      requestId: randomUUID(),
+      id: randomUUID().slice(0, 8),
+      chatId: request.chatId,
+      threadKey: request.threadKey,
+      proposer: request.proposer,
+      sourceMessageId: request.sourceMessageId,
+      createdAt: this.now(),
+      state: "working",
+      ...(request.precheck ? { precheck: request.precheck } : {}),
+    };
+    const task: McpTaskContext = { chatId: request.chatId, senderId: request.operator.openId, messageId: request.sourceMessageId };
+    let outcome: Outcome;
+    try {
+      outcome = await this.save(proposal, confirmerOf(request.operator), task);
+    } catch (err) {
+      if (err instanceof StaleProposalError) {
+        return { lines: [err.message], ok: false };
+      }
+      this.logger.warn(`冲突卡片 取代经验 ${request.replaces.id} 没存成 proposal=${proposal.id}`, err);
+      proposal.state = "pending";
+      proposal.note = `冲突卡片上点的同步没存成：${describe(err)}。可以在这张卡片上再点「保存」`;
+      const attached = await this.attach(proposal, request.replyTo);
+      return {
+        lines: [`经验 ${request.replaces.id} 没改成：${describe(err)}。${attached ? "话题里另发了一张确认卡片，可以在那张上再点「保存」" : ""}`],
+        ok: false,
+      };
+    }
+    // 表格链接冲突卡片上统一列一次
+    const done = outcome.done.filter((line) => !line.startsWith("经验库表格："));
+    if (outcome.unfinished.length === 0) {
+      return { lines: done, ok: !outcome.replacedKept };
+    }
+    proposal.state = "partial";
+    proposal.result = outcome.done;
+    proposal.unfinished = outcome.unfinished;
+    this.logger.warn(`冲突卡片 取代经验有步骤没做成 proposal=${proposal.id}：${outcome.unfinished.join("；")}`);
+    const attached = await this.attach(proposal, request.replyTo);
+    return {
+      lines: [...done, attached ? "还有没做成的，见话题里另发的确认卡片，可以在那张上点「再试一次」" : `还有没做成的：${outcome.unfinished.join("；")}`],
+      ok: false,
+    };
+  }
+
+  /** 冲突卡片上没做完的那条经验：登记成一张确认卡片发到话题里，之后按普通的确认卡片处理。发不出去时返回 false */
+  private async attach(proposal: SaveProposal, replyTo: string): Promise<boolean> {
+    // 冲突卡片上只列了结论和怎么处理，确认卡片要列整条草稿：旧经验其他字段很长时可能超过卡片大小，发不出去就不发
+    const card = renderProposalCard(proposal);
+    if (!cardFits(card) || !draftFits(proposal.draft)) {
+      this.logger.warn(`冲突卡片 没做完的经验卡片太大，没发 proposal=${proposal.id}`);
+      return false;
+    }
+    try {
+      const { messageId } = await this.options.send(proposal.chatId, { card }, { replyTo, replyInThread: true });
+      proposal.cardMessageId = messageId;
+      this.proposals.set(proposal.id, proposal);
+      return true;
+    } catch (err) {
+      this.logger.warn(`冲突卡片 没做完的经验卡片发不出去 proposal=${proposal.id}`, err);
+      return false;
     }
   }
 
   private async execute(proposal: Proposal, operator: Person): Promise<void> {
     await this.render(proposal);
     const task: McpTaskContext = { chatId: proposal.chatId, senderId: operator.openId, messageId: proposal.sourceMessageId };
-    const confirmedBy = operator.name ?? operator.openId;
+    const confirmedBy = confirmerOf(operator);
+    this.logger.info(`经验库卡片 确认 proposal=${proposal.id} operator=${operator.openId}`);
     let outcome: Outcome;
     try {
       outcome = proposal.kind === "save" ? await this.save(proposal, confirmedBy, task) : await this.archive(proposal, confirmedBy, task);
@@ -631,6 +751,11 @@ export class KnowledgeDesk {
       }
       entry = saved;
     } else {
+      // 冲突卡片来的：轮到存的时候再核对一次群记忆（前面可能排着别的取代，等了一会儿）
+      const stale = await proposal.precheck?.();
+      if (stale) {
+        throw new StaleProposalError(stale);
+      }
       // 上次存的结果没传回来时草稿编号一样，已经写进去的直接返回那一行
       entry = await base.save(draft, {
         proposedBy: proposal.proposer.name ?? proposal.proposer.openId,
@@ -1079,6 +1204,7 @@ export class KnowledgeDesk {
           out.done.push(
             `旧的经验 ${old.id} 在卡片发出后在表格里改过，卡片上确认取代的不是现在这条，没有归档它，aiops 里同步的那条也没动。要归档的话请按现在的内容另外起草归档。`,
           );
+          out.replacedKept = true;
           return;
         }
         out.unfinished.push(`旧的经验 ${old.id} 没能归档：${describe(err)}。不归档的话新旧两条都会被检索到`);
@@ -1252,7 +1378,10 @@ export class KnowledgeDesk {
       await this.render(proposal);
       signal.throwIfAborted();
     }
-    const replaced = [...this.proposals.values()].filter((old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending");
+    // 冲突卡片没做完另发的确认卡片不是草稿的旧版本，不作废：作废了那一处就没地方接着点了
+    const replaced = [...this.proposals.values()].filter(
+      (old) => old.chatId === ctx.chatId && old.threadKey === ctx.threadKey && old.state === "pending" && !(old.kind === "save" && old.precheck),
+    );
     for (const old of replaced) {
       old.state = "superseded";
       old.result = ["已换成新的草稿，以下面的卡片为准"];
@@ -1560,6 +1689,14 @@ function optionalInteger(value: unknown, name: string): number | undefined {
 /** 飞书里的名字会写进表格、日志，同步到 aiops：像是有密钥或手机号、身份证号的（有人把令牌、号码改成了名字）不用，只留 open_id */
 function person(openId: string, name: string | undefined): Person {
   return { openId, ...(name && !findSensitive(name) ? { name } : {}) };
+}
+
+/**
+ * 记进表格「确认人」、写在卡片上的确认人。没拿到名字时不写 open_id（群里看不懂，还会被检索出来写进回答），
+ * 能确认的只有写权限名单里的人；是谁看日志里的 operator
+ */
+function confirmerOf(operator: Person): string {
+  return operator.name ?? "写权限名单里的同事";
 }
 
 /**

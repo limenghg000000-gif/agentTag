@@ -38,6 +38,7 @@ import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { containsSecret, maskPersonal } from "./knowledge.js";
+import { CONFLICT_TOOL } from "./tools/conflicts.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
@@ -433,11 +434,38 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    const knowledge = await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
+    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
+    const followUp = options.readOnly === true;
+    // 只是整理话题里已经有的内容（总结、讲给谁听、换个说法）：不查经验库、不给查询的工具，直接按上文写。按钮上的话是接着要查的新问题，不算
+    const restate =
+      !followUp &&
+      restatesEarlier(question, history, [deps.botName() || FALLBACK_BOT_NAME, ...msg.mentions.flatMap((mention) => (mention.name ? [mention.name] : []))]);
+    if (restate) {
+      logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
+    }
+    // 经验库一个话题只自动查成一次：这个话题已经查成过（不管查没查到），后面的追问不再查（查到的经验那次回答已经用上了），
+    // 追问里有新线索时模型自己用 knowledge_search 查。没查成过的（超时、出错、只查成一边、那次是整理不查、重启后记不得）照样查。
+    // 追问里明说要查经验库、知识库的也照样先查
+    const topics = lookedUpTopics(deps);
+    const lookupSkipped = !restate && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
+    if (lookupSkipped) {
+      logger.info(`这个话题查过经验库了，这次追问不再自动查 message=${msg.messageId}`);
+    }
+    const knowledge =
+      restate || lookupSkipped
+        ? undefined
+        : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
+    if (knowledge && !knowledge.missed?.length) {
+      rememberLookup(topics, taskContext.threadKey);
+    }
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
+    // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
+    const toolTexts: string[] = [];
+    // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
+    let mergedNow = false;
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
@@ -445,8 +473,23 @@ async function runTask(
     const recentThreadTools = deps.recentThreads
       ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
       : [];
-    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
-    const followUp = options.readOnly === true;
+    // 整理之前内容时写文档、记群记忆、起草经验：写进去的内容和回答一样，只能用话题里之前写过的代码位置和数据（回答里多半只有个链接，检查不到写进去的）
+    const checkRestatedWrite = (tool: Tool, args: Record<string, unknown>) => {
+      // 整理时读文档、网页只读这次的提问和话题里给过的链接：模型自己想到的网页读进来会被当成依据，里面的数据就能混进整理
+      const link = restate ? RESTATE_READS.get(tool.spec.name) : undefined;
+      if (link !== undefined) {
+        const value = typeof args[link] === "string" ? args[link].trim().replace(/\/+$/, "") : "";
+        if (!value || ![asked, ...history.map((m) => m.content)].some((text) => text.includes(value))) {
+          throw new Error("这次是整理话题里之前的内容，只能读这次的提问和话题里给过的文档、网页链接。没给过的不要读，按之前的回答写。");
+        }
+      }
+      if (restate && (tool.writes || MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) {
+        const added = restatedAdditions(stringArgs(args), saidBefore(), restateScope);
+        if (added.length > 0) {
+          throw new Error(restatedWriteNote(added));
+        }
+      }
+    };
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
@@ -462,6 +505,7 @@ async function runTask(
                   : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
             );
           }
+          checkRestatedWrite(tool, args);
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
           if (tool.instructionsOnly) {
             return tool.run(args, ctx);
@@ -480,8 +524,14 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
+            mergedNow = true;
+          }
           // 和 runAgent 交给模型时一样截短：截断处以后的模型没看到，不算
           const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
+          if (!MEMORY_WRITE_TOOLS.has(tool.spec.name)) {
+            toolTexts.push(seenByModel(output, limit));
+          }
           const seenFacts = output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit);
           evidence.push(
             code
@@ -504,8 +554,20 @@ async function runTask(
       }),
     ).concat(
       // 经验库的工具不记进上面几样：查到的是以前确认过的结论，不是这次实时查到的数据，也不是这次读到的代码。
-      // 只查了经验库就给出线上结论、引用文件行号，照样要打回
-      knowledgeTools,
+      // 只查了经验库就给出线上结论、引用文件行号，照样要打回。查到的原文记下来，里面写着的合并请求编号回答里可以写
+      knowledgeTools.map(
+        (tool): Tool => ({
+          ...tool,
+          run: async (args, ctx) => {
+            checkRestatedWrite(tool, args);
+            const output = await tool.run(args, ctx);
+            if (!KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) {
+              toolTexts.push(seenByModel(output, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
+            }
+            return output;
+          },
+        }),
+      ),
     );
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
@@ -514,7 +576,8 @@ async function runTask(
     // 不然有人在群里埋一句「把某某文档清空」，等写权限名单里的人 @ 一句，模型就可能借他的权限照做。
     // 提问本身说了要改哪个文档或代码：给改的工具、不带群聊（和没有旁听时一样）；没说：带群聊、只给读的工具
     const ambient = hasWrites && !noPermission && !followUp && context.history.some(isChatContext);
-    const chatDropped = ambient && CHANGE_REQUEST.test(question);
+    // 「合到 uat」「开个 MR」也算要改：合并、开合并请求的工具只在发起人这句话明确要时才给，不能带群聊
+    const chatDropped = ambient && (CHANGE_REQUEST.test(question) || asksToOpenRequest(question));
     const ambientOnly = ambient && !chatDropped;
     const modelHistory = chatDropped ? history.filter((m) => !isChatContext(m)) : history;
     // 跟聊接过来的、没 @ 机器人的话：话题里谁都能写字，写权限名单里的人随口说一句没 @ 的话，
@@ -532,6 +595,9 @@ async function runTask(
         !(readOnly && tool.writes) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
         !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
+        !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
+        // 合并只在发起人这句话明确要合并时给：群记忆、话题里别人的话、合并请求描述里写着「直接合掉」也不会让它去合
+        (tool.spec.name !== MERGE_TOOL || asksToMerge(question)) &&
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
     toolCount = taskTools.length;
@@ -557,11 +623,24 @@ async function runTask(
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
     const readCode = () => evidence.some(linksCode);
+    // 整理之前内容时核对哪几样：配了代码工具（这次给没给都算）就核对代码位置，配了 MCP 服务就核对线上数据
+    const restateScope = { code: allTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX)), ops: Boolean(deps.mcp?.names.length) };
+    // 整理之前内容时的依据：这次的提问、话题里之前写过的（之前的回答、群成员说的）和这次读到的文档网页。检查时再取，读到的才算上
+    const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence)].join("\n");
+    // 合并请求编号的依据：这次的提问、话题里之前的消息和这次的工具结果。检查时再取，查到的才算上
+    // 群记忆、回答前查到的经验里写着的编号也算（群成员记下的「uat 的合并请求是 !360」）
+    const requestsKnown = () =>
+      [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
+    const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL), merged: () => mergedNow };
     const reviews = [
-      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
-      // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
-      ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
-      ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+      ...(restate
+        ? [reviewRestatedAnswer(saidBefore, restateScope)]
+        : [
+            ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode, requests)] : []),
+            // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
+            ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
+            ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+          ]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -603,6 +682,7 @@ async function runTask(
         ...(unaddressed ? { unaddressed: true } : {}),
         ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
+        restate,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
@@ -623,7 +703,12 @@ async function runTask(
         ...(deps.knowledge
           ? {
               knowledge: {
-                ...(knowledge
+                // 整理之前内容时没查经验库，提示词里不说查到没查到
+                ...(restate
+                  ? {}
+                  : lookupSkipped
+                  ? { skipped: true }
+                  : knowledge
                   ? {
                       hits: knowledge.text,
                       ...(knowledge.aiops ? { aiopsHits: true } : {}),
@@ -701,7 +786,13 @@ async function runTask(
     // 最后一道检查也按显示出来的文字看：<font>、<text_tag> 标签去掉
     const shown = stripRichTags(result.text);
     let blockedCode = false;
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
+    // 整理之前内容时：重做以后回答里还有话题里之前没写过的代码位置、线上数据（条数、百分比这类也算），不发出去
+    const restatedAdded = restate && result.finish !== "filtered" ? restatedAdditions(shown, saidBefore(), restateScope) : [];
+    if (restatedAdded.length > 0) {
+      logger.warn(`整理之前的内容，重做以后还是添了之前没写过的内容，没有发出 message=${msg.messageId}：${restatedAdded.join("、")}`);
+      answer = BLOCKED_RESTATE_ANSWER;
+    }
+    if (!restate && deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
@@ -728,10 +819,17 @@ async function runTask(
         logger.warn(`回答打回重做以后还是引用了没查到的代码位置，没有发出 message=${msg.messageId}：${unseen.map((cite) => cite.text).join("、")}`);
         answer = blockedCodeAnswer(deps.codeRepos ?? []);
         blockedCode = true;
+      } else {
+        const madeUp = madeUpRequestRefs(shown, requestsKnown());
+        if (madeUp.length > 0) {
+          logger.warn(`回答打回重做以后还是写了查不到的合并请求编号，没有发出 message=${msg.messageId}：${madeUp.join("、")}`);
+          answer = blockedRequestAnswer(madeUp);
+          blockedCode = true;
+        }
       }
     }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
-    if (answer === BLOCKED_OPS_ANSWER || blockedCode || result.finish === "filtered") {
+    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || result.finish === "filtered") {
       state.thoughts = undefined;
     }
     state.phase = "done";
@@ -740,7 +838,7 @@ async function runTask(
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified, labelUserMessage(context.askerName, askedFull || "（@ 了你，没有写别的内容）"));
     // 被拦下、被审核拦下的回答里没有结论，不记
-    if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
+    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && result.finish !== "filtered") {
       await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
@@ -1273,11 +1371,49 @@ export function codeContent(output: string, facts: readonly CodeFact[]): string 
 
 /** 列分支、切分支的代码工具：点按钮问的不让切（见 runTask 里的 followUp） */
 const BRANCHES_TOOL = "code_branches";
+const OPEN_PR_TOOL = "code_open_pr";
+const MERGE_TOOL = "code_merge";
+
+/** 每个机器人记在内存里的「哪些话题查成过经验库」，重启就忘（忘了就再查一次，多查不出错） */
+const LOOKED_UP_TOPICS = new WeakMap<BotDeps, Map<string, number>>();
+/** 最多记这么多个话题、记这么久，超了忘掉最早的 */
+const LOOKED_UP_TOPICS_MAX = 2000;
+const LOOKED_UP_TOPICS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function lookedUpTopics(deps: BotDeps): { has(key: string): boolean; map: Map<string, number> } {
+  let map = LOOKED_UP_TOPICS.get(deps);
+  if (!map) {
+    map = new Map();
+    LOOKED_UP_TOPICS.set(deps, map);
+  }
+  const topics = map;
+  return {
+    map: topics,
+    has(key) {
+      const at = topics.get(key);
+      return at !== undefined && Date.now() - at < LOOKED_UP_TOPICS_MS;
+    },
+  };
+}
+
+function rememberLookup(topics: { map: Map<string, number> }, key: string): void {
+  topics.map.delete(key);
+  topics.map.set(key, Date.now());
+  for (const oldest of topics.map.keys()) {
+    if (topics.map.size <= LOOKED_UP_TOPICS_MAX) {
+      break;
+    }
+    topics.map.delete(oldest);
+  }
+}
+
+/** 追问里明说要查经验库：照样先自动查一次。「飞书知识库」说的是飞书文档，不算 */
+const ASKS_KNOWLEDGE = /经验库|(?<!飞书\s*)知识库/;
 
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
 /** 起草存进、归档经验库的确认卡片的工具：点按钮问的也不给（按钮上的话是模型写的，可以写成「沉淀成经验」） */
-const KNOWLEDGE_DRAFT_TOOLS: ReadonlySet<string> = new Set(["knowledge_propose", "knowledge_propose_archive"]);
+const KNOWLEDGE_DRAFT_TOOLS: ReadonlySet<string> = new Set(["knowledge_propose", "knowledge_propose_archive", CONFLICT_TOOL]);
 
 /** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact）和模型看到的原文（只核对数），别的工具是模型看到的原文 */
 export interface ToolEvidence {
@@ -1692,14 +1828,147 @@ function mentionsRepo(text: string, repos: readonly string[]): boolean {
  * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码。
  * readCode：通过 aiops 这类 MCP 服务读过代码（结果里有代码永久链接），和调过代码工具一样只核对引用
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false, readCode: () => boolean = () => false) {
+export function reviewCodeAnswer(
+  question: string,
+  repos: readonly string[],
+  seen: CitationCheck = () => false,
+  readCode: () => boolean = () => false,
+  requests?: RequestCheck,
+) {
+  const act = requests?.canOpen === true && asksToOpenRequest(question);
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     const unseen = unseenCodeCitations(answer, seen);
-    if ([...usedTools].some(isCodeTool) || readCode()) {
-      return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
+    const usedCode = [...usedTools].some(isCodeTool) || readCode();
+    const madeUp = requests ? madeUpRequestRefs(answer, requests.known()) : [];
+    // 让把做好的修改开合并请求、合到别的分支，却没调 code_open_pr：编了编号、说开好了、一个代码工具没调就答。
+    // 打回时叫它直接去开，不叫它去搜代码（下面那两句会让它把之前的结论从头查一遍）
+    // 能合并时，一个都没调就说合好了的也打回
+    if (
+      act &&
+      !usedTools.has(OPEN_PR_TOOL) &&
+      !usedTools.has(MERGE_TOOL) &&
+      (madeUp.length > 0 ||
+        OPENED_CLAIM.test(answer) ||
+        (requests.canMerge === true && MERGED_CLAIM.test(answer)) ||
+        (!usedCode && (unseen.length > 0 || mentionsRepo(`${question}\n${answer}`, repos))))
+    ) {
+      return openRequestAnswer(madeUp, unseen.map((cite) => cite.text), requests.canMerge === true);
     }
-    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;
+    // 开了合并请求、没调 code_merge（或者调了没合成、只设成了自动合并）就说合好了
+    if (act && requests.canMerge === true && !(requests.merged?.() ?? usedTools.has(MERGE_TOOL)) && MERGED_CLAIM.test(answer)) {
+      return mergedClaimAnswer();
+    }
+    const notes = [
+      usedCode
+        ? unseen.length > 0
+          ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos)
+          : undefined
+        : mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0
+          ? unverifiedCodeAnswer(unseen.map((cite) => cite.text))
+          : undefined,
+      madeUp.length > 0 ? madeUpRequestAnswer(madeUp) : undefined,
+    ].filter((note): note is string => note !== undefined);
+    return notes.length > 0 ? notes.join("\n") : undefined;
   };
+}
+
+/** 核对回答里的合并请求编号要用的：已知的文字（提问、话题里之前的消息、这次的工具结果），这次能不能开合并请求 */
+export interface RequestCheck {
+  known: () => string;
+  canOpen: boolean;
+  /** 这次有 code_merge（机器人能合并允许开发者合并的分支） */
+  canMerge?: boolean;
+  /** code_merge 这次真的合进去了（调用失败、只设成流水线通过后自动合并的不算） */
+  merged?: () => boolean;
+}
+
+/**
+ * 让机器人把做好的修改开合并请求、合到别的分支、合并：「提个 PR」「开个 MR」「把这个 PR 合并到 uat」「也合到 uat」「把 !354 合了」。
+ * 问合没合的不算（「合到 uat 了吗」「有没有合并到 uat」）
+ */
+export function asksToOpenRequest(question: string): boolean {
+  // 「把 !354 合了」「帮我合了」末尾的「了」是叫它去做，不是说已经合了：只看有没有问的字眼
+  if (MERGE_IMPERATIVE.test(question)) {
+    return !MERGE_QUESTION.test(question);
+  }
+  return (OPEN_REQUEST_ASK.test(question) || MERGE_ASK.test(question)) && !REQUEST_STATUS_QUESTION.test(question);
+}
+
+/** 发起人这句话明确要合并：「合到 uat」「合并到 uat」「把 !354 合了」「合并一下」。只说「提个 PR」「开个 MR 到 uat」的不算 */
+export function asksToMerge(question: string): boolean {
+  return !MERGE_REFUSED.test(question) && asksToOpenRequest(question) && (MERGE_IMPERATIVE.test(question) || MERGE_ASK.test(question) || MERGE_INTO.test(question));
+}
+
+/** 说了不要合：「不要把 !354 合了」「先别合到 uat，只开 MR」「暂时不用合并」 */
+const MERGE_REFUSED = /(?:不要|别|不用|无需|不需要|先不|暂时不|暂不|不必)[^，。,;；\n]{0,20}?合/;
+const MERGE_INTO = /(?:合并|合)到\s*[a-z0-9]/i;
+// 两段 \s* 中间的可选词要和后面的 \s* 包在一起：分开写时一长串空白会被两段 \s* 来回分，卡住几秒
+const OPEN_REQUEST_ASK = /(?:开|提|建|发起?)\s*(?:(?:一?个|一下)\s*)?(?:(?:mr|pr)(?![a-z])|合并请求)|(?:合并|合)到\s*[a-z0-9][\w./-]*/i;
+/** 让合并：「直接合」「帮我合并」「把 !354 合了」，和「合并一下」「合并吧」。「配合一下」「适合吧」不算，所以后面两种要写全「合并」 */
+const MERGE_IMPERATIVE = /(?:直接|帮我|给我|麻烦你?)\s*合(?:并|进)?|把\s*[!！]\d+\s*合/;
+const MERGE_ASK = /合并(?:一下|掉|吧)/;
+const MERGE_QUESTION = /有没有|是否|是不是|了[吗么没]|[吗么][?？。.]?\s*$|没有[?？]?\s*$|[?？]\s*$/;
+const REQUEST_STATUS_QUESTION = /有没有|是否|是不是|了[吗么没]|没有[?？]?\s*$|了[?？。.]?\s*$/;
+/**
+ * 回答里说已经开好了合并请求：「已开合并请求」「已经帮你开好了到 uat 的 MR」「PR 已提」。
+ * 「之前开过」「之前已经开了」说的是以前的
+ */
+const OPENED_CLAIM =
+  /(?<!之前|此前|以前|上次|原来|早先)(?:已经?|帮你|给你)\s*(?:(?:帮你|给你)\s*)?(?:开|提|创建|建|发起)(?!过)(?:好|了)*[^。；;\n]{0,20}?(?:合并请求|merge\s*request|(?<![a-z])(?:mr|pr)(?![a-z]))|(?:合并请求|(?<![a-z])(?:mr|pr)(?![a-z]))[^。；;\n]{0,6}?已经?(?:开|提|创建|建)(?!过)/i;
+
+/**
+ * 回答里说已经合好了：「已合并到 uat」「已经合进 uat 了」「帮你合好了」。「之前已经合了」说的是以前的
+ */
+const MERGED_CLAIM = /(?<!之前|此前|以前|上次|原来|早先|是否|有没有)(?:已经?|帮你|给你)\s*(?:(?:帮你|给你)\s*)?合(?:并|进|到|好|入|了|掉)/;
+
+/** GitLab 合并请求的编号（!353）和链接里的编号（/merge_requests/353） */
+const REQUEST_REF = /(?<![\w!])!([1-9]\d{0,6})(?!\d)|\/merge_requests\/([1-9]\d{0,6})(?!\d)/g;
+
+/**
+ * 回答里写的合并请求编号，在已知的文字里一次都没出现过的（编出来的）。
+ * 回答里的代码块、行内代码不看（「if (!1)」），只写着一个编号的行内代码（「`!354`」）照样看
+ */
+export function madeUpRequestRefs(answer: string, known: string): string[] {
+  const numbers = (text: string) => [...text.matchAll(REQUEST_REF)].map((match) => match[1] ?? match[2]);
+  const said = new Set(numbers(known));
+  const prose = answer.replace(/```[\s\S]*?(?:```|$)/g, " ").replace(/`([^`\n]*)`/g, (span, inner: string) => (/^\s*!\d+\s*$/.test(inner) ? inner : " "));
+  return [...new Set(numbers(prose).filter((number) => !said.has(number)))].map((number) => `!${number}`);
+}
+
+const OPEN_REQUEST_HINT =
+  "群成员是让你把已经做好的修改开合并请求或合到别的分支：这是要你动手，不是重新排查，不用再搜代码、读代码去核对之前的结论。" +
+  "是这个话题自己的改动，直接调 code_open_pr，target 填要合到的分支；是别的话题或别人开的合并请求，先用 code_requests 找到编号，再调 code_open_pr（from 填编号，target 填分支）。" +
+  "按它返回的编号和链接回答；开不了（报错、冲突、这个分支上已经开过）就照实说是什么原因。";
+
+const MERGE_HINT =
+  "群成员要合并的，开好以后（已经开过的直接）用 code_merge 填编号合掉；它只合机器人自己开的、开到允许开发者合并的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了。";
+
+/** 没调 code_merge 就说合好了 */
+export function mergedClaimAnswer(): string {
+  return `（系统检查）你这次没有用 code_merge 合成（没调、调了出错，或者只设成了流水线通过后自动合并），回答里却说已经合好了。${MERGE_HINT}没合成就照实说开了哪个、为什么没合。其余内容不用改，重新给出完整的回答，不要提这段检查。`;
+}
+
+/** 让开合并请求、合并，却没调 code_open_pr、code_merge 就答了：叫它直接去开、去合 */
+export function openRequestAnswer(madeUp: readonly string[], cites: readonly string[], canMerge = false): string {
+  return (
+    `（系统检查）你这次没有调用 code_open_pr${canMerge ? " 和 code_merge" : ""}` +
+    (madeUp.length > 0 ? `，回答里的 ${madeUp.join("、")} 在这次的工具结果、话题和提问里都找不到，是编出来的` : `，这个合并请求没有开出来${canMerge ? "，也没有合并" : ""}`) +
+    (cites.length > 0 ? `；回答里还写了没查过的代码位置：${cites.join("、")}，不要写` : "") +
+    `。${OPEN_REQUEST_HINT}${canMerge ? MERGE_HINT : ""}不要提这段检查。`
+  );
+}
+
+/** 回答里有查不到的合并请求编号 */
+export function madeUpRequestAnswer(madeUp: readonly string[]): string {
+  return (
+    `（系统检查）回答里的 ${madeUp.join("、")} 在这次的工具结果、话题和提问里都找不到，是编出来的。` +
+    "合并请求的编号和链接只写工具返回的、话题里写过的；不确定是哪个就用 code_requests 查，查不到就说没找到。其余内容不用改，重新给出完整的回答，不要提这段检查。"
+  );
+}
+
+/** 打回重做以后还是写了查不到的合并请求编号时，换成这句发出去 */
+export function blockedRequestAnswer(madeUp: readonly string[]): string {
+  return `这次没能给出结论：回答里写的合并请求 ${madeUp.join("、")} 查不到，为免误导没有发出来。请再说一次，要开合并请求可以说清楚开到哪个分支。`;
 }
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
@@ -1925,7 +2194,7 @@ const EARLIER_CONTENT =
   /上面|上述|你的回答|这段(?!时间)|(?:以上|前面|之前|刚才|刚刚)(?:查到|说|聊|讲|提到|的(?:回答|结果|内容|情况|信息|结论)|内容|信息|结果|情况|结论)/;
 // 「重新整理」「现在把上面的翻译成英文」里的「重新」「现在」说的是改写这个动作，不算要重新查
 const LIVE_REQUEST =
-  /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
+  /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版|说|讲|解释|梳理|表述|描述|简化|精简|提炼|转述)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
 /** 说工具调用失败的那一句（「aiops 连续 3 次查询都超时」），这句里的次数说的是调用本身 */
 const TOOL_FAILURE_CLAUSE = /(?:aiops|工具|调用|查询)[^，,。；;\n]{0,12}(?:超时|失败|出错|连不上|繁忙)/i;
 
@@ -1962,6 +2231,235 @@ export function blockUnverifiedOps(
 
 function rewriteOnly(question: string): boolean {
   return REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question) && (EARLIER_CONTENT.test(question) || !OPS_QUESTION.test(question));
+}
+
+/** 整理、改写已经有的内容：REWRITE_REQUEST 之外，还有讲给谁听、换个说法、用大白话讲（eli5）、精简这类 */
+const RESTATE_REQUEST = new RegExp(
+  [
+    REWRITE_REQUEST.source,
+    String.raw`简化|精简|提炼|浓缩|摘要|转述|转告|通俗|大白话|白话|说人话|讲人话|(?:解释|说明)一下|eli5|explain like|tl;?dr|summari[sz]e|summary|translate|rephrase|rewrite|simplify`,
+    String.raw`(?:讲|说|解释)给[^，。,.!?！？\n]{1,20}听`,
+    String.raw`换(?:个|一种|一个)?(?:说法|方式|角度|口吻|讲法)`,
+  ].join("|"),
+  "i",
+);
+const TIME_AMOUNT = String.raw`(?:\d+|[一二两三四五六七八九十半几]+)`;
+/**
+ * 要看现在的数据：LIVE_REQUEST 之外，带数的时间窗口（「最近 1 小时」「过去 30 分钟」「近三天」「这两天」「2 小时内」），「重查」「复查」「核实」。
+ * 只说「今天」「昨天」的不算：「把今天查到的总结一下」是整理
+ */
+const FRESH_REQUEST = new RegExp(
+  [
+    String.raw`(?:最近|过去|近|这|前)\s*${TIME_AMOUNT}\s*(?:个\s*)?(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月)`,
+    String.raw`${TIME_AMOUNT}\s*(?:个\s*)?(?:秒钟?|分钟|小时|钟头|天|周|星期|礼拜|月)(?:以内|之内|内|以来)`,
+    "重查|复查|核实",
+  ].join("|"),
+);
+/**
+ * 一句话里夹着要改东西：「修复代码后总结一下」「改代码」「开个 MR」「合并到 uat」。分成几段说的（「总结一下，然后删除这个文件」）见 CLAUSE_BREAK。
+ * 说的是之前的方案、过程（「把修复方案总结一下」「总结一下修复后的结果」「讲给负责修复的同事听」）不算；「开发」多半说的是人（「讲给开发同事听」），不算
+ */
+const NEW_WORK = new RegExp(
+  [
+    String.raw`(?:修复|修好|修掉|修一下|改掉|改好|重构|优化|实现|上线|发版|部署|重启|回滚)(?!方案|办法|建议|思路|计划|过程|记录|情况|结果|原理|方式|逻辑|细节|架构|时间|空间|方向|点|项|的|了|后的|前的|完的)`,
+    String.raw`(?:开|提|建)个?\s*(?:mr|pr|合并请求)`,
+    // 「合并到 uat」「也合到 master」「合到 release/1.2」是再开一个合并请求；「合并到飞书文档里」「合到一起」是整理
+    String.raw`(?:合并|合)到\s*(?:[a-z][\w./-]*|主干|主分支|测试分支|预发分支?)`,
+    String.raw`(?:改|修改)一?下?(?:代码|配置)`,
+  ].join("|"),
+  "i",
+);
+/** 提问里的英文词（服务名常不带连字符：appservice、gateway）；整理的说法、常见英文词不算 */
+const ASCII_WORDS = /[a-z][a-z0-9_.]{2,}/gi;
+const RESTATE_WORDS = new RegExp(
+  "^(?:" +
+    [
+      // 整理的说法和常见英文虚词（「summarize the above for the team」）
+      "eli5|tldr|explain|like|five|translate|rephrase|rewrite|simplify|summary|summari[sz]e|english|chinese|simple|plain|short|brief|briefly",
+      "the|above|this|that|these|those|please|for|and|with|into|our|your|team|previous|earlier|answer|result|results|version|words|bullet|points",
+      // 讲给谁听、写成什么格式（「讲给 SRE 同事听」「整理成 JSON」）
+      "sre|devops|ops|dev|devs|ceo|cto|boss|json|yaml|csv|ppt|pdf|excel|word|html|table|markdown|emoji",
+    ].join("|") +
+    ")$",
+  "i",
+);
+/**
+ * 提问拆成几段（标点和「然后」「再」「顺便」这类连接词隔开），每段都要是整理：整理的说法、讲给谁听 / 写成什么样、客气话。
+ * 有一段是别的事（「总结一下上面的原因，然后删除这个文件」「概括一下，再跑一下测试」）就不算只整理，照常给工具：
+ * 认不出的说法宁可照常查，也不能把要改东西、要查的请求当成整理拿掉工具。「、」不拆：「讲给 @A、@B 听」是一段
+ */
+const CLAUSE_BREAK = /[，,。;；!！?？\n]|\.(?!\S)|然后|接着|之后|顺便|另外|并且|(?<!合)并|同时|还要|还得|再(?!次)/;
+/** 说讲给谁、写成什么样的一段（「写成飞书文档」「让运营也看得懂」「发给运营」「控制在三句话」） */
+const FORMAT_CLAUSE = /用|以|按|写成|做成|整理成|弄成|变成|转成|发给|发到|讲给|说给|让|分点|列成|控制在|不超过|篇幅|字数|合并成|合成|合到一起|(?:合并|合|放|写|整理|汇总)(?:到|进)|(?:讲|说|写)得?(?:简单|短|通俗|清楚|明白|详细|具体|口语|正式|轻松)|简单|短一?点|通俗|口语/;
+/** 讲给谁、写成什么样的那段里不能有要动手、要查的词（「然后用 aiops 查一下」「用新的写法替换这个函数」） */
+const ACTION_WORD = /查|看|搜|读|找|修|改|删|加|建|开|提交|合并|部署|重启|回滚|跑|执行|运行|测|对比|比较|分析|排查|诊断|定位|确认|检查|核对|更新|调整|新增|添加|替换|升级|迁移|实现|重构|优化|处理|解决/;
+/** 这些说的是读的人看不看得懂、怎么排版，不是要动手 */
+// 「合并到飞书文档里」：合并到分支（「合并到 uat」）NEW_WORK 先认出来了
+const HARMLESS_PHRASES = /看得懂|看懂|听得懂|听懂|看得明白|看明白|加粗|合并成|合到一起|(?:合并|合)(?:到|进)/g;
+/** 客气话、称呼（@ 的名字去掉以后剩下的「各位同事」） */
+const FILLER_CLAUSE = /^(?:谢谢|多谢|辛苦了?|麻烦了?|拜托|好的|ok|嗯|请|各位|大家|同事们?|各位同事)$/i;
+
+function restateClausesOnly(asked: string): boolean {
+  return asked
+    .replace(/tl;\s*dr/gi, "tldr")
+    .split(CLAUSE_BREAK)
+    .map((clause) => clause.replace(/[\s~～…]+/g, ""))
+    .every(
+      (clause) =>
+        clause === "" ||
+        RESTATE_REQUEST.test(clause) ||
+        FILLER_CLAUSE.test(clause) ||
+        (FORMAT_CLAUSE.test(clause) && !ACTION_WORD.test(clause.replace(HARMLESS_PHRASES, ""))),
+    );
+}
+/**
+ * 要查的对象：线上服务、日志这类（OPS_QUESTION），和代码、配置这类。话题里之前没出现过的，说明问的是新东西，不算整理。
+ * 文档、网页链接不算：整理时照样给读文档、网页的工具（「总结成飞书文档」也不能因为说了文档就重查）
+ */
+const NEW_TARGET = new RegExp(`${OPS_QUESTION.source}|代码|仓库|分支|提交|文件|函数|配置`, "i");
+const TARGET_TERMS = new RegExp(NEW_TARGET.source, "gi");
+
+/**
+ * 这次只是整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不用重新查。
+ * 2026-10-14 测试群：转链排查答完以后，有人在同一个话题里 @ 机器人「用 eli5 方式总结给 @某某 同事」，机器人把查经验库、读剧本、查日志、读代码、查提交整个重来了一遍：
+ * 提示词说话题里之前的回答不算查证、要重新查，回答前查到的经验也要先核对；模型直接整理的话，回答里的时间、Pod 数、仓库名又会被检查打回去查。
+ * 要满足：话题里有上文；提问说的是整理、改写；没说要重新查、看现在的情况，也没说整理完还要分析、查别的；
+ * 提问里说到的服务名、日志、代码、配置这类对象话题里之前都出现过（「把 product-service-api 这个问题总结给大家」说的还是之前那个，
+ * 「整理一下 gateway 的部署配置」「总结一下上面，再看看 payment-service」问到了新的服务、要读配置，就不是只整理）
+ */
+export function restatesEarlier(question: string, history: readonly ChatMessage[], names: readonly string[] = []): boolean {
+  if (
+    history.length === 0 ||
+    !RESTATE_REQUEST.test(question) ||
+    LIVE_REQUEST.test(question) ||
+    FRESH_REQUEST.test(question) ||
+    NEW_WORK.test(question)
+  ) {
+    return false;
+  }
+  const said = history.map((m) => m.content).join("\n").toLowerCase();
+  // @ 的人名、机器人名不算（「@飞书 CLI」「@John」）
+  const asked = names.reduce((text, name) => (name ? text.split(`@${name}`).join(" ") : text), question);
+  if (!restateClausesOnly(asked)) {
+    return false;
+  }
+  // 话题里没出现过的英文词多半是新的服务名、仓库名（「总结一下 appservice 的报错」，之前聊的是 gateway-api）
+  const newWord = (asked.match(ASCII_WORDS) ?? []).some((word) => !RESTATE_WORDS.test(word) && !said.includes(word.toLowerCase()));
+  // 「上面的排查结果」说的是之前排查出来的，不是要排查新东西
+  const target = asked.replace(/(?:排查|诊断)(?=结果|过程|情况|结论|记录|报告)/g, " ");
+  return !newWord && !NEW_TARGET.test(target.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
+}
+
+/** 工具参数里的文字（写文档的正文、记忆的内容） */
+function stringArgs(args: Record<string, unknown>): string {
+  return Object.values(args)
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+export function restatedWriteNote(added: readonly string[]): string {
+  const shown = added.slice(0, MAX_RESTATED_ADDITIONS).map((text) => (text.length > 80 ? `${text.slice(0, 80)}…` : text));
+  return (
+    `这次是整理话题里之前的内容，可要写进去的内容里这些在话题里之前的消息中都找不到：${shown.join("、")}${added.length > shown.length ? " 等" : ""}。` +
+    "只写之前的回答和大家说过的话里写过的事实、数据和代码位置，改好再调一次；没写过的就写之前没查到。"
+  );
+}
+
+/** 整理之前内容时给模型的工具：读群成员给的文档、网页，按要求写成文档、记进群记忆、起草经验。查线上、查代码、搜网页、查经验库、看别的话题的都不给 */
+const RESTATE_TOOLS: ReadonlySet<string> = new Set([
+  "feishu_doc_read",
+  "feishu_doc_create",
+  "feishu_doc_edit",
+  "fetch_url",
+  "memory_search",
+  "memory_save",
+  "memory_update",
+  "memory_delete",
+  "knowledge_propose",
+  "knowledge_propose_archive",
+]);
+
+/** 整理时能读的文档、网页工具，和放链接的参数 */
+const RESTATE_READS: ReadonlyMap<string, string> = new Map([
+  ["feishu_doc_read", "document"],
+  ["fetch_url", "url"],
+]);
+
+/** 回答里最多列几处添上的内容 */
+const MAX_RESTATED_ADDITIONS = 10;
+
+/**
+ * 整理之前内容时，回答里添上的、话题里之前没写过的东西：代码位置（code：配了代码工具时）和线上数据（ops：配了 MCP 服务时，时间、Pod 名、条数这类）。
+ * known 是话题里之前的内容（之前的回答、群成员说的）、这次的提问和这次读到的文档网页
+ */
+export function restatedAdditions(answer: string, known: string, { code, ops }: { code: boolean; ops: boolean }): string[] {
+  const cites = code
+    ? unseenCodeCitations(answer, (cite, line) => (line === undefined ? mentions(known, cite) : mentionsLine(known, cite, line))).map((cite) => cite.text)
+    : [];
+  const said = ops ? valueForm(known) : "";
+  // 每种写法分开找：「prod、xx-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署」整段是定位结果，里面的 Pod 名、时间、次数也要一个个对
+  const data = ops
+    ? RESTATE_OPS_PATTERNS.flatMap((pattern) => [...answer.matchAll(pattern)])
+        .sort((a, b) => a.index - b.index)
+        .map((match) => match[0])
+        .filter((text) => !saidValue(said, text) && !TIME_LAYOUT.test(text))
+    : [];
+  return [...new Set([...cites, ...data])];
+}
+
+const RESTATE_OPS_PATTERNS = [...OPS_TIME_PATTERNS, ...OPS_STRONG_PATTERNS, ...OPS_WEAK_PATTERNS].map((pattern) => new RegExp(pattern, "gi"));
+
+/** 比较数据用的写法：去掉空白、不分大小写，时间的小时去掉开头的 0（09:01:48 和 9:01:48 是同一个时间） */
+function valueForm(text: string): string {
+  return text.replace(/\s+/g, "").toLowerCase().replace(/(?<![\d:])0(\d:\d{2})/g, "$1");
+}
+
+/**
+ * 这个数据之前写过：整个数对得上才算，15%、14 个 Pod 里的 5%、4 个 Pod 不算（前后紧挨着数字、小数点的不算）；
+ * 就绪数只看比值（之前写的是「**1/1** 就绪」，回答写「1/1 就绪」）；只有整个就是就绪数时才这样，一长段里带着个比值的不算
+ */
+function saidValue(said: string, text: string): boolean {
+  const value = valueForm(text);
+  const exact = new RegExp(`(?<![\\d.])${escapeRegExp(value)}${/\d$/.test(value) ? "(?!\\.?\\d)" : ""}`);
+  const ratio = /(\d+)\/(\d+)/.exec(value);
+  if (exact.test(said)) {
+    return true;
+  }
+  // 之前写的也要是就绪数：之前是「请求成功 1/1」，回答写「Ready: 1/1」不算
+  const pair = ratio === null ? "" : `${ratio[1]}/${ratio[2]}`;
+  return (
+    ratio !== null &&
+    READINESS_REST.test(value.replace(ratio[0], "")) &&
+    new RegExp(
+      `(?:就绪|ready)[*_\x60:：]*(?<![\\d.])${pair}(?!\\d)|(?<![\\d.])${pair}(?!\\d)[*_\x60]*(?:就绪|ready|running|副本)`,
+    ).test(said)
+  );
+}
+
+/** 就绪数去掉比值后剩下的：就绪、ready 这类词和 Markdown 符号 */
+const READINESS_REST = /^[*_\x60:：]*(?:就绪|ready|running|副本)?[*_\x60:：]*$/i;
+
+export const BLOCKED_RESTATE_ANSWER =
+  "这次没能整理好：整理出来的回答里有话题里之前没写过的数据或代码位置，为免误导没有发出来。可以再说一次；要看最新情况，请说「重新查」。";
+
+export function restatedAnswerNote(added: readonly string[]): string {
+  const shown = added.slice(0, MAX_RESTATED_ADDITIONS).map((text) => (text.length > 80 ? `${text.slice(0, 80)}…` : text));
+  return (
+    `（系统检查）这次是整理话题里之前的内容，可回答里这些在话题里之前的消息中都找不到：${shown.join("、")}${added.length > shown.length ? " 等" : ""}。` +
+    "只用之前的回答和大家说过的话里写过的事实、数据和代码位置，不要添新的，也不要自己推算新的数；之前没写到的就说之前没查到，要最新情况请对方说「重新查」。" +
+    "其余内容不用改，重新给出完整的回答，不要提这段检查。"
+  );
+}
+
+/**
+ * 整理之前内容时检查回答（代替 reviewCodeAnswer、reviewOpsAnswer：那两项会叫模型去查，这次没给查的工具）：
+ * 代码位置和线上数据都得是话题里之前写过的，添了新的就打回一次，让模型只用写过的。known 在检查时再取，这次读到的文档网页也算
+ */
+export function reviewRestatedAnswer(known: () => string, scope: { code: boolean; ops: boolean }) {
+  return (answer: string): string | undefined => {
+    const added = restatedAdditions(answer, known(), scope);
+    return added.length > 0 ? restatedAnswerNote(added) : undefined;
+  };
 }
 
 /** 举例的句子 */

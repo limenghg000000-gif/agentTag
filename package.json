@@ -1,6 +1,6 @@
 {
   "name": "agenttag",
-  "version": "0.9.0",
+  "version": "0.16.0",
   "private": true,
   "description": "飞书版 Claude Tag：AI 助手作为成员加入飞书群，@ 它即可派活",
   "type": "module",

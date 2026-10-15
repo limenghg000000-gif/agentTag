@@ -1,5 +1,16 @@
-import { addChanges, type CodeWorkspaces, DEFAULT_LOG_COMMITS, MAX_LOG_COMMITS, RECENT_BRANCHES, type Workspace } from "../repo.js";
-import { type Tool, type ToolContext, type ToolOutput, ToolOutputBuilder } from "./tool.js";
+import type { BuildResult } from "../build.js";
+import {
+  addChanges,
+  type CodeWorkspaces,
+  DEFAULT_LIST_REQUESTS,
+  DEFAULT_LOG_COMMITS,
+  MAX_LIST_REQUESTS,
+  MAX_LOG_COMMITS,
+  type OpenedRequest,
+  RECENT_BRANCHES,
+  type Workspace,
+} from "../repo.js";
+import { type Piece, type Tool, type ToolContext, type ToolOutput, ToolOutputBuilder } from "./tool.js";
 
 export const CODE_TOOL_NAMES = [
   "code_branches",
@@ -7,9 +18,11 @@ export const CODE_TOOL_NAMES = [
   "code_read_file",
   "code_search",
   "code_log",
+  "code_requests",
   "code_edit_file",
   "code_diff",
   "code_open_pr",
+  "code_merge",
 ] as const;
 
 export interface CodeToolsOptions {
@@ -25,6 +38,8 @@ export interface CodeToolsOptions {
 export function createCodeTools({ workspaces, threadKey, askerName, botName }: CodeToolsOptions): Tool[] {
   const repos = workspaces.repos;
   const { requestName, refOf } = workspaces.host;
+  // 平台支持时机器人能合并：只合自己开的、开到允许开发者合并的分支的
+  const canMerge = workspaces.host.mergeCheck !== undefined && workspaces.host.mergeRequest !== undefined;
   const opened = new Map<string, Promise<Workspace>>();
   // 一个任务里每个仓库只打开（克隆或更新）一次
   const workspace = (args: Record<string, unknown>, { signal }: ToolContext) => {
@@ -59,12 +74,14 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
       description:
         "列出代码仓库的分支（按最近提交从新到旧，带最近一次提交的时间、作者和说明），或者用 switch_to 切换这个话题的当前分支。" +
         "默认看的是仓库默认分支；群成员说了要看哪个分支时切过去，这个话题后面看代码、改代码、开" +
-        `${requestName}都基于它。切换要单独调用，等它返回后再调其他代码工具。`,
+        `${requestName}都基于它。切换要单独调用，等它返回后再调其他代码工具。` +
+        `switch_to 只能切到已有的分支：要新分支不用先建，改好代码用 code_open_pr 的 branch 起名。` +
+        `开过${requestName}以后也能切，之前的${requestName}不受影响，切回那个分支时新改动接着推到它；改了代码还没推上去时不能切。`,
       parameters: {
         type: "object",
         properties: {
           repo: repoParam,
-          switch_to: { type: "string", description: "要切换到的分支名。不填就只列出分支" },
+          switch_to: { type: "string", description: "要切换到的已有分支名。不填就只列出分支" },
           filter: { type: "string", description: "只列名字里带这个词的分支" },
         },
         required: required(),
@@ -200,6 +217,33 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     },
   };
 
+  const requests: Tool = {
+    spec: {
+      name: "code_requests",
+      description:
+        `列出代码仓库里的${requestName}（编号、标题、从哪个分支合到哪个分支、状态、作者、更新时间），按最近更新从新到旧，标出这个话题开的。` +
+        `群成员提到别处做的修改、别的话题开的${requestName}（如「把京东短链修复合到 uat」「上次那个 MR」）时，先用它按关键词找到是哪一个，` +
+        "再说它合没合、合到了哪个分支；不要只看现有的代码和提交历史就下「已经合进去了」的结论。",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: repoParam,
+          query: { type: "string", description: "标题或描述里要有的词，如「短链」「jd」" },
+          state: { type: "string", enum: ["opened", "merged", "all"], description: "opened 开着的（默认），merged 已合并的，all 全部（含关掉的）" },
+          limit: { type: "integer", description: `最多列几个，默认 ${DEFAULT_LIST_REQUESTS}，最多 ${MAX_LIST_REQUESTS}` },
+        },
+        required: required(),
+      },
+    },
+    describe: (args) => `查${requestName}${optional(args.query) ? `：${preview(args.query)}` : ""}`,
+    async run(args, ctx) {
+      const ws = await workspace(args, ctx);
+      const state = args.state === "merged" || args.state === "all" ? args.state : "opened";
+      const options = { state, search: optional(args.query), limit: typeof args.limit === "number" ? args.limit : undefined } as const;
+      return report(ctx, await ws.listRequests(options, ctx.signal));
+    },
+  };
+
   const edit: Tool = {
     writes: true,
     spec: {
@@ -248,19 +292,39 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_open_pr",
       description:
-        `把改动提交到机器人新建的分支，开${requestName}到这个话题的当前分支（没切换过就是默认分支），返回链接。这个话题里已经开过${requestName}时，新改动推到同一个。` +
-        `只在群成员要你提交或开${requestName}时使用；机器人不会合并，也不会推到已有的分支。`,
+        `把改动提交到机器人新建的分支，开${requestName}到这个话题的当前分支（没切换过就是默认分支），返回链接。这个话题在这个分支上已经开过${requestName}时，新改动推到同一个。` +
+        `群成员要「起一个新分支」时就用它：branch 填群成员说的分支名，没说就不填，机器人会起名。` +
+        `分支是从线上分支拉的；uat 这类测试环境的分支上不能改。要测试（如「合并到 uat」「先上 uat」）时 target 填测试分支：从同一个分支再开一个到那个分支的${requestName}（不另拉分支、不搬改动），推之前先把改动放到那个分支上试一下，有冲突、编不过就不推；` +
+        `测完要上线时不填 target，开到线上分支。之后不填 target 推的新改动，开到测试分支的${requestName}跟着更新，合过了的再开一个。不用让群成员新开话题。` +
+        `要开到别处的是别的话题或别人开的${requestName}，先用 code_requests 找到编号，填 from 和 target：从它的源分支直接开。` +
+        `只在群成员要你提交、开${requestName}或者合到某个分支时使用；` +
+        (canMerge
+          ? `它只开不合，群成员要合并（「合并到 uat」）时，开好以后再用 code_merge 合。机器人不会推到已有的分支。`
+          : `机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`) +
+        (workspaces.buildCheck
+          ? "推之前会在服务器上照项目自己的构建方式编译一下（读流水线用的 Dockerfile，编里面 go build 的那个入口，再加上改到的包；PHP 查语法）：这次改动编不过就拒绝、不推，返回编译器的报错（报错可能在没改的文件里，比如改了函数签名、调用的地方编不过），按报错用 code_read_file 看清相关代码再改，改好再调用，改不好就把报错告诉群成员，不要绕过。编过只说明能编译，不等于测过。"
+          : ""),
       parameters: {
         type: "object",
         properties: {
           repo: repoParam,
           title: { type: "string", description: `${requestName}标题，也是提交说明的第一行，一句话说清改了什么` },
           body: { type: "string", description: `${requestName}描述：为什么改、改了什么、怎么验证（机器人没有运行代码，要写明）` },
+          branch: {
+            type: "string",
+            description: "新分支的名字，群成员说了分支名时填（如 bugfix/jd_shortlink）。只能是还没有的分支，不填由机器人起名；这个话题在这个分支上已经推过改动时不用填",
+          },
+          target: {
+            type: "string",
+            description: `${requestName}开到哪个分支，不填是这个话题当前的分支（线上分支）。填 uat 这类测试分支时，从同一个分支再开一个到它的`,
+          },
+          from: { type: "integer", description: `要开到 target 的是仓库里已有的这个${requestName}（填编号，如 353），从它的源分支直接开，要和 target 一起填` },
         },
         required: required("title", "body"),
       },
     },
-    describe: () => `提交代码并开${requestName}`,
+    describe: (args) =>
+      optional(args.target) ? `把改动开${requestName}到 ${optional(args.target)} 分支` : `提交代码并开${requestName}`,
     async run(args, ctx) {
       const title = requireString(args, "title").split("\n")[0].trim();
       const body = [
@@ -270,17 +334,106 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         .filter(Boolean)
         .join("\n\n---\n");
       const ws = await workspace(args, ctx);
-      const pr = await ws.openPullRequest(title, body, ctx.signal);
-      const out = new ToolOutputBuilder(ws.repo).line(
-        pr.created
-          ? `已开${requestName} ${refOf(pr.number)}：${pr.url}`
-          : `已把新改动推到这个话题之前开的${requestName} ${refOf(pr.number)}：${pr.url}`,
-      );
+      const from = requestNumber(args.from, "from");
+      const pr = await ws.openPullRequest(title, body, { branch: optional(args.branch), target: optional(args.target), from }, ctx.signal);
+      const out = new ToolOutputBuilder(ws.repo).parts(...openedLine(pr, requestName, refOf));
+      if (pr.checked) {
+        out.line(checkedLine(pr.checked));
+      }
       return report(ctx, addChanges(out.line(""), pr.changes).build());
     },
   };
 
-  return [branches, listFiles, read, search, log, edit, diff, openPr];
+  const merge: Tool = {
+    writes: true,
+    spec: {
+      name: "code_merge",
+      description:
+        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护、或者受保护但允许开发者合并的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}来的、源分支最新提交没跑过流水线（构建）或者没通过的都不合，流水线还在跑的设成通过后自动合并；` +
+        `开到只许维护者合并的受保护分支（master、prod 这类线上分支，以 ${workspaces.host.name} 上的「允许合并」设置为准）的不合，要人审过再点，照它返回的原因告诉群成员。` +
+        `只在群成员明确要合并时用（「合并到 uat」「把 !354 合了」）：先用 code_open_pr 开好到那个分支的${requestName}，再用它合；已经开过的直接填编号。` +
+        `只说「提个 PR」「开个${requestName}」时只开不合。要等流水线通过才能合的，会设成流水线通过后自动合并。`,
+      parameters: {
+        type: "object",
+        properties: {
+          repo: repoParam,
+          number: { type: "integer", description: `要合并的${requestName}编号，如 354` },
+        },
+        required: required("number"),
+      },
+    },
+    describe: (args) => {
+      let number: number | undefined;
+      try {
+        number = requestNumber(args.number, "number");
+      } catch {
+        number = undefined;
+      }
+      return number ? `合并${requestName} ${refOf(number)}` : `合并${requestName}`;
+    },
+    async run(args, ctx) {
+      const number = requestNumber(args.number, "number");
+      if (number === undefined) {
+        throw new Error(`缺少 number 参数，填要合并的${requestName}编号`);
+      }
+      return report(ctx, await (await workspace(args, ctx)).mergeRequest(number, ctx.signal));
+    },
+  };
+
+  return [branches, listFiles, read, search, log, requests, edit, diff, openPr, ...(canMerge ? [merge] : [])];
+}
+
+/** 推之前编译的结果：编过了、还是没编（合并时要看平台上的流水线） */
+function checkedLine(checked: BuildResult): string {
+  return checked.state === "passed"
+    ? `推之前在服务器上编译检查过：${checked.summary}。`
+    : checked.state === "unknown"
+      ? `推之前没能确认能编过（${checked.reason}），合并时要看平台上的流水线。`
+      : "推之前编译没通过。";
+}
+
+/** 开好合并请求以后的第一行：哪个分支开到哪个分支，开到测试分支的跟着怎么样了 */
+function openedLine(pr: OpenedRequest, requestName: string, refOf: (number: number) => string): Piece[] {
+  const ref = refOf(pr.number);
+  const route: Piece[] = ["（", [pr.branch, { branch: pr.branch }], " → ", [pr.base, { branch: pr.base }], `）：${pr.url}`];
+  const synced = (pr.targets ?? []).flatMap((t): Piece[] => {
+    const to: Piece = [t.target, { branch: t.target }];
+    switch (t.change) {
+      case "updated":
+        return ["开到 ", to, ` 的${requestName} ${refOf(t.number)} 也带上了新改动（同一个分支）。`];
+      case "opened":
+        return ["另开了到 ", to, ` 的${requestName} ${refOf(t.number)}：${t.url}。`];
+      case "reopened":
+        return ["之前开到 ", to, ` 的${t.replaced ? ` ${refOf(t.replaced)}` : ""} 已经合并了，新改动另开了${requestName} ${refOf(t.number)}：${t.url}。`];
+      case "closed":
+        return ["开到 ", to, ` 的 ${refOf(t.number)} 被关掉了，没再开。`];
+    }
+  });
+  if (pr.ported) {
+    const { request } = pr.ported;
+    return [
+      `已把 ${refOf(request.number)}（`,
+      [request.source, { branch: request.source }],
+      " → ",
+      [request.target, { branch: request.target }],
+      `，${request.state === "merged" ? "已合并" : "还开着"}）的分支直接开到 `,
+      [pr.base, { branch: pr.base }],
+      `，${pr.created ? "开了" : "之前已经开过"}${requestName} ${ref}`,
+      ...route,
+      `。改动没有搬、没有另拉分支，${refOf(request.number)} 不受影响。`,
+    ];
+  }
+  if (pr.replaced) {
+    const was =
+      pr.replaced.state === "merged"
+        ? `${refOf(pr.replaced.number)} 已经合并了，新改动`
+        : `${refOf(pr.replaced.number)} 已经关掉了（没合并），它的改动连同新改动`;
+    return [`这个话题之前开的${requestName} ${was}从 `, [pr.base, { branch: pr.base }], ` 最新的代码另开了${requestName} ${ref}`, ...route, ...synced];
+  }
+  const live: Piece[] = pr.live
+    ? ["这个分支到 ", [pr.live.base, { branch: pr.live.base }], ` 的${requestName} ${refOf(pr.live.number)} 照旧，测完合它上线。`]
+    : [];
+  return [pr.created ? `已开${requestName} ${ref}` : `已把新改动推到这个话题之前开的${requestName} ${ref}`, ...route, ...(synced.length || live.length ? ["。"] : []), ...synced, ...live];
 }
 
 /** 把结果里查到的代码位置交给机器人的回答检查，文字交给模型 */
@@ -301,6 +454,18 @@ function requireString(args: Record<string, unknown>, key: string): string {
 function list(value: unknown): string[] {
   const items = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,，、]/) : [];
   return items.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+}
+
+/** 合并请求的编号参数（from、number），模型有时写成「!353」「#353」 */
+function requestNumber(value: unknown, key: string): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const number = typeof value === "number" ? value : typeof value === "string" && /^\s*[!#]?\d+\s*$/.test(value) ? Number(value.replace(/\D/g, "")) : NaN;
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new Error(`${key} 要填合并请求的编号，如 353：${String(value)}`);
+  }
+  return number;
 }
 
 function onBranch(value: unknown): string {

@@ -131,8 +131,14 @@ test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层）�
     branches: {},
     host: { kind: "gitlab", url: "https://git.corp.example.com", token: "glpat-x" },
     workspaceDir: path.resolve("/srv/agenttag", "workspaces"),
+    build: true,
   });
   assert.deepEqual(loadConfig({ ...base, CODE_REPOS: "acme/app", GITHUB_TOKEN: "ghp" }).code?.host, { kind: "github", token: "ghp" });
+  // 编译检查默认开，BUILD_CHECK=off 关掉；BUILD_GOPROXY 换下载依赖的代理
+  const gh = { ...base, CODE_REPOS: "acme/app", GITHUB_TOKEN: "ghp" };
+  assert.equal(loadConfig({ ...gh, BUILD_CHECK: "off" }).code?.build, false);
+  assert.equal(loadConfig({ ...gh, BUILD_GOPROXY: "https://goproxy.corp,direct" }).code?.goproxy, "https://goproxy.corp,direct");
+  assert.throws(() => loadConfig({ ...gh, BUILD_CHECK: "yes" }), /BUILD_CHECK 只能是 on 或 off/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app" }), /GITLAB_URL 和 GITLAB_TOKEN/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app", GITLAB_URL: "https://git.corp" }), /GITLAB_TOKEN/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "app", GITLAB_URL: "https://git.corp", GITLAB_TOKEN: "t" }), /项目路径/);
@@ -338,4 +344,13 @@ test("更新通知的「产品功能说明」链接要是 https 地址", () => {
   assert.equal(off.announce, undefined);
   assert.equal(off.featuresLink, "https://docs.example.com/agenttag");
   assert.throws(() => loadConfig({ ...base, ANNOUNCE: "off", ANNOUNCE_LINK: "http://docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
+});
+
+test("更新通知的「文档中心」链接（DOCS_LINK）要是 https 地址，不填就没有", () => {
+  const config = loadConfig({ ...base, DOCS_LINK: " https://docs.example.com/center " });
+  assert.equal(config.docsLink, "https://docs.example.com/center");
+  assert.equal(config.announce?.docsLink, "https://docs.example.com/center");
+  assert.equal(loadConfig(base).announce?.docsLink, undefined);
+  assert.throws(() => loadConfig({ ...base, DOCS_LINK: "http://docs.example.com" }), /DOCS_LINK 要写成 https/);
+  assert.throws(() => loadConfig({ ...base, ANNOUNCE: "off", DOCS_LINK: "docs.example.com" }), /DOCS_LINK 要写成 https/);
 });

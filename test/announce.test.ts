@@ -10,8 +10,10 @@ import {
   parseChangelogTech,
   parseReleaseNotes,
   pendingVersions,
+  MAX_VERSION_LINKS,
   renderAnnouncementCard,
   renderAnnouncementMarkdown,
+  resolveNotesLink,
   UpdateAnnouncer,
 } from "../src/announce.js";
 
@@ -98,7 +100,7 @@ test("通知卡片：标题带最新版本号，几个版本各写「x.y.z 更�
   ];
   const card = renderAnnouncementCard(versions, { botName: "飞书 CLI", link: "https://docs.example.com/agenttag", firstTime: true });
   const json = JSON.stringify(card);
-  assert.match(json, /飞书 CLI 更新了 · 0\.10\.0/);
+  assert.match(json, /AgentTag 更新了 · 0\.10\.0/);
   assert.match(json, /\*\*0\.10\.0 更新了什么\*\*/);
   assert.match(json, /\*\*0\.9\.1 更新了什么\*\*/);
   assert.ok(!json.includes("本次更新了什么"));
@@ -114,6 +116,66 @@ test("通知卡片：标题带最新版本号，几个版本各写「x.y.z 更�
   assert.ok(!single.includes("button"));
   assert.ok(!single.includes("我是"));
   assert.match(JSON.stringify(renderAnnouncementCard([versions[1]!])), /版本 0\.9\.1(?! ·)/);
+});
+
+test("版本说明里单独一行的链接拿出来做按钮，最多 MAX_VERSION_LINKS 个，多的和句子里的链接留在说明里", () => {
+  const extra = Array.from({ length: MAX_VERSION_LINKS + 1 }, (_, i) => `- [文档 ${i + 1}](文档中心#s${i + 1})`).join("\n");
+  const [v] = parseReleaseNotes(
+    `## 0.13.0 — 2026-10-16\n\n**能看文档了**\n\n- 新功能，详见 [说明](https://a.example.com)（#57）\n\n[改代码怎么用](功能说明#guide-f-code)\n${extra}\n`,
+  );
+  assert.deepEqual(v!.links?.map((link) => [link.text, link.target]), [
+    ["改代码怎么用", "功能说明#guide-f-code"],
+    ["文档 1", "文档中心#s1"],
+    ["文档 2", "文档中心#s2"],
+  ]);
+  assert.equal(v!.notes, `**能看文档了**\n\n- 新功能，详见 [说明](https://a.example.com)\n\n- [文档 3](文档中心#s3)\n- [文档 4](文档中心#s4)`);
+  assert.equal(parseReleaseNotes("## 0.9.0\n\n- 没有链接\n")[0]!.links, undefined);
+});
+
+test("文档链接：「文档中心」「功能说明」换成配置的地址（# 换成写的小节），https 原样用，别的、没配的不放", () => {
+  const options = { link: "https://features.example.com/page#old", docsLink: "https://docs.example.com/page" };
+  assert.equal(resolveNotesLink("文档中心", options), "https://docs.example.com/page");
+  assert.equal(resolveNotesLink("文档中心#guide-f-code", options), "https://docs.example.com/page#guide-f-code");
+  assert.equal(resolveNotesLink("功能说明#guide-f-about", options), "https://features.example.com/page#guide-f-about");
+  assert.equal(resolveNotesLink("https://x.example.com/a?b=1", options), "https://x.example.com/a?b=1");
+  assert.equal(resolveNotesLink("文档中心", { link: options.link }), undefined);
+  assert.equal(resolveNotesLink("http://x.example.com", options), undefined);
+  assert.equal(resolveNotesLink("javascript:alert(1)", options), undefined);
+  assert.equal(resolveNotesLink("文档中心#a b", options), undefined);
+  assert.equal(resolveNotesLink("别的文档", options), undefined);
+});
+
+test("通知卡片：标题用产品名 AgentTag；每版的文档按钮放在这一版说明下面；最下面一排是「产品功能说明」「文档中心」", () => {
+  const versions = [
+    { version: "0.13.0", notes: "- 新功能", links: [{ text: "怎么用", target: "文档中心#guide-f-about" }, { text: "没配的", target: "http://x" }] },
+    { version: "0.12.1", notes: "- 修好了" },
+  ];
+  const options = { botName: "飞书 CLI", link: "https://features.example.com", docsLink: "https://docs.example.com" };
+  const card = renderAnnouncementCard(versions, options) as { header: { title: { content: string } }; body: { elements: { tag: string }[] } };
+  assert.equal(card.header.title.content, "AgentTag 更新了 · 0.13.0");
+  const json = JSON.stringify(card);
+  const buttons = [...json.matchAll(/"content":"([^"]+)"},"type":"(\w+)","size":"small","behaviors":\[\{"type":"open_url","default_url":"([^"]+)"/g)].map(
+    (m) => [m[1], m[2], m[3]],
+  );
+  assert.deepEqual(buttons, [
+    ["怎么用", "default", "https://docs.example.com#guide-f-about"],
+    ["产品功能说明", "primary", "https://features.example.com"],
+    ["文档中心", "default", "https://docs.example.com"],
+  ]);
+  assert.deepEqual(
+    card.body.elements.map((element) => element.tag),
+    ["markdown", "column_set", "markdown", "markdown", "column_set"],
+  );
+  // 只配了一个链接时只放那一个
+  const onlyDocs = JSON.stringify(renderAnnouncementCard([versions[1]!], { docsLink: "https://docs.example.com" }));
+  assert.match(onlyDocs, /文档中心/);
+  assert.ok(!onlyDocs.includes("产品功能说明"));
+
+  const markdown = renderAnnouncementMarkdown(versions, options);
+  assert.match(markdown, /^\*\*AgentTag 更新了 · 0\.13\.0\*\*/);
+  assert.match(markdown, /- 新功能\n怎么用：https:\/\/docs\.example\.com#guide-f-about/);
+  assert.match(markdown, /产品功能说明：https:\/\/features\.example\.com\n文档中心：https:\/\/docs\.example\.com$/);
+  assert.ok(!markdown.includes("没配的"));
 });
 
 test("读技术版更新日志：版本号对应整段内容，分类小标题换成加粗，没有版本号的段跳过", () => {
@@ -283,7 +345,7 @@ test("飞书说卡片格式不对时改发文字", async () => {
   await t.make().run();
   assert.equal(t.sent.length, 1);
   const input = t.sent[0]!.input as { markdown: string };
-  assert.match(input.markdown, /飞书 CLI 更新了 · 0\.10\.0/);
+  assert.match(input.markdown, /AgentTag 更新了 · 0\.10\.0/);
   assert.match(input.markdown, /新功能 A/);
   assert.deepEqual((await t.state()).chats, { oc_a: "0.10.0" });
 });

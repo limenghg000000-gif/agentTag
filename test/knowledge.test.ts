@@ -18,6 +18,7 @@ import { raceAbort } from "../src/abort.js";
 import { generateKeyPairSync } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { buildSystemPrompt } from "../src/prompt.js";
+import type { NameLookup } from "../src/operator-names.js";
 import { MAX_CARD_BYTES } from "../src/progress.js";
 import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
 
@@ -853,12 +854,14 @@ function deskSetup({
   approvers = new Set(["ou_admin"]),
   saveLesson = () => JSON.stringify({ saved: true, id: 31 }),
   searchLessons = () => JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9 }, { id: 40, title: "Open WebUI 存的", score: 8 }] }),
+  nameOf,
 }: {
   aiops?: boolean;
   /** null：没配写权限名单 */
   approvers?: ReadonlySet<string> | null;
   saveLesson?: (args: Record<string, unknown>) => string;
   searchLessons?: (args: Record<string, unknown>) => string;
+  nameOf?: NameLookup;
 } = {}) {
   // holds：按发送的先后，每次发送等对应的一个；用完了等 hold
   const control: { failSend: boolean; failUpdate?: boolean; hold?: Promise<void>; holds?: Promise<void>[]; updateHold?: Promise<void> } = { failSend: false };
@@ -914,20 +917,22 @@ function deskSetup({
     },
     ...(approvers ? { approvers } : {}),
     allowedChatIds: new Set(["oc_1"]),
+    ...(nameOf ? { nameOf } : {}),
     logger: quiet,
     now: () => now,
     retryDelayMs: 0,
   });
   const ctx = { chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: "张三", messageId: "om_1" };
   const tool = (name: string) => desk.tools(ctx).find((t) => t.spec.name === name)!;
-  const click = (card: any, op: string, openId = "ou_admin", name = "ML"): CardActionEvent => {
+  // name 为 null：飞书回调里没带名字（线上一般都没带）
+  const click = (card: any, op: string, openId = "ou_admin", name: string | null = "ML"): CardActionEvent => {
     const buttons = JSON.stringify(card).match(/"value":\{[^}]*\}/g)!.map((v) => JSON.parse(v.slice(8)));
     const value = buttons.find((v) => v.op === op);
     assert.ok(value, `卡片上没有 ${op} 按钮`);
     // 点的是哪条消息上的卡片：发出去的按发的顺序编号，改过的按改的那条
     const index = sent.findIndex((one) => (one.input as { card?: unknown }).card === card);
     const messageId = index >= 0 ? `om_card_${index + 1}` : (updates.findLast((one) => one.card === card)?.messageId ?? "om_card_1");
-    return { messageId, chatId: "oc_1", operator: { openId, name }, action: { tag: "button", value } };
+    return { messageId, chatId: "oc_1", operator: { openId, ...(name === null ? {} : { name }) }, action: { tag: "button", value } };
   };
   const lastCard = () => updates.at(-1)!.card;
   return { backend, base, desk, sent, updates, calls, mcp, handlers, lessonPaths, tool, click, lastCard, control, advance: (ms: number) => (now += ms) };
@@ -993,6 +998,46 @@ test("写权限名单里的人点保存：存进经验库，排查经验同步�
   await desk.idle();
   assert.equal(backend.entries.length, 1);
   assert.equal(lastCard().header.title.content, "已失效");
+});
+
+test("飞书回调里没有点的人的名字：卡片上、确认人写找到的名字；找不到写「有人」「写权限名单里的同事」，不写 open_id", async () => {
+  const asked: [string, string][] = [];
+  const found = deskSetup({
+    aiops: false,
+    nameOf: async (openId, messageId) => {
+      asked.push([openId, messageId]);
+      return openId === "ou_admin" ? "ML" : undefined;
+    },
+  });
+  await found.tool("knowledge_propose").run(code8, { signal });
+  const card = (found.sent[0].input as { card: any }).card;
+  await found.desk.handleCardAction(found.click(card, "save", "ou_2", null));
+  assert.match(cardText(found.lastCard()), /有人点了确认：只有写权限名单里的人能确认/);
+  await found.desk.handleCardAction(found.click(card, "save", "ou_admin", null));
+  await found.desk.idle();
+  assert.deepEqual(asked, [
+    ["ou_2", "om_card_1"],
+    ["ou_admin", "om_card_1"],
+  ]);
+  assert.equal(found.backend.entries[0].confirmedBy, "ML");
+  const reply = (found.sent.at(-1)!.input as { markdown: string }).markdown;
+  assert.match(reply, /确认人 ML/);
+  assert.ok(![...found.updates.map((u) => cardText(u.card)), reply].some((t) => t.includes("ou_")), "卡片和话题里都不出现 open_id");
+
+  // 发起人点取消：用他提问时的名字，不用去找
+  await found.tool("knowledge_propose").run({ ...code8, title: "另一条" }, { signal });
+  asked.length = 0;
+  await found.desk.handleCardAction(found.click((found.sent.at(-1)!.input as { card: any }).card, "cancel", "ou_1", null));
+  assert.match(cardText(found.lastCard()), /张三取消了/);
+  assert.deepEqual(asked, []);
+
+  // 没给找名字的：确认人不写 open_id
+  const plain = deskSetup({ aiops: false });
+  await plain.tool("knowledge_propose").run(code8, { signal });
+  await plain.desk.handleCardAction(plain.click((plain.sent[0].input as { card: any }).card, "save", "ou_admin", null));
+  await plain.desk.idle();
+  assert.equal(plain.backend.entries[0].confirmedBy, "写权限名单里的同事");
+  assert.match((plain.sent.at(-1)!.input as { markdown: string }).markdown, /确认人 写权限名单里的同事/);
 });
 
 test("点了保存马上返回，后台执行；执行中再点不会存两遍", async () => {
@@ -3876,7 +3921,7 @@ test("草稿和归档原因里的手机号、身份证号不让发卡片；打�
   assert.equal(sent.length, 1);
 });
 
-test("名字里像是有密钥的发起人、确认人：卡片、表格和 aiops 里只记 open_id", async () => {
+test("名字里像是有密钥的发起人、确认人：不记名字，发起人记 open_id，确认人写「写权限名单里的同事」", async () => {
   const leaked = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
   const { backend, desk, sent, calls, click, lastCard } = deskSetup();
   const propose = desk.tools({ chatId: "oc_1", threadKey: "om_root", senderId: "ou_1", askerName: leaked, messageId: "om_1" }).find((t) => t.spec.name === "knowledge_propose")!;
@@ -3886,8 +3931,8 @@ test("名字里像是有密钥的发起人、确认人：卡片、表格和 aiop
   await desk.handleCardAction(click(card, "save", "ou_admin", leaked));
   await desk.idle();
   assert.equal(backend.entries[0].proposedBy, "ou_1");
-  assert.equal(backend.entries[0].confirmedBy, "ou_admin");
-  assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:ou_admin");
+  assert.equal(backend.entries[0].confirmedBy, "写权限名单里的同事");
+  assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:写权限名单里的同事");
   assert.ok(![JSON.stringify(sent), cardText(lastCard())].some((text) => text.includes(leaked)));
 });
 
@@ -3983,7 +4028,7 @@ test("回答前检索：提问里的手机号、身份证号换成 *** 再查 ai
   assert.equal(maskPersonal(`用户 138****8000，号码 ${wrong}，订单 2026101013800138000`), `用户 138****8000，号码 ${wrong}，订单 2026101013800138000`);
 });
 
-test("编号里写了手机号的行：日志、报错里编号换成占位；名字是手机号、身份证号的发起人、确认人只记 open_id", async () => {
+test("编号里写了手机号的行：日志、报错里编号换成占位；名字是手机号、身份证号的发起人、确认人不记名字", async () => {
   const { base, backend } = deskSetup();
   await base.save(normalizeDraft(dau));
   backend.entries[0].id = "13800138000";
@@ -4002,8 +4047,8 @@ test("编号里写了手机号的行：日志、报错里编号换成占位；�
   await desk.handleCardAction(click(card, "save", "ou_admin", id));
   await desk.idle();
   assert.equal(saved.entries[0].proposedBy, "ou_1");
-  assert.equal(saved.entries[0].confirmedBy, "ou_admin");
-  assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:ou_admin");
+  assert.equal(saved.entries[0].confirmedBy, "写权限名单里的同事");
+  assert.equal(calls.find((call) => call.tool === "save_lesson")!.args.created_by, "feishu:写权限名单里的同事");
   assert.ok(![JSON.stringify(sent), cardText(lastCard())].some((text) => text.includes("13800138000") || text.includes(id)));
 });
 
