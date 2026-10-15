@@ -3924,6 +3924,16 @@ test("让把做好的修改开合并请求、合到 uat 才算要开：问合没
   }
 });
 
+test("判断是不是让开合并请求、回答是不是说开好了时，超长的空白不会让正则卡住", () => {
+  const blank = "\n".repeat(100_000);
+  const review = reviewCodeAnswer("提个 PR", ["golang/appservice"], () => false, () => false, { known: () => "", canOpen: true });
+  for (const run of [() => asksToOpenRequest(`帮我开${blank}x`), () => review(`已经${blank}x`, new Set(["code_search"]))]) {
+    const started = performance.now();
+    run();
+    assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
+  }
+});
+
 test("回答里的合并请求编号要在提问、话题或这次的工具结果里出现过；代码里的 !1 不算编号", () => {
   const known = "已开合并请求 !353（agenttag/20261014-a1b2c3 → master）：https://lab.corp/golang/appservice/-/merge_requests/353";
   assert.deepEqual(madeUpRequestRefs("!353 还开着，已经从 uat 开了 !354：https://lab.corp/golang/appservice/-/merge_requests/355", known), ["!354", "!355"]);
