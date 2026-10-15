@@ -778,11 +778,20 @@ test("别的话题开的合并请求也要开到 uat：从它的源分支直接�
   const gone = await ws.openPullRequest("A 返回 7（uat）", "", { from: 11, target: "uat" });
   assert.deepEqual(brief(gone), [true, 2, "fix/gone", "uat"]);
   assert.deepEqual(await remoteLog("fix/gone"), ["A 返回 7", "init"]);
+  // 合并后源分支上又有了别的提交：不从它开（会带上没核对过的改动），按当时的提交另建一个分支
+  requests[12] = { ...seven, number: 12, state: "merged" };
+  await writeFile(path.join(portSeed, "b.go"), "package a\n");
+  await runGit(["add", "b.go"], { cwd: portSeed });
+  await runGit(["commit", "-q", "-m", "后来的提交"], { cwd: portSeed, env: author });
+  await runGit(["push", "-q", "origin", "fix/other"], { cwd: portSeed });
+  const moved = await ws.openPullRequest("A 返回 7（test）", "", { from: 12, target: "uat", branch: "fix/other-uat" });
+  assert.deepEqual(brief(moved), [true, 3, "fix/other-uat", "uat"]);
+  assert.deepEqual(await remoteLog("fix/other-uat"), ["A 返回 7", "init"]);
   // 平台不支持读合并请求
   const plain = await portWorkspaces().all.open("om_p8", portRepo);
   await assert.rejects(plain.openPullRequest("t", "", { from: 7, target: "uat" }), /Fake 还不支持把别的合并请求开到别的分支/);
   await runGit(["checkout", "-q", "uat"], { cwd: portSeed });
-  await runGit(["push", "-q", "origin", "--delete", "fix/gone"], { cwd: portSeed });
+  await runGit(["push", "-q", "origin", "--delete", "fix/gone", "fix/other-uat"], { cwd: portSeed });
 });
 
 test("列合并请求：写明从哪个分支到哪个分支、状态，标出这个话题开的；分支名记作查到的", async () => {
@@ -964,7 +973,21 @@ test("GitLab 列分支：调 v4 接口，按最近更新排，带最近一次提
     { name: "master", isDefault: true, date: "2026-03-12T10:00:00.000+08:00", author: "张三", title: "Initial commit" },
     { name: "aiops", isDefault: false, date: "2026-09-20T10:00:00.000+08:00", author: "李四", title: "feat: k8s" },
   ]);
-  assert.equal(urls[0], "https://lab.corp/api/v4/projects/ai%2Faiops-mcp/repository/branches?per_page=100&sort=updated_desc");
+  assert.equal(urls[0], "https://lab.corp/api/v4/projects/ai%2Faiops-mcp/repository/branches?per_page=100&page=1&sort=updated_desc");
+  assert.equal(urls.length, 1);
+
+  // 分支多：翻页列全，受保护的线上分支在第二页也看得到
+  const pages: string[] = [];
+  const paged = createGitLabHost("https://lab.corp", "glpat-x", (async (url: string) => {
+    pages.push(url);
+    const page = Number(/[?&]page=(\d+)/.exec(url)![1]);
+    const items = page === 1 ? Array.from({ length: 100 }, (_, i) => ({ name: `feature/${i}` })) : [{ name: "prod", protected: true }];
+    return new Response(JSON.stringify(items), { status: 200, headers: { "x-next-page": page === 1 ? "2" : "" } });
+  }) as unknown as typeof fetch);
+  const all = await paged.listBranches!("golang/appservice");
+  assert.equal(all.length, 101);
+  assert.equal(all.find((b) => b.name === "prod")?.protected, true);
+  assert.equal(pages.length, 2);
 });
 
 test("代码工具：code_branches 列出和切换分支，code_search 的 branches 也接受逗号分隔的字符串", async () => {
@@ -1323,6 +1346,11 @@ test("之前开的合并请求合并了或关掉了：新改动另开一个，�
   await ws3.editFile("c.txt", undefined, "c\n");
   await ws3.openPullRequest("加 c", "", { branch: "fix/c" });
   assert.equal((await ws3.openPullRequest("加 c（uat）", "", { target: "uat" })).number, 6);
+  // 真的合进 uat（合并提交），之后改同一行：只试合进去以后的新改动，不会和已经在 uat 上的那份冲突
+  await runGit(["fetch", "-q", "--unshallow", "origin", "+refs/heads/uat:refs/remotes/origin/uat", "+refs/heads/fix/c:refs/remotes/origin/fix/c"], { cwd: ws3.dir });
+  const tree = (await runGit(["merge-tree", "--write-tree", "refs/remotes/origin/uat", "refs/remotes/origin/fix/c"], { cwd: ws3.dir })).stdout.trim();
+  const merge = (await runGit(["commit-tree", tree, "-p", "refs/remotes/origin/uat", "-p", "refs/remotes/origin/fix/c", "-m", "Merge fix/c into uat"], { cwd: ws3.dir })).stdout.trim();
+  await runGit(["push", "-q", "origin", `${merge}:refs/heads/uat`], { cwd: ws3.dir });
   states[6] = "merged";
   await ws3.editFile("c.txt", "c\n", "cc\n");
   const more = await ws3.openPullRequest("改 c", "");
@@ -1798,6 +1826,8 @@ test("流水线里按分支部署的分支：only 列的、rules 和脚本里比
   ].join("\n");
   assert.deepEqual(ciBranches(ci).sort(), ["dev", "feature_zzw", "master", "release", "staging", "uat"]);
   assert.deepEqual(ciBranches("build:\n  script:\n    - go build\n"), []);
+  // 行尾注释里的比较不算
+  assert.deepEqual(ciBranches("notify:\n  script:\n    - echo done # \"$CI_COMMIT_BRANCH\" == \"uat\"\n"), []);
   const list = (protectedNames: string[]) => ["master", "uat", "prod", "release"].map((name) => ({ name, ...(protectedNames.includes(name) ? { protected: true } : {}) }));
   // 默认分支受保护、在部署分支里：线上是默认分支
   assert.deepEqual(branchRoles(["uat", "release", "master"], list(["master", "release"]), "master"), { live: "master", env: ["uat", "release"] });
@@ -1897,4 +1927,19 @@ test("开到 uat 前把改动放到 uat 上编一下：编不过不推；编过�
   });
   await ws.mergeRequest(pr.number);
   assert.deepEqual(merged, [{ number: pr.number, requirePipeline: false }]);
+  // 开到 uat 的合并后不删这个分支（还要开到线上分支）
+  assert.equal((prs[0] as { keepSource?: boolean }).keepSource, true);
+  // 编过以后 uat 又进了别的提交：编的不是现在的 uat 了，要看流水线
+  await runGit(["fetch", "-q", "origin", "+refs/heads/uat:refs/remotes/origin/uat"], { cwd: ws.dir });
+  const tree = (await runGit(["rev-parse", "refs/remotes/origin/uat^{tree}"], { cwd: ws.dir })).stdout.trim();
+  const moved = (await runGit(["commit-tree", tree, "-p", "refs/remotes/origin/uat", "-m", "别人合进 uat"], { cwd: ws.dir })).stdout.trim();
+  await runGit(["push", "-q", "origin", `${moved}:refs/heads/uat`], { cwd: ws.dir });
+  await ws.mergeRequest(pr.number);
+  assert.deepEqual(merged.at(-1), { number: pr.number, requirePipeline: true });
+
+  // 合进 uat 时分支被删了：要接着开到线上分支时按推过的提交建回来
+  await runGit(["push", "-q", "origin", `:refs/heads/${pr.branch}`], { cwd: ws.dir });
+  const live = await ws.openPullRequest("A 返回 2", "");
+  assert.equal(live.base, "main");
+  assert.equal((await runGit(["ls-remote", "--heads", "origin", `refs/heads/${pr.branch}`], { cwd: ws.dir })).stdout.split("\t")[0], sha);
 });
