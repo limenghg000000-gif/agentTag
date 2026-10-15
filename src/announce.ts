@@ -13,7 +13,21 @@ export interface ReleaseNotesVersion {
   notes: string;
   /** 技术版 CHANGELOG.md 里同一版本的内容，卡片上折叠放在「技术说明」里；没有时为空 */
   tech?: string;
+  /** 说明里单独一行写的文档链接，卡片上做成这一版下面的按钮；没有时为空 */
+  links?: ReleaseNotesLink[];
 }
+
+/**
+ * 版本说明里单独一行的链接「[改代码怎么用](https://…)」：target 是 https 地址，
+ * 或者「文档中心」「功能说明」（后面可以带 #小节），发的时候换成 DOCS_LINK、ANNOUNCE_LINK，仓库里不用写死地址
+ */
+export interface ReleaseNotesLink {
+  text: string;
+  target: string;
+}
+
+/** 产品名：通知卡片的标题用它，不用飞书里机器人的名字（以后可能换机器人） */
+export const PRODUCT_NAME = "AgentTag";
 
 /** 一张通知卡片最多列几个版本，更早的只说还有几个 */
 export const MAX_ANNOUNCED_VERSIONS = 5;
@@ -33,18 +47,28 @@ const H2 = /^##\s/;
 const H3 = /^###\s/;
 /** 结尾的 PR 号：（#26）、(#35、#37)、（#40, #41） */
 const PR_REFS = /\s*[（(]\s*#\d+(?:\s*[、，,]\s*#\d+)*\s*[）)]/g;
+/** 单独一行的链接，前面可以有「- 」：「[改代码怎么用](文档中心#guide-f-code)」。按钮上的字最多 20 个 */
+const LINK_LINE = /^\s*(?:[-*]\s+)?\[([^[\]\n]{1,20})\]\(([^()\s<>]+)\)\s*$/;
+/** 一个版本下面最多几个文档按钮，多的照原样留在说明里 */
+export const MAX_VERSION_LINKS = 3;
 
 /**
  * 读产品更新说明（RELEASE_NOTES.md）：每个「## 0.8.0 — 2026-10-14」开头的段是一个版本，按文件里的先后返回（最新的在最上面）。
- * 「## 未发布」这类没有版本号的段跳过。每段只取 ### 小标题之前的部分，结尾的 PR 号去掉
+ * 「## 未发布」这类没有版本号的段跳过。每段只取 ### 小标题之前的部分，结尾的 PR 号去掉；
+ * 单独一行的链接（最多 MAX_VERSION_LINKS 个）从说明里拿出来，放进 links
  */
 export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
   const versions: ReleaseNotesVersion[] = [];
-  let current: { version: string; date?: string; lines: string[]; cut: boolean } | undefined;
+  let current: { version: string; date?: string; lines: string[]; links: ReleaseNotesLink[]; cut: boolean } | undefined;
   const flush = () => {
     if (current) {
-      const notes = current.lines.join("\n").replace(PR_REFS, "").trim();
-      versions.push({ version: current.version, ...(current.date ? { date: current.date } : {}), notes });
+      const notes = current.lines.join("\n").replace(PR_REFS, "").replace(/\n{3,}/g, "\n\n").trim();
+      versions.push({
+        version: current.version,
+        ...(current.date ? { date: current.date } : {}),
+        notes,
+        ...(current.links.length > 0 ? { links: current.links } : {}),
+      });
     }
   };
   for (const line of text.split(/\r?\n/)) {
@@ -52,7 +76,7 @@ export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
       flush();
       const match = VERSION_HEADING.exec(line);
       current = match
-        ? { version: `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`, date: match[4] || undefined, lines: [], cut: false }
+        ? { version: `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`, date: match[4] || undefined, lines: [], links: [], cut: false }
         : undefined;
       continue;
     }
@@ -63,10 +87,43 @@ export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
       current.cut = true;
       continue;
     }
+    const link = LINK_LINE.exec(line);
+    if (link && current.links.length < MAX_VERSION_LINKS) {
+      current.links.push({ text: link[1]!.trim(), target: link[2]! });
+      continue;
+    }
     current.lines.push(line.trimEnd());
   }
   flush();
   return versions;
+}
+
+/** 文档链接的写法：「文档中心」「功能说明」，后面可以带 #小节（字母、数字、- _ . ~） */
+const NAMED_TARGET = /^(文档中心|功能说明)(#[\w.~-]+)?$/;
+
+/**
+ * 版本说明里的链接换成能打开的地址：https 地址原样用；「文档中心」「功能说明」换成配置的 DOCS_LINK、ANNOUNCE_LINK（原来带的 # 去掉，换成这里写的小节）。
+ * 没配对应的链接、或者写的不是这两种的，不放按钮
+ */
+export function resolveNotesLink(target: string, options: Pick<AnnouncementOptions, "link" | "docsLink">): string | undefined {
+  const named = NAMED_TARGET.exec(target);
+  if (named) {
+    const base = named[1] === "文档中心" ? options.docsLink : options.link;
+    return base ? `${base.replace(/#.*$/, "")}${named[2] ?? ""}` : undefined;
+  }
+  try {
+    return new URL(target).protocol === "https:" ? target : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 这个版本能放的文档按钮：按钮上的字和打开的地址 */
+function versionLinks(v: ReleaseNotesVersion, options: AnnouncementOptions): { text: string; url: string }[] {
+  return (v.links ?? []).flatMap((link) => {
+    const url = resolveNotesLink(link.target, options);
+    return url ? [{ text: link.text, url }] : [];
+  });
 }
 
 /**
@@ -130,8 +187,10 @@ export function pendingVersions(versions: readonly ReleaseNotesVersion[], lastAn
 
 export interface AnnouncementOptions {
   botName?: string;
-  /** 「产品功能说明」按钮打开的链接 */
+  /** 「产品功能说明」按钮打开的链接（ANNOUNCE_LINK） */
   link?: string;
+  /** 「文档中心」按钮打开的链接（DOCS_LINK） */
+  docsLink?: string;
   /** 这个群第一次收到更新通知：末尾介绍一句自己 */
   firstTime?: boolean;
 }
@@ -199,41 +258,71 @@ function footerLines(name: string, rest: number, firstTime: boolean | undefined)
   ];
 }
 
+/** 卡片最下面的按钮：产品功能说明、文档中心，配了哪个放哪个 */
+function footerLinks(options: AnnouncementOptions): { text: string; url: string; primary?: boolean }[] {
+  return [
+    ...(options.link ? [{ text: "产品功能说明", url: options.link, primary: true }] : []),
+    ...(options.docsLink ? [{ text: "文档中心", url: options.docsLink }] : []),
+  ];
+}
+
+/** 一排打开链接的按钮，手机上放不下自动换行 */
+function buttonRow(buttons: readonly { text: string; url: string; primary?: boolean }[]): object {
+  return {
+    tag: "column_set",
+    flex_mode: "flow",
+    horizontal_spacing: "8px",
+    columns: buttons.map((button) => ({
+      tag: "column",
+      width: "auto",
+      elements: [
+        {
+          tag: "button",
+          text: { tag: "plain_text", content: button.text },
+          type: button.primary ? "primary" : "default",
+          size: "small",
+          behaviors: [{ type: "open_url", default_url: button.url }],
+        },
+      ],
+    })),
+  };
+}
+
 /** 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前 */
 export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): object {
   const name = options.botName || "机器人";
   const shown = shownVersions(versions);
-  const title = `${name} 更新了 · ${versions[0]?.version ?? ""}`;
+  const title = `${PRODUCT_NAME} 更新了 · ${versions[0]?.version ?? ""}`;
   const grey = (text: string) => `<font color='grey'>${escapeCardMarkdown(text)}</font>`;
-  const elements: object[] = shown.flatMap((v) => [
-    { tag: "markdown", content: [versionHeading(v, versions.length === 1, grey), escapeCardMarkdown(v.notes)].join("\n") },
-    // 技术说明给开发同事看，默认收起
-    ...(v.tech
-      ? [
-          {
-            tag: "collapsible_panel",
-            expanded: false,
-            header: {
-              title: { tag: "markdown", content: `<font color='grey'>技术说明（${escapeCardMarkdown(v.version)}，给开发看）</font>` },
-              icon: { tag: "standard_icon", token: "down-small-ccm_outlined", size: "16px 16px" },
-              icon_position: "right",
-              icon_expanded_angle: -180,
+  const elements: object[] = shown.flatMap((v) => {
+    const docs = versionLinks(v, options);
+    return [
+      { tag: "markdown", content: [versionHeading(v, versions.length === 1, grey), escapeCardMarkdown(v.notes)].join("\n") },
+      // 这一版新功能的文档
+      ...(docs.length > 0 ? [buttonRow(docs)] : []),
+      // 技术说明给开发同事看，默认收起
+      ...(v.tech
+        ? [
+            {
+              tag: "collapsible_panel",
+              expanded: false,
+              header: {
+                title: { tag: "markdown", content: `<font color='grey'>技术说明（${escapeCardMarkdown(v.version)}，给开发看）</font>` },
+                icon: { tag: "standard_icon", token: "down-small-ccm_outlined", size: "16px 16px" },
+                icon_position: "right",
+                icon_expanded_angle: -180,
+              },
+              elements: [{ tag: "markdown", content: escapeCardMarkdown(v.tech) }],
             },
-            elements: [{ tag: "markdown", content: escapeCardMarkdown(v.tech) }],
-          },
-        ]
-      : []),
-  ]);
+          ]
+        : []),
+    ];
+  });
   const footer = footerLines(escapeCardMarkdown(name), versions.length - shown.length, options.firstTime);
   elements.push({ tag: "markdown", content: footer.map((line) => `<font color='grey'>${line}</font>`).join("\n") });
-  if (options.link) {
-    elements.push({
-      tag: "button",
-      text: { tag: "plain_text", content: "产品功能说明" },
-      type: "primary",
-      size: "small",
-      behaviors: [{ type: "open_url", default_url: options.link }],
-    });
+  const links = footerLinks(options);
+  if (links.length > 0) {
+    elements.push(buttonRow(links));
   }
   return {
     schema: "2.0",
@@ -250,13 +339,15 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
 export function renderAnnouncementMarkdown(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): string {
   const name = options.botName || "机器人";
   const shown = shownVersions(versions);
-  const lines = [`**${name} 更新了 · ${versions[0]?.version ?? ""}**`];
+  const lines = [`**${PRODUCT_NAME} 更新了 · ${versions[0]?.version ?? ""}**`];
   for (const v of shown) {
     lines.push("", versionHeading(v, versions.length === 1, (text) => text), v.notes);
+    lines.push(...versionLinks(v, options).map((link) => `${link.text}：${link.url}`));
   }
   lines.push("", ...footerLines(name, versions.length - shown.length, options.firstTime));
-  if (options.link) {
-    lines.push("", `产品功能说明：${options.link}`);
+  const links = footerLinks(options);
+  if (links.length > 0) {
+    lines.push("", ...links.map((link) => `${link.text}：${link.url}`));
   }
   return lines.join("\n").replace(/</g, "＜").replace(/>/g, "＞");
 }
@@ -277,7 +368,10 @@ export interface UpdateAnnouncerOptions {
   chatIds: readonly string[];
   send: (to: string, input: SendInput) => Promise<SendResult>;
   botName?: () => string | undefined;
+  /** 「产品功能说明」按钮（ANNOUNCE_LINK） */
   link?: string;
+  /** 「文档中心」按钮（DOCS_LINK） */
+  docsLink?: string;
   logger?: Logger;
   retryMs?: number;
   maxAttempts?: number;
@@ -350,6 +444,7 @@ export class UpdateAnnouncer {
       const options: AnnouncementOptions = {
         ...(this.opts.botName?.() ? { botName: this.opts.botName() } : {}),
         ...(this.opts.link ? { link: this.opts.link } : {}),
+        ...(this.opts.docsLink ? { docsLink: this.opts.docsLink } : {}),
         firstTime: last === undefined,
       };
       const list = pending.map((v) => v.version).join("、");

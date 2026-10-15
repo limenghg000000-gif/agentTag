@@ -312,3 +312,12 @@ test("更新通知的「产品功能说明」链接要是 https 地址", () => {
   assert.equal(off.featuresLink, "https://docs.example.com/agenttag");
   assert.throws(() => loadConfig({ ...base, ANNOUNCE: "off", ANNOUNCE_LINK: "http://docs.example.com" }), /ANNOUNCE_LINK 要写成 https/);
 });
+
+test("更新通知的「文档中心」链接（DOCS_LINK）要是 https 地址，不填就没有", () => {
+  const config = loadConfig({ ...base, DOCS_LINK: " https://docs.example.com/center " });
+  assert.equal(config.docsLink, "https://docs.example.com/center");
+  assert.equal(config.announce?.docsLink, "https://docs.example.com/center");
+  assert.equal(loadConfig(base).announce?.docsLink, undefined);
+  assert.throws(() => loadConfig({ ...base, DOCS_LINK: "http://docs.example.com" }), /DOCS_LINK 要写成 https/);
+  assert.throws(() => loadConfig({ ...base, ANNOUNCE: "off", DOCS_LINK: "docs.example.com" }), /DOCS_LINK 要写成 https/);
+});
