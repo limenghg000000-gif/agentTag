@@ -392,9 +392,21 @@ async function runTask(
     if (restate) {
       logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
     }
-    const knowledge = restate
-      ? undefined
-      : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
+    // 经验库一个话题只自动查成一次：这个话题已经查成过（不管查没查到），后面的追问不再查（查到的经验那次回答已经用上了），
+    // 追问里有新线索时模型自己用 knowledge_search 查。没查成过的（超时、出错、只查成一边、那次是整理不查、重启后记不得）照样查。
+    // 追问里明说要查经验库、知识库的也照样先查
+    const topics = lookedUpTopics(deps);
+    const lookupSkipped = !restate && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
+    if (lookupSkipped) {
+      logger.info(`这个话题查过经验库了，这次追问不再自动查 message=${msg.messageId}`);
+    }
+    const knowledge =
+      restate || lookupSkipped
+        ? undefined
+        : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
+    if (knowledge && !knowledge.missed?.length) {
+      rememberLookup(topics, taskContext.threadKey);
+    }
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
@@ -609,6 +621,8 @@ async function runTask(
                 // 整理之前内容时没查经验库，提示词里不说查到没查到
                 ...(restate
                   ? {}
+                  : lookupSkipped
+                  ? { skipped: true }
                   : knowledge
                   ? {
                       hits: knowledge.text,
@@ -1273,6 +1287,42 @@ export function codeContent(output: string, facts: readonly CodeFact[]): string 
 const BRANCHES_TOOL = "code_branches";
 const OPEN_PR_TOOL = "code_open_pr";
 const MERGE_TOOL = "code_merge";
+
+/** 每个机器人记在内存里的「哪些话题查成过经验库」，重启就忘（忘了就再查一次，多查不出错） */
+const LOOKED_UP_TOPICS = new WeakMap<BotDeps, Map<string, number>>();
+/** 最多记这么多个话题、记这么久，超了忘掉最早的 */
+const LOOKED_UP_TOPICS_MAX = 2000;
+const LOOKED_UP_TOPICS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function lookedUpTopics(deps: BotDeps): { has(key: string): boolean; map: Map<string, number> } {
+  let map = LOOKED_UP_TOPICS.get(deps);
+  if (!map) {
+    map = new Map();
+    LOOKED_UP_TOPICS.set(deps, map);
+  }
+  const topics = map;
+  return {
+    map: topics,
+    has(key) {
+      const at = topics.get(key);
+      return at !== undefined && Date.now() - at < LOOKED_UP_TOPICS_MS;
+    },
+  };
+}
+
+function rememberLookup(topics: { map: Map<string, number> }, key: string): void {
+  topics.map.delete(key);
+  topics.map.set(key, Date.now());
+  for (const oldest of topics.map.keys()) {
+    if (topics.map.size <= LOOKED_UP_TOPICS_MAX) {
+      break;
+    }
+    topics.map.delete(oldest);
+  }
+}
+
+/** 追问里明说要查经验库：照样先自动查一次。「飞书知识库」说的是飞书文档，不算 */
+const ASKS_KNOWLEDGE = /经验库|(?<!飞书\s*)知识库/;
 
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
