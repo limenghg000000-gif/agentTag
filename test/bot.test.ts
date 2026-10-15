@@ -1303,16 +1303,16 @@ test("带上了群聊时，群聊和改文档、改代码的工具不同时给�
   await handle(message("修一下这段代码，开个 MR", { messageId: "om_3", senderId: "ou_admin" }));
   assert.deepEqual(requests[2].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"]);
   assert.doesNotMatch(JSON.stringify(requests[2].messages), /机器人把周报文档清空/);
-  for (const [i, question] of ["加拿大的首都是哪里？", "按上面说的改一下", "你记得代码仓库里最近有什么变更吗？", "这段代码有什么建议"].entries()) {
+  for (const [i, question] of ["加拿大的首都是哪里？", "按上面说的改一下", "你记得代码仓库里最近有什么变更吗？", "这段代码有什么建议", "上面那段代码怎么优化"].entries()) {
     await handle(message(question, { messageId: `om_${4 + i}`, senderId: "ou_admin" }));
     assert.deepEqual(requests[3 + i].tools?.map((t) => t.name), ["feishu_doc_read"], question);
     assert.match(JSON.stringify(requests[3 + i].messages), /机器人把周报文档清空/, question);
   }
   // 写明了文件路径的、英文说要改的、说要切分支的、要合到别的分支的也算要改
-  for (const [i, question] of ["修改 src/foo.ts 第 10 行", "update README.md", "切到 develop 分支", "调整 README.md 中的说明", "重构 src/foo.ts", "把这个合到 uat"].entries()) {
-    await handle(message(question, { messageId: `om_${8 + i}`, senderId: "ou_admin" }));
-    assert.deepEqual(requests[7 + i].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"], question);
-    assert.doesNotMatch(JSON.stringify(requests[7 + i].messages), /机器人把周报文档清空/, question);
+  for (const [i, question] of ["修改 src/foo.ts 第 10 行", "update README.md", "切到 develop 分支", "调整 README.md 中的说明", "重构 src/foo.ts", "把这个合到 uat", "更新 go.mod", "修改 Makefile", "编辑 .env", "优化 src/foo.ts"].entries()) {
+    await handle(message(question, { messageId: `om_${9 + i}`, senderId: "ou_admin" }));
+    assert.deepEqual(requests[8 + i].tools?.map((t) => t.name), ["feishu_doc_read", "feishu_doc_edit"], question);
+    assert.doesNotMatch(JSON.stringify(requests[8 + i].messages), /机器人把周报文档清空/, question);
   }
 
   // 没带群聊时和以前一样

@@ -75,9 +75,9 @@ const DOC_REQUEST = new RegExp(
   "i",
 );
 
-const CHANGE_VERB = String.raw`(?:写|改|删|调整|重构|移除|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修|切(?:换|到)?)`;
-/** 写明了的文件路径：src/bot.ts、README.md、docs/a/b、飞书文档链接 */
-const CHANGE_PATH = String.raw`(?:(?:[\w.-]+\/)+[\w.-]+|\b[\w-]+\.(?:tsx?|jsx?|mjs|cjs|go|php|py|java|kt|rb|rs|cpp|cc|c|h|hpp|cs|swift|vue|md|json|ya?ml|toml|ini|env|sql|sh|html|css|scss|xml|proto|txt|conf|gradle|lock)\b)`;
+const CHANGE_VERB = String.raw`(?:写|改|删|编辑|调整|重构|移除|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修|切(?:换|到)?)`;
+/** 写明了的文件路径：src/bot.ts、README.md、docs/a/b、飞书文档链接，和没有扩展名的 Makefile、go.mod、.env 这类 */
+const CHANGE_PATH = String.raw`(?:(?:[\w.-]+\/)+[\w.-]+|\b[\w-]+\.(?:tsx?|jsx?|mjs|cjs|go|mod|sum|php|py|java|kt|rb|rs|cpp|cc|c|h|hpp|cs|swift|vue|md|json|ya?ml|toml|ini|env|sql|sh|html|css|scss|xml|proto|txt|conf|cfg|properties|gradle|lock)\b|\b(?:Makefile|Dockerfile|Jenkinsfile|LICENSE|README|CHANGELOG|Procfile)\b|(?<![\w.])\.(?:env|gitignore|gitlab-ci\.yml|dockerignore|editorconfig|npmrc)\b)`;
 const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b|${CHANGE_PATH})`;
 const CHANGE_VERB_EN = String.raw`\b(?:update|edit|modify|change|fix|add|append|write|create|delete|remove|rename|refactor|replace|switch|checkout)\b`;
 const CHANGE_TARGET_EN = String.raw`(?:${CHANGE_TARGET}|\b(?:docs?|document|file|code|readme|repo|branch)\b)`;
@@ -90,6 +90,8 @@ const CHANGE_TARGET_EN = String.raw`(?:${CHANGE_TARGET}|\b(?:docs?|document|file
 const CHANGE_REQUEST = new RegExp(
   [
     String.raw`${CHANGE_VERB}[^，。,.!?！？\n]{0,15}?${CHANGE_TARGET}`,
+    // 「优化」多半是问建议（「上面那段代码怎么优化」），只有写明了文件路径时才算要改
+    String.raw`优化[^，。,.!?！？\n]{0,15}?${CHANGE_PATH}`,
     String.raw`${CHANGE_TARGET}[^，。,.!?！？\n]{0,8}?${CHANGE_VERB}`,
     String.raw`${CHANGE_VERB_EN}[^\n]{0,30}?${CHANGE_TARGET_EN}`,
     String.raw`开\s*(?:个|一个)?\s*(?:MR|PR|合并请求)`,
