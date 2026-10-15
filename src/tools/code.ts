@@ -294,8 +294,9 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
       description:
         `把改动提交到机器人新建的分支，开${requestName}到这个话题的当前分支（没切换过就是默认分支），返回链接。这个话题在这个分支上已经开过${requestName}时，新改动推到同一个。` +
         `群成员要「起一个新分支」时就用它：branch 填群成员说的分支名，没说就不填，机器人会起名。` +
-        `同一份改动还要合到别的分支（如「合并到 uat」「uat 也要」）时，在这个话题里直接调用，target 填那个分支：机器人从那个分支拉一个新分支，把改动搬过去，再开一个到那个分支的${requestName}，之前开的不受影响，不用让群成员新开话题。` +
-        `要搬的是别的话题或别人开的${requestName}，先用 code_requests 找到编号，填 from 和 target。` +
+        `分支是从线上分支拉的；uat 这类测试环境的分支上不能改。要测试（如「合并到 uat」「先上 uat」）时 target 填测试分支：从同一个分支再开一个到那个分支的${requestName}（不另拉分支、不搬改动），推之前先把改动放到那个分支上试一下，有冲突、编不过就不推；` +
+        `测完要上线时不填 target，开到线上分支。之后不填 target 推的新改动，开到测试分支的${requestName}跟着更新，合过了的再开一个。不用让群成员新开话题。` +
+        `要开到别处的是别的话题或别人开的${requestName}，先用 code_requests 找到编号，填 from 和 target：从它的源分支直接开。` +
         `只在群成员要你提交、开${requestName}或者合到某个分支时使用；` +
         (canMerge
           ? `它只开不合，群成员要合并（「合并到 uat」）时，开好以后再用 code_merge 合。机器人不会推到已有的分支。`
@@ -315,9 +316,9 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
           },
           target: {
             type: "string",
-            description: `${requestName}开到哪个分支，不填是这个话题当前的分支。和当前分支不一样时，机器人从它拉新分支、把改动搬过去再开`,
+            description: `${requestName}开到哪个分支，不填是这个话题当前的分支（线上分支）。填 uat 这类测试分支时，从同一个分支再开一个到它的`,
           },
-          from: { type: "integer", description: `要搬的是仓库里已有的这个${requestName}的改动（填编号，如 353），要和 target 一起填` },
+          from: { type: "integer", description: `要开到 target 的是仓库里已有的这个${requestName}（填编号，如 353），从它的源分支直接开，要和 target 一起填` },
         },
         required: required("title", "body"),
       },
@@ -348,7 +349,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_merge",
       description:
-        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护、或者受保护但允许开发者合并的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}搬来的、源分支最新提交没跑过流水线（构建）或者没通过的都不合，流水线还在跑的设成通过后自动合并；` +
+        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护、或者受保护但允许开发者合并的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}来的、源分支最新提交没跑过流水线（构建）或者没通过的都不合，流水线还在跑的设成通过后自动合并；` +
         `开到只许维护者合并的受保护分支（master、prod 这类线上分支，以 ${workspaces.host.name} 上的「允许合并」设置为准）的不合，要人审过再点，照它返回的原因告诉群成员。` +
         `只在群成员明确要合并时用（「合并到 uat」「把 !354 合了」）：先用 code_open_pr 开好到那个分支的${requestName}，再用它合；已经开过的直接填编号。` +
         `只说「提个 PR」「开个${requestName}」时只开不合。要等流水线通过才能合的，会设成流水线通过后自动合并。`,
@@ -391,50 +392,48 @@ function checkedLine(checked: BuildResult): string {
       : "推之前编译没通过。";
 }
 
-/** 开好合并请求以后的第一行：哪个分支开到哪个分支，改动是不是从别处搬过来的 */
+/** 开好合并请求以后的第一行：哪个分支开到哪个分支，开到测试分支的跟着怎么样了 */
 function openedLine(pr: OpenedRequest, requestName: string, refOf: (number: number) => string): Piece[] {
   const ref = refOf(pr.number);
   const route: Piece[] = ["（", [pr.branch, { branch: pr.branch }], " → ", [pr.base, { branch: pr.base }], `）：${pr.url}`];
-  if (!pr.created) {
-    return [`已把新改动推到这个话题之前开的${requestName} ${ref}`, ...route];
+  const synced = (pr.targets ?? []).flatMap((t): Piece[] => {
+    const to: Piece = [t.target, { branch: t.target }];
+    switch (t.change) {
+      case "updated":
+        return ["开到 ", to, ` 的${requestName} ${refOf(t.number)} 也带上了新改动（同一个分支）。`];
+      case "opened":
+        return ["另开了到 ", to, ` 的${requestName} ${refOf(t.number)}：${t.url}。`];
+      case "reopened":
+        return ["之前开到 ", to, ` 的${t.replaced ? ` ${refOf(t.replaced)}` : ""} 已经合并了，新改动另开了${requestName} ${refOf(t.number)}：${t.url}。`];
+      case "closed":
+        return ["开到 ", to, ` 的 ${refOf(t.number)} 被关掉了，没再开。`];
+    }
+  });
+  if (pr.ported) {
+    const { request } = pr.ported;
+    return [
+      `已把 ${refOf(request.number)}（`,
+      [request.source, { branch: request.source }],
+      " → ",
+      [request.target, { branch: request.target }],
+      `，${request.state === "merged" ? "已合并" : "还开着"}）的分支直接开到 `,
+      [pr.base, { branch: pr.base }],
+      `，${pr.created ? "开了" : "之前已经开过"}${requestName} ${ref}`,
+      ...route,
+      `。改动没有搬、没有另拉分支，${refOf(request.number)} 不受影响。`,
+    ];
   }
   if (pr.replaced) {
     const was =
       pr.replaced.state === "merged"
         ? `${refOf(pr.replaced.number)} 已经合并了，新改动`
         : `${refOf(pr.replaced.number)} 已经关掉了（没合并），它的改动连同新改动`;
-    return [`这个话题之前开的${requestName} ${was}从 `, [pr.base, { branch: pr.base }], ` 最新的代码另开了${requestName} ${ref}`, ...route];
+    return [`这个话题之前开的${requestName} ${was}从 `, [pr.base, { branch: pr.base }], ` 最新的代码另开了${requestName} ${ref}`, ...route, ...synced];
   }
-  if (!pr.ported) {
-    return [`已开${requestName} ${ref}`, ...route];
-  }
-  const { from, earlier, request } = pr.ported;
-  const source: Piece[] = request
-    ? [
-        `，把${refOf(request.number)}（`,
-        [request.source, { branch: request.source }],
-        " → ",
-        [request.target, { branch: request.target }],
-        `，${request.state === "merged" ? "已合并" : "还开着"}）的改动`,
-      ]
-    : from
-      ? ["，把这个话题在 ", [from, { branch: from }], " 分支上的改动"]
-      : ["，把改动"];
-  const kept = request
-    ? `${refOf(request.number)} 不受影响。`
-    : from && earlier !== undefined
-      ? `之前在 ${from} 上开的 ${refOf(earlier)} 不受影响。`
-      : "";
-  return [
-    "已从 ",
-    [pr.base, { branch: pr.base }],
-    " 拉出新分支 ",
-    [pr.branch, { branch: pr.branch }],
-    ...source,
-    `搬过去，开了${requestName} ${ref}`,
-    ...route,
-    `。${kept}合并要人来点。`,
-  ];
+  const live: Piece[] = pr.live
+    ? ["这个分支到 ", [pr.live.base, { branch: pr.live.base }], ` 的${requestName} ${refOf(pr.live.number)} 照旧，测完合它上线。`]
+    : [];
+  return [pr.created ? `已开${requestName} ${ref}` : `已把新改动推到这个话题之前开的${requestName} ${ref}`, ...route, ...(synced.length || live.length ? ["。"] : []), ...synced, ...live];
 }
 
 /** 把结果里查到的代码位置交给机器人的回答检查，文字交给模型 */
