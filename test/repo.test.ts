@@ -1601,7 +1601,7 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
   await assert.rejects(plain.mergeRequest(1), /Fake 上机器人还不能合并合并请求，请人来点/);
 });
 
-test("合并从别的合并请求搬过来的：那个也是机器人开的才合，别人开的不合", async () => {
+test("合并从别的合并请求搬过来的：那个不是这个话题里开的就不合，再搬一次也记着", async () => {
   await runGit(["checkout", "-q", "-b", "fix/merge-src", "main"], { cwd: portSeed });
   await writeFile(path.join(portSeed, "a.go"), "package a\n\nfunc A() int {\n\treturn 8\n}\n");
   await runGit(["commit", "-q", "-am", "A 返回 8"], { cwd: portSeed, env: author });
@@ -1626,18 +1626,19 @@ test("合并从别的合并请求搬过来的：那个也是机器人开的才�
   const mine: MergeCheck = { ...source, number: pr.number, url: "", source: pr.branch, target: "uat", authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false, targetIsDefault: false };
   checks[pr.number] = mine;
   checks[40] = { ...mine, number: 40, author: "张三", authorUsername: "zhangsan" };
-  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40（张三 开的）搬过来的，不是机器人写的，机器人不合/);
+  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40 搬过来的，那个不是这个话题里开的/);
   // 下次打开（状态从文件读回来）也记得是搬过来的
-  await assert.rejects((await all.open("om_m5", portRepo)).mergeRequest(pr.number), /是从 !40（张三 开的）搬过来的/);
+  await assert.rejects((await all.open("om_m5", portRepo)).mergeRequest(pr.number), /是从 !40 搬过来的/);
   // 再搬到别的分支（test）也记着是从 !40 搬来的
   await runGit(["push", "-q", "origin", "uat:test"], { cwd: portSeed });
   const again = await ws.openPullRequest("A 返回 8（test）", "", { target: "test" });
   const againSha = (await runGit(["rev-parse", `refs/heads/${again.branch}`], { cwd: portRemote })).stdout.trim();
   checks[again.number] = { ...mine, number: again.number, source: again.branch, target: "test", sha: againSha };
-  await assert.rejects(ws.mergeRequest(again.number), /是从 !40（张三 开的）搬过来的/);
+  await assert.rejects(ws.mergeRequest(again.number), /是从 !40 搬过来的/);
+  // !40 是机器人开的，但不是这个话题开的：看不到它是不是又从别人的合并请求搬来的，也不合
   checks[40] = { ...mine, number: 40 };
-  assert.match((await ws.mergeRequest(pr.number)).text, /^已合并合并请求 !1/);
-  assert.deepEqual(merged, [pr.number]);
+  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40 搬过来的，那个不是这个话题里开的，机器人查不清是谁写的，不合/);
+  assert.deepEqual(merged, []);
   await runGit(["push", "-q", "origin", "--delete", "test"], { cwd: portSeed });
 });
 

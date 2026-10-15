@@ -1098,9 +1098,17 @@ export class Workspace {
     if (!own.pushedSha || own.pushedSha !== check.sha) {
       throw new RepoError(`${ref} 的源分支上有机器人没推过的提交（最新的不是机器人推的那个），机器人不合，请人看过再点合并：${check.url}`);
     }
-    // 改动是从别的合并请求搬过来的：那个也得是机器人开的，别人写的改动没经人审，不替他合
+    // 改动是从别的合并请求搬过来的：那个也得是这个话题里机器人自己开的、本身不是搬来的。
+    // 别的话题开的看不到它的来历（可能又是从别人的合并请求搬来的，一层层搬下去），不替它合
     if (own.portedFrom !== undefined) {
-      const source = await this.host.mergeCheck(this.repo, own.portedFrom, signal);
+      const from = own.portedFrom;
+      const origin = [this.state, ...this.earlier].find((change) => change !== own && change.prNumber === from);
+      if (!origin || origin.portedFrom !== undefined) {
+        throw new RepoError(
+          `${ref} 的改动是从 ${this.host.refOf(from)} 搬过来的，${origin ? "那个本身也是搬来的" : "那个不是这个话题里开的"}，机器人查不清是谁写的，不合，请人审过再点合并：${check.url}`,
+        );
+      }
+      const source = await this.host.mergeCheck(this.repo, from, signal);
       if (!isBot(source.authorUsername)) {
         throw new RepoError(
           `${ref} 的改动是从 ${this.host.refOf(own.portedFrom)}（${source.author ?? source.authorUsername ?? "别人"} 开的）搬过来的，不是机器人写的，机器人不合，请人审过再点合并：${check.url}`,
