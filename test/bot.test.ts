@@ -3981,6 +3981,30 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("总结一下改了什么，合并到 uat", uatTopic), false);
   assert.equal(restatesEarlier("精简一下，也合到 uat", uatTopic), false);
   assert.equal(restatesEarlier("把两段合到一起，精简一下", uatTopic), true);
+  // 分成几段说的：有一段是别的事（删、加、更新、跑测试……）就照常给工具，认不出的宁可照常查
+  for (const ask of [
+    "总结一下上面的原因，然后删除这个文件",
+    "概括一下，再新增一个配置项",
+    "总结一下，顺便更新一下文档里的版本号",
+    "精简一下结论，然后跑一下测试",
+    "总结一下，然后用新的写法替换这个函数",
+    "用大白话讲一下，并且调整一下日志级别",
+  ]) {
+    assert.equal(restatesEarlier(ask, earlierTopic), false, ask);
+  }
+  // 每段都是整理、讲给谁、写成什么样、客气话的，还是整理
+  for (const ask of [
+    "总结一下修复后的结果",
+    "解释一下上面的结论",
+    "summarize the above for the team",
+    "用大白话讲给 SRE 同事听",
+    "整理成 JSON",
+    "辛苦了，用大白话总结一下，发给运营",
+    "总结一下，控制在三句话以内，让老板看得懂",
+    "把 services/goods/jingdong.go 那段讲给开发同事听",
+  ]) {
+    assert.equal(restatesEarlier(ask, earlierTopic), true, ask);
+  }
   assert.equal(restatesEarlier("总结一下上面的原因，然后重构代码", earlierTopic), false);
   assert.equal(restatesEarlier("概括一下，顺便优化一下", earlierTopic), false);
   assert.equal(restatesEarlier("总结一下，然后优化代码", earlierTopic), false);
@@ -4017,6 +4041,8 @@ test("整理之前内容时检查回答：代码位置和线上数据要是话�
   assert.deepEqual(restatedAdditions("错误率 15%，涉及 14 个 Pod，从 9:01:48 开始", counts, scope), []);
   assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **1/1** 就绪", scope), []);
   assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **11/12** 就绪", scope), ["就绪 1/1"]);
+  // 之前的比值也要是就绪数：「请求成功 1/1」不能给编出来的「Ready: 1/1」作证
+  assert.deepEqual(restatedAdditions("Ready: 1/1", "请求成功 1/1", scope), ["Ready: 1/1"]);
   // 一长段定位结果里带着个之前写过的比值：整段不算写过，里面的 Pod 名、时间、次数也一个个对
   assert.deepEqual(restatedAdditions("命名空间 prod 1/1、gateway-api-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署", "副本 1/1 就绪", scope), [
     "命名空间 prod 1/1、gateway-api-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署",

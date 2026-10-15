@@ -1930,7 +1930,7 @@ function rewriteOnly(question: string): boolean {
 const RESTATE_REQUEST = new RegExp(
   [
     REWRITE_REQUEST.source,
-    String.raw`简化|精简|提炼|浓缩|摘要|转述|转告|通俗|大白话|白话|说人话|讲人话|eli5|explain like|tl;?dr`,
+    String.raw`简化|精简|提炼|浓缩|摘要|转述|转告|通俗|大白话|白话|说人话|讲人话|(?:解释|说明)一下|eli5|explain like|tl;?dr|summari[sz]e|summary|translate|rephrase|rewrite|simplify`,
     String.raw`(?:讲|说|解释)给[^，。,.!?！？\n]{1,20}听`,
     String.raw`换(?:个|一种|一个)?(?:说法|方式|角度|口吻|讲法)`,
   ].join("|"),
@@ -1949,13 +1949,12 @@ const FRESH_REQUEST = new RegExp(
   ].join("|"),
 );
 /**
- * 整理之外还要做新的事：「总结一下上面，再分析 xx 的报错」「顺便看看」「并排查原因」，或者要改东西「然后修复它」「然后重构代码」「改代码」「开个 MR」「合并到 uat」。
- * 说的是之前的方案、过程（「把修复方案总结一下」「总结一下部署情况」「讲给负责修复的同事听」）不算；「开发」多半说的是人（「讲给开发同事听」），不算
+ * 一句话里夹着要改东西：「修复代码后总结一下」「改代码」「开个 MR」「合并到 uat」。分成几段说的（「总结一下，然后删除这个文件」）见 CLAUSE_BREAK。
+ * 说的是之前的方案、过程（「把修复方案总结一下」「总结一下修复后的结果」「讲给负责修复的同事听」）不算；「开发」多半说的是人（「讲给开发同事听」），不算
  */
 const NEW_WORK = new RegExp(
   [
-    String.raw`(?:再|另外|顺便|然后|并且?|同时|还要|还得)\s*(?:(?:帮我?|给我)\s*)?(?:分析|排查|查|看看|看一下|看下|对比|比较|诊断|定位|搜|确认|检查|核对|修|改(?!写|成|一下(?:说法|措辞))|重构|优化|处理|解决|提交|合并(?!成|为)|回滚)`,
-    String.raw`(?:修复|修好|修掉|修一下|改掉|改好|重构|优化|实现|上线|发版|部署|重启|回滚)(?!方案|办法|建议|思路|计划|过程|记录|情况|结果|原理|方式|逻辑|细节|架构|时间|空间|方向|点|项|的|了)`,
+    String.raw`(?:修复|修好|修掉|修一下|改掉|改好|重构|优化|实现|上线|发版|部署|重启|回滚)(?!方案|办法|建议|思路|计划|过程|记录|情况|结果|原理|方式|逻辑|细节|架构|时间|空间|方向|点|项|的|了|后的|前的|完的)`,
     String.raw`(?:开|提|建)个?\s*(?:mr|pr|合并请求)`,
     // 「合并到 uat」「也合到 uat」是再开一个合并请求；「合到一起」「合并到一段」是整理
     String.raw`(?:合并|合)到(?!一起|一块|一段|一处|一条)`,
@@ -1965,7 +1964,46 @@ const NEW_WORK = new RegExp(
 );
 /** 提问里的英文词（服务名常不带连字符：appservice、gateway）；整理的说法、常见英文词不算 */
 const ASCII_WORDS = /[a-z][a-z0-9_.]{2,}/gi;
-const RESTATE_WORDS = /^(?:eli5|tldr|explain|like|five|translate|english|chinese|summary|summarize|simple|plain|markdown|emoji)$/i;
+const RESTATE_WORDS = new RegExp(
+  "^(?:" +
+    [
+      // 整理的说法和常见英文虚词（「summarize the above for the team」）
+      "eli5|tldr|explain|like|five|translate|rephrase|rewrite|simplify|summary|summari[sz]e|english|chinese|simple|plain|short|brief|briefly",
+      "the|above|this|that|these|those|please|for|and|with|into|our|your|team|previous|earlier|answer|result|results|version|words|bullet|points",
+      // 讲给谁听、写成什么格式（「讲给 SRE 同事听」「整理成 JSON」）
+      "sre|devops|ops|dev|devs|ceo|cto|boss|json|yaml|csv|ppt|pdf|excel|word|html|table|markdown|emoji",
+    ].join("|") +
+    ")$",
+  "i",
+);
+/**
+ * 提问拆成几段（标点和「然后」「再」「顺便」这类连接词隔开），每段都要是整理：整理的说法、讲给谁听 / 写成什么样、客气话。
+ * 有一段是别的事（「总结一下上面的原因，然后删除这个文件」「概括一下，再跑一下测试」）就不算只整理，照常给工具：
+ * 认不出的说法宁可照常查，也不能把要改东西、要查的请求当成整理拿掉工具。「、」不拆：「讲给 @A、@B 听」是一段
+ */
+const CLAUSE_BREAK = /[，,。;；!！?？\n]|\.(?!\S)|然后|接着|之后|顺便|另外|并且|(?<!合)并|同时|还要|还得|再(?!次)/;
+/** 说讲给谁、写成什么样的一段（「写成飞书文档」「让运营也看得懂」「发给运营」「控制在三句话」） */
+const FORMAT_CLAUSE = /用|以|按|写成|做成|整理成|弄成|变成|转成|发给|发到|讲给|说给|让|分点|列成|控制在|不超过|篇幅|字数|合并成|合成|合到一起|(?:讲|说|写)得?(?:简单|短|通俗|清楚|明白|详细|具体|口语|正式|轻松)|简单|短一?点|通俗|口语/;
+/** 讲给谁、写成什么样的那段里不能有要动手、要查的词（「然后用 aiops 查一下」「用新的写法替换这个函数」） */
+const ACTION_WORD = /查|看|搜|读|找|修|改|删|加|建|开|提交|合并|部署|重启|回滚|跑|执行|运行|测|对比|比较|分析|排查|诊断|定位|确认|检查|核对|更新|调整|新增|添加|替换|升级|迁移|实现|重构|优化|处理|解决/;
+/** 这些说的是读的人看不看得懂、怎么排版，不是要动手 */
+const HARMLESS_PHRASES = /看得懂|看懂|听得懂|听懂|看得明白|看明白|加粗|合并成|合到一起/g;
+/** 客气话、称呼（@ 的名字去掉以后剩下的「各位同事」） */
+const FILLER_CLAUSE = /^(?:谢谢|多谢|辛苦了?|麻烦了?|拜托|好的|ok|嗯|请|各位|大家|同事们?|各位同事)$/i;
+
+function restateClausesOnly(asked: string): boolean {
+  return asked
+    .replace(/tl;\s*dr/gi, "tldr")
+    .split(CLAUSE_BREAK)
+    .map((clause) => clause.replace(/[\s~～…]+/g, ""))
+    .every(
+      (clause) =>
+        clause === "" ||
+        RESTATE_REQUEST.test(clause) ||
+        FILLER_CLAUSE.test(clause) ||
+        (FORMAT_CLAUSE.test(clause) && !ACTION_WORD.test(clause.replace(HARMLESS_PHRASES, ""))),
+    );
+}
 /**
  * 要查的对象：线上服务、日志这类（OPS_QUESTION），和代码、配置这类。话题里之前没出现过的，说明问的是新东西，不算整理。
  * 文档、网页链接不算：整理时照样给读文档、网页的工具（「总结成飞书文档」也不能因为说了文档就重查）
@@ -1994,6 +2032,9 @@ export function restatesEarlier(question: string, history: readonly ChatMessage[
   const said = history.map((m) => m.content).join("\n").toLowerCase();
   // @ 的人名、机器人名不算（「@飞书 CLI」「@John」）
   const asked = names.reduce((text, name) => (name ? text.split(`@${name}`).join(" ") : text), question);
+  if (!restateClausesOnly(asked)) {
+    return false;
+  }
   // 话题里没出现过的英文词多半是新的服务名、仓库名（「总结一下 appservice 的报错」，之前聊的是 gateway-api）
   const newWord = (asked.match(ASCII_WORDS) ?? []).some((word) => !RESTATE_WORDS.test(word) && !said.includes(word.toLowerCase()));
   return !newWord && !NEW_TARGET.test(asked.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
@@ -2065,8 +2106,18 @@ function saidValue(said: string, text: string): boolean {
   const value = valueForm(text);
   const exact = new RegExp(`(?<![\\d.])${escapeRegExp(value)}${/\d$/.test(value) ? "(?!\\.?\\d)" : ""}`);
   const ratio = /(\d+)\/(\d+)/.exec(value);
-  const readiness = ratio !== null && READINESS_REST.test(value.replace(ratio[0], ""));
-  return exact.test(said) || (readiness && new RegExp(`(?<![\\d.])${ratio[1]}/${ratio[2]}(?!\\d)`).test(said));
+  if (exact.test(said)) {
+    return true;
+  }
+  // 之前写的也要是就绪数：之前是「请求成功 1/1」，回答写「Ready: 1/1」不算
+  const pair = ratio === null ? "" : `${ratio[1]}/${ratio[2]}`;
+  return (
+    ratio !== null &&
+    READINESS_REST.test(value.replace(ratio[0], "")) &&
+    new RegExp(
+      `(?:就绪|ready)[*_\x60:：]*(?<![\\d.])${pair}(?!\\d)|(?<![\\d.])${pair}(?!\\d)[*_\x60]*(?:就绪|ready|running|副本)`,
+    ).test(said)
+  );
 }
 
 /** 就绪数去掉比值后剩下的：就绪、ready 这类词和 Markdown 符号 */
