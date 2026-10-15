@@ -58,7 +58,7 @@ export interface CodeHost {
   /** 合并前要核对的：合并请求的状态、分支、谁开的、源分支最新的提交，机器人自己的账号，要合到的分支受不受保护。没有实现时机器人不能合并 */
   mergeCheck?(repo: string, number: number, signal?: AbortSignal): Promise<MergeCheck>;
   /** 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并 */
-  mergeRequest?(repo: string, number: number, options: { sha: string; target: string }, signal?: AbortSignal): Promise<MergeResult>;
+  mergeRequest?(repo: string, number: number, options: { sha: string; target: string; whenPipelineSucceeds?: boolean }, signal?: AbortSignal): Promise<MergeResult>;
 }
 
 /** 合并前核对用的 */
@@ -75,6 +75,8 @@ export interface MergeCheck extends RequestInfo {
   targetProtected: boolean;
   /** 受保护的分支在平台上允许开发者合并（GitLab「允许合并」里有 Developers）；只许维护者合的是 false */
   targetDevelopersCanMerge?: boolean;
+  /** 源分支最新的流水线（构建）：状态和跑的是哪个提交；没跑过就没有 */
+  pipeline?: { status: string; sha?: string };
 }
 
 /** 合并的结果：合好了，或者设成了流水线通过后自动合并 */
@@ -411,10 +413,11 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         botUsername,
         ...(fromFork ? { fromFork } : {}),
         targetProtected: branch.protected,
+        ...(request.head_pipeline?.status ? { pipeline: { status: request.head_pipeline.status, ...(request.head_pipeline.sha ? { sha: request.head_pipeline.sha } : {}) } } : {}),
         ...(branch.protected ? { targetDevelopersCanMerge: branch.developers_can_merge === true } : {}),
       };
     },
-    async mergeRequest(repo, number, { sha, target }, signal) {
+    async mergeRequest(repo, number, { sha, target, whenPipelineSucceeds }, signal) {
       const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
       // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），等它算完再合
       let status = "";
@@ -435,7 +438,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         throw new RepoError(`!${number} 现在合不了：${blocked}`);
       }
       // 要等流水线通过才能合的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
-      const pipeline = status === "ci_must_pass" || status === "ci_still_running";
+      const pipeline = whenPipelineSucceeds === true || status === "ci_must_pass" || status === "ci_still_running";
       const res = await fetchImpl(`${project}/merge_requests/${number}/merge`, {
         method: "PUT",
         headers: { "private-token": token, "content-type": "application/json" },
@@ -506,6 +509,9 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** 流水线还在跑（还没出结果）的状态：合并请求设成流水线通过后自动合并 */
+const PIPELINE_RUNNING = new Set(["created", "waiting_for_resource", "preparing", "pending", "running", "scheduled", "waiting_for_callback"]);
+
 /** 合并前等 GitLab 算完能不能合：最多看几次、每次隔多久 */
 const MERGE_CHECK_TRIES = 6;
 const MERGE_CHECK_WAIT_MS = 2000;
@@ -537,6 +543,7 @@ const MERGE_BLOCKED: Record<string, string> = {
 
 interface GitLabMergeRequest extends GitLabRequest {
   sha?: string;
+  head_pipeline?: { status?: string; sha?: string } | null;
   detailed_merge_status?: string;
   merge_status?: string;
   source_project_id?: number;
@@ -1130,7 +1137,22 @@ export class Workspace {
         this.onBranch(check.target),
       );
     }
-    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target }, signal);
+    // 机器人跑不了编译：源分支最新的提交得有流水线（构建）通过才合，还在跑的设成通过后自动合并，没跑过、没通过的不合
+    const pipeline = check.pipeline && (check.pipeline.sha === undefined || check.pipeline.sha === check.sha) ? check.pipeline.status : undefined;
+    if (pipeline === undefined) {
+      throw new RepoError(
+        `${ref} 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合；请人在 ${this.host.name} 上跑一下流水线、或者审过再点合并：${check.url}`,
+      );
+    }
+    if (pipeline !== "success" && !PIPELINE_RUNNING.has(pipeline)) {
+      throw new RepoError(`${ref} 的流水线（构建）没通过（${pipeline}），机器人不合，要先把问题修好：${check.url}`);
+    }
+    const merged = await this.host.mergeRequest(
+      this.repo,
+      number,
+      { sha: check.sha, target: check.target, ...(pipeline === "success" ? {} : { whenPipelineSucceeds: true }) },
+      signal,
+    );
     const url = merged.url || check.url;
     const out = this.output();
     return (

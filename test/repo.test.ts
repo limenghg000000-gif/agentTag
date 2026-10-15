@@ -1451,7 +1451,7 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
     new Response(JSON.stringify(mr({})), { status: 200 }),
     new Response(JSON.stringify({ username: "agent-boot" }), { status: 200 }),
     new Response(JSON.stringify({ name: "uat", protected: false, default: false }), { status: 200 }),
-    new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9 })), { status: 200 }),
+    new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9, head_pipeline: { id: 7, status: "running", sha: "c".repeat(40) } })), { status: 200 }),
     new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false, developers_can_merge: true }), { status: 200 }),
     new Response(JSON.stringify(mr({ target_branch: "gone" })), { status: 200 }),
     new Response("{}", { status: 404 }),
@@ -1474,6 +1474,8 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
     ["zhangsan", "agent-boot", true, true, true],
   );
   assert.equal(uat.targetDevelopersCanMerge, undefined);
+  assert.equal(uat.pipeline, undefined);
+  assert.deepEqual(release.pipeline, { status: "running", sha: "c".repeat(40) });
   await assert.rejects(host.mergeCheck!("golang/appservice", 354), /!354 要合到的 gone 分支不存在了/);
   assert.deepEqual(calls, [
     "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
@@ -1514,6 +1516,10 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" })).state, "merged");
   responses.push(status("ci_must_pass"), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
   assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), { state: "auto", url });
+  assert.deepEqual(calls.at(-1)?.body, { sha, auto_merge: true, merge_when_pipeline_succeeds: true });
+  // 项目没要求流水线，但源分支的流水线还在跑：也设成通过后自动合并
+  responses.push(status("mergeable"), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
+  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat", whenPipelineSucceeds: true }), { state: "auto", url });
   assert.deepEqual(calls.at(-1)?.body, { sha, auto_merge: true, merge_when_pipeline_succeeds: true });
   const before = calls.length;
   responses.push(status("conflict"));
@@ -1568,6 +1574,7 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     botUsername: "Agent-Boot",
     sha,
     targetProtected: false,
+    pipeline: { status: "success", sha },
   };
   checks[1] = base;
   const out = await ws.mergeRequest(1);
@@ -1600,11 +1607,21 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     [1, { sha: "d".repeat(40) }, /^RepoError: !1 的源分支上有机器人没推过的提交/],
     // 别的话题开的
     [9, {}, /^RepoError: !9 不是这个话题里开的，机器人只合并当前话题里自己开的合并请求/],
+    // 机器人编译不了：没跑过流水线、流水线跑的是旧提交、没通过的都不合
+    [1, { pipeline: undefined }, /^RepoError: !1 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合/],
+    [1, { pipeline: { status: "success", sha: "d".repeat(40) } }, /没有跑过流水线（构建）/],
+    [1, { pipeline: { status: "failed", sha } }, /^RepoError: !1 的流水线（构建）没通过（failed），机器人不合/],
+    [1, { pipeline: { status: "canceled", sha } }, /没通过（canceled）/],
   ] as const) {
     checks[number] = { ...base, number, ...bad };
     await assert.rejects(ws.mergeRequest(number), message, JSON.stringify(bad));
   }
   assert.deepEqual(merged, []);
+  // 流水线还在跑：设成通过后自动合并
+  checks[1] = { ...base, pipeline: { status: "running", sha } };
+  result = { state: "auto", url: "https://example.com/pr/1" };
+  assert.match((await ws.mergeRequest(1)).text, /已设成流水线通过后自动合并/);
+  assert.deepEqual(merged, [{ number: 1, sha, target: "uat", whenPipelineSucceeds: true }]);
   // 平台不支持合并
   const plain = await workspaces(fakeHost().host).open("om_m2", "acme/demo");
   await assert.rejects(plain.mergeRequest(1), /Fake 上机器人还不能合并合并请求，请人来点/);
@@ -1667,7 +1684,7 @@ test("合并本话题里搬过来的改动：搬的时候那边源分支得是�
   const [s40, s41, other] = ["a", "b", "c"].map((c) => c.repeat(40));
   const check = (number: number, sha: string): MergeCheck => ({
     number, title: "x", url: `https://example.com/pr/${number}`, state: "opened", source: `fix/${number}`, target: "uat",
-    authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false,
+    authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false, pipeline: { status: "success", sha },
   });
   checks[40] = check(40, s40);
   checks[41] = check(41, s41);
