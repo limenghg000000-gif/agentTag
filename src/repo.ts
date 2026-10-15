@@ -744,6 +744,8 @@ interface Change {
   pushedSha?: string;
   prUrl?: string;
   prNumber?: number;
+  /** 改动是从仓库里这个合并请求搬过来的（code_open_pr 的 from）：合并前要看那个是不是机器人自己开的 */
+  portedFrom?: number;
 }
 
 /** 推上去以后放到一边的改动：切到别的分支、或者把改动搬到别的分支时存下，切回 base 分支时接着用 */
@@ -878,7 +880,10 @@ function validState(state: WorkspaceState): boolean {
   const changes: Change[] = [state, ...(state.earlier ?? [])];
   const names = [...changes.flatMap((change) => [change.base, change.branch]), state.porting?.back, state.porting?.branch];
   const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha]);
+  // 拿去查合并请求、写进接口地址的编号
+  const numbers = changes.flatMap((change) => [change.prNumber, change.portedFrom]);
   return (
+    numbers.every((n) => n === undefined || (Number.isSafeInteger(n) && (n as number) > 0)) &&
     names.every((name) => name === undefined || (typeof name === "string" && isBranchName(name))) &&
     shas.every((sha) => sha === undefined || (typeof sha === "string" && /^[0-9a-f]{40,64}$/.test(sha)))
   );
@@ -1073,10 +1078,28 @@ export class Workspace {
       throw new RepoError(`${ref} 是从别的项目（fork）提过来的，机器人不合，请人在 ${this.host.name} 上处理：${check.url}`);
     }
     // 只合机器人自己推的代码：别人开的合并请求里的改动机器人没经手，由开的人或有权限的人决定
-    if (!check.authorUsername || check.authorUsername.toLowerCase() !== check.botUsername.toLowerCase()) {
+    const isBot = (username: string | undefined) => username !== undefined && username.toLowerCase() === check.botUsername.toLowerCase();
+    if (!isBot(check.authorUsername)) {
       throw new RepoError(
         `${ref} 是 ${check.author ?? check.authorUsername ?? "别人"} 开的，机器人只合并自己开的${name}，请开的人或有权限的人在 ${this.host.name} 上点合并：${check.url}`,
       );
+    }
+    // 只合这个话题自己开的、源分支上就是机器人推上去的那个提交：别人后来往分支上推了提交、别的话题开的，都不合
+    const own = [this.state, ...this.earlier].find((change) => change.prNumber === number);
+    if (!own) {
+      throw new RepoError(`${ref} 不是这个话题里开的，机器人只合并当前话题里自己开的${name}；请到开它的话题里说，或者请人在 ${this.host.name} 上点合并：${check.url}`);
+    }
+    if (!own.pushedSha || own.pushedSha !== check.sha) {
+      throw new RepoError(`${ref} 的源分支上有机器人没推过的提交（最新的不是机器人推的那个），机器人不合，请人看过再点合并：${check.url}`);
+    }
+    // 改动是从别的合并请求搬过来的：那个也得是机器人开的，别人写的改动没经人审，不替他合
+    if (own.portedFrom !== undefined) {
+      const source = await this.host.mergeCheck(this.repo, own.portedFrom, signal);
+      if (!isBot(source.authorUsername)) {
+        throw new RepoError(
+          `${ref} 的改动是从 ${this.host.refOf(own.portedFrom)}（${source.author ?? source.authorUsername ?? "别人"} 开的）搬过来的，不是机器人写的，机器人不合，请人审过再点合并：${check.url}`,
+        );
+      }
     }
     if (check.targetProtected || check.targetIsDefault) {
       throw new RepoError(
@@ -1750,6 +1773,8 @@ export class Workspace {
     }
     const derived = `${request.source}-${target.replace(/\//g, "-")}`;
     const opened = await this.port({ base: request.baseSha, tip: request.headSha }, target, title, body, requested, derived, signal);
+    this.state = { ...this.state, portedFrom: number };
+    await this.saveState();
     return { ...opened, ported: { request: { number, source: request.source, target: request.target, state: request.state } } };
   }
 
@@ -1915,11 +1940,18 @@ export class Workspace {
 
   /** 这个话题当前推上去了的改动（放到一边时用）；没推过的不算 */
   private parked(): ParkedChange | undefined {
-    const { branch, pushedSha, baseSha, prUrl, prNumber } = this.state;
+    const { branch, pushedSha, baseSha, prUrl, prNumber, portedFrom } = this.state;
     if (!branch || !pushedSha) {
       return undefined;
     }
-    return { base: this.baseBranch, branch, pushedSha, ...(baseSha ? { baseSha } : {}), ...(prUrl && prNumber ? { prUrl, prNumber } : {}) };
+    return {
+      base: this.baseBranch,
+      branch,
+      pushedSha,
+      ...(baseSha ? { baseSha } : {}),
+      ...(prUrl && prNumber ? { prUrl, prNumber } : {}),
+      ...(portedFrom ? { portedFrom } : {}),
+    };
   }
 
   /** 改了代码还没推上去：工作目录有改动，或者机器人的分支上有没推的提交 */

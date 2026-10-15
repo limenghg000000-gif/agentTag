@@ -505,6 +505,8 @@ async function runTask(
         !(readOnly && tool.writes) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
         !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
+        // 合并只在发起人这句话明确要合并时给：群记忆、话题里别人的话、合并请求描述里写着「直接合掉」也不会让它去合
+        (tool.spec.name !== MERGE_TOOL || asksToMerge(question)) &&
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
     toolCount = taskTools.length;
@@ -1745,6 +1747,12 @@ export function asksToOpenRequest(question: string): boolean {
   return (OPEN_REQUEST_ASK.test(question) || MERGE_ASK.test(question)) && !REQUEST_STATUS_QUESTION.test(question);
 }
 
+/** 发起人这句话明确要合并：「合到 uat」「合并到 uat」「把 !354 合了」「合并一下」。只说「提个 PR」「开个 MR 到 uat」的不算 */
+export function asksToMerge(question: string): boolean {
+  return asksToOpenRequest(question) && (MERGE_IMPERATIVE.test(question) || MERGE_ASK.test(question) || MERGE_INTO.test(question));
+}
+
+const MERGE_INTO = /(?:合并|合)到\s*[a-z0-9]/i;
 // 两段 \s* 中间的可选词要和后面的 \s* 包在一起：分开写时一长串空白会被两段 \s* 来回分，卡住几秒
 const OPEN_REQUEST_ASK = /(?:开|提|建|发起?)\s*(?:(?:一?个|一下)\s*)?(?:(?:mr|pr)(?![a-z])|合并请求)|(?:合并|合)到\s*[a-z0-9][\w./-]*/i;
 /** 让合并：「直接合」「帮我合并」「把 !354 合了」，和「合并一下」「合并吧」。「配合一下」「适合吧」不算，所以后面两种要写全「合并」 */

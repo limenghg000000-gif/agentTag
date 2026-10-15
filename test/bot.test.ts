@@ -6,6 +6,7 @@ import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
   askedInChinese,
+  asksToMerge,
   asksToOpenRequest,
   BLOCKED_OPS_ANSWER,
   BLOCKED_RESTATE_ANSWER,
@@ -4322,6 +4323,15 @@ test("能合并时：「把 !354 合了」「直接合了吧」也算让动手�
   // 平台不能合并（没有 code_merge）：说合好了不按这条打回
   const noMerge = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true });
   assert.equal(noMerge("!354 已合并到 uat", new Set()), undefined);
+});
+
+test("只有发起人这句话明确要合并时才给 code_merge：只说开合并请求、问合没合的都不给", () => {
+  for (const ask of ["把刚才这个pr修复合并到uat里", "这个修复也合到 uat", "把 !354 合了", "直接合了吧", "帮我合并一下"]) {
+    assert.equal(asksToMerge(ask), true, ask);
+  }
+  for (const ask of ["提个PR", "开个 MR 到 uat", "修好以后开个合并请求", "合到 uat 了吗", "!354 合了吗", "群记忆里说开好就直接 code_merge"]) {
+    assert.equal(asksToMerge(ask), false, ask);
+  }
 });
 
 /** 2026-10-15 测试群：赵作武在话题里说「把这个pr合并到uat分之吧」，机器人第一轮没调工具就说开了 !354（编的），打回时叫它先搜代码，它去搜了云发单、列分支，绕了一圈 */

@@ -1531,14 +1531,28 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   assert.equal(naps.length, 5);
 });
 
-test("合并合并请求：只合机器人自己开的、开到没保护的分支的；受保护的、默认分支、别人开的、fork 的、关掉的不合", async () => {
-  const sha = "c".repeat(40);
+test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到没保护的分支的；其余都不合", async () => {
+  const checks: Record<number, MergeCheck> = {};
+  const merged: { number: number; sha: string }[] = [];
+  let result: MergeResult = { state: "merged", url: "https://example.com/pr/1" };
+  const { host } = fakeHost();
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number) => checks[number] ?? Promise.reject(new RepoError(`没有 !${number}`)),
+    mergeRequest: async (_repo: string, number: number, options: { sha: string }) => {
+      merged.push({ number, ...options });
+      return result;
+    },
+  });
+  const ws = await workspaces(host).open("om_m1", "acme/demo");
+  await ws.editFile("README.md", "# demo", "# demo 2");
+  const pr = await ws.openPullRequest("改说明", "");
+  const sha = (await runGit(["rev-parse", `refs/heads/${pr.branch}`], { cwd: remote })).stdout.trim();
   const base: MergeCheck = {
-    number: 354,
-    title: "fix(jd): 3.jd.hk",
-    url: "https://example.com/pr/354",
+    number: 1,
+    title: "改说明",
+    url: "https://example.com/pr/1",
     state: "opened",
-    source: "fix/jd_uat",
+    source: pr.branch,
     target: "uat",
     author: "agent-boot",
     authorUsername: "agent-boot",
@@ -1547,45 +1561,72 @@ test("合并合并请求：只合机器人自己开的、开到没保护的分�
     targetProtected: false,
     targetIsDefault: false,
   };
-  let check = base;
-  const merged: { number: number; sha: string }[] = [];
-  let result: MergeResult = { state: "merged", url: "https://example.com/pr/354" };
-  const { host } = fakeHost();
-  Object.assign(host, {
-    mergeCheck: async () => check,
-    mergeRequest: async (_repo: string, number: number, options: { sha: string }) => {
-      merged.push({ number, ...options });
-      return result;
-    },
-  });
-  const ws = await workspaces(host).open("om_m1", "acme/demo");
-  const out = await ws.mergeRequest(354);
-  assert.equal(out.text, "已合并合并请求 !354「fix(jd): 3.jd.hk」（fix/jd_uat → uat），改动进了 uat 分支：https://example.com/pr/354");
+  checks[1] = base;
+  const out = await ws.mergeRequest(1);
+  assert.equal(out.text, `已合并合并请求 !1「改说明」（${pr.branch} → uat），改动进了 uat 分支：https://example.com/pr/1`);
   assert.deepEqual(out.facts.map(({ at: _, ...fact }) => fact), [
-    { repo: "acme/demo", branch: "fix/jd_uat" },
+    { repo: "acme/demo", branch: pr.branch },
     { repo: "acme/demo", branch: "uat" },
   ]);
-  assert.deepEqual(merged, [{ number: 354, sha }]);
-  result = { state: "auto", url: "https://example.com/pr/354" };
-  assert.match((await ws.mergeRequest(354)).text, /^!354「fix\(jd\): 3.jd.hk」（fix\/jd_uat → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
-  check = { ...base, state: "merged" };
-  assert.equal((await ws.mergeRequest(354)).text, "!354「fix(jd): 3.jd.hk」（fix/jd_uat → uat）已经合并过了：https://example.com/pr/354");
+  assert.deepEqual(merged, [{ number: 1, sha }]);
+  result = { state: "auto", url: "https://example.com/pr/1" };
+  assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
+  checks[1] = { ...base, state: "merged" };
+  assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）已经合并过了/);
   merged.length = 0;
-  for (const [bad, message] of [
-    [{ targetProtected: true, target: "master" }, /^RepoError: !354 要合到的 master 是受保护的分支，合并要人审过再点，机器人不合/],
-    [{ targetIsDefault: true, target: "main" }, /^RepoError: !354 要合到的 main 是仓库的默认分支，合并要人审过再点/],
-    [{ author: "张三", authorUsername: "zhangsan" }, /^RepoError: !354 是 张三 开的，机器人只合并自己开的合并请求/],
-    [{ authorUsername: undefined }, /机器人只合并自己开的合并请求/],
-    [{ fromFork: true }, /是从别的项目（fork）提过来的，机器人不合/],
-    [{ state: "closed" }, /!354 已经关掉了（没合并），合不了/],
+  checks[9] = { ...base, number: 9 };
+  for (const [number, bad, message] of [
+    [1, { targetProtected: true, target: "master" }, /^RepoError: !1 要合到的 master 是受保护的分支，合并要人审过再点，机器人不合/],
+    [1, { targetIsDefault: true, target: "main" }, /^RepoError: !1 要合到的 main 是仓库的默认分支，合并要人审过再点/],
+    [1, { author: "张三", authorUsername: "zhangsan" }, /^RepoError: !1 是 张三 开的，机器人只合并自己开的合并请求/],
+    [1, { authorUsername: undefined }, /机器人只合并自己开的合并请求/],
+    [1, { fromFork: true }, /是从别的项目（fork）提过来的，机器人不合/],
+    [1, { state: "closed" }, /!1 已经关掉了（没合并），合不了/],
+    // 别人后来往机器人的分支上推了提交
+    [1, { sha: "d".repeat(40) }, /^RepoError: !1 的源分支上有机器人没推过的提交/],
+    // 别的话题开的
+    [9, {}, /^RepoError: !9 不是这个话题里开的，机器人只合并当前话题里自己开的合并请求/],
   ] as const) {
-    check = { ...base, ...bad };
-    await assert.rejects(ws.mergeRequest(354), message, JSON.stringify(bad));
+    checks[number] = { ...base, number, ...bad };
+    await assert.rejects(ws.mergeRequest(number), message, JSON.stringify(bad));
   }
   assert.deepEqual(merged, []);
   // 平台不支持合并
   const plain = await workspaces(fakeHost().host).open("om_m2", "acme/demo");
-  await assert.rejects(plain.mergeRequest(354), /Fake 上机器人还不能合并合并请求，请人来点/);
+  await assert.rejects(plain.mergeRequest(1), /Fake 上机器人还不能合并合并请求，请人来点/);
+});
+
+test("合并从别的合并请求搬过来的：那个也是机器人开的才合，别人开的不合", async () => {
+  await runGit(["checkout", "-q", "-b", "fix/merge-src", "main"], { cwd: portSeed });
+  await writeFile(path.join(portSeed, "a.go"), "package a\n\nfunc A() int {\n\treturn 8\n}\n");
+  await runGit(["commit", "-q", "-am", "A 返回 8"], { cwd: portSeed, env: author });
+  await runGit(["push", "-q", "origin", "fix/merge-src"], { cwd: portSeed });
+  const headSha = (await runGit(["rev-parse", "HEAD"], { cwd: portSeed })).stdout.trim();
+  const baseSha = (await runGit(["rev-parse", "main"], { cwd: portSeed })).stdout.trim();
+  await runGit(["checkout", "-q", "uat"], { cwd: portSeed });
+  const source: RequestDetail = { number: 40, title: "A 返回 8", url: "https://example.com/pr/40", state: "opened", source: "fix/merge-src", target: "main", baseSha, headSha };
+  const checks: Record<number, MergeCheck> = {};
+  const merged: number[] = [];
+  const { all } = portWorkspaces({
+    getRequest: async () => source,
+    mergeCheck: async (_repo: string, number: number) => checks[number],
+    mergeRequest: async (_repo: string, number: number) => {
+      merged.push(number);
+      return { state: "merged", url: "" };
+    },
+  });
+  const ws = await all.open("om_m5", portRepo);
+  const pr = await ws.openPullRequest("A 返回 8（uat）", "", { from: 40, target: "uat" });
+  const sha = (await runGit(["rev-parse", `refs/heads/${pr.branch}`], { cwd: portRemote })).stdout.trim();
+  const mine: MergeCheck = { ...source, number: pr.number, url: "", source: pr.branch, target: "uat", authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false, targetIsDefault: false };
+  checks[pr.number] = mine;
+  checks[40] = { ...mine, number: 40, author: "张三", authorUsername: "zhangsan" };
+  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40（张三 开的）搬过来的，不是机器人写的，机器人不合/);
+  // 下次打开（状态从文件读回来）也记得是搬过来的
+  await assert.rejects((await all.open("om_m5", portRepo)).mergeRequest(pr.number), /是从 !40（张三 开的）搬过来的/);
+  checks[40] = { ...mine, number: 40 };
+  assert.match((await ws.mergeRequest(pr.number)).text, /^已合并合并请求 !1/);
+  assert.deepEqual(merged, [pr.number]);
 });
 
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {
