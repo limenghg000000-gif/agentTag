@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } fro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import type { BuildChecker, BuildResult } from "../src/build.js";
 import {
   type CodeHost,
   type CommitQuery,
@@ -1451,7 +1452,7 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
     new Response(JSON.stringify(mr({})), { status: 200 }),
     new Response(JSON.stringify({ username: "agent-boot" }), { status: 200 }),
     new Response(JSON.stringify({ name: "uat", protected: false, default: false }), { status: 200 }),
-    new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9 })), { status: 200 }),
+    new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9, head_pipeline: { id: 7, status: "running", sha: "c".repeat(40) } })), { status: 200 }),
     new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false, developers_can_merge: true }), { status: 200 }),
     new Response(JSON.stringify(mr({ target_branch: "gone" })), { status: 200 }),
     new Response("{}", { status: 404 }),
@@ -1474,6 +1475,8 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
     ["zhangsan", "agent-boot", true, true, true],
   );
   assert.equal(uat.targetDevelopersCanMerge, undefined);
+  assert.equal(uat.pipelineStatus, undefined);
+  assert.equal(release.pipelineStatus, "running");
   await assert.rejects(host.mergeCheck!("golang/appservice", 354), /!354 要合到的 gone 分支不存在了/);
   assert.deepEqual(calls, [
     "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
@@ -1515,6 +1518,42 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   responses.push(status("ci_must_pass"), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
   assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), { state: "auto", url });
   assert.deepEqual(calls.at(-1)?.body, { sha, auto_merge: true, merge_when_pipeline_succeeds: true });
+  // 要看流水线（requirePipeline）：项目没要求流水线也照样看，以合之前最后读到的为准
+  const withPipeline = (s: string, head: object | null) =>
+    new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, target_branch: "uat", detailed_merge_status: s, head_pipeline: head }), { status: 200 });
+  const need = { sha, target: "uat", requirePipeline: true };
+  // 还在跑：设成通过后自动合并
+  responses.push(withPipeline("mergeable", { status: "running", sha }), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
+  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, need), { state: "auto", url });
+  assert.deepEqual(calls.at(-1)?.body, { sha, auto_merge: true, merge_when_pipeline_succeeds: true });
+  // 通过了：直接合
+  responses.push(withPipeline("mergeable", { status: "success", sha }), new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }));
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, need)).state, "merged");
+  assert.deepEqual(calls.at(-1)?.body, { sha });
+  // 合并结果流水线跑的是临时的合并提交，按 ref 认
+  responses.push(
+    withPipeline("mergeable", { status: "success", sha: "e".repeat(40), ref: "refs/merge-requests/354/merge" }),
+    new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }),
+  );
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, need)).state, "merged");
+  // 流水线刚建出来：先没有、再读到在跑
+  naps.length = 0;
+  responses.push(withPipeline("mergeable", null), withPipeline("mergeable", { status: "pending", sha }), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, need)).state, "auto");
+  assert.deepEqual(naps, [2000]);
+  const noPut = calls.length;
+  // 一直没有流水线、只有旧提交的流水线：看够次数不合
+  responses.push(...Array.from({ length: 6 }, () => withPipeline("mergeable", { status: "success", sha: "d".repeat(40), ref: "fix/jd_uat" })));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, need), /^RepoError: !354 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合/);
+  // 核对时是通过的，合之前重跑失败了：不合
+  responses.push(withPipeline("mergeable", { status: "failed", sha }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, need), /^RepoError: !354 的流水线（构建）没通过（failed），机器人不合/);
+  // 机器人自己编过的（不要求流水线）：读到流水线失败也不合，还在跑的等它跑完
+  responses.push(withPipeline("mergeable", { status: "failed", sha }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /^RepoError: !354 的流水线（构建）没通过（failed），机器人不合/);
+  assert.ok(calls.slice(noPut).every((c) => c.method === "GET"));
+  responses.push(withPipeline("mergeable", { status: "running", sha }), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" })).state, "auto");
   const before = calls.length;
   responses.push(status("conflict"));
   await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /^RepoError: !354 现在合不了：和要合到的分支有冲突，要先解决冲突/);
@@ -1542,12 +1581,12 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
 
 test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到允许开发者合并的分支的；其余都不合", async () => {
   const checks: Record<number, MergeCheck> = {};
-  const merged: { number: number; sha: string; target: string }[] = [];
+  const merged: { number: number; sha: string; target: string; requirePipeline?: boolean }[] = [];
   let result: MergeResult = { state: "merged", url: "https://example.com/pr/1" };
   const { host } = fakeHost();
   Object.assign(host, {
     mergeCheck: async (_repo: string, number: number) => checks[number] ?? Promise.reject(new RepoError(`没有 !${number}`)),
-    mergeRequest: async (_repo: string, number: number, options: { sha: string; target: string }) => {
+    mergeRequest: async (_repo: string, number: number, options: { sha: string; target: string; requirePipeline?: boolean }) => {
       merged.push({ number, ...options });
       return result;
     },
@@ -1568,6 +1607,7 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     botUsername: "Agent-Boot",
     sha,
     targetProtected: false,
+    pipelineStatus: "success",
   };
   checks[1] = base;
   const out = await ws.mergeRequest(1);
@@ -1576,7 +1616,7 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     { repo: "acme/demo", branch: pr.branch },
     { repo: "acme/demo", branch: "uat" },
   ]);
-  assert.deepEqual(merged, [{ number: 1, sha, target: "uat" }]);
+  assert.deepEqual(merged, [{ number: 1, sha, target: "uat", requirePipeline: true }]);
   result = { state: "auto", url: "https://example.com/pr/1" };
   assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
   // 受保护、但 GitLab 上允许开发者合并的（uat 常这样设）：能合
@@ -1600,11 +1640,21 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     [1, { sha: "d".repeat(40) }, /^RepoError: !1 的源分支上有机器人没推过的提交/],
     // 别的话题开的
     [9, {}, /^RepoError: !9 不是这个话题里开的，机器人只合并当前话题里自己开的合并请求/],
+    // 机器人编译不了：已经知道流水线没通过的不合
+    [1, { pipelineStatus: "failed" }, /^RepoError: !1 的流水线（构建）没通过（failed），机器人不合/],
+    [1, { pipelineStatus: "canceled" }, /没通过（canceled）/],
   ] as const) {
     checks[number] = { ...base, number, ...bad };
     await assert.rejects(ws.mergeRequest(number), message, JSON.stringify(bad));
   }
   assert.deepEqual(merged, []);
+  // 还没有流水线、还在跑的：交给平台合之前再看一次
+  for (const pipelineStatus of [undefined, "running"]) {
+    checks[1] = { ...base, pipelineStatus };
+    result = { state: "auto", url: "https://example.com/pr/1" };
+    assert.match((await ws.mergeRequest(1)).text, /已设成流水线通过后自动合并/);
+  }
+  assert.deepEqual(merged.slice().map((m: { requirePipeline?: boolean }) => m.requirePipeline), [true, true]);
   // 平台不支持合并
   const plain = await workspaces(fakeHost().host).open("om_m2", "acme/demo");
   await assert.rejects(plain.mergeRequest(1), /Fake 上机器人还不能合并合并请求，请人来点/);
@@ -1667,7 +1717,7 @@ test("合并本话题里搬过来的改动：搬的时候那边源分支得是�
   const [s40, s41, other] = ["a", "b", "c"].map((c) => c.repeat(40));
   const check = (number: number, sha: string): MergeCheck => ({
     number, title: "x", url: `https://example.com/pr/${number}`, state: "opened", source: `fix/${number}`, target: "uat",
-    authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false,
+    authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false, pipelineStatus: "success",
   });
   checks[40] = check(40, s40);
   checks[41] = check(41, s41);
@@ -1684,6 +1734,46 @@ test("合并本话题里搬过来的改动：搬的时候那边源分支得是�
   await writeFile(stateFile, JSON.stringify(state(s40)));
   assert.match((await (await all.open("om_m6", "acme/demo")).mergeRequest(41)).text, /^已合并合并请求 !41/);
   assert.deepEqual(merged, [41]);
+});
+
+test("推之前编译：改到的代码编不过不推、把报错给模型；编过了的合并时不用等流水线", async () => {
+  const { host } = fakeHost();
+  const merged: { number: number; requirePipeline?: boolean }[] = [];
+  let sha = "";
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number): Promise<MergeCheck> => ({
+      number, title: "改说明", url: "https://example.com/pr/1", state: "opened", source: "x", target: "uat",
+      authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false,
+    }),
+    mergeRequest: async (_repo: string, number: number, options: { requirePipeline?: boolean }) => {
+      merged.push({ number, requirePipeline: options.requirePipeline });
+      return { state: "merged", url: "" };
+    },
+  });
+  const results: BuildResult[] = [{ state: "failed", output: "go build ./src 编不过：\nsrc/a.ts:1: undefined: logs" }, { state: "passed", summary: "go build ./src 编过了" }];
+  const seen: string[][] = [];
+  const build: BuildChecker = {
+    check: async (_dir, files) => {
+      seen.push([...files]);
+      return results.shift()!;
+    },
+  };
+  const all = new CodeWorkspaces({ root: path.join(tmp, `ws${rootCount++}`), host, repos: ["acme/demo"], logger: quiet, build });
+  const ws = await all.open("om_b1", "acme/demo");
+  await ws.editFile("src/a.ts", "export const a = 1;", "export const a = 2;");
+  await assert.rejects(ws.openPullRequest("改 a", ""), /^RepoError: 推之前在服务器上编译了一下，这次改的代码编不过，没推、也没开合并请求[\s\S]*undefined: logs/);
+  assert.equal(ws.pullRequest, undefined);
+  assert.deepEqual(seen, [["src/a.ts"]]);
+  // 改好再开：编过了，开好的结果里写着
+  const pr = await ws.openPullRequest("改 a", "");
+  assert.deepEqual(pr.checked, { state: "passed", summary: "go build ./src 编过了" });
+  sha = (await runGit(["rev-parse", `refs/heads/${pr.branch}`], { cwd: remote })).stdout.trim();
+  // 源分支最新的就是编过的那个：合并时不用等流水线
+  await ws.mergeRequest(pr.number);
+  assert.deepEqual(merged, [{ number: pr.number, requirePipeline: false }]);
+  // 别人后来推了新提交（对不上）的照旧拒绝；编过的记录在重新打开后还在
+  sha = "d".repeat(40);
+  await assert.rejects((await all.open("om_b1", "acme/demo")).mergeRequest(pr.number), /有机器人没推过的提交/);
 });
 
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {

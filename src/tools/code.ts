@@ -1,3 +1,4 @@
+import type { BuildResult } from "../build.js";
 import {
   addChanges,
   type CodeWorkspaces,
@@ -298,7 +299,10 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         `只在群成员要你提交、开${requestName}或者合到某个分支时使用；` +
         (canMerge
           ? `它只开不合，群成员要合并（「合并到 uat」）时，开好以后再用 code_merge 合。机器人不会推到已有的分支。`
-          : `机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`),
+          : `机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`) +
+        (workspaces.buildCheck
+          ? "推之前会在服务器上照项目自己的构建方式编译一下（读流水线用的 Dockerfile，编里面 go build 的那个入口，再加上改到的包；PHP 查语法）：这次改动编不过就拒绝、不推，返回编译器的报错（报错可能在没改的文件里，比如改了函数签名、调用的地方编不过），按报错用 code_read_file 看清相关代码再改，改好再调用，改不好就把报错告诉群成员，不要绕过。编过只说明能编译，不等于测过。"
+          : ""),
       parameters: {
         type: "object",
         properties: {
@@ -332,6 +336,9 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
       const from = requestNumber(args.from, "from");
       const pr = await ws.openPullRequest(title, body, { branch: optional(args.branch), target: optional(args.target), from }, ctx.signal);
       const out = new ToolOutputBuilder(ws.repo).parts(...openedLine(pr, requestName, refOf));
+      if (pr.checked) {
+        out.line(checkedLine(pr.checked));
+      }
       return report(ctx, addChanges(out.line(""), pr.changes).build());
     },
   };
@@ -341,7 +348,7 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_merge",
       description:
-        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护、或者受保护但允许开发者合并的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}搬来的都不合；` +
+        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护、或者受保护但允许开发者合并的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}搬来的、源分支最新提交没跑过流水线（构建）或者没通过的都不合，流水线还在跑的设成通过后自动合并；` +
         `开到只许维护者合并的受保护分支（master、prod 这类线上分支，以 ${workspaces.host.name} 上的「允许合并」设置为准）的不合，要人审过再点，照它返回的原因告诉群成员。` +
         `只在群成员明确要合并时用（「合并到 uat」「把 !354 合了」）：先用 code_open_pr 开好到那个分支的${requestName}，再用它合；已经开过的直接填编号。` +
         `只说「提个 PR」「开个${requestName}」时只开不合。要等流水线通过才能合的，会设成流水线通过后自动合并。`,
@@ -373,6 +380,15 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
   };
 
   return [branches, listFiles, read, search, log, requests, edit, diff, openPr, ...(canMerge ? [merge] : [])];
+}
+
+/** 推之前编译的结果：编过了、还是没编（合并时要看平台上的流水线） */
+function checkedLine(checked: BuildResult): string {
+  return checked.state === "passed"
+    ? `推之前在服务器上编译检查过：${checked.summary}。`
+    : checked.state === "unknown"
+      ? `推之前没能确认能编过（${checked.reason}），合并时要看平台上的流水线。`
+      : "推之前编译没通过。";
 }
 
 /** 开好合并请求以后的第一行：哪个分支开到哪个分支，改动是不是从别处搬过来的 */

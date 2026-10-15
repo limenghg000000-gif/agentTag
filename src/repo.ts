@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { BuildChecker, BuildResult } from "./build.js";
 import type { Logger } from "./history.js";
 import { type CodeFact, type CodeLocation, type Piece, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
 
@@ -57,8 +58,11 @@ export interface CodeHost {
   getRequest?(repo: string, number: number, signal?: AbortSignal): Promise<RequestDetail>;
   /** 合并前要核对的：合并请求的状态、分支、谁开的、源分支最新的提交，机器人自己的账号，要合到的分支受不受保护。没有实现时机器人不能合并 */
   mergeCheck?(repo: string, number: number, signal?: AbortSignal): Promise<MergeCheck>;
-  /** 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并 */
-  mergeRequest?(repo: string, number: number, options: { sha: string; target: string }, signal?: AbortSignal): Promise<MergeResult>;
+  /**
+   * 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并。
+   * requirePipeline：合之前再看一次源分支最新提交的流水线（构建），通过了才直接合，还在跑的设成通过后自动合并，没跑过、没通过的不合
+   */
+  mergeRequest?(repo: string, number: number, options: { sha: string; target: string; requirePipeline?: boolean }, signal?: AbortSignal): Promise<MergeResult>;
 }
 
 /** 合并前核对用的 */
@@ -75,6 +79,8 @@ export interface MergeCheck extends RequestInfo {
   targetProtected: boolean;
   /** 受保护的分支在平台上允许开发者合并（GitLab「允许合并」里有 Developers）；只许维护者合的是 false */
   targetDevelopersCanMerge?: boolean;
+  /** 源分支最新提交的流水线（构建）状态；没跑过就没有 */
+  pipelineStatus?: string;
 }
 
 /** 合并的结果：合好了，或者设成了流水线通过后自动合并 */
@@ -411,13 +417,15 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         botUsername,
         ...(fromFork ? { fromFork } : {}),
         targetProtected: branch.protected,
+        ...(pipelineOf(request, number, request.sha) ? { pipelineStatus: pipelineOf(request, number, request.sha) } : {}),
         ...(branch.protected ? { targetDevelopersCanMerge: branch.developers_can_merge === true } : {}),
       };
     },
-    async mergeRequest(repo, number, { sha, target }, signal) {
+    async mergeRequest(repo, number, { sha, target, requirePipeline }, signal) {
       const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
-      // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），等它算完再合
+      // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），流水线也是过一会儿才建，等它们出来再合
       let status = "";
+      let pipelineStatus: string | undefined;
       for (let tries = 0; ; tries++) {
         const request = await readMergeRequest(project, number, signal);
         // 核对以后有人把合并请求改成开到别的分支（比如 master）：合并接口只核对源分支的提交，这里不核对就会合到没查过的分支上
@@ -425,7 +433,9 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
           throw new RepoError(`!${number} 要合到的分支改成了 ${request.target_branch ?? "别的分支"}（核对时是 ${target}），机器人不合，请重新说一遍`);
         }
         status = request.detailed_merge_status ?? request.merge_status ?? "";
-        if (!MERGE_CHECKING.has(status) || tries + 1 >= MERGE_CHECK_TRIES) {
+        pipelineStatus = pipelineOf(request, number, sha);
+        const waiting = MERGE_CHECKING.has(status) || (requirePipeline === true && pipelineStatus === undefined);
+        if (!waiting || tries + 1 >= MERGE_CHECK_TRIES) {
           break;
         }
         await sleep(MERGE_CHECK_WAIT_MS, signal);
@@ -434,8 +444,17 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       if (blocked) {
         throw new RepoError(`!${number} 现在合不了：${blocked}`);
       }
-      // 要等流水线通过才能合的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
-      const pipeline = status === "ci_must_pass" || status === "ci_still_running";
+      // 机器人跑不了编译：要看流水线的，就在合之前这一次读到的结果上判断，免得核对以后流水线重跑、失败了还直接合
+      if (requirePipeline && pipelineStatus === undefined) {
+        throw new RepoError(`!${number} 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合；请人在 GitLab 上跑一下流水线、或者审过再点合并`);
+      }
+      // 机器人自己编过的也一样：这次读到流水线没通过就不合
+      if (pipelineStatus !== undefined && pipelineStatus !== "success" && !PIPELINE_RUNNING.has(pipelineStatus)) {
+        throw new RepoError(`!${number} 的流水线（构建）没通过（${pipelineStatus}），机器人不合，要先把问题修好`);
+      }
+      // 要等流水线通过才能合的、流水线还在跑的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
+      const pipeline =
+        ((requirePipeline === true || pipelineStatus !== undefined) && pipelineStatus !== "success") || status === "ci_must_pass" || status === "ci_still_running";
       const res = await fetchImpl(`${project}/merge_requests/${number}/merge`, {
         method: "PUT",
         headers: { "private-token": token, "content-type": "application/json" },
@@ -506,6 +525,22 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * 合并请求源分支最新提交的流水线状态。合并结果流水线（merged results）跑的是临时的合并提交，提交号对不上源分支，
+ * 按它的 ref（refs/merge-requests/编号/merge）认；别的提交号对不上的（旧提交的流水线）不算
+ */
+function pipelineOf(request: GitLabMergeRequest, number: number, sha: string | undefined): string | undefined {
+  const pipeline = request.head_pipeline;
+  if (!pipeline?.status || !sha) {
+    return undefined;
+  }
+  const mergeRef = pipeline.ref === `refs/merge-requests/${number}/merge` || pipeline.ref === `refs/merge-requests/${number}/train`;
+  return pipeline.sha === sha || mergeRef ? pipeline.status : undefined;
+}
+
+/** 流水线还在跑（还没出结果）的状态：合并请求设成流水线通过后自动合并 */
+const PIPELINE_RUNNING = new Set(["created", "waiting_for_resource", "preparing", "pending", "running", "scheduled", "waiting_for_callback"]);
+
 /** 合并前等 GitLab 算完能不能合：最多看几次、每次隔多久 */
 const MERGE_CHECK_TRIES = 6;
 const MERGE_CHECK_WAIT_MS = 2000;
@@ -537,6 +572,7 @@ const MERGE_BLOCKED: Record<string, string> = {
 
 interface GitLabMergeRequest extends GitLabRequest {
   sha?: string;
+  head_pipeline?: { status?: string; sha?: string; ref?: string } | null;
   detailed_merge_status?: string;
   merge_status?: string;
   source_project_id?: number;
@@ -754,6 +790,8 @@ interface Change {
   portedFrom?: number;
   /** 搬的时候那个合并请求源分支的提交：合并前核对它就是机器人自己推的那个，搬之前别人往那边推过的不合 */
   portedSha?: string;
+  /** 推之前在服务器上编译过、编过了的提交：合并时它就是源分支最新的提交，就不用再等平台上的流水线 */
+  checkedSha?: string;
 }
 
 /** 推上去以后放到一边的改动：切到别的分支、或者把改动搬到别的分支时存下，切回 base 分支时接着用 */
@@ -778,6 +816,8 @@ export interface CodeWorkspacesOptions {
   repos: readonly string[];
   /** 给仓库指定的默认分支（仓库 → 分支）。没指定的用仓库自己的默认分支 */
   branches?: Readonly<Record<string, string>>;
+  /** 推代码之前的编译检查；没有时不编译，合并时只看平台上的流水线 */
+  build?: BuildChecker;
   logger?: Logger;
   now?: () => Date;
 }
@@ -793,8 +833,13 @@ export class CodeWorkspaces {
   private readonly root: string;
   private readonly logger: Logger;
   private readonly now: () => Date;
+  private readonly build?: BuildChecker;
+  /** 推之前会不会编译检查（BUILD_CHECK） */
+  readonly buildCheck: boolean;
 
   constructor(opts: CodeWorkspacesOptions) {
+    this.build = opts.build;
+    this.buildCheck = opts.build !== undefined;
     this.root = opts.root;
     this.host = opts.host;
     this.repos = opts.repos;
@@ -830,7 +875,7 @@ export class CodeWorkspaces {
       }
       this.logger.info(`代码仓库 ${name} 已克隆到 ${dir}`);
     }
-    const workspace = new Workspace(name, dir, env, this.host, await readState(dir), this.now, configured);
+    const workspace = new Workspace(name, dir, env, this.host, await readState(dir), this.now, configured, this.build);
     await workspace.init(exists, signal);
     return workspace;
   }
@@ -887,7 +932,7 @@ function validState(state: WorkspaceState): boolean {
   }
   const changes: Change[] = [state, ...(state.earlier ?? [])];
   const names = [...changes.flatMap((change) => [change.base, change.branch]), state.porting?.back, state.porting?.branch];
-  const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha, change.portedSha]);
+  const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha, change.portedSha, change.checkedSha]);
   // 拿去查合并请求、写进接口地址的编号
   const numbers = changes.flatMap((change) => [change.prNumber, change.portedFrom]);
   return (
@@ -918,6 +963,8 @@ export class Workspace {
     private readonly now: () => Date,
     /** 配置里给这个仓库指定的默认分支 */
     private readonly configuredBranch?: string,
+    /** 推代码之前的编译检查 */
+    private readonly build?: BuildChecker,
   ) {}
 
   get pullRequest(): { url: string; number: number; branch: string } | undefined {
@@ -1130,7 +1177,14 @@ export class Workspace {
         this.onBranch(check.target),
       );
     }
-    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target }, signal);
+    // 机器人跑不了编译：源分支最新的提交得有流水线（构建）通过才合。已经知道没通过的这里就说；没跑过、还在跑的由平台合之前再看一次
+    const pipeline = check.pipelineStatus;
+    if (pipeline !== undefined && pipeline !== "success" && !PIPELINE_RUNNING.has(pipeline)) {
+      throw new RepoError(`${ref} 的流水线（构建）没通过（${pipeline}），机器人不合，要先把问题修好：${check.url}`);
+    }
+    // 推之前在服务器上编过的（源分支最新的提交就是编过的那个）不用再等流水线；没编过的看平台上的流水线
+    const built = own.checkedSha !== undefined && own.checkedSha === check.sha;
+    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target, requirePipeline: !built }, signal);
     const url = merged.url || check.url;
     const out = this.output();
     return (
@@ -1706,16 +1760,16 @@ export class Workspace {
         return { ...opened, replaced: { number: old.number, state } };
       }
     }
-    await this.push(branch, signal);
+    const checked = await this.push(branch, signal);
 
     if (this.pullRequest) {
-      return { ...this.pullRequest, created: false, changes, base: this.baseBranch };
+      return { ...this.pullRequest, created: false, changes, base: this.baseBranch, ...(checked ? { checked } : {}) };
     }
     // 上次推上去了但开 PR 失败时，这次直接补开
     const pr = await this.host.openPullRequest(this.repo, { head: branch, base: this.baseBranch, title, body });
     this.state = { ...this.state, prUrl: pr.url, prNumber: pr.number };
     await this.saveState();
-    return { ...pr, created: true, changes, branch, base: this.baseBranch };
+    return { ...pr, created: true, changes, branch, base: this.baseBranch, ...(checked ? { checked } : {}) };
   }
 
   /**
@@ -1873,12 +1927,12 @@ export class Workspace {
     if (dropped) {
       await this.git(["branch", "-q", "-D", dropped], signal).catch(() => {});
     }
-    await this.push(branch, signal);
+    const checked = await this.push(branch, signal);
     const changes = await this.changedFiles([targetSha, "HEAD"], signal);
     const pr = await this.host.openPullRequest(this.repo, { head: branch, base: target, title, body });
     this.state = { ...this.state, prUrl: pr.url, prNumber: pr.number };
     await this.saveState();
-    return { ...pr, created: true, changes, branch, base: target };
+    return { ...pr, created: true, changes, branch, base: target, ...(checked ? { checked } : {}) };
   }
 
   /** 这个话题已经在 target 上推过改动时不再搬一份：新改动要进的是那个合并请求，切过去接着改 */
@@ -1896,11 +1950,20 @@ export class Workspace {
     }
   }
 
-  /** 推到机器人自己的分支。第一次推时远端不能已经有这个分支：--force-with-lease=<分支>: 由远端原子地检查，不会推到别人的分支上 */
-  private async push(branch: string, signal?: AbortSignal): Promise<void> {
+  /**
+   * 推到机器人自己的分支。第一次推时远端不能已经有这个分支：--force-with-lease=<分支>: 由远端原子地检查，不会推到别人的分支上。
+   * 推之前先编译一下这个话题改到的代码：改到的文件编不过就不推，把报错交给模型改；返回编译的结果（没推新提交时不编）
+   */
+  private async push(branch: string, signal?: AbortSignal): Promise<BuildResult | undefined> {
     const head = await this.head(signal);
     if (head === this.state.pushedSha) {
-      return;
+      return undefined;
+    }
+    const checked = await this.buildCheck(signal);
+    if (checked?.state === "failed") {
+      throw new RepoError(
+        `推之前在服务器上编译了一下，这次改的代码编不过，没推、也没开${this.host.requestName}。按报错改好（用 code_read_file 看清上下文，别猜），再用 code_open_pr 推：\n${checked.output}`,
+      );
     }
     const fresh = this.state.pushedSha === undefined;
     try {
@@ -1915,7 +1978,23 @@ export class Workspace {
       throw err;
     }
     this.state.pushedSha = head;
+    if (checked?.state === "passed") {
+      this.state.checkedSha = head;
+    } else {
+      delete this.state.checkedSha;
+    }
     await this.saveState();
+    return checked;
+  }
+
+  /** 编译这个话题在 base 分支上改到的文件（和检出时的提交比，没有就和远端分支比）；编不过时在那个提交上再编一次比一比 */
+  private async buildCheck(signal?: AbortSignal): Promise<BuildResult | undefined> {
+    if (!this.build) {
+      return undefined;
+    }
+    const base = this.state.baseSha ?? `refs/remotes/origin/${this.baseBranch}`;
+    const files = (await this.changedFiles([base, "HEAD"], signal)).map((file) => file.path);
+    return this.build.check(this.dir, files, signal, base);
   }
 
   /** 搬过去的新分支的名字：跟着原来的分支起（如 fix/x-uat），不合规矩或者已经有了就另起一个 */
@@ -1965,7 +2044,7 @@ export class Workspace {
 
   /** 这个话题当前推上去了的改动（放到一边时用）；没推过的不算 */
   private parked(): ParkedChange | undefined {
-    const { branch, pushedSha, baseSha, prUrl, prNumber, portedFrom, portedSha } = this.state;
+    const { branch, pushedSha, baseSha, prUrl, prNumber, portedFrom, portedSha, checkedSha } = this.state;
     if (!branch || !pushedSha) {
       return undefined;
     }
@@ -1977,6 +2056,7 @@ export class Workspace {
       ...(prUrl && prNumber ? { prUrl, prNumber } : {}),
       ...(portedFrom ? { portedFrom } : {}),
       ...(portedSha ? { portedSha } : {}),
+      ...(checkedSha ? { checkedSha } : {}),
     };
   }
 
@@ -2142,6 +2222,8 @@ export interface OpenedRequest {
   ported?: { from?: string; earlier?: number; request?: { number: number; source: string; target: string; state: RequestState } };
   /** 这个话题之前开的合并请求已经合并或关掉了，新改动另开了这一个 */
   replaced?: { number: number; state: RequestState };
+  /** 推之前编译的结果（这次没推新提交时没有） */
+  checked?: BuildResult;
 }
 
 /** git grep -n -z 的一处结果 */

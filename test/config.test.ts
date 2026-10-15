@@ -131,8 +131,14 @@ test("代码仓库：配了 GITLAB_URL 接 GitLab（项目路径可以多层）�
     branches: {},
     host: { kind: "gitlab", url: "https://git.corp.example.com", token: "glpat-x" },
     workspaceDir: path.resolve("/srv/agenttag", "workspaces"),
+    build: true,
   });
   assert.deepEqual(loadConfig({ ...base, CODE_REPOS: "acme/app", GITHUB_TOKEN: "ghp" }).code?.host, { kind: "github", token: "ghp" });
+  // 编译检查默认开，BUILD_CHECK=off 关掉；BUILD_GOPROXY 换下载依赖的代理
+  const gh = { ...base, CODE_REPOS: "acme/app", GITHUB_TOKEN: "ghp" };
+  assert.equal(loadConfig({ ...gh, BUILD_CHECK: "off" }).code?.build, false);
+  assert.equal(loadConfig({ ...gh, BUILD_GOPROXY: "https://goproxy.corp,direct" }).code?.goproxy, "https://goproxy.corp,direct");
+  assert.throws(() => loadConfig({ ...gh, BUILD_CHECK: "yes" }), /BUILD_CHECK 只能是 on 或 off/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app" }), /GITLAB_URL 和 GITLAB_TOKEN/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/app", GITLAB_URL: "https://git.corp" }), /GITLAB_TOKEN/);
   assert.throws(() => loadConfig({ ...base, CODE_REPOS: "app", GITLAB_URL: "https://git.corp", GITLAB_TOKEN: "t" }), /项目路径/);
