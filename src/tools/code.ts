@@ -37,7 +37,7 @@ export interface CodeToolsOptions {
 export function createCodeTools({ workspaces, threadKey, askerName, botName }: CodeToolsOptions): Tool[] {
   const repos = workspaces.repos;
   const { requestName, refOf } = workspaces.host;
-  // 平台支持时机器人能合并：只合自己开的、开到没保护的分支的
+  // 平台支持时机器人能合并：只合自己开的、开到允许开发者合并的分支的
   const canMerge = workspaces.host.mergeCheck !== undefined && workspaces.host.mergeRequest !== undefined;
   const opened = new Map<string, Promise<Workspace>>();
   // 一个任务里每个仓库只打开（克隆或更新）一次
@@ -341,8 +341,8 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     spec: {
       name: "code_merge",
       description:
-        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}搬来的都不合；` +
-        `开到受保护的分支（master、prod 这类线上分支，以 ${workspaces.host.name} 上的保护设置为准）或仓库默认分支的不合，要人审过再点，照它返回的原因告诉群成员。` +
+        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护、或者受保护但允许开发者合并的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}搬来的都不合；` +
+        `开到只许维护者合并的受保护分支（master、prod 这类线上分支，以 ${workspaces.host.name} 上的「允许合并」设置为准）或仓库默认分支的不合，要人审过再点，照它返回的原因告诉群成员。` +
         `只在群成员明确要合并时用（「合并到 uat」「把 !354 合了」）：先用 code_open_pr 开好到那个分支的${requestName}，再用它合；已经开过的直接填编号。` +
         `只说「提个 PR」「开个${requestName}」时只开不合。要等流水线通过才能合的，会设成流水线通过后自动合并。`,
       parameters: {

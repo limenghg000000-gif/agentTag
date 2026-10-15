@@ -1452,7 +1452,7 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
     new Response(JSON.stringify({ username: "agent-boot" }), { status: 200 }),
     new Response(JSON.stringify({ name: "uat", protected: false, default: false }), { status: 200 }),
     new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9 })), { status: 200 }),
-    new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false }), { status: 200 }),
+    new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false, developers_can_merge: true }), { status: 200 }),
     new Response(JSON.stringify(mr({ target_branch: "gone" })), { status: 200 }),
     new Response("{}", { status: 404 }),
   ];
@@ -1469,7 +1469,11 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
   );
   // 账号查到了就记下，不再查
   const release = await host.mergeCheck!("golang/appservice", 354);
-  assert.deepEqual([release.authorUsername, release.botUsername, release.fromFork, release.targetProtected], ["zhangsan", "agent-boot", true, true]);
+  assert.deepEqual(
+    [release.authorUsername, release.botUsername, release.fromFork, release.targetProtected, release.targetDevelopersCanMerge],
+    ["zhangsan", "agent-boot", true, true, true],
+  );
+  assert.equal(uat.targetDevelopersCanMerge, undefined);
   await assert.rejects(host.mergeCheck!("golang/appservice", 354), /!354 要合到的 gone 分支不存在了/);
   assert.deepEqual(calls, [
     "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
@@ -1536,7 +1540,7 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   assert.equal(naps.length, 5);
 });
 
-test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到没保护的分支的；其余都不合", async () => {
+test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到允许开发者合并的分支的；其余都不合", async () => {
   const checks: Record<number, MergeCheck> = {};
   const merged: { number: number; sha: string; target: string }[] = [];
   let result: MergeResult = { state: "merged", url: "https://example.com/pr/1" };
@@ -1576,12 +1580,20 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
   assert.deepEqual(merged, [{ number: 1, sha, target: "uat" }]);
   result = { state: "auto", url: "https://example.com/pr/1" };
   assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
+  // 受保护、但 GitLab 上允许开发者合并的（uat 常这样设）：能合
+  result = { state: "merged", url: "https://example.com/pr/1" };
+  checks[1] = { ...base, targetProtected: true, targetDevelopersCanMerge: true };
+  assert.match((await ws.mergeRequest(1)).text, /^已合并合并请求 !1/);
+  merged.length = 0;
   checks[1] = { ...base, state: "merged" };
   assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）已经合并过了/);
   merged.length = 0;
   checks[9] = { ...base, number: 9 };
   for (const [number, bad, message] of [
-    [1, { targetProtected: true, target: "master" }, /^RepoError: !1 要合到的 master 是受保护的分支，合并要人审过再点，机器人不合/],
+    [1, { targetProtected: true, target: "prod" }, /^RepoError: !1 要合到的 prod 是受保护的分支，只许维护者合并，合并要人审过再点，机器人不合/],
+    [1, { targetProtected: true, targetDevelopersCanMerge: false, target: "prod" }, /是受保护的分支，只许维护者合并/],
+    // 允许开发者合并，但是默认分支：也不合
+    [1, { targetProtected: true, targetDevelopersCanMerge: true, targetIsDefault: true, target: "master" }, /^RepoError: !1 要合到的 master 是仓库的默认分支/],
     [1, { targetIsDefault: true, target: "main" }, /^RepoError: !1 要合到的 main 是仓库的默认分支，合并要人审过再点/],
     [1, { author: "张三", authorUsername: "zhangsan" }, /^RepoError: !1 是 张三 开的，机器人只合并自己开的合并请求/],
     [1, { authorUsername: undefined }, /机器人只合并自己开的合并请求/],

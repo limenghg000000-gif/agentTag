@@ -73,6 +73,8 @@ export interface MergeCheck extends RequestInfo {
   fromFork?: boolean;
   /** 要合到的分支在平台上受保护（按平台上的保护设置，含通配的规则） */
   targetProtected: boolean;
+  /** 受保护的分支在平台上允许开发者合并（GitLab「允许合并」里有 Developers）；只许维护者合的是 false */
+  targetDevelopersCanMerge?: boolean;
   /** 要合到的分支是仓库的默认分支 */
   targetIsDefault: boolean;
 }
@@ -399,7 +401,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       if (res.status === 404) {
         throw new RepoError(`!${number} 要合到的 ${target} 分支不存在了`);
       }
-      const branch = (await res.json().catch(() => ({}))) as { protected?: unknown; default?: unknown };
+      const branch = (await res.json().catch(() => ({}))) as { protected?: unknown; default?: unknown; developers_can_merge?: unknown };
       if (!res.ok || typeof branch.protected !== "boolean") {
         throw new RepoError(`GitLab 查 ${target} 分支是不是受保护的失败（HTTP ${res.status}），先不合并`);
       }
@@ -411,6 +413,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         botUsername,
         ...(fromFork ? { fromFork } : {}),
         targetProtected: branch.protected,
+        ...(branch.protected ? { targetDevelopersCanMerge: branch.developers_can_merge === true } : {}),
         targetIsDefault: branch.default === true,
       };
     },
@@ -1063,8 +1066,8 @@ export class Workspace {
   }
 
   /**
-   * 合并一个合并请求。只合机器人自己开的、开到没保护的分支（如 uat）的；开到受保护的分支（以平台上的保护设置为准，
-   * master、prod 这类线上分支）或者仓库默认分支的不合，要人审过再点。要等流水线的设成流水线通过后自动合并
+   * 合并一个合并请求。只合机器人自己开的、开到没保护的分支或者受保护但允许开发者合并的分支（如 uat）的；开到只许维护者合的
+   * 受保护分支（以平台上的保护设置为准，master、prod 这类线上分支）或者仓库默认分支的不合，要人审过再点。要等流水线的设成流水线通过后自动合并
    */
   async mergeRequest(number: number, signal?: AbortSignal): Promise<ToolOutput> {
     const name = this.host.requestName;
@@ -1115,9 +1118,11 @@ export class Workspace {
         );
       }
     }
-    if (check.targetProtected || check.targetIsDefault) {
+    // 受保护的分支看平台上的「允许合并」：允许开发者合的（uat、test 这类）机器人能合，只许维护者合的（master、prod 这类）要人点
+    const maintainersOnly = check.targetProtected && check.targetDevelopersCanMerge !== true;
+    if (check.targetIsDefault || maintainersOnly) {
       throw new RepoError(
-        `${ref} 要合到的 ${check.target} 是${check.targetProtected ? "受保护的分支" : "仓库的默认分支"}，合并要人审过再点，机器人不合：${check.url}`,
+        `${ref} 要合到的 ${check.target} 是${check.targetIsDefault ? "仓库的默认分支" : "受保护的分支，只许维护者合并"}，合并要人审过再点，机器人不合：${check.url}`,
         this.onBranch(check.target),
       );
     }
