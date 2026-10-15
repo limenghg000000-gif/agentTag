@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -380,54 +380,126 @@ async function atCommit<T>(
   }
 }
 
+/** 一步 go build：编的入口、写死的环境变量、-tags、用的 Go 版本 */
+interface GoStep {
+  targets: string[];
+  env: Record<string, string>;
+  tags?: string;
+  goVersion?: string;
+  unsupported?: string;
+}
+
 /**
- * 读项目的构建方式：.gitlab-ci.yml 里 docker build 用的 Dockerfile（--file/-f），没写就用根目录的 Dockerfile；
- * Dockerfile 里有 go build 的那一步：编的入口、那个阶段写死的环境变量、-tags、镜像里的 Go 版本。找不到返回 undefined
+ * 读项目的构建方式，按流水线来：
+ * 1. .gitlab-ci.yml 里 docker build 用的 Dockerfile（--file/-f，几个都读；路径里的 ${SERVICE_NAME} 这类按实际的目录展开），取里面每一步 go build；
+ * 2. 流水线没用 Dockerfile、直接在脚本里 go build 的（老项目：image: golang:1.18 加 script），照脚本里的 go build；
+ * 3. 流水线里两样都没有，用根目录的 Dockerfile。
+ * 一个都找不到返回 undefined（只编改到的包）
  */
 export async function readGoRecipe(dir: string): Promise<GoRecipe | undefined> {
-  const candidates: string[] = [];
   const ci = await readText(path.join(dir, ".gitlab-ci.yml"));
-  if (ci) {
-    const text = ci
-      .split("\n")
-      .filter((line) => !/^\s*#/.test(line))
-      .join("\n");
-    for (const match of text.matchAll(/(?:--file[\s=]+|\s-f\s+)["']?([^\s"']+)/g)) {
-      candidates.push(match[1]);
+  const ciText = ci ? withoutComments(ci) : "";
+  const files: string[] = [];
+  for (const match of ciText.matchAll(/(?:--file[\s=]+|\s-f\s+)["']?([^\s"']+)/g)) {
+    for (const file of await expandPath(dir, match[1])) {
+      if (!files.includes(file)) files.push(file);
     }
   }
-  candidates.push("Dockerfile");
-  for (const file of candidates) {
-    const rel = path.posix.normalize(file.replace(/^\.\//, ""));
-    if (rel.startsWith("..") || path.posix.isAbsolute(rel) || rel.includes("$")) {
-      continue;
-    }
-    const text = await readText(path.join(dir, rel));
-    if (!text) {
-      continue;
-    }
-    const recipe = parseDockerfile(text);
-    if (recipe) {
-      return { dockerfile: rel, ...recipe };
-    }
-    if (/\bgo\b[\s",]+build\b/.test(text)) {
-      return { dockerfile: rel, targets: [], env: {}, unsupported: `${rel} 里的 go build 读不懂` };
+  const found: { file: string; steps: GoStep[] }[] = [];
+  for (const file of files) {
+    const text = await readText(path.join(dir, file));
+    if (!text) continue;
+    const steps = dockerfileSteps(text);
+    if (steps.length > 0) {
+      found.push({ file, steps });
+    } else if (/\bgo\b[\s",]+build\b/.test(text)) {
+      found.push({ file, steps: [{ targets: [], env: {}, unsupported: `${file} 里的 go build 读不懂` }] });
     }
   }
-  return undefined;
+  if (found.length === 0 && ciText) {
+    const steps = ciScriptSteps(ciText);
+    if (steps.length > 0) found.push({ file: ".gitlab-ci.yml", steps });
+  }
+  if (found.length === 0 && files.length === 0) {
+    const text = await readText(path.join(dir, "Dockerfile"));
+    const steps = text ? dockerfileSteps(text) : [];
+    if (steps.length > 0) found.push({ file: "Dockerfile", steps });
+  }
+  if (found.length === 0) {
+    return undefined;
+  }
+  const merged = mergeSteps(found.flatMap((f) => f.steps));
+  return merged ? { dockerfile: found.map((f) => f.file).join("、"), ...merged } : undefined;
+}
+
+/** 去掉注释行（Dockerfile 和 YAML 都是 # 开头的整行；Dockerfile 的注释行在续行之前去掉） */
+function withoutComments(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+}
+
+/** 流水线里的 Dockerfile 路径：不能出仓库；带 ${SERVICE_NAME} 这类变量的段，按仓库里实际有的目录展开（最多 20 个） */
+async function expandPath(dir: string, raw: string): Promise<string[]> {
+  const rel = path.posix.normalize(raw.replace(/^\.\//, ""));
+  if (rel.startsWith("..") || path.posix.isAbsolute(rel)) {
+    return [];
+  }
+  let current = [""];
+  for (const segment of rel.split("/")) {
+    const next: string[] = [];
+    for (const prefix of current) {
+      if (!segment.includes("$")) {
+        next.push(path.posix.join(prefix, segment));
+      } else if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(segment)) {
+        const entries = await readdir(path.join(dir, prefix), { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          if (!entry.name.startsWith(".") && entry.name !== "vendor" && entry.name !== "node_modules") next.push(path.posix.join(prefix, entry.name));
+        }
+      }
+    }
+    current = next.slice(0, 20);
+  }
+  const existing: string[] = [];
+  for (const file of current) {
+    if (await isFile(path.join(dir, file))) existing.push(file);
+  }
+  return existing;
 }
 
 /** 从 Dockerfile 里读出 go build 那一步（导出给测试用） */
 export function parseDockerfile(text: string): Omit<GoRecipe, "dockerfile"> | undefined {
-  const lines = text
+  return mergeSteps(dockerfileSteps(text));
+}
+
+/** 几步 go build（比如先编工具再编服务）：入口都编；编译条件不一样的照一套编说明不了 */
+function mergeSteps(steps: readonly GoStep[]): Omit<GoRecipe, "dockerfile"> | undefined {
+  const [first] = steps;
+  if (!first) {
+    return undefined;
+  }
+  const same = steps.every((s) => s.tags === first.tags && s.goVersion === first.goVersion && JSON.stringify(s.env) === JSON.stringify(first.env));
+  const unsupported = steps.find((s) => s.unsupported)?.unsupported ?? (same ? undefined : "几步 go build 的编译条件（Go 版本、-tags、GOOS 这类）不一样");
+  return {
+    targets: [...new Set(steps.flatMap((s) => s.targets))],
+    env: first.env,
+    ...(first.tags ? { tags: first.tags } : {}),
+    ...(first.goVersion ? { goVersion: first.goVersion } : {}),
+    ...(unsupported ? { unsupported } : {}),
+  };
+}
+
+function dockerfileSteps(text: string): GoStep[] {
+  const lines = withoutComments(text)
     .replace(/\\\r?\n/g, " ")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
+    .filter(Boolean);
   const args: Record<string, string> = {};
   let image = "";
   let env: Record<string, string> = {};
-  const steps: { targets: string[]; env: Record<string, string>; tags?: string; goVersion?: string; unsupported?: string }[] = [];
+  const steps: GoStep[] = [];
   for (const line of lines) {
     const [, instruction = "", rest = ""] = /^(\S+)\s*(.*)$/.exec(line) ?? [];
     const name = instruction.toUpperCase();
@@ -451,37 +523,74 @@ export function parseDockerfile(text: string): Omit<GoRecipe, "dockerfile"> | un
           // 不是 JSON，当普通命令看
         }
       }
-      const build = /(?:^|[\s;&|(])((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)go\s+build\b([^;&|]*)/.exec(command);
-      if (!build) {
-        continue;
-      }
-      const inline = parseEnv(build[1]);
-      const { targets, tags, unsupported } = parseGoBuild(build[2]);
-      const merged: Record<string, string> = {};
-      // 写死的才用；$TARGETOS 这类由构建平台定的不管，留着这个阶段 ENV 里写的
-      for (const source of [env, inline]) {
-        for (const [key, value] of Object.entries(source)) {
-          if (GO_ENV_KEYS.has(key) && value && !value.includes("$")) merged[key] = value;
-        }
-      }
-      const goVersion = /golang:(\d+\.\d+(?:\.\d+)?)/.exec(image)?.[1];
-      steps.push({ targets: targets.length > 0 ? targets : ["."], env: merged, ...(tags ? { tags } : {}), ...(goVersion ? { goVersion } : {}), ...(unsupported ? { unsupported } : {}) });
+      const step = goStep(command, env, goVersionOf(image));
+      if (step) steps.push(step);
     }
   }
-  const [first] = steps;
-  if (!first) {
+  return steps;
+}
+
+/** 流水线脚本里直接跑的 go build（「- go build -o x main.go」），Go 版本看最近的 image；前面单独一行 cd 到子目录的，入口跟着换 */
+function ciScriptSteps(text: string): GoStep[] {
+  const steps: GoStep[] = [];
+  let image = "";
+  // 这个任务的脚本当前在哪个目录（相对仓库根目录）；cd 到仓库外、绝对路径时不知道
+  let cwd: string | undefined = "";
+  for (const line of text.split("\n")) {
+    if (/^\S[^:]*:\s*$/.test(line)) {
+      cwd = "";
+    }
+    const declared = /^\s*image:\s*["']?([^\s"']+)/.exec(line);
+    if (declared) {
+      image = declared[1];
+      continue;
+    }
+    if (!/^\s*-\s/.test(line)) continue;
+    const command = line.replace(/^\s*-\s+/, "");
+    const cd = /^cd\s+["']?([^\s"'&;]+)["']?\s*$/.exec(command.trim());
+    if (cd) {
+      const target = cd[1];
+      if (/^\$\{?CI_PROJECT_DIR\}?\/?$/.test(target)) cwd = "";
+      else if (cwd !== undefined && !target.includes("$") && !path.posix.isAbsolute(target)) {
+        const joined = path.posix.normalize(path.posix.join(cwd, target));
+        cwd = joined.startsWith("..") ? undefined : joined === "." ? "" : joined;
+      } else cwd = undefined;
+      continue;
+    }
+    const step = goStep(command, {}, goVersionOf(image));
+    if (!step) continue;
+    if (cwd === undefined) {
+      steps.push({ ...step, unsupported: step.unsupported ?? "流水线 cd 到了仓库外面再 go build" });
+    } else {
+      steps.push({ ...step, targets: step.targets.map((t) => (cwd ? path.posix.join(cwd, t) : t)) });
+    }
+  }
+  return steps;
+}
+
+/** 镜像名里的 Go 版本：golang:1.22-alpine、go1.21:v1.0.0 */
+function goVersionOf(image: string): string | undefined {
+  return /golang:(\d+\.\d+(?:\.\d+)?)/.exec(image)?.[1] ?? /\bgo(\d+\.\d+(?:\.\d+)?)\b/.exec(image)?.[1];
+}
+
+/** 一条命令里的 go build；cd 到别的目录再编的、-C 的算说不清 */
+function goStep(command: string, env: Record<string, string>, goVersion: string | undefined): GoStep | undefined {
+  const build = /(?:^|[\s;&|(])((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)go\s+build\b([^;&|]*)/.exec(command);
+  if (!build) {
     return undefined;
   }
-  // 几步 go build（比如先编工具再编服务）：入口都编；编译条件不一样的照一套编说明不了
-  const same = steps.every((s) => s.tags === first.tags && s.goVersion === first.goVersion && JSON.stringify(s.env) === JSON.stringify(first.env));
-  const unsupported = steps.find((s) => s.unsupported)?.unsupported ?? (same ? undefined : "Dockerfile 里几步 go build 的编译条件不一样");
-  return {
-    targets: [...new Set(steps.flatMap((s) => s.targets))],
-    env: first.env,
-    ...(first.tags ? { tags: first.tags } : {}),
-    ...(first.goVersion ? { goVersion: first.goVersion } : {}),
-    ...(unsupported ? { unsupported } : {}),
-  };
+  const inline = parseEnv(build[1]);
+  const { targets, tags, unsupported } = parseGoBuild(build[2]);
+  const merged: Record<string, string> = {};
+  // 写死的才用；$TARGETOS 这类由构建平台定的不管，留着这个阶段 ENV 里写的
+  for (const source of [env, inline]) {
+    for (const [key, value] of Object.entries(source)) {
+      if (GO_ENV_KEYS.has(key) && value && !value.includes("$")) merged[key] = value;
+    }
+  }
+  const moved = /(^|[\s;&|(])cd\s/.test(command.slice(0, build.index + 1)) ? "go build 之前 cd 到了别的目录" : undefined;
+  const why = unsupported ?? moved;
+  return { targets: targets.length > 0 ? targets : ["."], env: merged, ...(tags ? { tags } : {}), ...(goVersion ? { goVersion } : {}), ...(why ? { unsupported: why } : {}) };
 }
 
 function parseEnv(text: string): Record<string, string> {
@@ -575,6 +684,13 @@ async function readText(file: string): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+async function isFile(file: string): Promise<boolean> {
+  return stat(file).then(
+    (info) => info.isFile(),
+    () => false,
+  );
 }
 
 async function exists(file: string): Promise<boolean> {

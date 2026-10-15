@@ -193,7 +193,7 @@ test("编译检查：Dockerfile 的 exec 写法、几步 go build、-C、读不�
   const two = parseDockerfile("FROM golang:1.22\nRUN go build -o /m ./cmd/migrate\nRUN go build -o /a ./cmd/api\n");
   assert.deepEqual(two?.targets, ["./cmd/migrate", "./cmd/api"]);
   assert.equal(two?.unsupported, undefined);
-  assert.match(parseDockerfile("FROM golang:1.22\nRUN go build -tags a ./x\nRUN go build ./y\n")?.unsupported ?? "", /编译条件不一样/);
+  assert.match(parseDockerfile("FROM golang:1.22\nRUN go build -tags a ./x\nRUN go build ./y\n")?.unsupported ?? "", /编译条件.*不一样/);
   assert.match(parseDockerfile("FROM golang:1.22\nRUN go build -C cmd/api .\n")?.unsupported ?? "", /-C/);
   const odd = await repo({ Dockerfile: "FROM golang:1.22\nRUN sh -c 'cd x && go   build'\n" });
   // 能读出来的照读；读不出入口的 go build 不当作没有
@@ -250,4 +250,43 @@ test("编译检查：改到的文件被编译条件排除了、改了流水线�
   const checker = createBuildChecker({ run: slow });
   await Promise.all([checker.check(dir, ["a/a.go"]), checker.check(dir, ["a/a.go"])]);
   assert.equal(most, 1);
+});
+
+test("编译检查：照公司项目的几种流水线写法认出入口", async () => {
+  // 注释行末尾带反斜杠（appservice 的 deploy/Dockerfile 就是这样）：注释先去掉，不把下面的 RUN 吃掉
+  assert.deepEqual(
+    parseDockerfile("FROM golang:1.25-alpine AS builder\n# 打印调试信息 go build -v -o /build/chain-api main.go \\\nRUN --mount=type=cache,target=/go/pkg/mod/ \\\n  CGO_ENABLED=0 go build -o /build/product-api main.go\n")?.targets,
+    ["main.go"],
+  );
+  // push-service、user：一个流水线 docker build 两个 Dockerfile，入口都编
+  const two = await repo({
+    ".gitlab-ci.yml": "build:\n  script:\n    - docker buildx build --file  rpc/deploy/Dockerfile .\n    - docker buildx build --file  api/deploy/Dockerfile .\n",
+    "rpc/deploy/Dockerfile": "FROM r/golang:1.21-alpine AS builder\nRUN CGO_ENABLED=0 GOOS=$TARGETOS go build -o /app/push-rpc rpc/push.go\n",
+    "api/deploy/Dockerfile": "FROM r/golang:1.21-alpine AS builder\nRUN CGO_ENABLED=0 GOOS=$TARGETOS go build -o /app/push-api api/push.go\n",
+  });
+  const both = await readGoRecipe(two);
+  assert.deepEqual(both?.targets, ["rpc/push.go", "api/push.go"]);
+  assert.equal(both?.dockerfile, "rpc/deploy/Dockerfile、api/deploy/Dockerfile");
+  // xianbao-workflow：--file=${SERVICE_NAME}/deploy/Dockerfile，按仓库里有的目录展开
+  const service = await repo({
+    ".gitlab-ci.yml": "build:\n  script:\n    - docker build --file=${SERVICE_NAME}/deploy/Dockerfile .\n",
+    "api/deploy/Dockerfile": "FROM r/golang:1.22-alpine\nRUN go build -o /app/a api/main.go\n",
+    "job/deploy/Dockerfile": "FROM r/golang:1.22-alpine\nRUN go build -o /app/j job/main.go\n",
+    "rpc/main.go": "package main\n",
+  });
+  assert.deepEqual((await readGoRecipe(service))?.targets.sort(), ["api/main.go", "job/main.go"]);
+  // 老项目：流水线直接在 golang 镜像里 go build；注释掉的不算
+  const script = await repo({
+    ".gitlab-ci.yml": "image: golang:1.15\nbuild:\n  image: golang:1.18\n  script:\n    - go env -w GOPROXY=https://goproxy.cn,direct\n    #- go build -o old old.go\n    - go build -o /app/pay main.go\n",
+  });
+  const fromCi = await readGoRecipe(script);
+  assert.equal(fromCi?.dockerfile, ".gitlab-ci.yml");
+  assert.deepEqual(fromCi?.targets, ["main.go"]);
+  assert.equal(fromCi?.goVersion, "1.18");
+  // chain、yb_pay：前面一行 cd rpc，再 go build chain.go
+  const sub = await repo({ ".gitlab-ci.yml": "build:\n  image: golang:1.20\n  script:\n    - cd ${CI_PROJECT_DIR}\n    - cd rpc\n    - go build -o cmd/chain chain.go\n    - cd /app/x && tar czf a.tgz deploy\nother:\n  script:\n    - go build ./...\n" });
+  assert.deepEqual((await readGoRecipe(sub))?.targets, ["rpc/chain.go", "./..."]);
+  // 同一行 cd 再编：说不清
+  const cd = await repo({ ".gitlab-ci.yml": "b:\n  script:\n    - cd cmd && go build -o x .\n" });
+  assert.match((await readGoRecipe(cd))?.unsupported ?? "", /cd/);
 });
