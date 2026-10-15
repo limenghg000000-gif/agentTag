@@ -4300,6 +4300,30 @@ test("让开合并请求却没调 code_open_pr：编了编号、说开好了、�
   assert.equal(noWrite("已经帮你开好了 !354", new Set()), madeUpRequestAnswer(["!354"]));
 });
 
+test("能合并时：「把 !354 合了」「直接合了吧」也算让动手，问合没合的不算；一个都没调就说合好了的打回，叫它用 code_merge", () => {
+  for (const ask of ["把 !354 合了", "直接合了吧", "帮我合并一下", "这个合并吧", "麻烦合并掉", "把刚才这个pr修复合并到uat里"]) {
+    assert.equal(asksToOpenRequest(ask), true, ask);
+  }
+  for (const ask of ["!354 合了吗", "帮我合了没有", "把 !354 合了？", "麻烦配合一下查日志", "这样适合吧", "整合一下这几条"]) {
+    assert.equal(asksToOpenRequest(ask), false, ask);
+  }
+  const known = "[赵作武] 把刚才这个pr修复合并到uat里\n已从 uat 拉出新分支 fix/jd_uat，把 !353 的改动搬过去，开了合并请求 !354（fix/jd_uat → uat）";
+  const review = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true, canMerge: true });
+  assert.equal(review("!354 已合并到 uat", new Set()), openRequestAnswer([], [], true));
+  assert.equal(review("好的，帮你合好了", new Set(["code_requests"])), openRequestAnswer([], [], true));
+  assert.match(openRequestAnswer([], [], true), /^（系统检查）你这次没有调用 code_open_pr 和 code_merge，这个合并请求没有开出来，也没有合并。/);
+  assert.match(openRequestAnswer([], [], true), /用 code_merge 填编号合掉；它只合机器人自己开的、开到没保护的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了/);
+  assert.doesNotMatch(openRequestAnswer([], []), /code_merge/);
+  // 调了 code_merge：合好了、被拒了都照它说的放行
+  assert.equal(review("已合并合并请求 !354，改动进了 uat 分支", new Set(["code_merge"])), undefined);
+  assert.equal(review("!354 要合到的 master 是受保护的分支，要人审过再点", new Set(["code_merge"])), undefined);
+  // 说的是以前合过的不算
+  assert.equal(review("!353 之前已经合了，这次 !354 还开着，我这就去合", new Set(["code_requests"])), undefined);
+  // 平台不能合并（没有 code_merge）：说合好了不按这条打回
+  const noMerge = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true });
+  assert.equal(noMerge("!354 已合并到 uat", new Set()), undefined);
+});
+
 /** 2026-10-15 测试群：赵作武在话题里说「把这个pr合并到uat分之吧」，机器人第一轮没调工具就说开了 !354（编的），打回时叫它先搜代码，它去搜了云发单、列分支，绕了一圈 */
 function openRequestSetup(results: ChatResult[]) {
   const { model, requests } = fakeModel(() => results.shift()!);

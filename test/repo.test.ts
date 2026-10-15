@@ -8,6 +8,8 @@ import {
   type CommitQuery,
   type CommitSearch,
   CodeWorkspaces,
+  type MergeCheck,
+  type MergeResult,
   type RequestDetail,
   type RequestInfo,
   type RequestQuery,
@@ -1426,4 +1428,189 @@ test("不能借仓库里的符号链接读写 .git；状态文件里不对的分
     assert.equal(again.pullRequest, undefined);
     assert.deepEqual(again.earlier, []);
   }
+});
+
+test("GitLab 合并前核对：读合并请求、机器人自己的账号（查一次记下）、要合到的分支受不受保护", async () => {
+  const calls: string[] = [];
+  const mr = (extra: object) => ({
+    iid: 354,
+    title: "fix(jd): 3.jd.hk",
+    web_url: "https://lab.corp/golang/appservice/-/merge_requests/354",
+    state: "opened",
+    source_branch: "fix/jd_uat",
+    target_branch: "uat",
+    author: { name: "agent-boot", username: "agent-boot" },
+    sha: "c".repeat(40),
+    source_project_id: 5,
+    target_project_id: 5,
+    ...extra,
+  });
+  const responses: Response[] = [
+    new Response(JSON.stringify(mr({})), { status: 200 }),
+    new Response("{}", { status: 401 }),
+    new Response(JSON.stringify(mr({})), { status: 200 }),
+    new Response(JSON.stringify({ username: "agent-boot" }), { status: 200 }),
+    new Response(JSON.stringify({ name: "uat", protected: false, default: false }), { status: 200 }),
+    new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9 })), { status: 200 }),
+    new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false }), { status: 200 }),
+    new Response(JSON.stringify(mr({ target_branch: "gone" })), { status: 200 }),
+    new Response("{}", { status: 404 }),
+  ];
+  const fakeFetch = (async (url: string) => {
+    calls.push(url);
+    return responses.shift()!;
+  }) as unknown as typeof fetch;
+  const host = createGitLabHost("https://lab.corp", "glpat-x", fakeFetch);
+  await assert.rejects(host.mergeCheck!("golang/appservice", 354), /查不到机器人自己的 GitLab 账号（HTTP 401），先不合并/);
+  const uat = await host.mergeCheck!("golang/appservice", 354);
+  assert.deepEqual(
+    [uat.state, uat.source, uat.target, uat.sha, uat.authorUsername, uat.botUsername, uat.fromFork, uat.targetProtected, uat.targetIsDefault],
+    ["opened", "fix/jd_uat", "uat", "c".repeat(40), "agent-boot", "agent-boot", undefined, false, false],
+  );
+  // 账号查到了就记下，不再查
+  const release = await host.mergeCheck!("golang/appservice", 354);
+  assert.deepEqual([release.authorUsername, release.botUsername, release.fromFork, release.targetProtected], ["zhangsan", "agent-boot", true, true]);
+  await assert.rejects(host.mergeCheck!("golang/appservice", 354), /!354 要合到的 gone 分支不存在了/);
+  assert.deepEqual(calls, [
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
+    "https://lab.corp/api/v4/user",
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
+    "https://lab.corp/api/v4/user",
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/branches/uat",
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/branches/release%2F1.0",
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
+    "https://lab.corp/api/v4/projects/golang%2Fappservice/repository/branches/gone",
+  ]);
+});
+
+test("GitLab 合并：等它算完能不能合再合，带上核对过的提交；要等流水线的设成自动合并，有冲突的不合", async () => {
+  const calls: { url: string; method: string; body?: unknown }[] = [];
+  const url = "https://lab.corp/golang/appservice/-/merge_requests/354";
+  const responses: Response[] = [];
+  const status = (s: string) => new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, detailed_merge_status: s }), { status: 200 });
+  const fakeFetch = (async (u: string, init?: RequestInit) => {
+    calls.push({ url: u, method: init?.method ?? "GET", ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    return responses.shift()!;
+  }) as unknown as typeof fetch;
+  const naps: number[] = [];
+  const host = createGitLabHost("https://lab.corp", "glpat-x", fakeFetch, async (ms) => {
+    naps.push(ms);
+  });
+  const sha = "c".repeat(40);
+  responses.push(status("checking"), status("mergeable"), new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }));
+  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha }), { state: "merged", url });
+  assert.deepEqual(naps, [2000]);
+  assert.deepEqual(calls.at(-1), { url: "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354/merge", method: "PUT", body: { sha } });
+  // 老版本只有 merge_status
+  responses.push(
+    new Response(JSON.stringify({ iid: 354, state: "opened", merge_status: "can_be_merged" }), { status: 200 }),
+    new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }),
+  );
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha })).state, "merged");
+  responses.push(status("ci_must_pass"), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
+  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha }), { state: "auto", url });
+  assert.deepEqual(calls.at(-1)?.body, { sha, auto_merge: true, merge_when_pipeline_succeeds: true });
+  const before = calls.length;
+  responses.push(status("conflict"));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /^RepoError: !354 现在合不了：和要合到的分支有冲突，要先解决冲突/);
+  responses.push(status("draft_status"));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /还是草稿/);
+  // 合不了的没有去合
+  assert.ok(calls.slice(before).every((c) => c.method === "GET"));
+  responses.push(status("mergeable"), new Response(JSON.stringify({ message: "Branch cannot be merged" }), { status: 405 }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /GitLab 合并 !354 失败（HTTP 405）：GitLab 说现在不能合.*Branch cannot be merged/);
+  responses.push(status("mergeable"), new Response(JSON.stringify({ message: "SHA does not match HEAD of source branch" }), { status: 409 }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /HTTP 409）：源分支刚有新的提交，和核对过的不一样，没合/);
+  responses.push(status("mergeable"), new Response("{}", { status: 403 }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /HTTP 403）：机器人的账号没有权限合到这个分支/);
+  // 一直在算：看够次数就去合，由 GitLab 决定
+  naps.length = 0;
+  responses.push(...Array.from({ length: 6 }, () => status("checking")), new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }));
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha })).state, "merged");
+  assert.equal(naps.length, 5);
+});
+
+test("合并合并请求：只合机器人自己开的、开到没保护的分支的；受保护的、默认分支、别人开的、fork 的、关掉的不合", async () => {
+  const sha = "c".repeat(40);
+  const base: MergeCheck = {
+    number: 354,
+    title: "fix(jd): 3.jd.hk",
+    url: "https://example.com/pr/354",
+    state: "opened",
+    source: "fix/jd_uat",
+    target: "uat",
+    author: "agent-boot",
+    authorUsername: "agent-boot",
+    botUsername: "Agent-Boot",
+    sha,
+    targetProtected: false,
+    targetIsDefault: false,
+  };
+  let check = base;
+  const merged: { number: number; sha: string }[] = [];
+  let result: MergeResult = { state: "merged", url: "https://example.com/pr/354" };
+  const { host } = fakeHost();
+  Object.assign(host, {
+    mergeCheck: async () => check,
+    mergeRequest: async (_repo: string, number: number, options: { sha: string }) => {
+      merged.push({ number, ...options });
+      return result;
+    },
+  });
+  const ws = await workspaces(host).open("om_m1", "acme/demo");
+  const out = await ws.mergeRequest(354);
+  assert.equal(out.text, "已合并合并请求 !354「fix(jd): 3.jd.hk」（fix/jd_uat → uat），改动进了 uat 分支：https://example.com/pr/354");
+  assert.deepEqual(out.facts.map(({ at: _, ...fact }) => fact), [
+    { repo: "acme/demo", branch: "fix/jd_uat" },
+    { repo: "acme/demo", branch: "uat" },
+  ]);
+  assert.deepEqual(merged, [{ number: 354, sha }]);
+  result = { state: "auto", url: "https://example.com/pr/354" };
+  assert.match((await ws.mergeRequest(354)).text, /^!354「fix\(jd\): 3.jd.hk」（fix\/jd_uat → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
+  check = { ...base, state: "merged" };
+  assert.equal((await ws.mergeRequest(354)).text, "!354「fix(jd): 3.jd.hk」（fix/jd_uat → uat）已经合并过了：https://example.com/pr/354");
+  merged.length = 0;
+  for (const [bad, message] of [
+    [{ targetProtected: true, target: "master" }, /^RepoError: !354 要合到的 master 是受保护的分支，合并要人审过再点，机器人不合/],
+    [{ targetIsDefault: true, target: "main" }, /^RepoError: !354 要合到的 main 是仓库的默认分支，合并要人审过再点/],
+    [{ author: "张三", authorUsername: "zhangsan" }, /^RepoError: !354 是 张三 开的，机器人只合并自己开的合并请求/],
+    [{ authorUsername: undefined }, /机器人只合并自己开的合并请求/],
+    [{ fromFork: true }, /是从别的项目（fork）提过来的，机器人不合/],
+    [{ state: "closed" }, /!354 已经关掉了（没合并），合不了/],
+  ] as const) {
+    check = { ...base, ...bad };
+    await assert.rejects(ws.mergeRequest(354), message, JSON.stringify(bad));
+  }
+  assert.deepEqual(merged, []);
+  // 平台不支持合并
+  const plain = await workspaces(fakeHost().host).open("om_m2", "acme/demo");
+  await assert.rejects(plain.mergeRequest(354), /Fake 上机器人还不能合并合并请求，请人来点/);
+});
+
+test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {
+  const { host } = fakeHost();
+  const plainTools = createCodeTools({ workspaces: workspaces(host), threadKey: "om_m3", botName: () => "飞书 CLI" }).map((t) => t.spec.name);
+  assert.ok(!plainTools.includes("code_merge"));
+  assert.match(
+    createCodeTools({ workspaces: workspaces(host), threadKey: "om_m3", botName: () => "飞书 CLI" }).find((t) => t.spec.name === "code_open_pr")!.spec.description,
+    /机器人不会合并（「合并到 uat」就是开一个到 uat 的合并请求，合并要人来点）/,
+  );
+  const asked: number[] = [];
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number) => {
+      asked.push(number);
+      throw new RepoError(`没有 !${number} 这个合并请求`);
+    },
+    mergeRequest: async () => ({ state: "merged", url: "" }),
+  });
+  const tools = Object.fromEntries(createCodeTools({ workspaces: workspaces(host), threadKey: "om_m4", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  assert.ok(tools.code_merge.writes);
+  assert.match(tools.code_open_pr.spec.description, /群成员要合并（「合并到 uat」）时，开好以后再用 code_merge 合/);
+  assert.equal(tools.code_merge.describe({ number: "!354" }), "合并合并请求 !354");
+  assert.equal(tools.code_merge.describe({}), "合并合并请求");
+  await assert.rejects(tools.code_merge.run({ number: "!354" }, { signal }), /没有 !354 这个合并请求/);
+  await assert.rejects(tools.code_merge.run({}, { signal }), /缺少 number 参数/);
+  await assert.rejects(tools.code_merge.run({ number: "abc" }, { signal }), /number 要填合并请求的编号/);
+  assert.deepEqual(asked, [354]);
 });
