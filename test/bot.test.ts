@@ -6,8 +6,12 @@ import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
   askedInChinese,
+  asksToMerge,
+  asksToOpenRequest,
   BLOCKED_OPS_ANSWER,
+  BLOCKED_RESTATE_ANSWER,
   blockedCodeAnswer,
+  blockedRequestAnswer,
   blockUnverifiedOps,
   type BotDeps,
   codeContent,
@@ -15,9 +19,17 @@ import {
   createCardActionHandler,
   createMessageHandler,
   DEFLECTED_ANSWER,
+  madeUpRequestAnswer,
+  madeUpRequestRefs,
+  mergedClaimAnswer,
+  openRequestAnswer,
   reviewCodeAnswer,
   reviewDeflectedAnswer,
   reviewOpsAnswer,
+  restatedAdditions,
+  restatedAnswerNote,
+  restatesEarlier,
+  reviewRestatedAnswer,
   THINK_IN_CHINESE,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
@@ -573,9 +585,9 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   assert.equal(leaked[0].secret, true, "告诉经验库有密钥，不会查 aiops");
   assert.ok(leaked[0].query.length <= 800, "查的文字照样截短");
 
-  // 这次的提问短：最近几轮都放得下
+  // 这次的提问短：最近几轮都放得下（换个话题问：同一个话题查成过一次就不再自动查）
   queries.length = 0;
-  await handle(message("怎么修？"));
+  await handle(message("怎么修？", { messageId: "om_2" }));
   const lines = queries[0].split("\n");
   assert.equal(lines[0], "怎么修？");
   assert.match(lines[1], /^上一轮的说明/);
@@ -3908,4 +3920,534 @@ test("功能卡片发不出去时改发文字版；按钮问的、带了别的�
   // 交给模型时提示词里是这次用得上的功能清单
   assert.match(requests[0]!.system, /功能清单：\n- \*\*问问题、查资料\*\*/);
   assert.doesNotMatch(requests[0]!.system, /查代码、改代码/);
+});
+
+/** 2026-10-14 测试群那次转链排查的回答（缩短了）：之后有人在同一个话题里要「用 eli5 方式总结给同事」 */
+const EARLIER_ANSWER = [
+  "结论（prod / product-service-api）：不是用户操作问题，我们把 3.jd.hk / 3.cn 这类短链原样传给京东联盟转链，京东返回 2001102 materialId链接无法识别；代码里没有对这两种短链做跳转解析，需要开发介入（把握：中）。",
+  "| 时间 | 环节 | 结果 |",
+  "| 09:01:48 | /v1/api/convertLink 入口 | is_fail=1 |",
+  "3.cn/37d-lO3w 这一条被 10 个不同用户反复尝试，全部 2001102，分布在 4 个 Pod 上。",
+  "代码核对（golang/appservice master @ 60b7756）：services/goods/jingdong.go:120 直接把用户链接当 materialId 传给京东。",
+].join("\n");
+const ELI5_ASK = "@飞书 CLI 用 用eli5方式总结 给 @徐杨 @陈飞龙 @祝传利 同事总结一下";
+const earlierTopic: ChatMessage[] = [
+  { role: "user", content: "[赵作武] 这个转链为什么失败 https://3.jd.hk/-103ydbW?rid=15644" },
+  { role: "assistant", content: EARLIER_ANSWER },
+];
+
+test("要整理话题里之前的回答（总结、讲给谁听、换个说法）才算整理：要重新查、看现在、问别的服务的不算", () => {
+  // @ 的人名、机器人名和 runTask 里一样传进来，不当成新的服务名
+  assert.equal(restatesEarlier(ELI5_ASK, earlierTopic, ["飞书 CLI", "徐杨", "陈飞龙", "祝传利"]), true);
+  assert.equal(restatesEarlier("用 eli5 讲给 @John 听", earlierTopic, ["John"]), true);
+  assert.equal(restatesEarlier("总结一下上面查到的情况", earlierTopic), true);
+  assert.equal(restatesEarlier("翻译成英文", earlierTopic), true);
+  assert.equal(restatesEarlier("用大白话讲给运营同事听", earlierTopic), true);
+  assert.equal(restatesEarlier("换个说法，讲简单点", earlierTopic), true);
+  assert.equal(restatesEarlier("重新整理一下，精简到三句话", earlierTopic), true);
+  assert.equal(restatesEarlier("tl;dr", earlierTopic), true);
+  assert.equal(restatesEarlier("用大白话讲一下，让运营也看得懂", earlierTopic), true);
+  // 提到的服务、错误码话题里之前就有：说的还是之前那个问题
+  assert.equal(restatesEarlier("把 product-service-api 这个问题总结给大家", earlierTopic), true);
+  assert.equal(restatesEarlier("4 个 Pod 的情况概括一下", earlierTopic), true);
+  // 话题里没有上文的，照常查
+  assert.equal(restatesEarlier(ELI5_ASK, []), false);
+  // 要重新查、看现在的情况
+  assert.equal(restatesEarlier("重新查一下再总结", earlierTopic), false);
+  assert.equal(restatesEarlier("现在还有没有 2001102，总结一下", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下最近 1 小时的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("核实一下再用大白话讲", earlierTopic), false);
+  // 别的带数的时间窗口也一样（「今天」「昨天」不算：「把今天查到的总结一下」是整理）
+  for (const window of ["过去 1 小时", "近三天", "这两天", "前 30 分钟", "2 小时内", "半小时以来"]) {
+    assert.equal(restatesEarlier(`总结一下${window}的报错`, earlierTopic), false, window);
+  }
+  assert.equal(restatesEarlier("把今天查到的总结一下", earlierTopic), true);
+  assert.equal(restatesEarlier("排查 gateway-api 的告警并总结原因", earlierTopic), false);
+  // 问的是话题里没出现过的服务、要读代码和配置
+  assert.equal(restatesEarlier("总结一下 gateway-api 的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("整理一下部署配置", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下这个函数做了什么", earlierTopic), false);
+  // 服务名不带连字符、话题里没出现过的英文词，也是问新东西
+  assert.equal(restatesEarlier("总结一下 appservice 的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("用大白话讲讲 gateway 那边", earlierTopic), false);
+  assert.equal(restatesEarlier("用 eli5 讲给 John 听", earlierTopic), false);
+  // 代码话题里之前说过，文档、链接整理时照样能读
+  assert.equal(restatesEarlier("把代码核对的部分讲给开发同事听", earlierTopic), true);
+  assert.equal(restatesEarlier("用大白话总结一下，写成飞书文档", earlierTopic), true);
+  // 整理完还要分析、查别的
+  assert.equal(restatesEarlier("总结一下上面，再分析 payment-service 的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下上面的结论，顺便看看现在的 Pod", earlierTopic), false);
+  assert.equal(restatesEarlier("把上面的结论讲给大家听，再查一下修了没有", earlierTopic), false);
+  // 整理完还要改东西：修代码、开 MR
+  assert.equal(restatesEarlier("总结一下上面的原因，然后修复它", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下，顺便修一下", earlierTopic), false);
+  assert.equal(restatesEarlier("精简一下结论，再改一下代码", earlierTopic), false);
+  assert.equal(restatesEarlier("用大白话总结一下，然后开个 MR", earlierTopic), false);
+  // 话题里聊过 uat，「合并到 uat」也是要再开合并请求
+  const uatTopic: ChatMessage[] = [...earlierTopic, { role: "assistant", content: "已开合并请求到 master；uat 还没有这个修复。" }];
+  assert.equal(restatesEarlier("总结一下改了什么，合并到 uat", uatTopic), false);
+  assert.equal(restatesEarlier("精简一下，也合到 uat", uatTopic), false);
+  assert.equal(restatesEarlier("把两段合到一起，精简一下", uatTopic), true);
+  assert.equal(restatesEarlier("把上面的排查结果总结一下，合并到飞书文档里", uatTopic), true);
+  assert.equal(restatesEarlier("把两段合并到同一个总结里", uatTopic), true);
+  // 分成几段说的：有一段是别的事（删、加、更新、跑测试……）就照常给工具，认不出的宁可照常查
+  for (const ask of [
+    "总结一下上面的原因，然后删除这个文件",
+    "概括一下，再新增一个配置项",
+    "总结一下，顺便更新一下文档里的版本号",
+    "精简一下结论，然后跑一下测试",
+    "总结一下，然后用新的写法替换这个函数",
+    "用大白话讲一下，并且调整一下日志级别",
+  ]) {
+    assert.equal(restatesEarlier(ask, earlierTopic), false, ask);
+  }
+  // 每段都是整理、讲给谁、写成什么样、客气话的，还是整理
+  for (const ask of [
+    "总结一下修复后的结果",
+    "解释一下上面的结论",
+    "summarize the above for the team",
+    "用大白话讲给 SRE 同事听",
+    "整理成 JSON",
+    "辛苦了，用大白话总结一下，发给运营",
+    "总结一下，控制在三句话以内，让老板看得懂",
+    "把 services/goods/jingdong.go 那段讲给开发同事听",
+  ]) {
+    assert.equal(restatesEarlier(ask, earlierTopic), true, ask);
+  }
+  assert.equal(restatesEarlier("总结一下上面的原因，然后重构代码", earlierTopic), false);
+  assert.equal(restatesEarlier("概括一下，顺便优化一下", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下，然后优化代码", earlierTopic), false);
+  assert.equal(restatesEarlier("把上面的优化建议总结一下", earlierTopic), true);
+  assert.equal(restatesEarlier("精简一下，然后合并成一段话", earlierTopic), true);
+  // 说的是之前的修复方案、换个写法，还是整理
+  assert.equal(restatesEarlier("把上面的修复方案总结一下", earlierTopic), true);
+  assert.equal(restatesEarlier("改写成大白话，讲给运营听", earlierTopic), true);
+  assert.equal(restatesEarlier("讲给负责修复的同事听", earlierTopic), true);
+  // 不是整理
+  assert.equal(restatesEarlier("这个怎么修", earlierTopic), false);
+});
+
+test("判断是不是整理时，超长的空白不会让正则卡住", () => {
+  const spaces = " ".repeat(100_000);
+  for (const question of [`总结一下上面 最近1${spaces}x`, `总结一下上面，再${spaces}`, `总结一下 2${spaces}x`]) {
+    const started = performance.now();
+    restatesEarlier(question, earlierTopic);
+    assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
+  }
+});
+
+test("整理之前内容时检查回答：代码位置和线上数据要是话题里之前写过的、或者这次读到的，添了新的就列出来", () => {
+  const known = `${ELI5_ASK}\n${EARLIER_ANSWER}`;
+  const scope = { code: true, ops: true };
+  assert.deepEqual(restatedAdditions("09:01:48 那次 4 个 Pod 都一样，问题在 services/goods/jingdong.go:120（master @ 60b7756）", known, scope), []);
+  assert.deepEqual(
+    restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12，还有 services/goods/jingdong.go:121", known, scope),
+    ["services/goods/taobao.go:12", "services/goods/jingdong.go:121", "09:30:00"],
+  );
+  // 整个数对得上才算：之前写的是 15%、14 个 Pod，回答写 5%、4 个 Pod 不算写过；时间的小时带不带 0 都一样
+  const counts = "错误率 15%，涉及 14 个 Pod，查到 3.5 次重试，从 09:01:48 开始";
+  assert.deepEqual(restatedAdditions("错误率 5%，涉及 4 个 Pod，重试 5 次", counts, scope), ["5%", "4 个 Pod", "5 次"]);
+  assert.deepEqual(restatedAdditions("错误率 15%，涉及 14 个 Pod，从 9:01:48 开始", counts, scope), []);
+  assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **1/1** 就绪", scope), []);
+  assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **11/12** 就绪", scope), ["就绪 1/1"]);
+  // 之前的比值也要是就绪数：「请求成功 1/1」不能给编出来的「Ready: 1/1」作证
+  assert.deepEqual(restatedAdditions("Ready: 1/1", "请求成功 1/1", scope), ["Ready: 1/1"]);
+  // 一长段定位结果里带着个之前写过的比值：整段不算写过，里面的 Pod 名、时间、次数也一个个对
+  assert.deepEqual(restatedAdditions("命名空间 prod 1/1、gateway-api-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署", "副本 1/1 就绪", scope), [
+    "命名空间 prod 1/1、gateway-api-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署",
+    "gateway-api-6978f9454f-zzzzz",
+    "15:39:20",
+    "999 次",
+  ]);
+  // 没配代码工具、没配 MCP 服务时不看那一类
+  assert.deepEqual(restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12", known, { code: false, ops: false }), []);
+  // 这次读到的文档、网页里有的也算
+  const review = reviewRestatedAnswer(() => `${known}\n文档里写着 12:00:00 发版`, scope);
+  assert.equal(review("12:00:00 发版以后就好了"), undefined);
+  assert.equal(review("13:00:00 发版以后就好了"), restatedAnswerNote(["13:00:00"]));
+  assert.match(restatedAnswerNote(["13:00:00"]), /这次是整理话题里之前的内容，可回答里这些在话题里之前的消息中都找不到：13:00:00。/);
+  assert.match(restatedAnswerNote(Array.from({ length: 12 }, (_, i) => `${10 + i}:00:00`)), /19:00:00 等。/);
+});
+
+/** 转链排查那次的配置：aiops、代码工具、经验库都有 */
+function restateSetup(results: ChatResult[], history: ChatMessage[] = earlierTopic, extra: { taskTools?: Tool[]; knowledgeTools?: Tool[] } = {}) {
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const lookups: string[] = [];
+  const queryLogs = namedTool("aiops_query_logs");
+  const setupResult = setup({
+    model,
+    taskTools: () => [namedTool("code_search"), namedTool("code_read_file"), namedTool("feishu_doc_read"), ...(extra.taskTools ?? [])],
+    codeRepos: ["golang/appservice"],
+    mcp: {
+      names: ["aiops"],
+      tools: () => [queryLogs, { ...namedTool("aiops_playbook"), instructionsOnly: true }],
+      prompt: (names) => (names.some((name) => name.startsWith("aiops_")) ? "## aiops（MCP 服务）\n问题属于哪份剧本的场景，第一步先读剧本" : undefined),
+    },
+    knowledge: {
+      async lookup(query: string) {
+        lookups.push(query);
+        return { text: "经验 K1 [排查经验]：京东短链转链失败", ids: ["K1"] };
+      },
+      tools: () => extra.knowledgeTools ?? [namedTool("knowledge_search"), namedTool("knowledge_get"), namedTool("knowledge_propose")],
+    },
+    context: fakeContext({ history, source: "feishu" }).source,
+  });
+  return { ...setupResult, requests, lookups };
+}
+
+test("话题里查出答案以后要「用 eli5 方式总结给同事」：不查经验库、不给查询的工具，直接按之前的回答写，之前回答里的数据和代码位置照常发出", async () => {
+  const summary =
+    "用大白话说：用户发来的是京东的短链接，我们没先把它展开就交给京东，京东看不懂，回了 2001102。09:01:48 那次就是这样，4 个 Pod 上都一样，不是哪台机器坏了。" +
+    "问题在 services/goods/jingdong.go:120（golang/appservice master @ 60b7756），要开发加上短链展开。";
+  const { requests, lookups, sent, handle, updates } = restateSetup([{ text: summary, finish: "stop" }]);
+
+  await handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+
+  assert.deepEqual(lookups, []);
+  assert.ok(!updates.some((u) => cardText(u.card).includes("查经验库")));
+  assert.equal(requests.length, 1);
+  // 只留读文档和起草经验：查线上、查代码、查经验库的都不给
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "knowledge_propose"]);
+  assert.match(requests[0].system, /这次是让你整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不是重新查/);
+  assert.match(requests[0].system, /eli5 是讲给五岁小孩也听得懂的大白话/);
+  assert.doesNotMatch(requests[0].system, /话题里之前的回答不算查证|## aiops|这次提问可能相关的经验|没查成/);
+  assert.deepEqual(markdowns(sent), [summary]);
+});
+
+test("整理之前的回答时添了之前没有的数据、代码位置：打回一次让模型只用写过的，重做还添的不发出去", async () => {
+  const made = "09:30:00 又失败了一次，问题在 services/goods/taobao.go:12";
+  const clean = "京东看不懂我们传过去的短链接，09:01:48 那次就是这样";
+  const fixed = restateSetup([
+    { text: made, finish: "stop" },
+    { text: clean, finish: "stop" },
+  ]);
+  await fixed.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(fixed.requests.length, 2);
+  assert.deepEqual(fixed.requests[1].messages.at(-1), { role: "user", content: restatedAnswerNote(["services/goods/taobao.go:12", "09:30:00"]) });
+  assert.deepEqual(markdowns(fixed.sent), [clean]);
+
+  // 重做以后还编了线上的时间、代码位置，或者编了条数、百分比这类（不带「把握」也算）：不发出去
+  for (const added of ["09:30:00 又失败了一次", "问题在 services/goods/taobao.go:12", "一共影响了 5 个 Pod，失败率 80%"]) {
+    const again = restateSetup([
+      { text: added, finish: "stop" },
+      { text: added, finish: "stop" },
+    ]);
+    await again.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+    assert.equal(again.requests.length, 2, added);
+    assert.deepEqual(markdowns(again.sent), [BLOCKED_RESTATE_ANSWER], added);
+  }
+});
+
+test("整理成飞书文档、起草经验时，写进去的内容也只能用之前写过的：编了数据、代码位置的不执行，改好再调才写", async () => {
+  const written: string[] = [];
+  const docCreate: Tool = {
+    ...namedTool("feishu_doc_create"),
+    writes: true,
+    run: async (args) => {
+      written.push(String(args.content));
+      return "已新建文档「转链失败总结」，写入 3 块内容。";
+    },
+  };
+  const made = "09:30:00 又失败了一次，一共 5 个 Pod，问题在 services/goods/taobao.go:12";
+  const clean = "京东看不懂我们传过去的短链接，09:01:48 那次就是这样，4 个 Pod 上都一样，问题在 services/goods/jingdong.go:120";
+  const createCall = (id: string, content: string) => ({ id, name: "feishu_doc_create", arguments: JSON.stringify({ title: "转链失败总结", content }) });
+  const doc = restateSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [createCall("c1", made)] },
+      { text: "", finish: "tool_calls", toolCalls: [createCall("c2", clean)] },
+      { text: "写好了，文档「转链失败总结」", finish: "stop" },
+    ],
+    earlierTopic,
+    { taskTools: [docCreate] },
+  );
+  await doc.handle(message("用大白话总结一下，写成飞书文档", { rootId: "om_root", threadId: "omt_1" }));
+  assert.ok(doc.requests[0].tools?.some((t) => t.name === "feishu_doc_create"));
+  assert.deepEqual(written, [clean]);
+  const rejected = doc.requests[1].messages.find((m) => m.role === "tool")?.content ?? "";
+  for (const added of ["services/goods/taobao.go:12", "09:30:00", "5 个 Pod"]) {
+    assert.ok(rejected.includes(added), rejected);
+  }
+  assert.ok(rejected.includes("这次是整理话题里之前的内容，可要写进去的内容里这些在话题里之前的消息中都找不到"), rejected);
+  assert.deepEqual(markdowns(doc.sent), ["写好了，文档「转链失败总结」"]);
+
+  // 起草经验（发确认卡片）也一样
+  const drafts: string[] = [];
+  const propose: Tool = {
+    ...namedTool("knowledge_propose"),
+    run: async (args) => {
+      drafts.push(String(args.conclusion));
+      return "已发确认卡片";
+    },
+  };
+  const draftCall = (id: string, conclusion: string) => ({
+    id,
+    name: "knowledge_propose",
+    arguments: JSON.stringify({ category: "incident", title: "京东短链转链失败", question: "转链失败", conclusion }),
+  });
+  const knowledge = restateSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [draftCall("k1", made)] },
+      { text: "", finish: "tool_calls", toolCalls: [draftCall("k2", clean)] },
+      { text: "起草好了，请看卡片确认", finish: "stop" },
+    ],
+    earlierTopic,
+    { knowledgeTools: [propose] },
+  );
+  await knowledge.handle(message("把上面的结论用大白话总结成经验", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(drafts, [clean]);
+});
+
+test("整理时只读提问和话题里给过的链接：模型自己找的网页不读，读进来的内容也就不会被当成依据", async () => {
+  const fetched: string[] = [];
+  const fetchUrl: Tool = {
+    ...namedTool("fetch_url"),
+    run: async (args) => {
+      fetched.push(String(args.url));
+      return "网页正文";
+    },
+  };
+  const read = (id: string, url: string) => ({ id, name: "fetch_url", arguments: JSON.stringify({ url }) });
+  const { requests, handle } = restateSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [read("c1", "https://example.com/other")] },
+      { text: "", finish: "tool_calls", toolCalls: [read("c2", "https://3.jd.hk/-103ydbW?rid=15644")] },
+      { text: "翻译好了", finish: "stop" },
+    ],
+    earlierTopic,
+    { taskTools: [fetchUrl] },
+  );
+  await handle(message("翻译成英文", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(fetched, ["https://3.jd.hk/-103ydbW?rid=15644"]);
+  const rejected = requests[1].messages.find((m) => m.role === "tool")?.content ?? "";
+  assert.match(rejected, /只能读这次的提问和话题里给过的文档、网页链接/);
+});
+
+test("整理时群记忆太多没列全的，照样能用 memory_search 查约定", async () => {
+  const { requests, handle } = restateSetup([{ text: "好", finish: "stop" }], earlierTopic, { taskTools: [namedTool("memory_search")] });
+  await handle(message("按我们之前约定的格式总结一下", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "memory_search", "knowledge_propose"]);
+});
+
+test("同一个话题里说要重新查、看现在的情况：照常查经验库、给查询的工具", async () => {
+  const { requests, lookups, handle } = restateSetup([{ text: "要查哪个时间段？", finish: "stop" }]);
+  await handle(message("重新查一下现在还有没有 2001102", { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1);
+  const names = requests[0].tools?.map((t) => t.name) ?? [];
+  assert.ok(names.includes("aiops_query_logs") && names.includes("code_search") && names.includes("knowledge_search"), names.join(","));
+  assert.doesNotMatch(requests[0].system, /这次是让你整理话题里已经有的内容/);
+});
+
+test("同一个话题查成过经验库：后面的追问不再自动查，提示词说没查、要查时模型自己查；换个话题照常查", async () => {
+  const { requests, lookups, handle, updates } = restateSetup([
+    { text: "要查哪个时间段？", finish: "stop" },
+    { text: "好", finish: "stop" },
+    { text: "好", finish: "stop" },
+  ]);
+  await handle(message("重新查一下现在还有没有 2001102", { messageId: "om_2", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1);
+  const before = updates.length;
+  await handle(message("最近一小时的", { messageId: "om_3", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1, "同一个话题不再查");
+  assert.ok(!updates.slice(before).some((u) => cardText(u.card).includes("查经验库")));
+  assert.match(requests[1].system, /这是同一个话题里的追问，回答前没再自动查经验库/);
+  assert.match(requests[1].system, /需要参考以前的经验时自己查：团队经验库用 knowledge_search。/);
+  assert.doesNotMatch(requests[1].system, /没查到相近的经验|没查成|这次提问可能相关的经验/);
+  assert.ok(requests[1].tools?.some((t) => t.name === "knowledge_search"));
+
+  await handle(message("order-api 下单报 code=8 是怎么回事", { messageId: "om_9" }));
+  assert.equal(lookups.length, 2, "别的话题照常查");
+});
+
+test("话题里上次没查成经验库（超时、出错、只查成一边）：下次追问补查，查成以后才不再查", async () => {
+  const lookups: string[] = [];
+  const answers: Array<() => Promise<{ text: string; ids: string[]; missed?: string[] } | undefined>> = [
+    async () => {
+      throw new Error("飞书接口限流");
+    },
+    async () => ({ text: "", ids: [], missed: ["团队经验库"] }),
+    async () => ({ text: "", ids: [] }),
+  ];
+  const knowledge = {
+    async lookup(query: string) {
+      lookups.push(query);
+      return answers.shift()!();
+    },
+    tools: () => [],
+  };
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history: ChatMessage[] = [{ role: "user", content: "[张三] gateway-api 报 code=8" }];
+  const { handle } = setup({ model, knowledge, knowledgeLookupMs: 1000, context: fakeContext({ history, source: "feishu" }).source });
+  for (const [i, ask] of ["code=8 怎么回事", "是哪个服务", "什么时候开始的", "怎么修"].entries()) {
+    await handle(message(ask, { messageId: `om_${2 + i}`, rootId: "om_root", threadId: "omt_1" }));
+  }
+  assert.equal(lookups.length, 3, "前两次没查成，第三次查成了，第四次不再查");
+  assert.match(requests[3].system, /这是同一个话题里的追问，回答前没再自动查经验库/);
+});
+
+test("话题查成过经验库，追问里明说要查经验库、知识库：照样先自动查一次；说「飞书知识库」的是飞书文档，不算", async () => {
+  const { requests, lookups, handle } = restateSetup(Array.from({ length: 5 }, () => ({ text: "好", finish: "stop" as const })));
+  await handle(message("重新查一下现在还有没有 2001102", { messageId: "om_2", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1);
+  for (const [i, ask] of ["再查一下经验库有没有类似的", "知识库里有没有这个问题的记录"].entries()) {
+    await handle(message(ask, { messageId: `om_${3 + i}`, rootId: "om_root", threadId: "omt_1" }));
+    assert.equal(lookups.length, 2 + i, ask);
+    assert.match(requests[1 + i].system, /这次提问可能相关的经验（回答前自动查到的）/, ask);
+  }
+  await handle(message("飞书知识库里有这个接口的文档吗", { messageId: "om_5", rootId: "om_root", threadId: "omt_1" }));
+  await handle(message("飞书 知识库里有没有部署文档", { messageId: "om_6", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 3);
+});
+
+test("点「接着查」按钮问的就算像整理，也照常先查", async () => {
+  const { requests, lookups, handle } = restateSetup([
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "好", finish: "stop" },
+  ]);
+  await handle(message("总结一下 3.jd.hk 的失败", { rootId: "om_root", threadId: "omt_1" }), { readOnly: true });
+  assert.equal(lookups.length, 1);
+  assert.ok(requests[0].tools?.some((t) => t.name === "aiops_query_logs"));
+});
+
+test("让把做好的修改开合并请求、合到 uat 才算要开：问合没合的不算", () => {
+  for (const ask of ["@飞书 CLI 把这个pr合并到uat分之吧", "也合到 uat", "提个PR", "修好以后开个 MR", "把京东短链的修复合并到 uat 分支", "帮我建一个合并请求"]) {
+    assert.equal(asksToOpenRequest(ask), true, ask);
+  }
+  for (const ask of ["这个修复合到 uat 了吗", "有没有合并到 uat", "合到 uat 没有", "!353 合到 uat 了", "这个服务怎么启动", "把两段合到一起", "开 prod 的日志看看"]) {
+    assert.equal(asksToOpenRequest(ask), false, ask);
+  }
+});
+
+test("判断是不是让开合并请求、回答是不是说开好了时，超长的空白不会让正则卡住", () => {
+  const blank = "\n".repeat(100_000);
+  const review = reviewCodeAnswer("提个 PR", ["golang/appservice"], () => false, () => false, { known: () => "", canOpen: true });
+  for (const run of [() => asksToOpenRequest(`帮我开${blank}x`), () => review(`已经${blank}x`, new Set(["code_search"]))]) {
+    const started = performance.now();
+    run();
+    assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
+  }
+});
+
+test("回答里的合并请求编号要在提问、话题或这次的工具结果里出现过；代码里的 !1 不算编号", () => {
+  const known = "已开合并请求 !353（agenttag/20261014-a1b2c3 → master）：https://lab.corp/golang/appservice/-/merge_requests/353";
+  assert.deepEqual(madeUpRequestRefs("!353 还开着，已经从 uat 开了 !354：https://lab.corp/golang/appservice/-/merge_requests/355", known), ["!354", "!355"]);
+  assert.deepEqual(madeUpRequestRefs("就是 `!353` 那个", known), []);
+  assert.deepEqual(madeUpRequestRefs("写的是 `!354`", known), ["!354"]);
+  assert.deepEqual(madeUpRequestRefs("判断写成 `if (!1)`：\n```go\nreturn !0 && !2\n```", known), []);
+});
+
+test("让开合并请求却没调 code_open_pr：编了编号、说开好了、一个代码工具没调就答，打回时叫它直接去开，不叫它去搜代码", () => {
+  const ask = "把这个pr合并到uat分之吧";
+  const known = "[赵作武] 京东短链修一下\n已开合并请求 !353（agenttag/20261014-a1b2c3 → master）";
+  const requests = { known: () => known, canOpen: true };
+  const review = reviewCodeAnswer(ask, ["golang/appservice"], () => false, () => false, requests);
+  // 一个工具没调，编了 !354
+  assert.equal(review("已经帮你开好了到 uat 的合并请求 !354", new Set()), openRequestAnswer(["!354"], []));
+  assert.match(openRequestAnswer(["!354"], []), /^（系统检查）你这次没有调用 code_open_pr，回答里的 !354 在这次的工具结果、话题和提问里都找不到，是编出来的。/);
+  assert.doesNotMatch(openRequestAnswer(["!354"], []), /code_search 查清楚|code_read_file 查清楚/);
+  assert.match(openRequestAnswer([], []), /不用再搜代码、读代码去核对之前的结论/);
+  // 查了合并请求、搜了代码，没开就说开好了
+  assert.equal(review("到 uat 的合并请求已开好，等人审", new Set(["code_requests", "code_search"])), openRequestAnswer([], []));
+  // 一个工具没调、提到了仓库
+  assert.equal(review("golang/appservice 的 !353 我这就合到 uat", new Set()), openRequestAnswer([], []));
+  // 调了 code_open_pr：按它返回的写就放行；说的是之前开过的也放行
+  const opened = { known: () => `${known}\n已从 uat 拉出新分支 agenttag/20261014-a1b2c3-uat，开了合并请求 !355`, canOpen: true };
+  const after = reviewCodeAnswer(ask, ["golang/appservice"], () => false, () => false, opened);
+  assert.equal(after("已开合并请求 !355（agenttag/20261014-a1b2c3-uat → uat），合并要人来点", new Set(["code_requests", "code_open_pr"])), undefined);
+  // 开失败了照实说：不打回
+  assert.equal(review("开到 uat 时有冲突，之前开的 !353 不受影响", new Set(["code_open_pr"])), undefined);
+  // 不是让开合并请求的：编了编号照样打回，只叫它改编号
+  const plain = reviewCodeAnswer("京东短链修好了没", ["golang/appservice"], () => false, () => false, requests);
+  assert.equal(plain("修复在 !353 里，uat 上是 !354", new Set(["code_requests"])), madeUpRequestAnswer(["!354"]));
+  // 没有开合并请求的工具（不在写权限名单里）：照旧的检查，编号照样核对
+  const noWrite = reviewCodeAnswer(ask, ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: false });
+  assert.equal(noWrite("已经帮你开好了 !354", new Set()), madeUpRequestAnswer(["!354"]));
+});
+
+test("能合并时：「把 !354 合了」「直接合了吧」也算让动手，问合没合的不算；一个都没调就说合好了的打回，叫它用 code_merge", () => {
+  for (const ask of ["把 !354 合了", "直接合了吧", "帮我合并一下", "这个合并吧", "麻烦合并掉", "把刚才这个pr修复合并到uat里"]) {
+    assert.equal(asksToOpenRequest(ask), true, ask);
+  }
+  for (const ask of ["!354 合了吗", "帮我合了没有", "把 !354 合了？", "麻烦配合一下查日志", "这样适合吧", "整合一下这几条"]) {
+    assert.equal(asksToOpenRequest(ask), false, ask);
+  }
+  const known = "[赵作武] 把刚才这个pr修复合并到uat里\n已从 uat 拉出新分支 fix/jd_uat，把 !353 的改动搬过去，开了合并请求 !354（fix/jd_uat → uat）";
+  const review = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true, canMerge: true });
+  assert.equal(review("!354 已合并到 uat", new Set()), openRequestAnswer([], [], true));
+  assert.equal(review("好的，帮你合好了", new Set(["code_requests"])), openRequestAnswer([], [], true));
+  assert.match(openRequestAnswer([], [], true), /^（系统检查）你这次没有调用 code_open_pr 和 code_merge，这个合并请求没有开出来，也没有合并。/);
+  assert.match(openRequestAnswer([], [], true), /用 code_merge 填编号合掉；它只合机器人自己开的、开到允许开发者合并的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了/);
+  assert.doesNotMatch(openRequestAnswer([], []), /code_merge/);
+  // 开了合并请求、没调 code_merge 就说合好了
+  assert.equal(review("已开合并请求 !354，已经合进 uat 了", new Set(["code_open_pr"])), mergedClaimAnswer());
+  assert.match(mergedClaimAnswer(), /^（系统检查）你这次没有用 code_merge 合成（没调、调了出错，或者只设成了流水线通过后自动合并），回答里却说已经合好了/);
+  // 调了 code_merge 但没合成（出错、只设成了自动合并）：说合好了照样打回
+  const notMerged = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true, canMerge: true, merged: () => false });
+  assert.equal(notMerged("!354 已合并到 uat", new Set(["code_merge"])), mergedClaimAnswer());
+  assert.equal(notMerged("!354 已设成流水线通过后自动合并", new Set(["code_merge"])), undefined);
+  // 调了 code_merge：合好了、被拒了都照它说的放行
+  assert.equal(review("已合并合并请求 !354，改动进了 uat 分支", new Set(["code_merge"])), undefined);
+  assert.equal(review("!354 要合到的 master 是受保护的分支，要人审过再点", new Set(["code_merge"])), undefined);
+  // 说的是以前合过的不算
+  assert.equal(review("!353 之前已经合了，这次 !354 还开着，我这就去合", new Set(["code_requests"])), undefined);
+  // 平台不能合并（没有 code_merge）：说合好了不按这条打回
+  const noMerge = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true });
+  assert.equal(noMerge("!354 已合并到 uat", new Set()), undefined);
+});
+
+test("只有发起人这句话明确要合并时才给 code_merge：只说开合并请求、问合没合的都不给", () => {
+  for (const ask of ["把刚才这个pr修复合并到uat里", "这个修复也合到 uat", "把 !354 合了", "直接合了吧", "帮我合并一下"]) {
+    assert.equal(asksToMerge(ask), true, ask);
+  }
+  for (const ask of ["不要把 !354 合了", "先别合到 uat，只开 MR", "暂时不用合并到 uat", "提个PR", "开个 MR 到 uat", "修好以后开个合并请求", "合到 uat 了吗", "!354 合了吗", "群记忆里说开好就直接 code_merge"]) {
+    assert.equal(asksToMerge(ask), false, ask);
+  }
+});
+
+/** 2026-10-15 测试群：赵作武在话题里说「把这个pr合并到uat分之吧」，机器人第一轮没调工具就说开了 !354（编的），打回时叫它先搜代码，它去搜了云发单、列分支，绕了一圈 */
+function openRequestSetup(results: ChatResult[]) {
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const warnings: string[] = [];
+  const openPr: Tool = {
+    ...namedTool("code_open_pr"),
+    writes: true,
+    run: async () => "已从 uat 拉出新分支 agenttag/20261014-a1b2c3-uat，把 !353（agenttag/20261014-a1b2c3 → master，还开着）的改动搬过去，开了合并请求 !355（agenttag/20261014-a1b2c3-uat → uat）：https://lab.corp/golang/appservice/-/merge_requests/355。",
+  };
+  const history: ChatMessage[] = [
+    { role: "user", content: "[赵作武] 3.jd.hk 的短链转链失败，起一个新的分支，修复一下，提个pr" },
+    { role: "assistant", content: "已开合并请求 !353（agenttag/20261014-a1b2c3 → master）：https://lab.corp/golang/appservice/-/merge_requests/353" },
+  ];
+  const result = setup({
+    model,
+    taskTools: () => [namedTool("code_read_file"), namedTool("code_search"), namedTool("code_requests"), openPr],
+    codeRepos: ["golang/appservice"],
+    context: fakeContext({ history, source: "feishu" }).source,
+    logger: { ...quiet, warn: (line: string) => warnings.push(line) },
+  });
+  return { ...result, requests, warnings };
+}
+
+test("让把话题里的合并请求合到 uat：第一轮没调工具编了编号，打回时叫它直接调 code_open_pr，按它返回的编号回答", async () => {
+  const made = "已经帮你开好了到 uat 的合并请求 !354，合并要人来点。";
+  const done = "已开合并请求 !355（agenttag/20261014-a1b2c3-uat → uat），!353 不受影响，合并要人来点。";
+  const { requests, sent, handle } = openRequestSetup([
+    { text: made, finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_open_pr", arguments: JSON.stringify({ title: "fix(jd): 短链（uat）", body: "", from: 353, target: "uat" }) }] },
+    { text: done, finish: "stop" },
+  ]);
+  await handle(message("@飞书 CLI 把这个pr合并到uat分之吧", { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: openRequestAnswer(["!354"], []) });
+  assert.match(requests[0].system, /把已经做好的修改提合并请求、合到别的分支（「把这个修复提个 PR」「把这个 PR 合并到 uat」）是让你动手，不是重新排查/);
+  assert.deepEqual(markdowns(sent), [done]);
+});
+
+test("打回以后还是写了查不到的合并请求编号：不发出去", async () => {
+  const made = "已经帮你开好了到 uat 的合并请求 !354。";
+  const { sent, handle, warnings } = openRequestSetup([
+    { text: made, finish: "stop" },
+    { text: "uat 上的是 !356，合并要人来点。", finish: "stop" },
+  ]);
+  await handle(message("@飞书 CLI 把这个pr合并到uat分之吧", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(markdowns(sent), [blockedRequestAnswer(["!356"])]);
+  assert.match(warnings.join("\n"), /回答打回重做以后还是写了查不到的合并请求编号，没有发出 message=om_1：!356/);
 });

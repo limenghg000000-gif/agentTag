@@ -22,6 +22,7 @@ import { McpHub } from "./mcp.js";
 import type { AboutBot } from "./prompt.js";
 import { MemoryStore } from "./memory.js";
 import { RecentThreadStore } from "./recent-threads.js";
+import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { createCardKitApi } from "./stream-card.js";
 import { TaskRegistry } from "./tasks.js";
@@ -346,7 +347,13 @@ async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promis
     return undefined;
   }
   const host = code.host.kind === "gitlab" ? createGitLabHost(code.host.url, code.host.token) : createGitHubHost(code.host.token);
-  const workspaces = new CodeWorkspaces({ root: code.workspaceDir, host, repos: code.repos, branches: code.branches });
+  const workspaces = new CodeWorkspaces({
+    root: code.workspaceDir,
+    host,
+    repos: code.repos,
+    branches: code.branches,
+    ...(code.build ? { build: createBuildChecker(code.goproxy ? { goproxy: code.goproxy } : {}) } : {}),
+  });
   // 几天没用的话题工作目录，启动时和之后每天清一次
   const sweep = () => workspaces.sweep().catch((err) => console.error("清理代码工作目录失败", err));
   void sweep();

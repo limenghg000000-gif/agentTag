@@ -42,6 +42,10 @@ export interface Config {
     host: { kind: "gitlab"; url: string; token: string } | { kind: "github"; token: string };
     /** 拉代码的工作目录（每个话题一个子目录） */
     workspaceDir: string;
+    /** 推代码之前在服务器上编译检查（BUILD_CHECK，默认 on）：Go 用 go build，PHP 用 php -l；没装工具的跳过 */
+    build: boolean;
+    /** 编译时 go 下载依赖用的代理（BUILD_GOPROXY），不配用 goproxy.cn */
+    goproxy?: string;
   };
   /** 通过 MCP 接入的服务（MCP_SERVERS），没配时为空数组 */
   mcp: McpServerConfig[];
@@ -64,6 +68,8 @@ export interface Config {
   recentThreadsDir: string;
   /** 产品功能说明的链接（ANNOUNCE_LINK）：通知卡片上的按钮用，有人问「你能做什么」时回答里也附上。更新通知关掉时也有 */
   featuresLink?: string;
+  /** 文档中心的链接（DOCS_LINK）：通知卡片上「文档中心」按钮用。更新通知关掉时也有 */
+  docsLink?: string;
   /** 更新通知（ANNOUNCE，默认 on）：部署新版本后把产品更新说明 RELEASE_NOTES.md 里新版本的说明发到群里。关掉时为空 */
   announce?: {
     /** 发到这些群：ANNOUNCE_CHAT_IDS，不填就是白名单里的所有群 */
@@ -72,6 +78,8 @@ export interface Config {
     chatIdsFrom: "ANNOUNCE_CHAT_IDS" | "FEISHU_ALLOWED_CHAT_IDS";
     /** 通知卡片上「产品功能说明」按钮的链接（ANNOUNCE_LINK） */
     link?: string;
+    /** 通知卡片上「文档中心」按钮的链接（DOCS_LINK） */
+    docsLink?: string;
     /** 每个群发到哪一版记在这个文件里 */
     stateFile: string;
     /** 发到群里的产品更新说明 */
@@ -266,8 +274,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const allowedChatIds = new Set((env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
-  const featuresLink = loadFeaturesLink(env);
-  const announce = loadAnnounceConfig(env, allowedChatIds, featuresLink);
+  const featuresLink = loadLink(env, "ANNOUNCE_LINK");
+  const docsLink = loadLink(env, "DOCS_LINK");
+  const announce = loadAnnounceConfig(env, allowedChatIds, featuresLink, docsLink);
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
@@ -307,13 +316,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),
     ...(featuresLink ? { featuresLink } : {}),
+    ...(docsLink ? { docsLink } : {}),
     ...(announce ? { announce } : {}),
   };
 }
 
-/** ANNOUNCE_LINK：产品功能说明的链接，要是 https 地址 */
-function loadFeaturesLink(env: NodeJS.ProcessEnv): string | undefined {
-  const link = env.ANNOUNCE_LINK?.trim();
+/** ANNOUNCE_LINK（产品功能说明）、DOCS_LINK（文档中心）：要是 https 地址 */
+function loadLink(env: NodeJS.ProcessEnv, name: "ANNOUNCE_LINK" | "DOCS_LINK"): string | undefined {
+  const link = env[name]?.trim();
   if (!link) {
     return undefined;
   }
@@ -324,13 +334,18 @@ function loadFeaturesLink(env: NodeJS.ProcessEnv): string | undefined {
     url = undefined;
   }
   if (url?.protocol !== "https:") {
-    throw new Error(`ANNOUNCE_LINK 要写成 https://… 这样的完整地址，当前为 ${link}`);
+    throw new Error(`${name} 要写成 https://… 这样的完整地址，当前为 ${link}`);
   }
   return link;
 }
 
 /** ANNOUNCE=off 关掉；ANNOUNCE_CHAT_IDS 只能是白名单里的群 */
-function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<string>, link: string | undefined): Config["announce"] {
+function loadAnnounceConfig(
+  env: NodeJS.ProcessEnv,
+  allowedChatIds: ReadonlySet<string>,
+  link: string | undefined,
+  docsLink: string | undefined,
+): Config["announce"] {
   const switchEnv = (env.ANNOUNCE?.trim() || "on").toLowerCase();
   if (switchEnv !== "on" && switchEnv !== "off") {
     throw new Error(`ANNOUNCE 只能是 on 或 off，当前为 ${env.ANNOUNCE}`);
@@ -347,6 +362,7 @@ function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<
     chatIds: listed.length > 0 ? [...new Set(listed)] : [...allowedChatIds],
     chatIdsFrom: listed.length > 0 ? "ANNOUNCE_CHAT_IDS" : "FEISHU_ALLOWED_CHAT_IDS",
     ...(link ? { link } : {}),
+    ...(docsLink ? { docsLink } : {}),
     stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "announce", "state.json"),
     notesFile: RELEASE_NOTES_FILE,
     changelogFile: CHANGELOG_FILE,
@@ -457,6 +473,12 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     }
     return repo;
   });
+  const buildEnv = env.BUILD_CHECK?.trim().toLowerCase();
+  if (buildEnv && buildEnv !== "on" && buildEnv !== "off") {
+    throw new Error(`BUILD_CHECK 只能是 on 或 off，当前为 ${env.BUILD_CHECK}`);
+  }
+  const goproxy = env.BUILD_GOPROXY?.trim();
+  const build = { build: buildEnv !== "off", ...(goproxy ? { goproxy } : {}) };
   const gitlabUrl = env.GITLAB_URL?.trim();
   if (gitlabUrl) {
     if (!/^https?:\/\/[^/\s]+/.test(gitlabUrl)) {
@@ -469,14 +491,14 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 GitLab 的项目路径（如 group/project），多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
+    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN }, ...build };
   }
   if (env.GITHUB_TOKEN) {
     const bad = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN } };
+    return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN }, ...build };
   }
   throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
 }

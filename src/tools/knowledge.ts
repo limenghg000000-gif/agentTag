@@ -347,8 +347,8 @@ export class KnowledgeDesk {
       spec: {
         name: "knowledge_search",
         description:
-          "在团队经验库里查相近的经验（排查经验、应答卡、数据口径、需求结论）。回答前程序已经按提问查过一次，" +
-          "查到报错原文、错误码、服务名这类新线索后，可以换个说法再查。" +
+          "在团队经验库里查相近的经验（排查经验、应答卡、数据口径、需求结论）。话题第一次提问时程序已经按提问查过一次，同一个话题里的追问不再自动查；" +
+          "查到报错原文、错误码、服务名这类新线索，或者追问里出了新问题，可以自己再查。" +
           (otherTools.includes("aiops_search_knowledge") ? "aiops 自带的经验库用 aiops_search_knowledge 查" : ""),
         parameters: {
           type: "object",
