@@ -10,7 +10,7 @@ AgentTag 每个版本在技术上改了什么，写给开发和维护机器人�
 
 ### 修复
 
-- `code_merge` 判断能不能合改看 GitLab 的「允许合并」：受保护的分支允许开发者合并（分支接口的 `developers_can_merge`，「Developers + Maintainers」）的也能合，只许维护者合并的（master、prod 这类）和默认分支照旧不合。以前受保护的一律不合，而 uat、test、release、staging 在 GitLab 上通常也是受保护、只是放开给开发者合，机器人说「uat 是受保护分支，合不了」。部署后想让某个分支必须人审，把它的「允许合并」设成只许 Maintainers。（#56）
+- `code_merge` 判断能不能合改看 GitLab 的「允许合并」：受保护的分支允许开发者合并（分支接口的 `developers_can_merge`，「Developers + Maintainers」）的也能合，只许维护者合并的（master、prod 这类）照旧不合；不再按「是不是仓库默认分支」单独拦，线上分支不一定是默认分支，一律以 Roles 为准。以前受保护的一律不合，而 uat、test、release、staging 在 GitLab 上通常也是受保护、只是放开给开发者合，机器人说「uat 是受保护分支，合不了」。部署后想让某个分支必须人审，把它的「允许合并」设成只许 Maintainers。（#56）
 
 ### 安全
 

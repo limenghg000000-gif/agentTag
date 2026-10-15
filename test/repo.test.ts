@@ -1464,8 +1464,8 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
   await assert.rejects(host.mergeCheck!("golang/appservice", 354), /查不到机器人自己的 GitLab 账号（HTTP 401），先不合并/);
   const uat = await host.mergeCheck!("golang/appservice", 354);
   assert.deepEqual(
-    [uat.state, uat.source, uat.target, uat.sha, uat.authorUsername, uat.botUsername, uat.fromFork, uat.targetProtected, uat.targetIsDefault],
-    ["opened", "fix/jd_uat", "uat", "c".repeat(40), "agent-boot", "agent-boot", undefined, false, false],
+    [uat.state, uat.source, uat.target, uat.sha, uat.authorUsername, uat.botUsername, uat.fromFork, uat.targetProtected],
+    ["opened", "fix/jd_uat", "uat", "c".repeat(40), "agent-boot", "agent-boot", undefined, false],
   );
   // 账号查到了就记下，不再查
   const release = await host.mergeCheck!("golang/appservice", 354);
@@ -1568,7 +1568,6 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     botUsername: "Agent-Boot",
     sha,
     targetProtected: false,
-    targetIsDefault: false,
   };
   checks[1] = base;
   const out = await ws.mergeRequest(1);
@@ -1593,8 +1592,6 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     [1, { targetProtected: true, target: "prod" }, /^RepoError: !1 要合到的 prod 是受保护的分支，只许维护者合并，合并要人审过再点，机器人不合/],
     [1, { targetProtected: true, targetDevelopersCanMerge: false, target: "prod" }, /是受保护的分支，只许维护者合并/],
     // 允许开发者合并，但是默认分支：也不合
-    [1, { targetProtected: true, targetDevelopersCanMerge: true, targetIsDefault: true, target: "master" }, /^RepoError: !1 要合到的 master 是仓库的默认分支/],
-    [1, { targetIsDefault: true, target: "main" }, /^RepoError: !1 要合到的 main 是仓库的默认分支，合并要人审过再点/],
     [1, { author: "张三", authorUsername: "zhangsan" }, /^RepoError: !1 是 张三 开的，机器人只合并自己开的合并请求/],
     [1, { authorUsername: undefined }, /机器人只合并自己开的合并请求/],
     [1, { fromFork: true }, /是从别的项目（fork）提过来的，机器人不合/],
@@ -1635,7 +1632,7 @@ test("合并从别的合并请求搬过来的：那个不是这个话题里开�
   const ws = await all.open("om_m5", portRepo);
   const pr = await ws.openPullRequest("A 返回 8（uat）", "", { from: 40, target: "uat" });
   const sha = (await runGit(["rev-parse", `refs/heads/${pr.branch}`], { cwd: portRemote })).stdout.trim();
-  const mine: MergeCheck = { ...source, number: pr.number, url: "", source: pr.branch, target: "uat", authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false, targetIsDefault: false };
+  const mine: MergeCheck = { ...source, number: pr.number, url: "", source: pr.branch, target: "uat", authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false };
   checks[pr.number] = mine;
   checks[40] = { ...mine, number: 40, author: "张三", authorUsername: "zhangsan" };
   await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40 搬过来的，那个不是这个话题里开的/);
