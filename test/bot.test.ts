@@ -3950,6 +3950,11 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("现在还有没有 2001102，总结一下", earlierTopic), false);
   assert.equal(restatesEarlier("总结一下最近 1 小时的报错", earlierTopic), false);
   assert.equal(restatesEarlier("核实一下再用大白话讲", earlierTopic), false);
+  // 别的带数的时间窗口也一样（「今天」「昨天」不算：「把今天查到的总结一下」是整理）
+  for (const window of ["过去 1 小时", "近三天", "这两天", "前 30 分钟", "2 小时内", "半小时以来"]) {
+    assert.equal(restatesEarlier(`总结一下${window}的报错`, earlierTopic), false, window);
+  }
+  assert.equal(restatesEarlier("把今天查到的总结一下", earlierTopic), true);
   assert.equal(restatesEarlier("排查 gateway-api 的告警并总结原因", earlierTopic), false);
   // 问的是话题里没出现过的服务、要读代码和配置
   assert.equal(restatesEarlier("总结一下 gateway-api 的报错", earlierTopic), false);
@@ -3971,6 +3976,11 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("总结一下，顺便修一下", earlierTopic), false);
   assert.equal(restatesEarlier("精简一下结论，再改一下代码", earlierTopic), false);
   assert.equal(restatesEarlier("用大白话总结一下，然后开个 MR", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下上面的原因，然后重构代码", earlierTopic), false);
+  assert.equal(restatesEarlier("概括一下，顺便优化一下", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下，然后优化代码", earlierTopic), false);
+  assert.equal(restatesEarlier("把上面的优化建议总结一下", earlierTopic), true);
+  assert.equal(restatesEarlier("精简一下，然后合并成一段话", earlierTopic), true);
   // 说的是之前的修复方案、换个写法，还是整理
   assert.equal(restatesEarlier("把上面的修复方案总结一下", earlierTopic), true);
   assert.equal(restatesEarlier("改写成大白话，讲给运营听", earlierTopic), true);
@@ -4129,6 +4139,12 @@ test("整理成飞书文档、起草经验时，写进去的内容也只能用�
   );
   await knowledge.handle(message("把上面的结论用大白话总结成经验", { rootId: "om_root", threadId: "omt_1" }));
   assert.deepEqual(drafts, [clean]);
+});
+
+test("整理时群记忆太多没列全的，照样能用 memory_search 查约定", async () => {
+  const { requests, handle } = restateSetup([{ text: "好", finish: "stop" }], earlierTopic, { taskTools: [namedTool("memory_search")] });
+  await handle(message("按我们之前约定的格式总结一下", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "memory_search", "knowledge_propose"]);
 });
 
 test("同一个话题里说要重新查、看现在的情况：照常查经验库、给查询的工具", async () => {
