@@ -6,26 +6,21 @@ AgentTag 每个版本在技术上改了什么，写给开发和维护机器人�
 
 每个版本按这几类分：**新增**（新功能、新配置项）、**改进**（原有功能的行为变了）、**修复**（修好的问题）、**安全**（权限、转义、校验这类）。部署要注意的（要开的飞书权限、要改的 `.env`）写在对应条目里。
 
-## [0.14.0] - 2026-10-15
-
-### 新增
-
-- 推代码之前在服务器上照项目自己的构建方式编译检查（`BUILD_CHECK`，默认 on）：`code_open_pr` 每次推新提交前，读 `.gitlab-ci.yml` 里 docker build 用的 Dockerfile（`--file`/`-f`，几个都读，路径里的 `${SERVICE_NAME}` 这类按仓库里有的目录展开；流水线没用 Dockerfile 的老项目照脚本里的 `go build`，跟着前面的 `cd 子目录`；都没有才用根目录的 `Dockerfile`；Dockerfile 的注释行先去掉再拼续行），从里面所有 `go build`（含 `RUN ["go","build",…]` 写法）取编的入口（如 `main.go`、`./cmd/aiops-mcp`）、写死的 `GOOS`/`GOARCH`、`-tags`，在服务器上直接 `go build` 这些入口，再加上入口外改到的包（改了 go.mod/go.sum、删了整个包时加 `./...`）；不跑 docker、不拉镜像。构建镜像是 Go 1.21 以后、和装的不是同一个小版本时用镜像的版本（`GOTOOLCHAIN=go1.X.0+auto`，从代理下载官方工具链），否则 `GOTOOLCHAIN=auto`。`CGO_ENABLED=0`、`GOFLAGS` 置空（不照搬 Dockerfile 里的），`GOPROXY` 默认 `https://goproxy.cn,direct`（`BUILD_GOPROXY` 可换），`GOSUMDB` 默认 `sum.golang.google.cn`，产物放临时目录、编完删掉，最多等 10 分钟；编的全是库时不带 `-o` 重编。PHP 用 `php -l` 查改到的文件。编不过时用 `git worktree` 把检出时的提交放到临时目录再编一次：改之前能编过（报错在没改的文件里也算，比如改了函数签名）就不推、不开合并请求，报错交给模型改；改之前也编不过、没装工具、没有 go.mod、改到的文件被编译条件排除（`go list` 看 `GoFiles`，如 `_windows.go`、build tag）、Dockerfile 里有 `go build -C` 或几步 `go build` 条件不一样，或者改了编不了的文件（别的语言、Dockerfile、`.gitlab-ci.yml` 和它 include 的文件、composer 依赖）算「说不清」，照常推。同一时间只编一个，几个话题同时推时排队。编过了的提交记在工作目录状态里（`checkedSha`），`code_merge` 合并时源分支最新提交就是它的，不用再等流水线。`code_open_pr` 的结果写明照哪个 Dockerfile 编了什么。**部署**：服务器上装一个最新版 Go（golang.google.cn 或阿里云镜像下载），要查 PHP 仓库的再装 PHP；没装的语言跳过。（#57）
-
-### 修复
-
-- `code_merge` 合并前要求源分支最新提交的流水线通过（GitLab 合并请求的 `head_pipeline`，提交号要和源分支最新的一致；合并结果流水线按 `refs/merge-requests/<编号>/merge` 认）：在合并前最后一次读合并请求时判断，`success` 才直接合；还在跑（`running`、`pending` 这类）的设成流水线通过后自动合并；还没建出来的跟着等（最多看 6 次、每次隔 2 秒）；一直没有、只有旧提交的、`failed`/`canceled` 这类都不合，说清要人跑流水线或审过再点。没在服务器上编过的才要求有流水线；编过的读到流水线失败也不合，还在跑的同样设成通过后自动合并。以前项目没要求「流水线通过才能合」时机器人直接合，把编不过的改动合进了 uat。（#57）
-
 ## [0.13.0] - 2026-10-15
 
 ### 新增
 
 - 新配置 `DOCS_LINK`（文档中心的链接，要是 https 地址）：更新通知卡片最下面在「产品功能说明」旁边放「文档中心」按钮，两个按钮放一排（`column_set`，`flex_mode: flow`，窄屏自动换行）；退回文字时写成「文档中心：链接」。部署时在 `.env` 加 `DOCS_LINK=…`，不加就没有这个按钮。（#58）
 - `RELEASE_NOTES.md` 某一版里单独一行的链接 `[按钮上的字](目标)`（前面可以有「- 」）做成这一版说明下面的按钮，最多 3 个，按钮上的字最多 20 个，这一行不再出现在说明文字里：目标写 `文档中心`、`功能说明`（后面可以带 `#小节`）时换成 `DOCS_LINK`、`ANNOUNCE_LINK`，也可以直接写 https 地址；别的写法、没配对应链接的不放按钮。`npm test` 核对 `RELEASE_NOTES.md` 里每个链接都能换成地址、不是 GitHub 地址。（#58）
+- 推代码之前在服务器上照项目自己的构建方式编译检查（`BUILD_CHECK`，默认 on）：`code_open_pr` 每次推新提交前，读 `.gitlab-ci.yml` 里 docker build 用的 Dockerfile（`--file`/`-f`，几个都读，路径里的 `${SERVICE_NAME}` 这类按仓库里有的目录展开；流水线没用 Dockerfile 的老项目照脚本里的 `go build`，跟着前面的 `cd 子目录`；都没有才用根目录的 `Dockerfile`；Dockerfile 的注释行先去掉再拼续行），从里面所有 `go build`（含 `RUN ["go","build",…]` 写法）取编的入口（如 `main.go`、`./cmd/aiops-mcp`）、写死的 `GOOS`/`GOARCH`、`-tags`，在服务器上直接 `go build` 这些入口，再加上入口外改到的包（改了 go.mod/go.sum、删了整个包时加 `./...`）；不跑 docker、不拉镜像。构建镜像是 Go 1.21 以后、和装的不是同一个小版本时用镜像的版本（`GOTOOLCHAIN=go1.X.0+auto`，从代理下载官方工具链），否则 `GOTOOLCHAIN=auto`。`CGO_ENABLED=0`、`GOFLAGS` 置空（不照搬 Dockerfile 里的），`GOPROXY` 默认 `https://goproxy.cn,direct`（`BUILD_GOPROXY` 可换），`GOSUMDB` 默认 `sum.golang.google.cn`，产物放临时目录、编完删掉，最多等 10 分钟；编的全是库时不带 `-o` 重编。PHP 用 `php -l` 查改到的文件。编不过时用 `git worktree` 把检出时的提交放到临时目录再编一次：改之前能编过（报错在没改的文件里也算，比如改了函数签名）就不推、不开合并请求，报错交给模型改；改之前也编不过、没装工具、没有 go.mod、改到的文件被编译条件排除（`go list` 看 `GoFiles`，如 `_windows.go`、build tag）、Dockerfile 里有 `go build -C` 或几步 `go build` 条件不一样，或者改了编不了的文件（别的语言、Dockerfile、`.gitlab-ci.yml` 和它 include 的文件、composer 依赖）算「说不清」，照常推。同一时间只编一个，几个话题同时推时排队。编过了的提交记在工作目录状态里（`checkedSha`），`code_merge` 合并时源分支最新提交就是它的，不用再等流水线。`code_open_pr` 的结果写明照哪个 Dockerfile 编了什么。**部署**：服务器上装一个最新版 Go（golang.google.cn 或阿里云镜像下载），要查 PHP 仓库的再装 PHP；没装的语言跳过。（#57）
 
 ### 改进
 
 - 更新通知卡片的标题用产品名「AgentTag 更新了 · 版本号」，不再用飞书里机器人的名字（以后可能换机器人）；第一次发到群里时的自我介绍还用机器人的名字，群里要 @ 的是它。（#58）
+
+### 修复
+
+- `code_merge` 合并前要求源分支最新提交的流水线通过（GitLab 合并请求的 `head_pipeline`，提交号要和源分支最新的一致；合并结果流水线按 `refs/merge-requests/<编号>/merge` 认）：在合并前最后一次读合并请求时判断，`success` 才直接合；还在跑（`running`、`pending` 这类）的设成流水线通过后自动合并；还没建出来的跟着等（最多看 6 次、每次隔 2 秒）；一直没有、只有旧提交的、`failed`/`canceled` 这类都不合，说清要人跑流水线或审过再点。没在服务器上编过的才要求有流水线；编过的读到流水线失败也不合，还在跑的同样设成通过后自动合并。以前项目没要求「流水线通过才能合」时机器人直接合，把编不过的改动合进了 uat。（#57）
 
 ## [0.12.1] - 2026-10-15
 
