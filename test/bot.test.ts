@@ -3976,6 +3976,11 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("总结一下，顺便修一下", earlierTopic), false);
   assert.equal(restatesEarlier("精简一下结论，再改一下代码", earlierTopic), false);
   assert.equal(restatesEarlier("用大白话总结一下，然后开个 MR", earlierTopic), false);
+  // 话题里聊过 uat，「合并到 uat」也是要再开合并请求
+  const uatTopic: ChatMessage[] = [...earlierTopic, { role: "assistant", content: "已开合并请求到 master；uat 还没有这个修复。" }];
+  assert.equal(restatesEarlier("总结一下改了什么，合并到 uat", uatTopic), false);
+  assert.equal(restatesEarlier("精简一下，也合到 uat", uatTopic), false);
+  assert.equal(restatesEarlier("把两段合到一起，精简一下", uatTopic), true);
   assert.equal(restatesEarlier("总结一下上面的原因，然后重构代码", earlierTopic), false);
   assert.equal(restatesEarlier("概括一下，顺便优化一下", earlierTopic), false);
   assert.equal(restatesEarlier("总结一下，然后优化代码", earlierTopic), false);
