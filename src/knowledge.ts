@@ -1797,7 +1797,8 @@ export function formatKnowledge(
   const meta = [
     entry.status === "archived" ? "已归档" : "",
     entry.confirmedBy ? `确认人 ${entry.confirmedBy}` : "",
-    DATE_FORMAT.format(new Date(entry.createdAt)),
+    // 和群记忆一样写最后改的那天：两边说法对不上时按日期新的为准
+    DATE_FORMAT.format(new Date(entry.updatedAt ?? entry.createdAt)),
     entry.aiopsId ? `aiops 里是经验 #${entry.aiopsId}` : "",
   ].filter(Boolean);
   const fields = fieldLines(entry);

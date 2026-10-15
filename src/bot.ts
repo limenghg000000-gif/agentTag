@@ -38,6 +38,7 @@ import type { RecentThreadStore } from "./recent-threads.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { containsSecret, maskPersonal } from "./knowledge.js";
+import { CONFLICT_TOOL } from "./tools/conflicts.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
@@ -1327,7 +1328,7 @@ const ASKS_KNOWLEDGE = /经验库|(?<!飞书\s*)知识库/;
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
 /** 起草存进、归档经验库的确认卡片的工具：点按钮问的也不给（按钮上的话是模型写的，可以写成「沉淀成经验」） */
-const KNOWLEDGE_DRAFT_TOOLS: ReadonlySet<string> = new Set(["knowledge_propose", "knowledge_propose_archive"]);
+const KNOWLEDGE_DRAFT_TOOLS: ReadonlySet<string> = new Set(["knowledge_propose", "knowledge_propose_archive", CONFLICT_TOOL]);
 
 /** 一次工具调用查到的：代码工具是它记下的代码位置（见 CodeFact）和模型看到的原文（只核对数），别的工具是模型看到的原文 */
 export interface ToolEvidence {
