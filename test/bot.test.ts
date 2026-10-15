@@ -18,6 +18,10 @@ import {
   reviewCodeAnswer,
   reviewDeflectedAnswer,
   reviewOpsAnswer,
+  restatedAdditions,
+  restatedAnswerNote,
+  restatesEarlier,
+  reviewRestatedAnswer,
   THINK_IN_CHINESE,
   type ThreadContextSource,
   UNVERIFIED_CODE_ANSWER,
@@ -3908,4 +3912,159 @@ test("功能卡片发不出去时改发文字版；按钮问的、带了别的�
   // 交给模型时提示词里是这次用得上的功能清单
   assert.match(requests[0]!.system, /功能清单：\n- \*\*问问题、查资料\*\*/);
   assert.doesNotMatch(requests[0]!.system, /查代码、改代码/);
+});
+
+/** 2026-10-14 测试群那次转链排查的回答（缩短了）：之后有人在同一个话题里要「用 eli5 方式总结给同事」 */
+const EARLIER_ANSWER = [
+  "结论（prod / product-service-api）：不是用户操作问题，我们把 3.jd.hk / 3.cn 这类短链原样传给京东联盟转链，京东返回 2001102 materialId链接无法识别；代码里没有对这两种短链做跳转解析，需要开发介入（把握：中）。",
+  "| 时间 | 环节 | 结果 |",
+  "| 09:01:48 | /v1/api/convertLink 入口 | is_fail=1 |",
+  "3.cn/37d-lO3w 这一条被 10 个不同用户反复尝试，全部 2001102，分布在 4 个 Pod 上。",
+  "代码核对（golang/appservice master @ 60b7756）：services/goods/jingdong.go:120 直接把用户链接当 materialId 传给京东。",
+].join("\n");
+const ELI5_ASK = "@飞书 CLI 用 用eli5方式总结 给 @徐杨 @陈飞龙 @祝传利 同事总结一下";
+const earlierTopic: ChatMessage[] = [
+  { role: "user", content: "[赵作武] 这个转链为什么失败 https://3.jd.hk/-103ydbW?rid=15644" },
+  { role: "assistant", content: EARLIER_ANSWER },
+];
+
+test("要整理话题里之前的回答（总结、讲给谁听、换个说法）才算整理：要重新查、看现在、问别的服务的不算", () => {
+  assert.equal(restatesEarlier(ELI5_ASK, earlierTopic), true);
+  assert.equal(restatesEarlier("总结一下上面查到的情况", earlierTopic), true);
+  assert.equal(restatesEarlier("翻译成英文", earlierTopic), true);
+  assert.equal(restatesEarlier("用大白话讲给运营同事听", earlierTopic), true);
+  assert.equal(restatesEarlier("换个说法，讲简单点", earlierTopic), true);
+  assert.equal(restatesEarlier("重新整理一下，精简到三句话", earlierTopic), true);
+  assert.equal(restatesEarlier("tl;dr", earlierTopic), true);
+  // 提到的服务、错误码话题里之前就有：说的还是之前那个问题
+  assert.equal(restatesEarlier("把 product-service-api 这个问题总结给大家", earlierTopic), true);
+  assert.equal(restatesEarlier("4 个 Pod 的情况概括一下", earlierTopic), true);
+  // 话题里没有上文的，照常查
+  assert.equal(restatesEarlier(ELI5_ASK, []), false);
+  // 要重新查、看现在的情况
+  assert.equal(restatesEarlier("重新查一下再总结", earlierTopic), false);
+  assert.equal(restatesEarlier("现在还有没有 2001102，总结一下", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下最近 1 小时的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("核实一下再用大白话讲", earlierTopic), false);
+  assert.equal(restatesEarlier("排查 gateway-api 的告警并总结原因", earlierTopic), false);
+  // 问的是话题里没出现过的服务、要读代码和配置
+  assert.equal(restatesEarlier("总结一下 gateway-api 的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("整理一下部署配置", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下这个函数做了什么", earlierTopic), false);
+  // 代码话题里之前说过，文档、链接整理时照样能读
+  assert.equal(restatesEarlier("把代码核对的部分讲给开发同事听", earlierTopic), true);
+  assert.equal(restatesEarlier("用大白话总结一下，写成飞书文档", earlierTopic), true);
+  // 不是整理
+  assert.equal(restatesEarlier("这个怎么修", earlierTopic), false);
+});
+
+test("整理之前内容时检查回答：代码位置和线上数据要是话题里之前写过的、或者这次读到的，添了新的就列出来", () => {
+  const known = `${ELI5_ASK}\n${EARLIER_ANSWER}`;
+  const scope = { code: true, ops: true };
+  assert.deepEqual(restatedAdditions("09:01:48 那次 4 个 Pod 都一样，问题在 services/goods/jingdong.go:120（master @ 60b7756）", known, scope), []);
+  assert.deepEqual(
+    restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12，还有 services/goods/jingdong.go:121", known, scope),
+    ["services/goods/taobao.go:12", "services/goods/jingdong.go:121", "09:30:00"],
+  );
+  // 没配代码工具、没配 MCP 服务时不看那一类
+  assert.deepEqual(restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12", known, { code: false, ops: false }), []);
+  // 这次读到的文档、网页里有的也算
+  const review = reviewRestatedAnswer(() => `${known}\n文档里写着 12:00:00 发版`, scope);
+  assert.equal(review("12:00:00 发版以后就好了"), undefined);
+  assert.equal(review("13:00:00 发版以后就好了"), restatedAnswerNote(["13:00:00"]));
+  assert.match(restatedAnswerNote(["13:00:00"]), /这次是整理话题里之前的内容，可回答里这些在话题里之前的消息中都找不到：13:00:00。/);
+  assert.match(restatedAnswerNote(Array.from({ length: 12 }, (_, i) => `${10 + i}:00:00`)), /19:00:00 等。/);
+});
+
+/** 转链排查那次的配置：aiops、代码工具、经验库都有 */
+function restateSetup(results: ChatResult[], history: ChatMessage[] = earlierTopic) {
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const lookups: string[] = [];
+  const queryLogs = namedTool("aiops_query_logs");
+  const setupResult = setup({
+    model,
+    taskTools: () => [namedTool("code_search"), namedTool("code_read_file"), namedTool("feishu_doc_read")],
+    codeRepos: ["golang/appservice"],
+    mcp: {
+      names: ["aiops"],
+      tools: () => [queryLogs, { ...namedTool("aiops_playbook"), instructionsOnly: true }],
+      prompt: (names) => (names.some((name) => name.startsWith("aiops_")) ? "## aiops（MCP 服务）\n问题属于哪份剧本的场景，第一步先读剧本" : undefined),
+    },
+    knowledge: {
+      async lookup(query: string) {
+        lookups.push(query);
+        return { text: "经验 K1 [排查经验]：京东短链转链失败", ids: ["K1"] };
+      },
+      tools: () => [namedTool("knowledge_search"), namedTool("knowledge_get"), namedTool("knowledge_propose")],
+    },
+    context: fakeContext({ history, source: "feishu" }).source,
+  });
+  return { ...setupResult, requests, lookups };
+}
+
+test("话题里查出答案以后要「用 eli5 方式总结给同事」：不查经验库、不给查询的工具，直接按之前的回答写，之前回答里的数据和代码位置照常发出", async () => {
+  const summary =
+    "用大白话说：用户发来的是京东的短链接，我们没先把它展开就交给京东，京东看不懂，回了 2001102。09:01:48 那次就是这样，4 个 Pod 上都一样，不是哪台机器坏了。" +
+    "问题在 services/goods/jingdong.go:120（golang/appservice master @ 60b7756），要开发加上短链展开。";
+  const { requests, lookups, sent, handle, updates } = restateSetup([{ text: summary, finish: "stop" }]);
+
+  await handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+
+  assert.deepEqual(lookups, []);
+  assert.ok(!updates.some((u) => cardText(u.card).includes("查经验库")));
+  assert.equal(requests.length, 1);
+  // 只留读文档和起草经验：查线上、查代码、查经验库的都不给
+  assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "knowledge_propose"]);
+  assert.match(requests[0].system, /这次是让你整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不是重新查/);
+  assert.match(requests[0].system, /eli5 是讲给五岁小孩也听得懂的大白话/);
+  assert.doesNotMatch(requests[0].system, /话题里之前的回答不算查证|## aiops|这次提问可能相关的经验|没查成/);
+  assert.deepEqual(markdowns(sent), [summary]);
+});
+
+test("整理之前的回答时添了之前没有的数据、代码位置：打回一次让模型只用写过的，重做还添的不发出去", async () => {
+  const made = "09:30:00 又失败了一次，问题在 services/goods/taobao.go:12";
+  const clean = "京东看不懂我们传过去的短链接，09:01:48 那次就是这样";
+  const fixed = restateSetup([
+    { text: made, finish: "stop" },
+    { text: clean, finish: "stop" },
+  ]);
+  await fixed.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(fixed.requests.length, 2);
+  assert.deepEqual(fixed.requests[1].messages.at(-1), { role: "user", content: restatedAnswerNote(["services/goods/taobao.go:12", "09:30:00"]) });
+  assert.deepEqual(markdowns(fixed.sent), [clean]);
+
+  // 重做以后还编了线上的时间：不发出去
+  const time = restateSetup([
+    { text: "09:30:00 又失败了一次", finish: "stop" },
+    { text: "09:30:00 又失败了一次", finish: "stop" },
+  ]);
+  await time.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(markdowns(time.sent), [BLOCKED_OPS_ANSWER]);
+
+  // 重做以后还编了代码位置：不发出去
+  const path = restateSetup([
+    { text: "问题在 services/goods/taobao.go:12", finish: "stop" },
+    { text: "问题在 services/goods/taobao.go:12", finish: "stop" },
+  ]);
+  await path.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(markdowns(path.sent), [blockedCodeAnswer(["golang/appservice"])]);
+});
+
+test("同一个话题里说要重新查、看现在的情况：照常查经验库、给查询的工具", async () => {
+  const { requests, lookups, handle } = restateSetup([{ text: "要查哪个时间段？", finish: "stop" }]);
+  await handle(message("重新查一下现在还有没有 2001102", { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1);
+  const names = requests[0].tools?.map((t) => t.name) ?? [];
+  assert.ok(names.includes("aiops_query_logs") && names.includes("code_search") && names.includes("knowledge_search"), names.join(","));
+  assert.doesNotMatch(requests[0].system, /这次是让你整理话题里已经有的内容/);
+});
+
+test("点「接着查」按钮问的就算像整理，也照常先查", async () => {
+  const { requests, lookups, handle } = restateSetup([
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "好", finish: "stop" },
+  ]);
+  await handle(message("总结一下 3.jd.hk 的失败", { rootId: "om_root", threadId: "omt_1" }), { readOnly: true });
+  assert.equal(lookups.length, 1);
+  assert.ok(requests[0].tools?.some((t) => t.name === "aiops_query_logs"));
 });

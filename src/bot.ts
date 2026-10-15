@@ -383,7 +383,16 @@ async function runTask(
       askerName: context.askerName,
       messageId: msg.messageId,
     };
-    const knowledge = await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
+    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
+    const followUp = options.readOnly === true;
+    // 只是整理话题里已经有的内容（总结、讲给谁听、换个说法）：不查经验库、不给查询的工具，直接按上文写。按钮上的话是接着要查的新问题，不算
+    const restate = !followUp && restatesEarlier(question, history);
+    if (restate) {
+      logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
+    }
+    const knowledge = restate
+      ? undefined
+      : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
@@ -395,8 +404,6 @@ async function runTask(
     const recentThreadTools = deps.recentThreads
       ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
       : [];
-    // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
-    const followUp = options.readOnly === true;
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
@@ -460,6 +467,7 @@ async function runTask(
       (tool) =>
         !(readOnly && tool.writes) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
+        !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
     toolCount = taskTools.length;
@@ -478,11 +486,19 @@ async function runTask(
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
     const readCode = () => evidence.some(linksCode);
+    // 配了代码工具（这次给没给都算）：整理之前内容时没给代码工具，回答里的代码位置照样要核对
+    const codeConfigured = allTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
+    // 整理之前内容时的依据：这次的提问、话题里之前写过的（之前的回答、群成员说的）和这次读到的文档网页。检查时再取，读到的才算上
+    const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence)].join("\n");
     const reviews = [
-      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
-      // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
-      ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
-      ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+      ...(restate
+        ? [reviewRestatedAnswer(saidBefore, { code: codeConfigured, ops: Boolean(deps.mcp?.names.length) })]
+        : [
+            ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
+            // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
+            ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
+            ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+          ]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -520,6 +536,7 @@ async function runTask(
         memory: memory?.prompt,
         readOnly: noPermission,
         followUp,
+        restate,
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
@@ -540,7 +557,10 @@ async function runTask(
         ...(deps.knowledge
           ? {
               knowledge: {
-                ...(knowledge
+                // 整理之前内容时没查经验库，提示词里不说查到没查到
+                ...(restate
+                  ? {}
+                  : knowledge
                   ? {
                       hits: knowledge.text,
                       ...(knowledge.aiops ? { aiopsHits: true } : {}),
@@ -618,16 +638,21 @@ async function runTask(
     // 最后一道检查也按显示出来的文字看：<font>、<text_tag> 标签去掉
     const shown = stripRichTags(result.text);
     let blockedCode = false;
-    if (deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
+    if (
+      deps.mcp?.names.length &&
+      result.finish !== "filtered" &&
+      blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0, restate ? saidBefore() : undefined)
+    ) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
-    if (hasCodeTools && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
+    if ((hasCodeTools || (restate && codeConfigured)) && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
       // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
-      // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
-      const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
+      // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发。
+      // 整理之前内容时没给代码工具：话题里之前写过的（之前的回答也算）、这次读到的文档网页里有的才算，每个路径都得写过
+      const userText = restate ? saidBefore() : [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
+      const investigating = restate || [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -1841,7 +1866,7 @@ const EARLIER_CONTENT =
   /上面|上述|你的回答|这段(?!时间)|(?:以上|前面|之前|刚才|刚刚)(?:查到|说|聊|讲|提到|的(?:回答|结果|内容|情况|信息|结论)|内容|信息|结果|情况|结论)/;
 // 「重新整理」「现在把上面的翻译成英文」里的「重新」「现在」说的是改写这个动作，不算要重新查
 const LIVE_REQUEST =
-  /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
+  /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版|说|讲|解释|梳理|表述|描述|简化|精简|提炼|转述)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
 /** 说工具调用失败的那一句（「aiops 连续 3 次查询都超时」），这句里的次数说的是调用本身 */
 const TOOL_FAILURE_CLAUSE = /(?:aiops|工具|调用|查询)[^，,。；;\n]{0,12}(?:超时|失败|出错|连不上|繁忙)/i;
 
@@ -1863,21 +1888,110 @@ export function blockUnverifiedOps(
   succeeded: ReadonlySet<string>,
   answer: string,
   attempted = false,
+  earlier?: string,
 ): boolean {
-  if (checkedLive(servers, succeeded) || rewriteOnly(question)) {
+  // 整理之前内容的请求（见 restatesEarlier）给了 earlier（话题里之前的内容）：数据要是之前写过的才放行，不再整段放行
+  if (checkedLive(servers, succeeded) || (earlier === undefined && rewriteOnly(question))) {
     return false;
   }
   const conclusion = OPS_CONCLUSION.test(answer);
   const reported = attempted ? withoutToolFailures(answer) : answer;
   // 举例的句子不算（「例如 gateway-api-6978f9454f-tnc56 中，6978f9454f 是模板哈希」）；写成线上结论的照样整段查
   const text = conclusion ? reported : withoutExamples(reported);
-  const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
+  const said = earlier === undefined ? question : `${question}\n${earlier}`;
+  const live = (pattern: RegExp) => hasUnverified(pattern, said, text);
   const liveTime = !TIME_QUESTION.test(question) || (conclusion && OPS_QUESTION.test(question));
   return live(OPS_STRONG) || (liveTime && live(OPS_TIME)) || (conclusion && live(OPS_WEAK));
 }
 
 function rewriteOnly(question: string): boolean {
   return REWRITE_REQUEST.test(question) && !LIVE_REQUEST.test(question) && (EARLIER_CONTENT.test(question) || !OPS_QUESTION.test(question));
+}
+
+/** 整理、改写已经有的内容：REWRITE_REQUEST 之外，还有讲给谁听、换个说法、用大白话讲（eli5）、精简这类 */
+const RESTATE_REQUEST = new RegExp(
+  [
+    REWRITE_REQUEST.source,
+    String.raw`简化|精简|提炼|浓缩|摘要|转述|转告|通俗|大白话|白话|说人话|讲人话|eli5|explain like|tl;?dr`,
+    String.raw`(?:讲|说|解释)给[^，。,.!?！？\n]{1,20}听`,
+    String.raw`换(?:个|一种|一个)?(?:说法|方式|角度|口吻|讲法)`,
+  ].join("|"),
+  "i",
+);
+/** 要看现在的数据：LIVE_REQUEST 之外，「最近 1 小时」这类时间窗口，「重查」「复查」「核实」 */
+const FRESH_REQUEST = /最近\s*(?:\d+|[一二两三四五六七八九十半几]+)\s*个?\s*(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月)|重查|复查|核实/;
+/**
+ * 要查的对象：线上服务、日志这类（OPS_QUESTION），和代码、配置这类。话题里之前没出现过的，说明问的是新东西，不算整理。
+ * 文档、网页链接不算：整理时照样给读文档、网页的工具（「总结成飞书文档」也不能因为说了文档就重查）
+ */
+const NEW_TARGET = new RegExp(`${OPS_QUESTION.source}|代码|仓库|分支|提交|文件|函数|配置`, "i");
+const TARGET_TERMS = new RegExp(NEW_TARGET.source, "gi");
+
+/**
+ * 这次只是整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不用重新查。
+ * 2026-10-14 测试群：转链排查答完以后，有人在同一个话题里 @ 机器人「用 eli5 方式总结给 @某某 同事」，机器人把查经验库、读剧本、查日志、读代码、查提交整个重来了一遍：
+ * 提示词说话题里之前的回答不算查证、要重新查，回答前查到的经验也要先核对；模型直接整理的话，回答里的时间、Pod 数、仓库名又会被检查打回去查。
+ * 要满足：话题里有上文；提问说的是整理、改写；没说要重新查、看现在的情况；提问里说到的服务名、日志、代码、配置这类对象话题里之前都出现过
+ * （「把 product-service-api 这个问题总结给大家」说的还是之前那个，「整理一下 gateway 的部署配置」问另一个服务、要读配置的就不是整理）；
+ * 指着「上面」「之前的回答」说的，提到什么都算整理
+ */
+export function restatesEarlier(question: string, history: readonly ChatMessage[]): boolean {
+  if (history.length === 0 || !RESTATE_REQUEST.test(question) || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question)) {
+    return false;
+  }
+  if (EARLIER_CONTENT.test(question)) {
+    return true;
+  }
+  const said = history.map((m) => m.content).join("\n").toLowerCase();
+  return !NEW_TARGET.test(question.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
+}
+
+/** 整理之前内容时给模型的工具：读群成员给的文档、网页，按要求写成文档、记进群记忆、起草经验。查线上、查代码、搜网页、查经验库、看别的话题的都不给 */
+const RESTATE_TOOLS: ReadonlySet<string> = new Set([
+  "feishu_doc_read",
+  "feishu_doc_create",
+  "feishu_doc_edit",
+  "fetch_url",
+  "memory_save",
+  "memory_update",
+  "memory_delete",
+  "knowledge_propose",
+  "knowledge_propose_archive",
+]);
+
+/** 回答里最多列几处添上的内容 */
+const MAX_RESTATED_ADDITIONS = 10;
+
+/**
+ * 整理之前内容时，回答里添上的、话题里之前没写过的东西：代码位置（code：配了代码工具时）和线上数据（ops：配了 MCP 服务时，时间、Pod 名、条数这类）。
+ * known 是话题里之前的内容（之前的回答、群成员说的）、这次的提问和这次读到的文档网页
+ */
+export function restatedAdditions(answer: string, known: string, { code, ops }: { code: boolean; ops: boolean }): string[] {
+  const cites = code
+    ? unseenCodeCitations(answer, (cite, line) => (line === undefined ? mentions(known, cite) : mentionsLine(known, cite, line))).map((cite) => cite.text)
+    : [];
+  const data = ops ? [...answer.matchAll(OPS_DATA)].map((match) => match[0]).filter((text) => !inQuestion(known, text) && !TIME_LAYOUT.test(text)) : [];
+  return [...new Set([...cites, ...data])];
+}
+
+export function restatedAnswerNote(added: readonly string[]): string {
+  const shown = added.slice(0, MAX_RESTATED_ADDITIONS).map((text) => (text.length > 80 ? `${text.slice(0, 80)}…` : text));
+  return (
+    `（系统检查）这次是整理话题里之前的内容，可回答里这些在话题里之前的消息中都找不到：${shown.join("、")}${added.length > shown.length ? " 等" : ""}。` +
+    "只用之前的回答和大家说过的话里写过的事实、数据和代码位置，不要添新的，也不要自己推算新的数；之前没写到的就说之前没查到，要最新情况请对方说「重新查」。" +
+    "其余内容不用改，重新给出完整的回答，不要提这段检查。"
+  );
+}
+
+/**
+ * 整理之前内容时检查回答（代替 reviewCodeAnswer、reviewOpsAnswer：那两项会叫模型去查，这次没给查的工具）：
+ * 代码位置和线上数据都得是话题里之前写过的，添了新的就打回一次，让模型只用写过的。known 在检查时再取，这次读到的文档网页也算
+ */
+export function reviewRestatedAnswer(known: () => string, scope: { code: boolean; ops: boolean }) {
+  return (answer: string): string | undefined => {
+    const added = restatedAdditions(answer, known(), scope);
+    return added.length > 0 ? restatedAnswerNote(added) : undefined;
+  };
 }
 
 /** 举例的句子 */
