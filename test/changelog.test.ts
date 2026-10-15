@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { compareVersions, parseReleaseNotes } from "../src/announce.js";
+import { compareVersions, parseReleaseNotes, resolveNotesLink } from "../src/announce.js";
 import { RELEASE_NOTES_FILE } from "../src/config.js";
 
 // 两份更新日志的规矩见 CLAUDE.md：技术版 CHANGELOG.md 每个改了行为的 PR 都加一个新版本，package.json 的版本号跟着改；
@@ -83,6 +83,17 @@ test("RELEASE_NOTES.md 的版本从新到旧排、写日期，每一版都能在
     assert.equal(v.date, dates.get(v.version), `RELEASE_NOTES.md 的 ${v.version} 和 CHANGELOG.md 的日期要一样`);
     assert.ok(/^- /m.test(v.notes), `RELEASE_NOTES.md：${v.version} 至少要有一条「- 」开头的说明`);
     assert.ok(compareVersions(v.version, pkg.version) <= 0, `RELEASE_NOTES.md 的 ${v.version} 比 package.json 的 ${pkg.version} 还新`);
+  }
+});
+
+test("RELEASE_NOTES.md 里的文档链接写「文档中心」「功能说明」（可以带 #小节）或 https 地址，不放 GitHub 地址", async () => {
+  const notes = parseReleaseNotes(await readFile(RELEASE_NOTES_FILE, "utf8"));
+  const options = { link: "https://features.example.com/", docsLink: "https://docs.example.com/" };
+  for (const v of notes) {
+    for (const link of v.links ?? []) {
+      assert.ok(resolveNotesLink(link.target, options), `RELEASE_NOTES.md：${v.version} 的链接「${link.text}」打不开：${link.target}`);
+      assert.ok(!/github\.com/i.test(link.target), `RELEASE_NOTES.md：${v.version} 的链接不要放 GitHub 地址，同事看得到：${link.target}`);
+    }
   }
 });
 

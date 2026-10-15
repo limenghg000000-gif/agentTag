@@ -64,6 +64,8 @@ export interface Config {
   recentThreadsDir: string;
   /** 产品功能说明的链接（ANNOUNCE_LINK）：通知卡片上的按钮用，有人问「你能做什么」时回答里也附上。更新通知关掉时也有 */
   featuresLink?: string;
+  /** 文档中心的链接（DOCS_LINK）：通知卡片上「文档中心」按钮用。更新通知关掉时也有 */
+  docsLink?: string;
   /** 更新通知（ANNOUNCE，默认 on）：部署新版本后把产品更新说明 RELEASE_NOTES.md 里新版本的说明发到群里。关掉时为空 */
   announce?: {
     /** 发到这些群：ANNOUNCE_CHAT_IDS，不填就是白名单里的所有群 */
@@ -72,6 +74,8 @@ export interface Config {
     chatIdsFrom: "ANNOUNCE_CHAT_IDS" | "FEISHU_ALLOWED_CHAT_IDS";
     /** 通知卡片上「产品功能说明」按钮的链接（ANNOUNCE_LINK） */
     link?: string;
+    /** 通知卡片上「文档中心」按钮的链接（DOCS_LINK） */
+    docsLink?: string;
     /** 每个群发到哪一版记在这个文件里 */
     stateFile: string;
     /** 发到群里的产品更新说明 */
@@ -266,8 +270,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const allowedChatIds = new Set((env.FEISHU_ALLOWED_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
-  const featuresLink = loadFeaturesLink(env);
-  const announce = loadAnnounceConfig(env, allowedChatIds, featuresLink);
+  const featuresLink = loadLink(env, "ANNOUNCE_LINK");
+  const docsLink = loadLink(env, "DOCS_LINK");
+  const announce = loadAnnounceConfig(env, allowedChatIds, featuresLink, docsLink);
 
   const domainName = (env.FEISHU_DOMAIN ?? "feishu").toLowerCase();
   if (domainName !== "feishu" && domainName !== "lark") {
@@ -307,13 +312,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),
     ...(featuresLink ? { featuresLink } : {}),
+    ...(docsLink ? { docsLink } : {}),
     ...(announce ? { announce } : {}),
   };
 }
 
-/** ANNOUNCE_LINK：产品功能说明的链接，要是 https 地址 */
-function loadFeaturesLink(env: NodeJS.ProcessEnv): string | undefined {
-  const link = env.ANNOUNCE_LINK?.trim();
+/** ANNOUNCE_LINK（产品功能说明）、DOCS_LINK（文档中心）：要是 https 地址 */
+function loadLink(env: NodeJS.ProcessEnv, name: "ANNOUNCE_LINK" | "DOCS_LINK"): string | undefined {
+  const link = env[name]?.trim();
   if (!link) {
     return undefined;
   }
@@ -324,13 +330,18 @@ function loadFeaturesLink(env: NodeJS.ProcessEnv): string | undefined {
     url = undefined;
   }
   if (url?.protocol !== "https:") {
-    throw new Error(`ANNOUNCE_LINK 要写成 https://… 这样的完整地址，当前为 ${link}`);
+    throw new Error(`${name} 要写成 https://… 这样的完整地址，当前为 ${link}`);
   }
   return link;
 }
 
 /** ANNOUNCE=off 关掉；ANNOUNCE_CHAT_IDS 只能是白名单里的群 */
-function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<string>, link: string | undefined): Config["announce"] {
+function loadAnnounceConfig(
+  env: NodeJS.ProcessEnv,
+  allowedChatIds: ReadonlySet<string>,
+  link: string | undefined,
+  docsLink: string | undefined,
+): Config["announce"] {
   const switchEnv = (env.ANNOUNCE?.trim() || "on").toLowerCase();
   if (switchEnv !== "on" && switchEnv !== "off") {
     throw new Error(`ANNOUNCE 只能是 on 或 off，当前为 ${env.ANNOUNCE}`);
@@ -347,6 +358,7 @@ function loadAnnounceConfig(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<
     chatIds: listed.length > 0 ? [...new Set(listed)] : [...allowedChatIds],
     chatIdsFrom: listed.length > 0 ? "ANNOUNCE_CHAT_IDS" : "FEISHU_ALLOWED_CHAT_IDS",
     ...(link ? { link } : {}),
+    ...(docsLink ? { docsLink } : {}),
     stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "announce", "state.json"),
     notesFile: RELEASE_NOTES_FILE,
     changelogFile: CHANGELOG_FILE,
