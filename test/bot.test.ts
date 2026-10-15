@@ -21,6 +21,7 @@ import {
   DEFLECTED_ANSWER,
   madeUpRequestAnswer,
   madeUpRequestRefs,
+  mergedClaimAnswer,
   openRequestAnswer,
   reviewCodeAnswer,
   reviewDeflectedAnswer,
@@ -4315,6 +4316,9 @@ test("能合并时：「把 !354 合了」「直接合了吧」也算让动手�
   assert.match(openRequestAnswer([], [], true), /^（系统检查）你这次没有调用 code_open_pr 和 code_merge，这个合并请求没有开出来，也没有合并。/);
   assert.match(openRequestAnswer([], [], true), /用 code_merge 填编号合掉；它只合机器人自己开的、开到没保护的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了/);
   assert.doesNotMatch(openRequestAnswer([], []), /code_merge/);
+  // 开了合并请求、没调 code_merge 就说合好了
+  assert.equal(review("已开合并请求 !354，已经合进 uat 了", new Set(["code_open_pr"])), mergedClaimAnswer());
+  assert.match(mergedClaimAnswer(), /^（系统检查）你这次没有调用 code_merge，回答里却说已经合好了/);
   // 调了 code_merge：合好了、被拒了都照它说的放行
   assert.equal(review("已合并合并请求 !354，改动进了 uat 分支", new Set(["code_merge"])), undefined);
   assert.equal(review("!354 要合到的 master 是受保护的分支，要人审过再点", new Set(["code_merge"])), undefined);

@@ -57,8 +57,8 @@ export interface CodeHost {
   getRequest?(repo: string, number: number, signal?: AbortSignal): Promise<RequestDetail>;
   /** 合并前要核对的：合并请求的状态、分支、谁开的、源分支最新的提交，机器人自己的账号，要合到的分支受不受保护。没有实现时机器人不能合并 */
   mergeCheck?(repo: string, number: number, signal?: AbortSignal): Promise<MergeCheck>;
-  /** 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝）；要等流水线的设成流水线通过后自动合并 */
-  mergeRequest?(repo: string, number: number, options: { sha: string }, signal?: AbortSignal): Promise<MergeResult>;
+  /** 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并 */
+  mergeRequest?(repo: string, number: number, options: { sha: string; target: string }, signal?: AbortSignal): Promise<MergeResult>;
 }
 
 /** 合并前核对用的 */
@@ -414,12 +414,16 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         targetIsDefault: branch.default === true,
       };
     },
-    async mergeRequest(repo, number, { sha }, signal) {
+    async mergeRequest(repo, number, { sha, target }, signal) {
       const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
       // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），等它算完再合
       let status = "";
       for (let tries = 0; ; tries++) {
         const request = await readMergeRequest(project, number, signal);
+        // 核对以后有人把合并请求改成开到别的分支（比如 master）：合并接口只核对源分支的提交，这里不核对就会合到没查过的分支上
+        if (request.target_branch !== target) {
+          throw new RepoError(`!${number} 要合到的分支改成了 ${request.target_branch ?? "别的分支"}（核对时是 ${target}），机器人不合，请重新说一遍`);
+        }
         status = request.detailed_merge_status ?? request.merge_status ?? "";
         if (!MERGE_CHECKING.has(status) || tries + 1 >= MERGE_CHECK_TRIES) {
           break;
@@ -521,6 +525,8 @@ const MERGE_BLOCKED: Record<string, string> = {
   blocked_status: "被别的合并请求挡着",
   merge_request_blocked: "被别的合并请求挡着",
   external_status_checks: "外部检查还没通过",
+  status_checks_must_pass: "外部检查还没通过",
+  security_policy_pipeline_check: "安全策略的流水线还没跑完",
   security_policy_violations: "安全策略没通过",
   commits_status: "源分支的提交有问题（比如还没推上去）",
   locked_paths: "改到了被锁住的文件",
@@ -1107,7 +1113,7 @@ export class Workspace {
         this.onBranch(check.target),
       );
     }
-    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha }, signal);
+    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target }, signal);
     const url = merged.url || check.url;
     const out = this.output();
     return (

@@ -1713,6 +1713,10 @@ export function reviewCodeAnswer(
     ) {
       return openRequestAnswer(madeUp, unseen.map((cite) => cite.text), requests.canMerge === true);
     }
+    // 开了合并请求、没调 code_merge 就说合好了
+    if (act && requests.canMerge === true && !usedTools.has(MERGE_TOOL) && MERGED_CLAIM.test(answer)) {
+      return mergedClaimAnswer();
+    }
     const notes = [
       usedCode
         ? unseen.length > 0
@@ -1793,6 +1797,11 @@ const OPEN_REQUEST_HINT =
 
 const MERGE_HINT =
   "群成员要合并的，开好以后（已经开过的直接）用 code_merge 填编号合掉；它只合机器人自己开的、开到没保护的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了。";
+
+/** 没调 code_merge 就说合好了 */
+export function mergedClaimAnswer(): string {
+  return `（系统检查）你这次没有调用 code_merge，回答里却说已经合好了。${MERGE_HINT}没合成就照实说开了哪个、为什么没合。其余内容不用改，重新给出完整的回答，不要提这段检查。`;
+}
 
 /** 让开合并请求、合并，却没调 code_open_pr、code_merge 就答了：叫它直接去开、去合 */
 export function openRequestAnswer(madeUp: readonly string[], cites: readonly string[], canMerge = false): string {

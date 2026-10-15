@@ -1488,7 +1488,7 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   const calls: { url: string; method: string; body?: unknown }[] = [];
   const url = "https://lab.corp/golang/appservice/-/merge_requests/354";
   const responses: Response[] = [];
-  const status = (s: string) => new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, detailed_merge_status: s }), { status: 200 });
+  const status = (s: string) => new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, target_branch: "uat", detailed_merge_status: s }), { status: 200 });
   const fakeFetch = (async (u: string, init?: RequestInit) => {
     calls.push({ url: u, method: init?.method ?? "GET", ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
     return responses.shift()!;
@@ -1499,46 +1499,51 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   });
   const sha = "c".repeat(40);
   responses.push(status("checking"), status("mergeable"), new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }));
-  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha }), { state: "merged", url });
+  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), { state: "merged", url });
   assert.deepEqual(naps, [2000]);
   assert.deepEqual(calls.at(-1), { url: "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354/merge", method: "PUT", body: { sha } });
   // 老版本只有 merge_status
   responses.push(
-    new Response(JSON.stringify({ iid: 354, state: "opened", merge_status: "can_be_merged" }), { status: 200 }),
+    new Response(JSON.stringify({ iid: 354, state: "opened", target_branch: "uat", merge_status: "can_be_merged" }), { status: 200 }),
     new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }),
   );
-  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha })).state, "merged");
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" })).state, "merged");
   responses.push(status("ci_must_pass"), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
-  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha }), { state: "auto", url });
+  assert.deepEqual(await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), { state: "auto", url });
   assert.deepEqual(calls.at(-1)?.body, { sha, auto_merge: true, merge_when_pipeline_succeeds: true });
   const before = calls.length;
   responses.push(status("conflict"));
-  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /^RepoError: !354 现在合不了：和要合到的分支有冲突，要先解决冲突/);
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /^RepoError: !354 现在合不了：和要合到的分支有冲突，要先解决冲突/);
+  responses.push(status("status_checks_must_pass"));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /外部检查还没通过/);
+  // 核对以后有人把合并请求改成开到 master：不合
+  responses.push(new Response(JSON.stringify({ iid: 354, state: "opened", target_branch: "master", detailed_merge_status: "mergeable" }), { status: 200 }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /!354 要合到的分支改成了 master（核对时是 uat），机器人不合/);
   responses.push(status("draft_status"));
-  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /还是草稿/);
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /还是草稿/);
   // 合不了的没有去合
   assert.ok(calls.slice(before).every((c) => c.method === "GET"));
   responses.push(status("mergeable"), new Response(JSON.stringify({ message: "Branch cannot be merged" }), { status: 405 }));
-  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /GitLab 合并 !354 失败（HTTP 405）：GitLab 说现在不能合.*Branch cannot be merged/);
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /GitLab 合并 !354 失败（HTTP 405）：GitLab 说现在不能合.*Branch cannot be merged/);
   responses.push(status("mergeable"), new Response(JSON.stringify({ message: "SHA does not match HEAD of source branch" }), { status: 409 }));
-  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /HTTP 409）：源分支刚有新的提交，和核对过的不一样，没合/);
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /HTTP 409）：源分支刚有新的提交，和核对过的不一样，没合/);
   responses.push(status("mergeable"), new Response("{}", { status: 403 }));
-  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha }), /HTTP 403）：机器人的账号没有权限合到这个分支/);
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /HTTP 403）：机器人的账号没有权限合到这个分支/);
   // 一直在算：看够次数就去合，由 GitLab 决定
   naps.length = 0;
   responses.push(...Array.from({ length: 6 }, () => status("checking")), new Response(JSON.stringify({ iid: 354, state: "merged", web_url: url }), { status: 200 }));
-  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha })).state, "merged");
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" })).state, "merged");
   assert.equal(naps.length, 5);
 });
 
 test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到没保护的分支的；其余都不合", async () => {
   const checks: Record<number, MergeCheck> = {};
-  const merged: { number: number; sha: string }[] = [];
+  const merged: { number: number; sha: string; target: string }[] = [];
   let result: MergeResult = { state: "merged", url: "https://example.com/pr/1" };
   const { host } = fakeHost();
   Object.assign(host, {
     mergeCheck: async (_repo: string, number: number) => checks[number] ?? Promise.reject(new RepoError(`没有 !${number}`)),
-    mergeRequest: async (_repo: string, number: number, options: { sha: string }) => {
+    mergeRequest: async (_repo: string, number: number, options: { sha: string; target: string }) => {
       merged.push({ number, ...options });
       return result;
     },
@@ -1568,7 +1573,7 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     { repo: "acme/demo", branch: pr.branch },
     { repo: "acme/demo", branch: "uat" },
   ]);
-  assert.deepEqual(merged, [{ number: 1, sha }]);
+  assert.deepEqual(merged, [{ number: 1, sha, target: "uat" }]);
   result = { state: "auto", url: "https://example.com/pr/1" };
   assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
   checks[1] = { ...base, state: "merged" };
