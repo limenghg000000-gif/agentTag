@@ -388,6 +388,8 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
+    // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
+    const toolTexts: string[] = [];
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
@@ -425,6 +427,9 @@ async function runTask(
           succeeded.add(tool.spec.name);
           // 和 runAgent 交给模型时一样截短：截断处以后的模型没看到，不算
           const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
+          if (!MEMORY_WRITE_TOOLS.has(tool.spec.name)) {
+            toolTexts.push(seenByModel(output, limit));
+          }
           const seenFacts = output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit);
           evidence.push(
             code
@@ -447,8 +452,19 @@ async function runTask(
       }),
     ).concat(
       // 经验库的工具不记进上面几样：查到的是以前确认过的结论，不是这次实时查到的数据，也不是这次读到的代码。
-      // 只查了经验库就给出线上结论、引用文件行号，照样要打回
-      knowledgeTools,
+      // 只查了经验库就给出线上结论、引用文件行号，照样要打回。查到的原文记下来，里面写着的合并请求编号回答里可以写
+      knowledgeTools.map(
+        (tool): Tool => ({
+          ...tool,
+          run: async (args, ctx) => {
+            const output = await tool.run(args, ctx);
+            if (!KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) {
+              toolTexts.push(seenByModel(output, tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS));
+            }
+            return output;
+          },
+        }),
+      ),
     );
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
@@ -478,8 +494,13 @@ async function runTask(
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
     const readCode = () => evidence.some(linksCode);
+    // 合并请求编号的依据：这次的提问、话题里之前的消息和这次的工具结果。检查时再取，查到的才算上
+    // 群记忆、回答前查到的经验里写着的编号也算（群成员记下的「uat 的合并请求是 !360」）
+    const requestsKnown = () =>
+      [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
+    const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL) };
     const reviews = [
-      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
+      ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode, requests)] : []),
       // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
       ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
       ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
@@ -645,6 +666,13 @@ async function runTask(
         logger.warn(`回答打回重做以后还是引用了没查到的代码位置，没有发出 message=${msg.messageId}：${unseen.map((cite) => cite.text).join("、")}`);
         answer = blockedCodeAnswer(deps.codeRepos ?? []);
         blockedCode = true;
+      } else {
+        const madeUp = madeUpRequestRefs(shown, requestsKnown());
+        if (madeUp.length > 0) {
+          logger.warn(`回答打回重做以后还是写了查不到的合并请求编号，没有发出 message=${msg.messageId}：${madeUp.join("、")}`);
+          answer = blockedRequestAnswer(madeUp);
+          blockedCode = true;
+        }
       }
     }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
@@ -1189,6 +1217,7 @@ export function codeContent(output: string, facts: readonly CodeFact[]): string 
 
 /** 列分支、切分支的代码工具：点按钮问的不让切（见 runTask 里的 followUp） */
 const BRANCHES_TOOL = "code_branches";
+const OPEN_PR_TOOL = "code_open_pr";
 
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
@@ -1608,14 +1637,104 @@ function mentionsRepo(text: string, repos: readonly string[]): boolean {
  * 只放过结果里真出现过的，回答里多写一个结果里没有的照样打回。群成员在提问里写的路径不算查证，照样要先读代码。
  * readCode：通过 aiops 这类 MCP 服务读过代码（结果里有代码永久链接），和调过代码工具一样只核对引用
  */
-export function reviewCodeAnswer(question: string, repos: readonly string[], seen: CitationCheck = () => false, readCode: () => boolean = () => false) {
+export function reviewCodeAnswer(
+  question: string,
+  repos: readonly string[],
+  seen: CitationCheck = () => false,
+  readCode: () => boolean = () => false,
+  requests?: RequestCheck,
+) {
+  const act = requests?.canOpen === true && asksToOpenRequest(question);
   return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
     const unseen = unseenCodeCitations(answer, seen);
-    if ([...usedTools].some(isCodeTool) || readCode()) {
-      return unseen.length > 0 ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos) : undefined;
+    const usedCode = [...usedTools].some(isCodeTool) || readCode();
+    const madeUp = requests ? madeUpRequestRefs(answer, requests.known()) : [];
+    // 让把做好的修改开合并请求、合到别的分支，却没调 code_open_pr：编了编号、说开好了、一个代码工具没调就答。
+    // 打回时叫它直接去开，不叫它去搜代码（下面那两句会让它把之前的结论从头查一遍）
+    if (
+      act &&
+      !usedTools.has(OPEN_PR_TOOL) &&
+      (madeUp.length > 0 || OPENED_CLAIM.test(answer) || (!usedCode && (unseen.length > 0 || mentionsRepo(`${question}\n${answer}`, repos))))
+    ) {
+      return openRequestAnswer(madeUp, unseen.map((cite) => cite.text));
     }
-    return mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0 ? unverifiedCodeAnswer(unseen.map((cite) => cite.text)) : undefined;
+    const notes = [
+      usedCode
+        ? unseen.length > 0
+          ? unseenCodeAnswer(unseen.map((cite) => cite.text), repos)
+          : undefined
+        : mentionsRepo(`${question}\n${answer}`, repos) || unseen.length > 0
+          ? unverifiedCodeAnswer(unseen.map((cite) => cite.text))
+          : undefined,
+      madeUp.length > 0 ? madeUpRequestAnswer(madeUp) : undefined,
+    ].filter((note): note is string => note !== undefined);
+    return notes.length > 0 ? notes.join("\n") : undefined;
   };
+}
+
+/** 核对回答里的合并请求编号要用的：已知的文字（提问、话题里之前的消息、这次的工具结果），这次能不能开合并请求 */
+export interface RequestCheck {
+  known: () => string;
+  canOpen: boolean;
+}
+
+/**
+ * 让机器人把做好的修改开合并请求、合到别的分支：「提个 PR」「开个 MR」「把这个 PR 合并到 uat」「也合到 uat」。
+ * 问合没合的不算（「合到 uat 了吗」「有没有合并到 uat」）
+ */
+export function asksToOpenRequest(question: string): boolean {
+  return OPEN_REQUEST_ASK.test(question) && !REQUEST_STATUS_QUESTION.test(question);
+}
+
+const OPEN_REQUEST_ASK = /(?:开|提|建|发起?)\s*(?:一?个|一下)?\s*(?:(?:mr|pr)(?![a-z])|合并请求)|(?:合并|合)到\s*[a-z0-9][\w./-]*/i;
+const REQUEST_STATUS_QUESTION = /有没有|是否|是不是|了[吗么没]|没有[?？]?\s*$|了[?？。.]?\s*$/;
+/**
+ * 回答里说已经开好了合并请求：「已开合并请求」「已经帮你开好了到 uat 的 MR」「PR 已提」。
+ * 「之前开过」「之前已经开了」说的是以前的
+ */
+const OPENED_CLAIM =
+  /(?<!之前|此前|以前|上次|原来|早先)(?:已经?|帮你|给你)\s*(?:帮你|给你)?\s*(?:开|提|创建|建|发起)(?!过)(?:好|了)*[^。；;\n]{0,20}?(?:合并请求|merge\s*request|(?<![a-z])(?:mr|pr)(?![a-z]))|(?:合并请求|(?<![a-z])(?:mr|pr)(?![a-z]))[^。；;\n]{0,6}?已经?(?:开|提|创建|建)(?!过)/i;
+
+/** GitLab 合并请求的编号（!353）和链接里的编号（/merge_requests/353） */
+const REQUEST_REF = /(?<![\w!])!([1-9]\d{0,6})(?!\d)|\/merge_requests\/([1-9]\d{0,6})(?!\d)/g;
+
+/**
+ * 回答里写的合并请求编号，在已知的文字里一次都没出现过的（编出来的）。
+ * 回答里的代码块、行内代码不看（「if (!1)」），只写着一个编号的行内代码（「`!354`」）照样看
+ */
+export function madeUpRequestRefs(answer: string, known: string): string[] {
+  const numbers = (text: string) => [...text.matchAll(REQUEST_REF)].map((match) => match[1] ?? match[2]);
+  const said = new Set(numbers(known));
+  const prose = answer.replace(/```[\s\S]*?(?:```|$)/g, " ").replace(/`([^`\n]*)`/g, (span, inner: string) => (/^\s*!\d+\s*$/.test(inner) ? inner : " "));
+  return [...new Set(numbers(prose).filter((number) => !said.has(number)))].map((number) => `!${number}`);
+}
+
+const OPEN_REQUEST_HINT =
+  "群成员是让你把已经做好的修改开合并请求或合到别的分支：这是要你动手，不是重新排查，不用再搜代码、读代码去核对之前的结论。" +
+  "是这个话题自己的改动，直接调 code_open_pr，target 填要合到的分支；是别的话题或别人开的合并请求，先用 code_requests 找到编号，再调 code_open_pr（from 填编号，target 填分支）。" +
+  "按它返回的编号和链接回答；开不了（报错、冲突、这个分支上已经开过）就照实说是什么原因。";
+
+/** 让开合并请求、却没调 code_open_pr 就答了：叫它直接去开 */
+export function openRequestAnswer(madeUp: readonly string[], cites: readonly string[]): string {
+  return (
+    "（系统检查）你这次没有调用 code_open_pr" +
+    (madeUp.length > 0 ? `，回答里的 ${madeUp.join("、")} 在这次的工具结果、话题和提问里都找不到，是编出来的` : "，这个合并请求没有开出来") +
+    (cites.length > 0 ? `；回答里还写了没查过的代码位置：${cites.join("、")}，不要写` : "") +
+    `。${OPEN_REQUEST_HINT}不要提这段检查。`
+  );
+}
+
+/** 回答里有查不到的合并请求编号 */
+export function madeUpRequestAnswer(madeUp: readonly string[]): string {
+  return (
+    `（系统检查）回答里的 ${madeUp.join("、")} 在这次的工具结果、话题和提问里都找不到，是编出来的。` +
+    "合并请求的编号和链接只写工具返回的、话题里写过的；不确定是哪个就用 code_requests 查，查不到就说没找到。其余内容不用改，重新给出完整的回答，不要提这段检查。"
+  );
+}
+
+/** 打回重做以后还是写了查不到的合并请求编号时，换成这句发出去 */
+export function blockedRequestAnswer(madeUp: readonly string[]): string {
+  return `这次没能给出结论：回答里写的合并请求 ${madeUp.join("、")} 查不到，为免误导没有发出来。请再说一次，要开合并请求可以说清楚开到哪个分支。`;
 }
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
