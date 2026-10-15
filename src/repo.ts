@@ -86,6 +86,8 @@ export interface RequestInfo {
 export interface RequestDetail extends RequestInfo {
   baseSha: string;
   headSha: string;
+  /** 从别的项目（fork）提过来的 */
+  fromFork?: boolean;
 }
 
 /** 查提交历史的条件 */
@@ -332,13 +334,18 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       if (!res.ok) {
         throw new RepoError(`GitLab 读合并请求 !${number} 失败（HTTP ${res.status}）`);
       }
-      const body = (await res.json()) as GitLabRequest & { diff_refs?: { base_sha?: string; head_sha?: string } | null };
+      const body = (await res.json()) as GitLabRequest & {
+        diff_refs?: { base_sha?: string; head_sha?: string } | null;
+        source_project_id?: number;
+        target_project_id?: number;
+      };
       const baseSha = body.diff_refs?.base_sha;
       const headSha = body.diff_refs?.head_sha;
       if (!baseSha || !headSha) {
         throw new RepoError(`GitLab 没给出 !${number} 的改动范围（可能还在计算），过一会儿再试`);
       }
-      return { ...gitLabRequest(body), baseSha, headSha };
+      const fromFork = body.source_project_id !== undefined && body.source_project_id !== body.target_project_id;
+      return { ...gitLabRequest(body), baseSha, headSha, ...(fromFork ? { fromFork } : {}) };
     },
   };
 }
@@ -667,11 +674,27 @@ async function lastUsed(threadDir: string): Promise<number> {
 }
 
 async function readState(dir: string): Promise<WorkspaceState> {
+  let state: WorkspaceState;
   try {
-    return JSON.parse(await readFile(path.join(dir, ".git", STATE_FILE), "utf8")) as WorkspaceState;
+    state = JSON.parse(await readFile(path.join(dir, ".git", STATE_FILE), "utf8")) as WorkspaceState;
   } catch {
     return {};
   }
+  // 状态文件里的分支名、提交号会拿去 checkout、push：对不上规矩的整个不认，当成新话题
+  return validState(state) ? state : {};
+}
+
+function validState(state: WorkspaceState): boolean {
+  if (typeof state !== "object" || state === null || (state.earlier !== undefined && !Array.isArray(state.earlier))) {
+    return false;
+  }
+  const changes: Change[] = [state, ...(state.earlier ?? [])];
+  const names = [...changes.flatMap((change) => [change.base, change.branch]), state.porting?.back, state.porting?.branch];
+  const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha]);
+  return (
+    names.every((name) => name === undefined || (typeof name === "string" && isBranchName(name))) &&
+    shas.every((sha) => sha === undefined || (typeof sha === "string" && /^[0-9a-f]{40,64}$/.test(sha)))
+  );
 }
 
 /** 一个仓库的工作目录。路径都相对仓库根目录，不能跳出去，也不能碰 .git */
@@ -720,6 +743,14 @@ export class Workspace {
       await this.git(["checkout", "-q", back], signal);
       await this.git(["branch", "-q", "-D", branch], signal).catch(() => {});
       delete this.state.porting;
+    }
+    if (existed && this.state.branch && !(await this.hasChanges(signal))) {
+      // 切分支时被打断（检出了别的分支，状态文件还没写）：退回状态文件里记的机器人的分支
+      const current = (await this.git(["symbolic-ref", "-q", "--short", "HEAD"], signal, [1])).trim();
+      if (current !== this.state.branch && !(await this.checkoutOwn(this.state.branch, signal))) {
+        // 本地连机器人的分支都没有了：当成这个分支上还没改过，下面从最新的代码开始
+        this.state = { ...(this.state.base ? { base: this.state.base } : {}), ...(this.state.earlier ? { earlier: this.state.earlier } : {}) };
+      }
     }
     if (!existed) {
       this.state.baseSha = (await this.git(["rev-parse", "HEAD"], signal)).trim();
@@ -853,10 +884,39 @@ export class Workspace {
           this.onBranch(this.baseBranch),
         );
       }
-      const restore = this.earlier.findLast((change) => change.base === name || change.branch === name);
+      let restore = this.earlier.findLast((change) => change.base === name || change.branch === name);
+      // 放到一边的合并请求后来合并了、关掉了：不再接着用它，从那个分支最新的代码重新开始
+      let finished: { change: ParkedChange; state: RequestState | "missing" } | undefined;
+      const state = restore && (await this.requestState(restore.prNumber, signal));
+      if (restore && (state === "merged" || state === "closed")) {
+        finished = { change: restore, state };
+        restore = undefined;
+      } else if (restore && !(await this.git(["rev-parse", "-q", "--verify", `refs/heads/${restore.branch}`], signal, [1])).trim()) {
+        finished = { change: restore, state: "missing" };
+        restore = undefined;
+      }
+      const goal = finished ? finished.change.base : name;
+      if (finished && goal === this.baseBranch) {
+        // 说的是这个分支上之前那个机器人的分支：只把它从记录里去掉，当前的不动
+        const rest = this.earlier.filter((change) => change !== finished.change);
+        this.state = { ...this.state, earlier: rest.length > 0 ? rest : undefined };
+        await this.saveState();
+        return this.output()
+          .parts(
+            ...this.finishedNote(finished.change, finished.state, false),
+            "已经在 ",
+            [goal, { branch: goal }],
+            " 分支上了",
+            ...(this.state.branch ? this.ownBranchNote() : ["。"]),
+          )
+          .build();
+      }
       const parked = this.parked();
-      const earlier = [...this.earlier.filter((change) => change !== restore), ...(parked ? [parked] : [])];
+      const earlier = [...this.earlier.filter((change) => change !== restore && change !== finished?.change), ...(parked ? [parked] : [])];
       const pieces: Piece[] = [];
+      if (finished) {
+        pieces.push(...this.finishedNote(finished.change, finished.state, true));
+      }
       if (restore) {
         await this.checkoutOwn(restore.branch, signal);
         this.state = { ...restore, ...(earlier.length > 0 ? { earlier } : {}) };
@@ -865,9 +925,9 @@ export class Workspace {
         pieces.push("已切到 ", [restore.base, { branch: restore.base }], " 分支", ...this.ownBranchNote());
       } else {
         try {
-          await this.fetchBranches([name], signal);
+          await this.fetchBranches([goal], signal);
         } catch (err) {
-          if (err instanceof MissingBranchError) {
+          if (err instanceof MissingBranchError && !finished) {
             throw new RepoError(
               `没有 ${name} 这个分支，只能切到已有的分支。要新建分支不用先切：基于当前的 ${this.baseBranch} 分支（或者先切到要基于的已有分支）改好代码，` +
                 `用 code_open_pr 开${this.host.requestName}时把 branch 填成 ${name}，机器人会建这个新分支。看有哪些分支用 code_branches`,
@@ -875,14 +935,14 @@ export class Workspace {
           }
           throw err;
         }
-        await this.checkout(name, signal);
-        this.state = { base: name, baseSha: this.state.baseSha, ...(earlier.length > 0 ? { earlier } : {}) };
-        this.baseBranch = name;
+        await this.checkout(goal, signal);
+        this.state = { base: goal, baseSha: this.state.baseSha, ...(earlier.length > 0 ? { earlier } : {}) };
+        this.baseBranch = goal;
         await this.saveState();
         const [sha, last] = (await this.git(["log", "-1", "--format=%h%x00%cs %an「%s」"], signal)).trim().split("\0");
         pieces.push(
           "已切到 ",
-          [name, { branch: name }],
+          [goal, { branch: goal }],
           " 分支，最新提交 ",
           [sha, { commit: sha }],
           ` ${last}。这个话题后面看代码、改代码、开${this.host.requestName}都基于这个分支。`,
@@ -899,6 +959,30 @@ export class Workspace {
       }
       return this.output().parts(...pieces).build();
     });
+  }
+
+  /** 「之前在 main 上开的 !12 已经合并了…」 */
+  private finishedNote(change: Change, state: RequestState | "missing", fresh: boolean): Piece[] {
+    const base = change.base ?? this.baseBranch;
+    const what = change.prNumber ? `开的${this.host.requestName} ${this.host.refOf(change.prNumber)} ` : "推过的改动";
+    const why = state === "merged" ? "已经合并了" : state === "closed" ? "已经关掉了" : "在工作目录里找不到了";
+    const next = fresh ? `这次从 ${base} 最新的代码开始，新改动会另开${this.host.requestName}。` : "";
+    return ["之前在 ", [base, { branch: base }], ` 上${what}${why}，不再往上推。${next}`];
+  }
+
+  /** 之前开的合并请求现在的状态。平台不支持查、或者查失败时不知道（当它还开着，和以前一样） */
+  private async requestState(number: number | undefined, signal?: AbortSignal): Promise<RequestState | undefined> {
+    if (!number || !this.host.getRequest) {
+      return undefined;
+    }
+    try {
+      return (await this.host.getRequest(this.repo, number, signal)).state;
+    } catch (err) {
+      if (signal?.aborted) {
+        throw err;
+      }
+      return undefined;
+    }
   }
 
   /** 「，改动在机器人建的 xx 分支上（合并请求 !12）…」：当前分支上已经有机器人的分支时，说明新改动推到哪里 */
@@ -1331,6 +1415,17 @@ export class Workspace {
           : "还没有任何改动，先用 code_edit_file 改代码",
       );
     }
+    if (this.pullRequest && head !== this.state.pushedSha) {
+      const old = this.pullRequest;
+      const state = await this.requestState(old.number, signal);
+      if ((state === "merged" || state === "closed") && this.state.pushedSha) {
+        // 之前开的已经合并或关掉了：那个分支不再往上推，从这个分支最新的代码另开一个。
+        // 合并了的只搬后来的新改动；关掉了（没合并）的之前那份没进去，连同新改动整份搬
+        const from = state === "merged" ? this.state.pushedSha : (this.state.baseSha ?? this.state.pushedSha);
+        const opened = await this.port({ base: from, tip: head }, this.baseBranch, title, body, undefined, undefined, signal, true);
+        return { ...opened, replaced: { number: old.number, state } };
+      }
+    }
     await this.push(branch, signal);
 
     if (this.pullRequest) {
@@ -1404,6 +1499,10 @@ export class Workspace {
     if (request.state === "closed") {
       throw new RepoError(`${ref} 已经关掉了（没合并），不搬。确认要的话请群成员说清楚要哪份改动`);
     }
+    // 别的项目（fork）提过来的代码没人在这个项目里审过，机器人不替它在这个项目里建分支
+    if (request.fromFork) {
+      throw new RepoError(`${ref} 是从别的项目（fork）提过来的，机器人不搬外面项目的代码，请人在 ${this.host.name} 上处理：${request.url}`);
+    }
     if (request.target === target) {
       throw new RepoError(`${ref} 本来就是开到 ${target} 分支的：${request.url}`, this.onBranch(target));
     }
@@ -1432,6 +1531,8 @@ export class Workspace {
     requested: string | undefined,
     derived: string | undefined,
     signal?: AbortSignal,
+    /** 当前的合并请求已经合并或关掉了：不放到一边，直接丢掉 */
+    drop = false,
   ): Promise<OpenedRequest> {
     await this.fetchBranches([target], signal);
     if (requested) {
@@ -1479,7 +1580,7 @@ export class Workspace {
       throw err;
     }
     // 推过的改动放到一边，切回原来的分支时接着用；只在本地、还没推过的不用留，已经整份搬过来了
-    const parked = this.parked();
+    const parked = drop ? undefined : this.parked();
     const dropped = parked ? undefined : this.state.branch;
     const earlier = [...this.earlier, ...(parked ? [parked] : [])];
     this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}) };
@@ -1592,15 +1693,17 @@ export class Workspace {
     return (await this.hasChanges(signal)) || (this.state.branch !== undefined && (await this.head(signal)) !== this.state.pushedSha);
   }
 
-  /** 检出机器人之前建的分支：本地还在就用本地的，不在了从远端拉 */
-  private async checkoutOwn(branch: string, signal?: AbortSignal): Promise<void> {
+  /**
+   * 检出机器人之前建的分支，只用工作目录里本地的那个：不从远端拉同名分支，那可能是机器人的分支合并删掉以后别人新建的。
+   * 本地没有了返回 false
+   */
+  private async checkoutOwn(branch: string, signal?: AbortSignal): Promise<boolean> {
     const local = await this.git(["rev-parse", "-q", "--verify", `refs/heads/${branch}`], signal, [1]);
-    if (local.trim()) {
-      await this.git(["checkout", "-q", branch], signal);
-      return;
+    if (!local.trim()) {
+      return false;
     }
-    await this.fetchBranches([branch], signal);
-    await this.git(["checkout", "-q", "-B", branch, `refs/remotes/origin/${branch}`], signal);
+    await this.git(["checkout", "-q", branch], signal);
+    return true;
   }
 
   private async head(signal?: AbortSignal): Promise<string> {
@@ -1702,6 +1805,11 @@ export class Workspace {
         if (target !== this.realDir && !target.startsWith(this.realDir + path.sep)) {
           throw new RepoError(`${file} 指向仓库外面，不能访问`);
         }
+        // 仓库里提交的符号链接目录（如 evil -> .git）也不能拿来读写 .git：改了状态文件、.git/config 就能推到别人的分支、在服务器上跑命令
+        const gitDir = path.join(this.realDir, ".git");
+        if (target === gitDir || target.startsWith(gitDir + path.sep)) {
+          throw new RepoError("不能读写 .git 目录");
+        }
         return abs;
       } catch (err) {
         if (err instanceof RepoError || (err as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -1740,6 +1848,8 @@ export interface OpenedRequest {
   base: string;
   /** 改动是搬过来的：从这个话题在 from 分支上的改动（earlier 是那边开过的合并请求），或者从仓库里已有的合并请求 request */
   ported?: { from?: string; earlier?: number; request?: { number: number; source: string; target: string; state: RequestState } };
+  /** 这个话题之前开的合并请求已经合并或关掉了，新改动另开了这一个 */
+  replaced?: { number: number; state: RequestState };
 }
 
 /** git grep -n -z 的一处结果 */
@@ -1945,6 +2055,15 @@ function closingBrace(lines: readonly string[], header: number): number | undefi
     }
   }
   return undefined;
+}
+
+/** 已经是整理好的分支名（状态文件里记的） */
+function isBranchName(name: string): boolean {
+  try {
+    return branchName(name) === name;
+  } catch {
+    return false;
+  }
 }
 
 /** 分支名：去掉 origin/、refs/heads/ 前缀，只许 git 分支名里常见的字符 */

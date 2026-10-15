@@ -11,6 +11,7 @@ import {
   type RequestDetail,
   type RequestInfo,
   type RequestQuery,
+  type RequestState,
   createGitHubHost,
   createGitLabHost,
   enclosingFunction,
@@ -773,7 +774,11 @@ test("搬别的话题开的合并请求：按编号拿到改动范围，从 uat 
   const headSha = (await runGit(["rev-parse", "HEAD"], { cwd: portSeed })).stdout.trim();
   const baseSha = (await runGit(["rev-parse", "main"], { cwd: portSeed })).stdout.trim();
   const seven: RequestDetail = { number: 7, title: "A 返回 7", url: "https://example.com/pr/7", state: "opened", source: "fix/other", target: "main", baseSha, headSha };
-  const requests: Record<number, RequestDetail> = { 7: seven, 8: { ...seven, number: 8, state: "closed" } };
+  const requests: Record<number, RequestDetail> = {
+    7: seven,
+    8: { ...seven, number: 8, state: "closed" },
+    10: { ...seven, number: 10, fromFork: true },
+  };
   const { all, prs } = portWorkspaces({
     async getRequest(_repo, number) {
       return requests[number] ?? Promise.reject(new RepoError(`没有 !${number}`));
@@ -783,6 +788,8 @@ test("搬别的话题开的合并请求：按编号拿到改动范围，从 uat 
   await assert.rejects(ws.openPullRequest("t", "", { from: 7 }), /要搬 !7 的改动，target 要填搬到哪个分支/);
   await rejectsWith(ws.openPullRequest("t", "", { from: 7, target: "main" }), /^!7 本来就是开到 main 分支的/, [{ repo: portRepo, branch: "main" }]);
   await assert.rejects(ws.openPullRequest("t", "", { from: 8, target: "uat" }), /!8 已经关掉了/);
+  // 从别的项目（fork）提过来的：没人在这个项目里审过，不搬
+  await assert.rejects(ws.openPullRequest("t", "", { from: 10, target: "uat" }), /^RepoError: !10 是从别的项目（fork）提过来的，机器人不搬外面项目的代码/);
   await assert.rejects(ws.openPullRequest("t", "", { from: 9, target: "uat" }), /没有 !9/);
   const pr = await ws.openPullRequest("A 返回 7（uat）", "", { from: 7, target: "uat" });
   assert.deepEqual(brief(pr), [true, 1, "fix/other-uat", "uat"]);
@@ -902,11 +909,25 @@ test("GitLab 合并请求：按更新时间列、带搜索词；读一个时用 
       { status: 200 },
     ),
     new Response(
-      JSON.stringify({ iid: 353, title: "t", web_url: "u", state: "merged", source_branch: "s", target_branch: "master", diff_refs: { base_sha: "b0", head_sha: "h1", start_sha: "s0" } }),
+      JSON.stringify({
+        iid: 353,
+        title: "t",
+        web_url: "u",
+        state: "merged",
+        source_branch: "s",
+        target_branch: "master",
+        source_project_id: 5,
+        target_project_id: 5,
+        diff_refs: { base_sha: "b0", head_sha: "h1", start_sha: "s0" },
+      }),
       { status: 200 },
     ),
     new Response("{}", { status: 404 }),
     new Response(JSON.stringify({ iid: 354, title: "t", state: "opened", diff_refs: null }), { status: 200 }),
+    new Response(
+      JSON.stringify({ iid: 355, title: "t", state: "opened", source_project_id: 9, target_project_id: 5, diff_refs: { base_sha: "b0", head_sha: "h1" } }),
+      { status: 200 },
+    ),
     new Response("{}", { status: 403 }),
   ];
   const fakeFetch = (async (url: string) => {
@@ -939,9 +960,11 @@ test("GitLab 合并请求：按更新时间列、带搜索词；读一个时用 
   );
   const one = await host.getRequest!("golang/appservice", 353);
   assert.equal(urls[1], "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/353");
-  assert.deepEqual([one.state, one.target, one.baseSha, one.headSha], ["merged", "master", "b0", "h1"]);
+  assert.deepEqual([one.state, one.target, one.baseSha, one.headSha, one.fromFork], ["merged", "master", "b0", "h1", undefined]);
   await assert.rejects(host.getRequest!("golang/appservice", 9), /没有 !9 这个合并请求，用 code_requests 找一下/);
   await assert.rejects(host.getRequest!("golang/appservice", 354), /GitLab 没给出 !354 的改动范围/);
+  // 从别的项目（fork）提过来的
+  assert.equal((await host.getRequest!("golang/appservice", 355)).fromFork, true);
   await assert.rejects(host.listRequests!("golang/appservice", { state: "all", limit: 5 }), /GitLab 列合并请求失败（HTTP 403）：令牌没有读这个项目的权限/);
 });
 
@@ -1265,4 +1288,142 @@ test("搬改动时被打断（比如重启）：下次打开先退回原来的�
   assert.equal(JSON.parse(await readFile(stateFile, "utf8")).porting, undefined);
   // 接着搬：照常开到 uat
   assert.deepEqual(brief(await again.openPullRequest("A 返回 13（uat）", "", { target: "uat" })), [true, 2, "fix/thirteen-uat", "uat"]);
+});
+
+test("之前开的合并请求合并了或关掉了：新改动另开一个，不再推到那个分支；切回那边时也从最新的代码开始", async () => {
+  // 单独一个远端：要真的把合并请求合进 main
+  const finishedRemote = path.join(tmp, "finished.git");
+  await runGit(["clone", "-q", "--bare", portRemote, finishedRemote]);
+  const states: Record<number, RequestState> = {};
+  const { all } = portWorkspaces({
+    cloneUrl: () => `file://${finishedRemote}`,
+    async getRequest(_repo, number) {
+      const state = states[number] ?? "opened";
+      return { number, title: "", url: `https://example.com/pr/${number}`, state, source: "", target: "", baseSha: "", headSha: "" };
+    },
+  });
+  const log = async (ref: string) => (await runGit(["log", "--format=%s", ref], { cwd: finishedRemote })).stdout.trim().split("\n");
+  const show = async (ref: string, file: string) => (await runGit(["show", `${ref}:${file}`], { cwd: finishedRemote })).stdout;
+
+  // 合并了：新改动从 main 最新的代码另开一个，只带新改动；合过的分支不再往上推，本地也删掉
+  const ws = await all.open("om_f1", portRepo);
+  await ws.editFile("a.go", "return 1", "return 2");
+  await ws.openPullRequest("A 返回 2", "", { branch: "fix/merged" });
+  await runGit(["push", "-q", "origin", "fix/merged:main"], { cwd: ws.dir });
+  states[1] = "merged";
+  await ws.editFile("a.go", "return 2", "return 3");
+  const next = await ws.openPullRequest("A 返回 3", "");
+  assert.deepEqual(brief(next).slice(0, 2), [true, 2]);
+  assert.equal(next.base, "main");
+  assert.match(next.branch, /^agenttag\/20261015-[0-9a-f]{6}$/);
+  assert.deepEqual(next.replaced, { number: 1, state: "merged" });
+  assert.deepEqual(await log(next.branch), ["A 返回 3", "A 返回 2", "init"]);
+  assert.deepEqual(await log("fix/merged"), ["A 返回 2", "init"]);
+  assert.equal(ws.pullRequest?.number, 2);
+  assert.deepEqual(ws.earlier, []);
+  assert.equal((await runGit(["branch", "--list", "fix/merged"], { cwd: ws.dir })).stdout.trim(), "");
+
+  // 关掉了（没合并）：之前那份没进 main，连同新改动整份另开一个
+  const tools = Object.fromEntries(createCodeTools({ workspaces: all, threadKey: "om_f2", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  await tools.code_edit_file.run({ path: "b.txt", old_text: "three", new_text: "3" }, { signal });
+  await tools.code_open_pr.run({ title: "b 改 3", body: "", branch: "fix/closed" }, { signal });
+  states[3] = "closed";
+  await tools.code_edit_file.run({ path: "b.txt", old_text: "one", new_text: "1" }, { signal });
+  const reopened = (await tools.code_open_pr.run({ title: "b 改 1 和 3", body: "" }, { signal })).split("\n")[0];
+  assert.match(
+    reopened,
+    /^这个话题之前开的合并请求 !3 已经关掉了（没合并），它的改动连同新改动从 main 最新的代码另开了合并请求 !4（(agenttag\/20261015-[0-9a-f]{6}) → main）：https:\/\/example.com\/pr\/4$/,
+  );
+  const reopenedBranch = /（(\S+) → main）/.exec(reopened)![1];
+  assert.equal(await show(reopenedBranch, "b.txt"), "1\ntwo\n3\n");
+  assert.deepEqual(await log(reopenedBranch), ["b 改 1 和 3", "A 返回 2", "init"]);
+  assert.deepEqual(await log("fix/closed"), ["b 改 3", "A 返回 2", "init"]);
+
+  // 开到 uat 以后，main 上那个合并了：切回 main 不接着用它，从 main 最新的代码开始；uat 上那个照旧放着
+  const ws3 = await all.open("om_f3", portRepo);
+  await ws3.editFile("c.txt", undefined, "c\n");
+  await ws3.openPullRequest("加 c", "", { branch: "fix/c" });
+  assert.equal((await ws3.openPullRequest("加 c（uat）", "", { target: "uat" })).number, 6);
+  states[5] = "merged";
+  const back = await ws3.switchBranch("main");
+  assert.match(
+    back.text,
+    /^之前在 main 上开的合并请求 !5 已经合并了，不再往上推。这次从 main 最新的代码开始，新改动会另开合并请求。已切到 main 分支，最新提交 [0-9a-f]{7} .*之前在 uat 上开的合并请求 !6 不受影响，切回 uat 会接着用它。$/,
+  );
+  assert.equal(ws3.baseBranch, "main");
+  assert.equal(ws3.pullRequest, undefined);
+  assert.deepEqual(ws3.earlier.map((c) => [c.base, c.branch, c.prNumber]), [["uat", "fix/c-uat", 6]]);
+  // 放着的分支在本地找不到了：也不从远端拉同名分支，从 uat 最新的代码开始
+  await runGit(["branch", "-q", "-D", "fix/c-uat"], { cwd: ws3.dir });
+  const lost = await ws3.switchBranch("uat");
+  assert.match(lost.text, /^之前在 uat 上开的合并请求 !6 在工作目录里找不到了，不再往上推。这次从 uat 最新的代码开始，新改动会另开合并请求。已切到 uat 分支/);
+  assert.equal(ws3.pullRequest, undefined);
+  assert.deepEqual(ws3.earlier, []);
+});
+
+test("切分支时被打断（检出了别的分支，状态还没记下）：下次打开退回机器人的分支；本地连分支都没了就从最新的代码开始", async () => {
+  const { all } = portWorkspaces();
+  const ws = await all.open("om_p14", portRepo);
+  await ws.editFile("a.go", "return 1", "return 14");
+  await ws.openPullRequest("A 返回 14", "", { branch: "fix/fourteen" });
+  const head = async () => (await runGit(["symbolic-ref", "--short", "HEAD"], { cwd: ws.dir })).stdout.trim();
+  await runGit(["fetch", "-q", "--depth", "1", "origin", "+refs/heads/uat:refs/remotes/origin/uat"], { cwd: ws.dir });
+  await runGit(["checkout", "-q", "-B", "uat", "refs/remotes/origin/uat"], { cwd: ws.dir });
+
+  const again = await all.open("om_p14", portRepo);
+  assert.equal(await head(), "fix/fourteen");
+  assert.equal(again.baseBranch, "main");
+  assert.equal(again.pullRequest?.number, 1);
+  assert.match((await again.readFile("a.go")).text, /return 14/);
+
+  // 机器人的分支在本地没了：不从远端拉同名分支（可能已经不是机器人的了），当成还没改过
+  await runGit(["checkout", "-q", "-B", "uat", "refs/remotes/origin/uat"], { cwd: ws.dir });
+  await runGit(["branch", "-q", "-D", "fix/fourteen"], { cwd: ws.dir });
+  const third = await all.open("om_p14", portRepo);
+  assert.equal(await head(), "main");
+  assert.equal(third.baseBranch, "main");
+  assert.equal(third.pullRequest, undefined);
+  assert.match((await third.readFile("a.go")).text, /return 1$/m);
+});
+
+test("不能借仓库里的符号链接读写 .git；状态文件里不对的分支名、提交号整个不认", async () => {
+  const evilRemote = path.join(tmp, "evil.git");
+  const evilSeed = path.join(tmp, "evil-seed");
+  await runGit(["init", "-q", "--bare", "-b", "main", evilRemote]);
+  await runGit(["clone", "-q", evilRemote, evilSeed]);
+  await writeFile(path.join(evilSeed, "a.txt"), "a\n");
+  await symlink(".git", path.join(evilSeed, "evil"));
+  await symlink(".git/config", path.join(evilSeed, "conf"));
+  await runGit(["add", "-A"], { cwd: evilSeed });
+  await runGit(["commit", "-q", "-m", "init"], { cwd: evilSeed, env: author });
+  await runGit(["push", "-q", "origin", "main"], { cwd: evilSeed });
+  const { host } = fakeHost();
+  host.cloneUrl = () => `file://${evilRemote}`;
+  const all = new CodeWorkspaces({ root: path.join(tmp, `ws${rootCount++}`), host, repos: ["acme/evil"], logger: quiet });
+  const ws = await all.open("om_e1", "acme/evil");
+  for (const file of ["evil", "evil/config", "evil/.agenttag.json", "conf"]) {
+    await assert.rejects(ws.readFile(file), /不能读写 \.git 目录/, file);
+  }
+  for (const file of ["evil/config", "evil/.agenttag.json", "evil/hooks/pre-commit", "evil/new/x", "conf"]) {
+    await assert.rejects(ws.editFile(file, undefined, "x"), /不能读写 \.git 目录/, file);
+  }
+  assert.match((await ws.readFile("a.txt")).text, /a/);
+
+  const stateFile = path.join(ws.dir, ".git", ".agenttag.json");
+  const sha = "a".repeat(40);
+  for (const bad of [
+    { base: "--upload-pack=touch x", branch: "fix/x" },
+    { branch: "main;rm -rf", pushedSha: sha },
+    { branch: "fix/ok", pushedSha: "HEAD" },
+    { earlier: "x" },
+    { earlier: [{ base: "main", branch: "../x", pushedSha: sha }] },
+    { porting: { back: "-f", branch: "fix/ok" } },
+    null,
+  ]) {
+    await writeFile(stateFile, JSON.stringify(bad));
+    const again = await all.open("om_e1", "acme/evil");
+    assert.equal(again.baseBranch, "main", JSON.stringify(bad));
+    assert.equal(again.pullRequest, undefined);
+    assert.deepEqual(again.earlier, []);
+  }
 });

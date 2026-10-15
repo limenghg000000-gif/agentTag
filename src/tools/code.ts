@@ -340,6 +340,13 @@ function openedLine(pr: OpenedRequest, requestName: string, refOf: (number: numb
   if (!pr.created) {
     return [`已把新改动推到这个话题之前开的${requestName} ${ref}`, ...route];
   }
+  if (pr.replaced) {
+    const was =
+      pr.replaced.state === "merged"
+        ? `${refOf(pr.replaced.number)} 已经合并了，新改动`
+        : `${refOf(pr.replaced.number)} 已经关掉了（没合并），它的改动连同新改动`;
+    return [`这个话题之前开的${requestName} ${was}从 `, [pr.base, { branch: pr.base }], ` 最新的代码另开了${requestName} ${ref}`, ...route];
+  }
   if (!pr.ported) {
     return [`已开${requestName} ${ref}`, ...route];
   }
