@@ -1799,6 +1799,8 @@ export class Workspace {
     /** 当前的合并请求已经合并或关掉了：不放到一边，直接丢掉 */
     drop = false,
   ): Promise<OpenedRequest> {
+    // 当前的改动本来是从别人的合并请求搬来的：再搬到别的分支也记着，合并前照样核对
+    const portedFrom = this.state.portedFrom;
     await this.fetchBranches([target], signal);
     if (requested) {
       await this.assertNewBranch(requested, signal);
@@ -1848,7 +1850,7 @@ export class Workspace {
     const parked = drop ? undefined : this.parked();
     const dropped = parked ? undefined : this.state.branch;
     const earlier = [...this.earlier, ...(parked ? [parked] : [])];
-    this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}) };
+    this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}), ...(portedFrom ? { portedFrom } : {}) };
     this.baseBranch = target;
     await this.saveState();
     if (dropped) {

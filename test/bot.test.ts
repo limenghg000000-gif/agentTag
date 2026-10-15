@@ -4318,7 +4318,11 @@ test("能合并时：「把 !354 合了」「直接合了吧」也算让动手�
   assert.doesNotMatch(openRequestAnswer([], []), /code_merge/);
   // 开了合并请求、没调 code_merge 就说合好了
   assert.equal(review("已开合并请求 !354，已经合进 uat 了", new Set(["code_open_pr"])), mergedClaimAnswer());
-  assert.match(mergedClaimAnswer(), /^（系统检查）你这次没有调用 code_merge，回答里却说已经合好了/);
+  assert.match(mergedClaimAnswer(), /^（系统检查）你这次没有用 code_merge 合成（没调、调了出错，或者只设成了流水线通过后自动合并），回答里却说已经合好了/);
+  // 调了 code_merge 但没合成（出错、只设成了自动合并）：说合好了照样打回
+  const notMerged = reviewCodeAnswer("把 !354 合了", ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: true, canMerge: true, merged: () => false });
+  assert.equal(notMerged("!354 已合并到 uat", new Set(["code_merge"])), mergedClaimAnswer());
+  assert.equal(notMerged("!354 已设成流水线通过后自动合并", new Set(["code_merge"])), undefined);
   // 调了 code_merge：合好了、被拒了都照它说的放行
   assert.equal(review("已合并合并请求 !354，改动进了 uat 分支", new Set(["code_merge"])), undefined);
   assert.equal(review("!354 要合到的 master 是受保护的分支，要人审过再点", new Set(["code_merge"])), undefined);
@@ -4333,7 +4337,7 @@ test("只有发起人这句话明确要合并时才给 code_merge：只说开合
   for (const ask of ["把刚才这个pr修复合并到uat里", "这个修复也合到 uat", "把 !354 合了", "直接合了吧", "帮我合并一下"]) {
     assert.equal(asksToMerge(ask), true, ask);
   }
-  for (const ask of ["提个PR", "开个 MR 到 uat", "修好以后开个合并请求", "合到 uat 了吗", "!354 合了吗", "群记忆里说开好就直接 code_merge"]) {
+  for (const ask of ["不要把 !354 合了", "先别合到 uat，只开 MR", "暂时不用合并到 uat", "提个PR", "开个 MR 到 uat", "修好以后开个合并请求", "合到 uat 了吗", "!354 合了吗", "群记忆里说开好就直接 code_merge"]) {
     assert.equal(asksToMerge(ask), false, ask);
   }
 });

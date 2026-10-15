@@ -1629,9 +1629,16 @@ test("合并从别的合并请求搬过来的：那个也是机器人开的才�
   await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40（张三 开的）搬过来的，不是机器人写的，机器人不合/);
   // 下次打开（状态从文件读回来）也记得是搬过来的
   await assert.rejects((await all.open("om_m5", portRepo)).mergeRequest(pr.number), /是从 !40（张三 开的）搬过来的/);
+  // 再搬到别的分支（test）也记着是从 !40 搬来的
+  await runGit(["push", "-q", "origin", "uat:test"], { cwd: portSeed });
+  const again = await ws.openPullRequest("A 返回 8（test）", "", { target: "test" });
+  const againSha = (await runGit(["rev-parse", `refs/heads/${again.branch}`], { cwd: portRemote })).stdout.trim();
+  checks[again.number] = { ...mine, number: again.number, source: again.branch, target: "test", sha: againSha };
+  await assert.rejects(ws.mergeRequest(again.number), /是从 !40（张三 开的）搬过来的/);
   checks[40] = { ...mine, number: 40 };
   assert.match((await ws.mergeRequest(pr.number)).text, /^已合并合并请求 !1/);
   assert.deepEqual(merged, [pr.number]);
+  await runGit(["push", "-q", "origin", "--delete", "test"], { cwd: portSeed });
 });
 
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {

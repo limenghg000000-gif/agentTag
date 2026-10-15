@@ -401,6 +401,8 @@ async function runTask(
     const attempted = new Set<string>();
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
+    // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
+    let mergedNow = false;
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
@@ -452,6 +454,9 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
+            mergedNow = true;
+          }
           // 和 runAgent 交给模型时一样截短：截断处以后的模型没看到，不算
           const limit = tool.maxOutputChars ?? MAX_TOOL_OUTPUT_CHARS;
           if (!MEMORY_WRITE_TOOLS.has(tool.spec.name)) {
@@ -533,7 +538,7 @@ async function runTask(
     // 群记忆、回答前查到的经验里写着的编号也算（群成员记下的「uat 的合并请求是 !360」）
     const requestsKnown = () =>
       [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
-    const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL) };
+    const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL), merged: () => mergedNow };
     const reviews = [
       ...(restate
         ? [reviewRestatedAnswer(saidBefore, restateScope)]
@@ -1713,8 +1718,8 @@ export function reviewCodeAnswer(
     ) {
       return openRequestAnswer(madeUp, unseen.map((cite) => cite.text), requests.canMerge === true);
     }
-    // 开了合并请求、没调 code_merge 就说合好了
-    if (act && requests.canMerge === true && !usedTools.has(MERGE_TOOL) && MERGED_CLAIM.test(answer)) {
+    // 开了合并请求、没调 code_merge（或者调了没合成、只设成了自动合并）就说合好了
+    if (act && requests.canMerge === true && !(requests.merged?.() ?? usedTools.has(MERGE_TOOL)) && MERGED_CLAIM.test(answer)) {
       return mergedClaimAnswer();
     }
     const notes = [
@@ -1737,6 +1742,8 @@ export interface RequestCheck {
   canOpen: boolean;
   /** 这次有 code_merge（机器人能合并没保护的分支） */
   canMerge?: boolean;
+  /** code_merge 这次真的合进去了（调用失败、只设成流水线通过后自动合并的不算） */
+  merged?: () => boolean;
 }
 
 /**
@@ -1753,9 +1760,11 @@ export function asksToOpenRequest(question: string): boolean {
 
 /** 发起人这句话明确要合并：「合到 uat」「合并到 uat」「把 !354 合了」「合并一下」。只说「提个 PR」「开个 MR 到 uat」的不算 */
 export function asksToMerge(question: string): boolean {
-  return asksToOpenRequest(question) && (MERGE_IMPERATIVE.test(question) || MERGE_ASK.test(question) || MERGE_INTO.test(question));
+  return !MERGE_REFUSED.test(question) && asksToOpenRequest(question) && (MERGE_IMPERATIVE.test(question) || MERGE_ASK.test(question) || MERGE_INTO.test(question));
 }
 
+/** 说了不要合：「不要把 !354 合了」「先别合到 uat，只开 MR」「暂时不用合并」 */
+const MERGE_REFUSED = /(?:不要|别|不用|无需|不需要|先不|暂时不|暂不|不必)[^，。,;；\n]{0,20}?合/;
 const MERGE_INTO = /(?:合并|合)到\s*[a-z0-9]/i;
 // 两段 \s* 中间的可选词要和后面的 \s* 包在一起：分开写时一长串空白会被两段 \s* 来回分，卡住几秒
 const OPEN_REQUEST_ASK = /(?:开|提|建|发起?)\s*(?:(?:一?个|一下)\s*)?(?:(?:mr|pr)(?![a-z])|合并请求)|(?:合并|合)到\s*[a-z0-9][\w./-]*/i;
@@ -1800,7 +1809,7 @@ const MERGE_HINT =
 
 /** 没调 code_merge 就说合好了 */
 export function mergedClaimAnswer(): string {
-  return `（系统检查）你这次没有调用 code_merge，回答里却说已经合好了。${MERGE_HINT}没合成就照实说开了哪个、为什么没合。其余内容不用改，重新给出完整的回答，不要提这段检查。`;
+  return `（系统检查）你这次没有用 code_merge 合成（没调、调了出错，或者只设成了流水线通过后自动合并），回答里却说已经合好了。${MERGE_HINT}没合成就照实说开了哪个、为什么没合。其余内容不用改，重新给出完整的回答，不要提这段检查。`;
 }
 
 /** 让开合并请求、合并，却没调 code_open_pr、code_merge 就答了：叫它直接去开、去合 */
