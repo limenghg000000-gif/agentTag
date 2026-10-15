@@ -1651,6 +1651,41 @@ test("合并从别的合并请求搬过来的：那个不是这个话题里开�
   await runGit(["push", "-q", "origin", "--delete", "test"], { cwd: portSeed });
 });
 
+test("合并本话题里搬过来的改动：搬的时候那边源分支得是机器人推的那个提交", async () => {
+  const { host } = fakeHost();
+  const merged: number[] = [];
+  const checks: Record<number, MergeCheck> = {};
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number) => checks[number],
+    mergeRequest: async (_repo: string, number: number) => {
+      merged.push(number);
+      return { state: "merged", url: "" };
+    },
+  });
+  const all = workspaces(host);
+  const ws = await all.open("om_m6", "acme/demo");
+  const [s40, s41, other] = ["a", "b", "c"].map((c) => c.repeat(40));
+  const check = (number: number, sha: string): MergeCheck => ({
+    number, title: "x", url: `https://example.com/pr/${number}`, state: "opened", source: `fix/${number}`, target: "uat",
+    authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false,
+  });
+  checks[40] = check(40, s40);
+  checks[41] = check(41, s41);
+  await runGit(["branch", "fix/41"], { cwd: ws.dir });
+  const stateFile = path.join(ws.dir, ".git", ".agenttag.json");
+  const state = (portedSha: string) => ({
+    base: "main", branch: "fix/41", pushedSha: s41, prUrl: "https://example.com/pr/41", prNumber: 41, portedFrom: 40, portedSha,
+    earlier: [{ base: "main", branch: "fix/40", pushedSha: s40, prUrl: "https://example.com/pr/40", prNumber: 40 }],
+  });
+  // 搬之前别人往 !40 的分支上推过提交：搬来的不是机器人推的那个
+  await writeFile(stateFile, JSON.stringify(state(other)));
+  await assert.rejects((await all.open("om_m6", "acme/demo")).mergeRequest(41), /^RepoError: !41 的改动是从 !40 搬过来的，搬的时候那边的源分支上有机器人没推过的提交/);
+  assert.deepEqual(merged, []);
+  await writeFile(stateFile, JSON.stringify(state(s40)));
+  assert.match((await (await all.open("om_m6", "acme/demo")).mergeRequest(41)).text, /^已合并合并请求 !41/);
+  assert.deepEqual(merged, [41]);
+});
+
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {
   const { host } = fakeHost();
   const plainTools = createCodeTools({ workspaces: workspaces(host), threadKey: "om_m3", botName: () => "飞书 CLI" }).map((t) => t.spec.name);
