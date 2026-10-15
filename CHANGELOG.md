@@ -10,7 +10,7 @@ AgentTag 每个版本在技术上改了什么，写给开发和维护机器人�
 
 ### 新增
 
-- 推代码之前在服务器上编译检查（`BUILD_CHECK`，默认 on）：`code_open_pr` 每次推新提交前，把这个话题相对检出时的提交改到的文件拿去编译。Go 仓库（根目录有 `go.mod`）用 `go build` 编改到的包（改了 go.mod/go.sum 编 `./...`），产物放临时目录、编完删掉，`CGO_ENABLED=0`，`GOTOOLCHAIN=auto`（项目要更新的 Go 时按 go.mod 从代理下载官方工具链，更旧的直接编），`GOPROXY` 默认 `https://goproxy.cn,direct`（`BUILD_GOPROXY` 可换），`GOSUMDB` 默认 `sum.golang.google.cn`，最多等 10 分钟；PHP 用 `php -l` 查改到的文件。报错落在改到的文件上就不推、不开合并请求，报错交给模型按报错改；报错都在没改的文件上（本来就编不过）、没装工具、没有 go.mod 的算「说不清」，照常推。编过了的提交记在工作目录状态里（`checkedSha`），`code_merge` 合并时源分支最新提交就是它的，不用再等流水线。`code_open_pr` 的结果写明编译检查的结果。**部署**：服务器上装一个最新版 Go（golang.google.cn 或阿里云镜像下载），要查 PHP 仓库的再装 PHP；没装的语言跳过。（#57）
+- 推代码之前在服务器上照项目自己的构建方式编译检查（`BUILD_CHECK`，默认 on）：`code_open_pr` 每次推新提交前，读 `.gitlab-ci.yml` 里 docker build 用的 Dockerfile（`--file`/`-f`，没写就用根目录的 `Dockerfile`），从里面 `go build` 那一步取编的入口（如 `main.go`、`./cmd/aiops-mcp`）、写死的 `GOOS`/`GOARCH`、`-tags`，在服务器上直接 `go build` 这个入口，再加上入口外改到的包（改了 go.mod/go.sum 加 `./...`）；不跑 docker、不拉镜像。`CGO_ENABLED=0`、`GOFLAGS` 置空（不照搬 Dockerfile 里的），`GOTOOLCHAIN=auto`（项目要更新的 Go 时按 go.mod 从代理下载官方工具链），`GOPROXY` 默认 `https://goproxy.cn,direct`（`BUILD_GOPROXY` 可换），`GOSUMDB` 默认 `sum.golang.google.cn`，产物放临时目录、编完删掉，最多等 10 分钟；编的全是库时不带 `-o` 重编。PHP 用 `php -l` 查改到的文件。编不过时用 `git worktree` 把检出时的提交放到临时目录再编一次：改之前能编过（报错在没改的文件里也算，比如改了函数签名）或者报错落在改到的文件上，就不推、不开合并请求，报错交给模型改；改之前也编不过、没装工具、没有 go.mod，或者改了编不了的文件（别的语言、Dockerfile、`.gitlab-ci.yml`、composer 依赖）算「说不清」，照常推。编过了的提交记在工作目录状态里（`checkedSha`），`code_merge` 合并时源分支最新提交就是它的，不用再等流水线。`code_open_pr` 的结果写明照哪个 Dockerfile 编了什么。**部署**：服务器上装一个最新版 Go（golang.google.cn 或阿里云镜像下载），要查 PHP 仓库的再装 PHP；没装的语言跳过。（#57）
 
 ### 修复
 

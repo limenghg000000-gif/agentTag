@@ -179,7 +179,7 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, f
               "。",
           ]
         : []),
-      "- code_open_pr 推之前会在服务器上编译一下改到的代码（Go 用 go build，PHP 查语法）：编不过它会拒绝、不推，返回编译器的报错，你按报错用 code_read_file 看清相关代码再改，改好再调 code_open_pr，改不好就把报错告诉群成员，不要绕过。编过只说明能编译，不等于测过。",
+      "- code_open_pr 推之前会在服务器上照项目自己的构建方式编译一下（读流水线用的 Dockerfile，编里面 go build 的那个入口，再加上改到的包；PHP 查语法）：这次改动编不过它会拒绝（报错可能在没改的文件里，比如改了函数签名、调用的地方编不过）、不推，返回编译器的报错，你按报错用 code_read_file 看清相关代码再改，改好再调 code_open_pr，改不好就把报错告诉群成员，不要绕过。编过只说明能编译，不等于测过。",
       toolNames.includes("code_merge")
         ? "- 你不能运行代码和测试，改完要说明没有跑过测试；开到 master、prod 这类线上分支的请人审查后再合并，合进 uat 这类测试分支的请大家在那边验一下。"
         : "- 你不能运行代码和测试，改完要说明没有跑过测试，请人审查后再合并。",

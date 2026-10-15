@@ -1985,14 +1985,14 @@ export class Workspace {
     return checked;
   }
 
-  /** 编译这个话题在 base 分支上改到的文件（和检出时的提交比，没有就和远端分支比） */
+  /** 编译这个话题在 base 分支上改到的文件（和检出时的提交比，没有就和远端分支比）；编不过时在那个提交上再编一次比一比 */
   private async buildCheck(signal?: AbortSignal): Promise<BuildResult | undefined> {
     if (!this.build) {
       return undefined;
     }
     const base = this.state.baseSha ?? `refs/remotes/origin/${this.baseBranch}`;
     const files = (await this.changedFiles([base, "HEAD"], signal)).map((file) => file.path);
-    return this.build.check(this.dir, files, signal);
+    return this.build.check(this.dir, files, signal, base);
   }
 
   /** 搬过去的新分支的名字：跟着原来的分支起（如 fix/x-uat），不合规矩或者已经有了就另起一个 */

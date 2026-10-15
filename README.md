@@ -179,7 +179,7 @@ npm start
 | `WEB_SEARCH` | 否 | 联网搜索，`on`（默认）或 `off`。只在 `MODEL_BASE_URL` 是百炼的 OpenAI 兼容接口时生效 |
 | `WEB_SEARCH_MODEL` | 否 | 搜索用的百炼模型，要支持联网搜索（千问系列）。默认和 `MODEL_ID` 一样，`MODEL_ID` 不是千问时默认 `qwen3.8-max`。要省钱可以换成千问的小模型 |
 | `CODE_REPOS` | 否 | 允许机器人操作的仓库，多个用逗号分隔：GitLab 写项目路径（`group/project`，可以多层），GitHub 写 `owner/repo`。仓库的默认分支不是大家平时用的那个时写成 `group/project@分支`，没被点名分支时先看它。不填就没有代码仓库工具 |
-| `BUILD_CHECK` | 否 | 推代码之前在服务器上编译检查，默认 `on`：Go 仓库用 `go build` 编这次改到的包（关掉 cgo，项目要更新的 Go 时自动下载官方工具链），PHP 用 `php -l` 查语法。改到的文件编不过就不推，报错交给模型改；编过了的机器人合并时不用等 GitLab 流水线，没编（没装工具）的要看到流水线通过才合。服务器上要装 Go（装一个最新版就行）和 PHP。`off` 关掉 |
+| `BUILD_CHECK` | 否 | 推代码之前在服务器上编译检查，默认 `on`：照项目自己的构建方式编：读 `.gitlab-ci.yml` 里 docker build 用的 Dockerfile（没写就用根目录的），编里面 `go build` 的那个入口，`GOOS`、`-tags` 照着用（cgo 和 `GOFLAGS` 不照搬），再加上入口外改到的包；不跑 docker、不拉镜像，项目要更新的 Go 时自动下载官方工具链。PHP 用 `php -l` 查语法。编不过时在改之前的提交上再编一次：改之前能编过（或者报错在改的文件上）才算这次改坏的，不推，报错交给模型改。编过了的机器人合并时不用等 GitLab 流水线；没编的（没装工具、改了别的语言、Dockerfile、composer 依赖）要看到流水线通过才合。服务器上要装 Go（装一个最新版就行）和 PHP。`off` 关掉 |
 | `BUILD_GOPROXY` | 否 | 编译时 go 下载依赖和工具链的代理，不填用 `https://goproxy.cn,direct`；校验用 `sum.golang.google.cn` |
 | `WRITE_ALLOWED_USERS` | 否 | 写权限名单，逗号分隔的飞书 open_id（`ou_` 开头）。只有这些人能让机器人新建或修改飞书文档、改代码、开合并请求，其他人只能问和读。自己的 open_id 在日志「收到提问 … sender=ou_xxx」里。不填时所有人都能（团队经验库例外：不填时只能查、不能存） |
 | `GITLAB_URL` | 接 GitLab 时必填 | 公司 GitLab 的地址，如 `https://gitlab.example.com` |
