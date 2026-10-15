@@ -107,6 +107,18 @@ const CHANGE_REQUEST = new RegExp(
 const MEMORY_REQUEST =
   /记住|记下|记一下|忘掉|把[^，。,.!?！？\n]{0,12}忘了|(?:删|改|更新)[^，。,.!?！？\n]{0,8}记忆|记忆[^，。,.!?！？\n]{0,8}(?:删|改|更新)/;
 
+/** 提问本身说到了经验库的事：「沉淀成经验」「记到经验库」「把 #5 归档」「群记忆和经验库有没有冲突」。「数据对不上」「代码冲突」不算 */
+const KNOWLEDGE_REQUEST = /沉淀|经验|知识库|归档/;
+
+/** 这句话要经验库的卡片：自己说到了经验库，或者是在答上一条回答末尾问的「要不要沉淀成经验？」（「要」「好的」） */
+function knowledgeRequested(question: string, history: readonly ChatMessage[]): boolean {
+  if (KNOWLEDGE_REQUEST.test(question)) {
+    return true;
+  }
+  const reply = history.at(-1);
+  return reply?.role === "assistant" && /[？?]\s*$/.test(reply.content.trim()) && KNOWLEDGE_REQUEST.test(reply.content);
+}
+
 /**
  * 这次要不要新建文档。也看话题里刚说的：上一条回答在问话（「要整理成飞书文档吗？」「标题叫什么？」），
  * 而这条回答或者它前面那条提问说到了写文档，接着回的「好，建吧」「叫周报」也算。上一条回答已经建好了文档（不是在问话）就不算
@@ -590,6 +602,12 @@ async function runTask(
     // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
     const memoryLocked =
       !followUp && (modelHistory.some(isChatContext) || options.unaddressed === true) && !MEMORY_REQUEST.test(question);
+    // 起草经验、归档经验、群记忆和经验库冲突的卡片也一样：点了就改经验库或群记忆，这句话本身没说到经验库、记忆的事就不给
+    const draftsLocked =
+      !followUp &&
+      (modelHistory.some(isChatContext) || options.unaddressed === true) &&
+      !knowledgeRequested(question, context.history) &&
+      !MEMORY_REQUEST.test(question);
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter(
@@ -597,6 +615,7 @@ async function runTask(
         !(readOnly && tool.writes) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
         !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
+        !(draftsLocked && KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) &&
         !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
         // 合并只在发起人这句话明确要合并时给：群记忆、话题里别人的话、合并请求描述里写着「直接合掉」也不会让它去合
         (tool.spec.name !== MERGE_TOOL || asksToMerge(question)) &&
@@ -720,6 +739,7 @@ async function runTask(
                   : { failed: true }),
                 // 起草的工具是按钮问的才拿掉的，提示词叫人直接 @；本来就没有（没配写权限名单）时照实说存不了
                 ...(followUp && allTools.some((tool) => KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) ? { draftsHidden: true } : {}),
+                ...(draftsLocked && allTools.some((tool) => KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) ? { draftsLocked: true } : {}),
               },
             }
           : {}),

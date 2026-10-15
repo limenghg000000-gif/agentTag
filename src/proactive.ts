@@ -51,6 +51,8 @@ export interface ProactiveOptions {
   reply: (msg: NormalizedMessage, markdown: string) => Promise<unknown>;
   /** 主动回了以后调用：回复开的话题交给跟聊，群成员接着说不用 @ */
   onReplied?: (msg: NormalizedMessage) => void;
+  /** 话题里跟聊开着（FOLLOW_THREADS）：开着时回的话里才说「我回答过的话题里，追问不用 @」 */
+  followsThreads?: boolean;
   /** 判断完要回之前再问一下：这条后来发现是话题里「同时发送到群」的副本的话不回（话题里那份归跟聊） */
   superseded?: (msg: NormalizedMessage) => boolean;
   maxPerHour?: number;
@@ -189,7 +191,10 @@ export class ProactiveReplier {
     }
     if (!enabled) {
       return this.opts
-        .reply(msg, "这个群没开主动接话，我本来就只在被 @ 时回（我回答过的话题里，追问不用 @）。要打开，请管理员把这个群加进 PROACTIVE_CHAT_IDS。")
+        .reply(
+          msg,
+          `这个群没开主动接话，我本来就只在被 @ 时回${this.opts.followsThreads ? "（我回答过的话题里，追问不用 @）" : ""}。要打开，请管理员把这个群加进 PROACTIVE_CHAT_IDS。`,
+        )
         .then(() => undefined);
     }
     if (pause) {
@@ -212,7 +217,7 @@ export class ProactiveReplier {
     await this.opts.reply(
       msg,
       pause
-        ? "好的，这个群里我不主动接话了，只在被 @ 时回（我回答过的话题里，追问照样不用 @）。要重新打开，@ 我说「可以主动说话」。"
+        ? `好的，这个群里我不主动接话了，只在被 @ 时回${this.opts.followsThreads ? "（我回答过的话题里，追问照样不用 @）" : ""}。要重新打开，@ 我说「可以主动说话」。`
         : `好的，这个群里我会看情况主动接一句：有人问的事群记忆或刚才的聊天里有答案，或者提了我能帮的事，每小时最多 ${this.maxPerHour} 次。不想要了就 @ 我说「别主动插话」。`,
     );
   }

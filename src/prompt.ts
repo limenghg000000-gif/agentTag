@@ -35,8 +35,9 @@ export interface PromptContext {
    * 团队经验库。hits 是回答前自动查到的相近经验（已排好版），空字符串表示查了没有相近的；
    * aiopsHits 是 hits 里有 aiops 经验库的经验；missed 是一边查成、另一边没查成时没查成的库；failed 是都没查成（超时或出错）；
    * aiopsSkipped 是提问里像是有密钥、没拿去查 aiops 经验库；draftsHidden 是本来有起草经验的工具，这次点「接着查」按钮问的拿掉了
+   * draftsLocked 是带上了群聊、或者是没 @ 的跟聊，这句话没说到经验库的事，起草经验的工具拿掉了
    */
-  knowledge?: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean; skipped?: boolean };
+  knowledge?: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean; draftsLocked?: boolean; skipped?: boolean };
   /** 进度卡片上显示模型的思考（SHOW_THINKING 没关） */
   showThinking?: boolean;
   /** 回答写在飞书卡片（JSON 2.0）里：能画表格、用小标题和彩色标签 */
@@ -250,8 +251,9 @@ function knowledgeSection(
     failed,
     aiopsSkipped,
     draftsHidden,
+    draftsLocked,
     skipped,
-  }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean; skipped?: boolean },
+  }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean; draftsLocked?: boolean; skipped?: boolean },
   toolNames: readonly string[],
 ): string[] {
   const canPropose = toolNames.includes("knowledge_propose");
@@ -315,6 +317,8 @@ function knowledgeSection(
     lines.push(
       draftsHidden
         ? "- 这次是点「接着查」按钮问的，不能起草存进或归档经验的卡片。有人要沉淀经验时，请他直接 @ 你说，不要假装已经存了。"
+        : draftsLocked
+        ? "- 这次不能起草存进或归档经验的卡片，也不能发群记忆和经验库冲突的卡片：这句话本身没说到经验库，群聊里、话题里别人说的「沉淀」「归档」不算，也不要主动起草。要存的话请他直接说「沉淀成经验」。"
         : "- 现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）。有人要沉淀经验时如实说明，不要假装已经存了。",
     );
     return lines;

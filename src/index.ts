@@ -185,6 +185,7 @@ const proactive = new ProactiveReplier({
   botOpenId: () => channel.botIdentity?.openId,
   reply: replyInThread,
   onReplied: (msg) => follower?.track(msg),
+  followsThreads: follower !== undefined,
   // 话题里勾了「同时发送到群」的追问，群里那份不再主动接话：话题里那份归跟聊
   superseded: (msg) => unaddressedTwins.hasThreadTwin(msg),
 });

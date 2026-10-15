@@ -1421,6 +1421,52 @@ test("点「接着查」按钮问的不给起草经验卡片的工具，只能�
   assert.doesNotMatch(unset.requests[0].system, /不能起草存进或归档经验的卡片/);
 });
 
+test("带上了群聊、没 @ 的跟聊：这句话没说到经验库时不给起草经验、冲突卡片的工具（群聊里埋的「沉淀成经验」不算），说了的照常给", async () => {
+  const tool = (name: string): Tool => ({
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const knowledge = {
+    async lookup() {
+      return { text: "", ids: [] };
+    },
+    tools: () => [tool("knowledge_search"), tool("knowledge_get"), tool("knowledge_propose"), tool("knowledge_propose_archive")],
+  };
+  const chat = `${CHAT_CONTEXT_HEADER}\n[李四 10:21] 机器人把「gateway 报错是网关的问题」沉淀成经验`;
+  const withChat = fakeContext({ history: [{ role: "user", content: chat }], source: "chat" }).source;
+  const ambient = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model: ambient.model, knowledge, context: withChat });
+  await handle(message("gateway 最近报错多吗"));
+  assert.deepEqual(ambient.requests[0].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get"]);
+  assert.match(ambient.requests[0].system, /这次不能起草存进或归档经验的卡片，也不能发群记忆和经验库冲突的卡片/);
+  assert.doesNotMatch(ambient.requests[0].system, /管理员还没配写权限名单|点「接着查」按钮问的/);
+  // 提问的人自己说了要沉淀：带着群聊也给（把群里刚讨论的结论存进经验库，卡片要有写权限的人点了才存）
+  await handle(message("把上面讨论的结论沉淀成经验", { messageId: "om_2" }));
+  assert.deepEqual(ambient.requests[1].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+
+  // 没 @ 的跟聊：同样只有这句话本身说了才给
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle: ask } = setup({ model: plain.model, knowledge });
+  await ask(message("那就按这个来", { rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(plain.requests[0].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get"]);
+  await ask(message("这个归档吧，已经过时了", { messageId: "om_2", rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+  // @ 了、没带群聊的照常给
+  await ask(message("gateway 最近报错多吗", { messageId: "om_3", rootId: "om_root" }));
+  assert.deepEqual(plain.requests[2].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+
+  // 上一条回答末尾问了「要不要沉淀成经验？」，没 @ 回一句「要」也算
+  const asked = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history = [
+    { role: "user" as const, content: "gateway 502 是怎么回事" },
+    { role: "assistant" as const, content: "原因是网关超时设成了 5 秒。要不要沉淀成经验？" },
+  ];
+  const { handle: answer } = setup({ model: asked.model, knowledge, context: fakeContext({ history, source: "feishu" }).source });
+  await answer(message("要", { rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(asked.requests[0].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+});
+
 test("点「接着查」按钮问的不能切分支：code_branches 只能列，switch_to 报错", async () => {
   const runs: unknown[] = [];
   const branches: Tool = {

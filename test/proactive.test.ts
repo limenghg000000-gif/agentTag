@@ -39,6 +39,7 @@ async function setup(
     superseded?: (msg: NormalizedMessage) => boolean;
     listChat?: () => Promise<ThreadMessage[]>;
     judgeTimeoutMs?: number;
+    followsThreads?: boolean;
   } = {},
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "proactive-"));
@@ -82,6 +83,7 @@ async function setup(
       ...(opts.maxPerHour ? { maxPerHour: opts.maxPerHour } : {}),
       ...(opts.superseded ? { superseded: opts.superseded } : {}),
       ...(opts.judgeTimeoutMs ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
+      ...(opts.followsThreads !== undefined ? { followsThreads: opts.followsThreads } : {}),
       logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error: (line: string) => logs.push(line) },
       now: () => now,
     });
@@ -433,6 +435,24 @@ test("群主界面的开关话后来有人回复、补漏读到时带着 threadI
     assert.equal(t.replier.active("oc_1"), false);
   } finally {
     await t.cleanup();
+  }
+});
+
+test("跟聊开着才说「回答过的话题里追问不用 @」：关了跟聊（FOLLOW_THREADS=off）不这么说", async () => {
+  for (const followsThreads of [true, false]) {
+    const t = await setup({ followsThreads });
+    try {
+      await t.replier.toggleIfAsked(msg("om_1", { mentionedBot: true, content: "别主动插话" }));
+      await t.replier.toggleIfAsked(msg("om_2", { chatId: "oc_2", mentionedBot: true, content: "可以主动说话" }));
+      assert.equal(t.replies.length, 2);
+      assert.match(t.replies[0], /不主动接话了/);
+      assert.match(t.replies[1], /这个群没开主动接话/);
+      for (const reply of t.replies) {
+        assert.equal(/追问.*不用 @/.test(reply), followsThreads, reply);
+      }
+    } finally {
+      await t.cleanup();
+    }
   }
 });
 
