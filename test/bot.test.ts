@@ -3989,6 +3989,15 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("这个怎么修", earlierTopic), false);
 });
 
+test("判断是不是整理时，超长的空白不会让正则卡住", () => {
+  const spaces = " ".repeat(100_000);
+  for (const question of [`总结一下上面 最近1${spaces}x`, `总结一下上面，再${spaces}`, `总结一下 2${spaces}x`]) {
+    const started = performance.now();
+    restatesEarlier(question, earlierTopic);
+    assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
+  }
+});
+
 test("整理之前内容时检查回答：代码位置和线上数据要是话题里之前写过的、或者这次读到的，添了新的就列出来", () => {
   const known = `${ELI5_ASK}\n${EARLIER_ANSWER}`;
   const scope = { code: true, ops: true };
@@ -4003,6 +4012,13 @@ test("整理之前内容时检查回答：代码位置和线上数据要是话�
   assert.deepEqual(restatedAdditions("错误率 15%，涉及 14 个 Pod，从 9:01:48 开始", counts, scope), []);
   assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **1/1** 就绪", scope), []);
   assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **11/12** 就绪", scope), ["就绪 1/1"]);
+  // 一长段定位结果里带着个之前写过的比值：整段不算写过，里面的 Pod 名、时间、次数也一个个对
+  assert.deepEqual(restatedAdditions("命名空间 prod 1/1、gateway-api-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署", "副本 1/1 就绪", scope), [
+    "命名空间 prod 1/1、gateway-api-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署",
+    "gateway-api-6978f9454f-zzzzz",
+    "15:39:20",
+    "999 次",
+  ]);
   // 没配代码工具、没配 MCP 服务时不看那一类
   assert.deepEqual(restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12", known, { code: false, ops: false }), []);
   // 这次读到的文档、网页里有的也算

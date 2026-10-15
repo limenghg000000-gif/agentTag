@@ -1943,8 +1943,8 @@ const TIME_AMOUNT = String.raw`(?:\d+|[一二两三四五六七八九十半几]+
  */
 const FRESH_REQUEST = new RegExp(
   [
-    String.raw`(?:最近|过去|近|这|前)\s*${TIME_AMOUNT}\s*个?\s*(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月)`,
-    String.raw`${TIME_AMOUNT}\s*个?\s*(?:秒钟?|分钟|小时|钟头|天|周|星期|礼拜|月)(?:以内|之内|内|以来)`,
+    String.raw`(?:最近|过去|近|这|前)\s*${TIME_AMOUNT}\s*(?:个\s*)?(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月)`,
+    String.raw`${TIME_AMOUNT}\s*(?:个\s*)?(?:秒钟?|分钟|小时|钟头|天|周|星期|礼拜|月)(?:以内|之内|内|以来)`,
     "重查|复查|核实",
   ].join("|"),
 );
@@ -1954,7 +1954,7 @@ const FRESH_REQUEST = new RegExp(
  */
 const NEW_WORK = new RegExp(
   [
-    String.raw`(?:再|另外|顺便|然后|并且?|同时|还要|还得)\s*(?:帮我?|给我)?\s*(?:分析|排查|查|看看|看一下|看下|对比|比较|诊断|定位|搜|确认|检查|核对|修|改(?!写|成|一下(?:说法|措辞))|重构|优化|处理|解决|提交|合并(?!成|为)|回滚)`,
+    String.raw`(?:再|另外|顺便|然后|并且?|同时|还要|还得)\s*(?:(?:帮我?|给我)\s*)?(?:分析|排查|查|看看|看一下|看下|对比|比较|诊断|定位|搜|确认|检查|核对|修|改(?!写|成|一下(?:说法|措辞))|重构|优化|处理|解决|提交|合并(?!成|为)|回滚)`,
     String.raw`(?:修复|修好|修掉|修一下|改掉|改好|重构|优化|实现|上线|发版|部署|重启|回滚)(?!方案|办法|建议|思路|计划|过程|记录|情况|结果|原理|方式|逻辑|细节|架构|时间|空间|方向|点|项|的|了)`,
     String.raw`(?:开|提|建)个?\s*(?:mr|pr|合并请求)`,
     String.raw`(?:改|修改)一?下?(?:代码|配置)`,
@@ -2038,9 +2038,17 @@ export function restatedAdditions(answer: string, known: string, { code, ops }: 
     ? unseenCodeCitations(answer, (cite, line) => (line === undefined ? mentions(known, cite) : mentionsLine(known, cite, line))).map((cite) => cite.text)
     : [];
   const said = ops ? valueForm(known) : "";
-  const data = ops ? [...answer.matchAll(OPS_DATA)].map((match) => match[0]).filter((text) => !saidValue(said, text) && !TIME_LAYOUT.test(text)) : [];
+  // 每种写法分开找：「prod、xx-6978f9454f-zzzzz 在 15:39:20 OOM 了 999 次、staging 都有部署」整段是定位结果，里面的 Pod 名、时间、次数也要一个个对
+  const data = ops
+    ? RESTATE_OPS_PATTERNS.flatMap((pattern) => [...answer.matchAll(pattern)])
+        .sort((a, b) => a.index - b.index)
+        .map((match) => match[0])
+        .filter((text) => !saidValue(said, text) && !TIME_LAYOUT.test(text))
+    : [];
   return [...new Set([...cites, ...data])];
 }
+
+const RESTATE_OPS_PATTERNS = [...OPS_TIME_PATTERNS, ...OPS_STRONG_PATTERNS, ...OPS_WEAK_PATTERNS].map((pattern) => new RegExp(pattern, "gi"));
 
 /** 比较数据用的写法：去掉空白、不分大小写，时间的小时去掉开头的 0（09:01:48 和 9:01:48 是同一个时间） */
 function valueForm(text: string): string {
@@ -2049,14 +2057,18 @@ function valueForm(text: string): string {
 
 /**
  * 这个数据之前写过：整个数对得上才算，15%、14 个 Pod 里的 5%、4 个 Pod 不算（前后紧挨着数字、小数点的不算）；
- * 就绪数只看比值（之前写的是「**1/1** 就绪」，回答写「1/1 就绪」）
+ * 就绪数只看比值（之前写的是「**1/1** 就绪」，回答写「1/1 就绪」）；只有整个就是就绪数时才这样，一长段里带着个比值的不算
  */
 function saidValue(said: string, text: string): boolean {
   const value = valueForm(text);
   const exact = new RegExp(`(?<![\\d.])${escapeRegExp(value)}${/\d$/.test(value) ? "(?!\\.?\\d)" : ""}`);
   const ratio = /(\d+)\/(\d+)/.exec(value);
-  return exact.test(said) || (ratio !== null && new RegExp(`(?<![\\d.])${ratio[1]}/${ratio[2]}(?!\\d)`).test(said));
+  const readiness = ratio !== null && READINESS_REST.test(value.replace(ratio[0], ""));
+  return exact.test(said) || (readiness && new RegExp(`(?<![\\d.])${ratio[1]}/${ratio[2]}(?!\\d)`).test(said));
 }
+
+/** 就绪数去掉比值后剩下的：就绪、ready 这类词和 Markdown 符号 */
+const READINESS_REST = /^[*_\x60:：]*(?:就绪|ready|running|副本)?[*_\x60:：]*$/i;
 
 export const BLOCKED_RESTATE_ANSWER =
   "这次没能整理好：整理出来的回答里有话题里之前没写过的数据或代码位置，为免误导没有发出来。可以再说一次；要看最新情况，请说「重新查」。";
