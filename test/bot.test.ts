@@ -3930,7 +3930,9 @@ const earlierTopic: ChatMessage[] = [
 ];
 
 test("要整理话题里之前的回答（总结、讲给谁听、换个说法）才算整理：要重新查、看现在、问别的服务的不算", () => {
-  assert.equal(restatesEarlier(ELI5_ASK, earlierTopic), true);
+  // @ 的人名、机器人名和 runTask 里一样传进来，不当成新的服务名
+  assert.equal(restatesEarlier(ELI5_ASK, earlierTopic, ["飞书 CLI", "徐杨", "陈飞龙", "祝传利"]), true);
+  assert.equal(restatesEarlier("用 eli5 讲给 @John 听", earlierTopic, ["John"]), true);
   assert.equal(restatesEarlier("总结一下上面查到的情况", earlierTopic), true);
   assert.equal(restatesEarlier("翻译成英文", earlierTopic), true);
   assert.equal(restatesEarlier("用大白话讲给运营同事听", earlierTopic), true);
@@ -3953,6 +3955,10 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("总结一下 gateway-api 的报错", earlierTopic), false);
   assert.equal(restatesEarlier("整理一下部署配置", earlierTopic), false);
   assert.equal(restatesEarlier("总结一下这个函数做了什么", earlierTopic), false);
+  // 服务名不带连字符、话题里没出现过的英文词，也是问新东西
+  assert.equal(restatesEarlier("总结一下 appservice 的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("用大白话讲讲 gateway 那边", earlierTopic), false);
+  assert.equal(restatesEarlier("用 eli5 讲给 John 听", earlierTopic), false);
   // 代码话题里之前说过，文档、链接整理时照样能读
   assert.equal(restatesEarlier("把代码核对的部分讲给开发同事听", earlierTopic), true);
   assert.equal(restatesEarlier("用大白话总结一下，写成飞书文档", earlierTopic), true);
@@ -3960,6 +3966,15 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("总结一下上面，再分析 payment-service 的报错", earlierTopic), false);
   assert.equal(restatesEarlier("总结一下上面的结论，顺便看看现在的 Pod", earlierTopic), false);
   assert.equal(restatesEarlier("把上面的结论讲给大家听，再查一下修了没有", earlierTopic), false);
+  // 整理完还要改东西：修代码、开 MR
+  assert.equal(restatesEarlier("总结一下上面的原因，然后修复它", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下，顺便修一下", earlierTopic), false);
+  assert.equal(restatesEarlier("精简一下结论，再改一下代码", earlierTopic), false);
+  assert.equal(restatesEarlier("用大白话总结一下，然后开个 MR", earlierTopic), false);
+  // 说的是之前的修复方案、换个写法，还是整理
+  assert.equal(restatesEarlier("把上面的修复方案总结一下", earlierTopic), true);
+  assert.equal(restatesEarlier("改写成大白话，讲给运营听", earlierTopic), true);
+  assert.equal(restatesEarlier("讲给负责修复的同事听", earlierTopic), true);
   // 不是整理
   assert.equal(restatesEarlier("这个怎么修", earlierTopic), false);
 });
@@ -3989,13 +4004,13 @@ test("整理之前内容时检查回答：代码位置和线上数据要是话�
 });
 
 /** 转链排查那次的配置：aiops、代码工具、经验库都有 */
-function restateSetup(results: ChatResult[], history: ChatMessage[] = earlierTopic) {
+function restateSetup(results: ChatResult[], history: ChatMessage[] = earlierTopic, extra: { taskTools?: Tool[]; knowledgeTools?: Tool[] } = {}) {
   const { model, requests } = fakeModel(() => results.shift()!);
   const lookups: string[] = [];
   const queryLogs = namedTool("aiops_query_logs");
   const setupResult = setup({
     model,
-    taskTools: () => [namedTool("code_search"), namedTool("code_read_file"), namedTool("feishu_doc_read")],
+    taskTools: () => [namedTool("code_search"), namedTool("code_read_file"), namedTool("feishu_doc_read"), ...(extra.taskTools ?? [])],
     codeRepos: ["golang/appservice"],
     mcp: {
       names: ["aiops"],
@@ -4007,7 +4022,7 @@ function restateSetup(results: ChatResult[], history: ChatMessage[] = earlierTop
         lookups.push(query);
         return { text: "经验 K1 [排查经验]：京东短链转链失败", ids: ["K1"] };
       },
-      tools: () => [namedTool("knowledge_search"), namedTool("knowledge_get"), namedTool("knowledge_propose")],
+      tools: () => extra.knowledgeTools ?? [namedTool("knowledge_search"), namedTool("knowledge_get"), namedTool("knowledge_propose")],
     },
     context: fakeContext({ history, source: "feishu" }).source,
   });
@@ -4055,6 +4070,65 @@ test("整理之前的回答时添了之前没有的数据、代码位置：打�
     assert.equal(again.requests.length, 2, added);
     assert.deepEqual(markdowns(again.sent), [BLOCKED_RESTATE_ANSWER], added);
   }
+});
+
+test("整理成飞书文档、起草经验时，写进去的内容也只能用之前写过的：编了数据、代码位置的不执行，改好再调才写", async () => {
+  const written: string[] = [];
+  const docCreate: Tool = {
+    ...namedTool("feishu_doc_create"),
+    writes: true,
+    run: async (args) => {
+      written.push(String(args.content));
+      return "已新建文档「转链失败总结」，写入 3 块内容。";
+    },
+  };
+  const made = "09:30:00 又失败了一次，一共 5 个 Pod，问题在 services/goods/taobao.go:12";
+  const clean = "京东看不懂我们传过去的短链接，09:01:48 那次就是这样，4 个 Pod 上都一样，问题在 services/goods/jingdong.go:120";
+  const createCall = (id: string, content: string) => ({ id, name: "feishu_doc_create", arguments: JSON.stringify({ title: "转链失败总结", content }) });
+  const doc = restateSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [createCall("c1", made)] },
+      { text: "", finish: "tool_calls", toolCalls: [createCall("c2", clean)] },
+      { text: "写好了，文档「转链失败总结」", finish: "stop" },
+    ],
+    earlierTopic,
+    { taskTools: [docCreate] },
+  );
+  await doc.handle(message("用大白话总结一下，写成飞书文档", { rootId: "om_root", threadId: "omt_1" }));
+  assert.ok(doc.requests[0].tools?.some((t) => t.name === "feishu_doc_create"));
+  assert.deepEqual(written, [clean]);
+  const rejected = doc.requests[1].messages.find((m) => m.role === "tool")?.content ?? "";
+  for (const added of ["services/goods/taobao.go:12", "09:30:00", "5 个 Pod"]) {
+    assert.ok(rejected.includes(added), rejected);
+  }
+  assert.ok(rejected.includes("这次是整理话题里之前的内容，可要写进去的内容里这些在话题里之前的消息中都找不到"), rejected);
+  assert.deepEqual(markdowns(doc.sent), ["写好了，文档「转链失败总结」"]);
+
+  // 起草经验（发确认卡片）也一样
+  const drafts: string[] = [];
+  const propose: Tool = {
+    ...namedTool("knowledge_propose"),
+    run: async (args) => {
+      drafts.push(String(args.conclusion));
+      return "已发确认卡片";
+    },
+  };
+  const draftCall = (id: string, conclusion: string) => ({
+    id,
+    name: "knowledge_propose",
+    arguments: JSON.stringify({ category: "incident", title: "京东短链转链失败", question: "转链失败", conclusion }),
+  });
+  const knowledge = restateSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [draftCall("k1", made)] },
+      { text: "", finish: "tool_calls", toolCalls: [draftCall("k2", clean)] },
+      { text: "起草好了，请看卡片确认", finish: "stop" },
+    ],
+    earlierTopic,
+    { knowledgeTools: [propose] },
+  );
+  await knowledge.handle(message("把上面的结论用大白话总结成经验", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(drafts, [clean]);
 });
 
 test("同一个话题里说要重新查、看现在的情况：照常查经验库、给查询的工具", async () => {

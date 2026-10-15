@@ -386,7 +386,9 @@ async function runTask(
     // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
     const followUp = options.readOnly === true;
     // 只是整理话题里已经有的内容（总结、讲给谁听、换个说法）：不查经验库、不给查询的工具，直接按上文写。按钮上的话是接着要查的新问题，不算
-    const restate = !followUp && restatesEarlier(question, history);
+    const restate =
+      !followUp &&
+      restatesEarlier(question, history, [deps.botName() || FALLBACK_BOT_NAME, ...msg.mentions.flatMap((mention) => (mention.name ? [mention.name] : []))]);
     if (restate) {
       logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
     }
@@ -404,6 +406,15 @@ async function runTask(
     const recentThreadTools = deps.recentThreads
       ? [createRecentThreadsTool({ store: deps.recentThreads, chatId: msg.chatId, threadKey: threadKeyOf(msg) })]
       : [];
+    // 整理之前内容时写文档、记群记忆、起草经验：写进去的内容和回答一样，只能用话题里之前写过的代码位置和数据（回答里多半只有个链接，检查不到写进去的）
+    const checkRestatedWrite = (tool: Tool, args: Record<string, unknown>) => {
+      if (restate && (tool.writes || MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) {
+        const added = restatedAdditions(stringArgs(args), saidBefore(), restateScope);
+        if (added.length > 0) {
+          throw new Error(restatedWriteNote(added));
+        }
+      }
+    };
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
       (tool): Tool => ({
         ...tool,
@@ -412,6 +423,7 @@ async function runTask(
           if (followUp && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
             throw new Error("这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数");
           }
+          checkRestatedWrite(tool, args);
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
           if (tool.instructionsOnly) {
             return tool.run(args, ctx);
@@ -455,7 +467,15 @@ async function runTask(
     ).concat(
       // 经验库的工具不记进上面几样：查到的是以前确认过的结论，不是这次实时查到的数据，也不是这次读到的代码。
       // 只查了经验库就给出线上结论、引用文件行号，照样要打回
-      knowledgeTools,
+      knowledgeTools.map(
+        (tool): Tool => ({
+          ...tool,
+          run: async (args, ctx) => {
+            checkRestatedWrite(tool, args);
+            return tool.run(args, ctx);
+          },
+        }),
+      ),
     );
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
@@ -1918,8 +1938,22 @@ const RESTATE_REQUEST = new RegExp(
 );
 /** 要看现在的数据：LIVE_REQUEST 之外，「最近 1 小时」这类时间窗口，「重查」「复查」「核实」 */
 const FRESH_REQUEST = /最近\s*(?:\d+|[一二两三四五六七八九十半几]+)\s*个?\s*(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月)|重查|复查|核实/;
-/** 整理之外还要做新的事：「总结一下上面，再分析 xx 的报错」「顺便看看」「并排查原因」 */
-const NEW_WORK = /(?:再|另外|顺便|然后|并且?|同时|还要|还得)\s*(?:帮我?|给我)?\s*(?:分析|排查|查|看看|看一下|看下|对比|比较|诊断|定位|搜|确认|检查|核对)/;
+/**
+ * 整理之外还要做新的事：「总结一下上面，再分析 xx 的报错」「顺便看看」「并排查原因」，或者要改东西「然后修复它」「改代码」「开个 MR」。
+ * 说的是之前的方案、过程（「把修复方案总结一下」「总结一下部署情况」「讲给负责修复的同事听」）不算；「开发」多半说的是人（「讲给开发同事听」），不算
+ */
+const NEW_WORK = new RegExp(
+  [
+    String.raw`(?:再|另外|顺便|然后|并且?|同时|还要|还得)\s*(?:帮我?|给我)?\s*(?:分析|排查|查|看看|看一下|看下|对比|比较|诊断|定位|搜|确认|检查|核对|修|改(?!写|成|一下(?:说法|措辞)))`,
+    String.raw`(?:修复|修好|修掉|修一下|改掉|改好|实现|上线|发版|部署|重启|回滚)(?!方案|办法|建议|思路|计划|过程|记录|情况|结果|原理|方式|逻辑|细节|架构|时间|的|了)`,
+    String.raw`(?:开|提|建)个?\s*(?:mr|pr|合并请求)`,
+    String.raw`(?:改|修改)一?下?(?:代码|配置)`,
+  ].join("|"),
+  "i",
+);
+/** 提问里的英文词（服务名常不带连字符：appservice、gateway）；整理的说法、常见英文词不算 */
+const ASCII_WORDS = /[a-z][a-z0-9_.]{2,}/gi;
+const RESTATE_WORDS = /^(?:eli5|tldr|explain|like|five|translate|english|chinese|summary|summarize|simple|plain|markdown|emoji)$/i;
 /**
  * 要查的对象：线上服务、日志这类（OPS_QUESTION），和代码、配置这类。话题里之前没出现过的，说明问的是新东西，不算整理。
  * 文档、网页链接不算：整理时照样给读文档、网页的工具（「总结成飞书文档」也不能因为说了文档就重查）
@@ -1935,7 +1969,7 @@ const TARGET_TERMS = new RegExp(NEW_TARGET.source, "gi");
  * 提问里说到的服务名、日志、代码、配置这类对象话题里之前都出现过（「把 product-service-api 这个问题总结给大家」说的还是之前那个，
  * 「整理一下 gateway 的部署配置」「总结一下上面，再看看 payment-service」问到了新的服务、要读配置，就不是只整理）
  */
-export function restatesEarlier(question: string, history: readonly ChatMessage[]): boolean {
+export function restatesEarlier(question: string, history: readonly ChatMessage[], names: readonly string[] = []): boolean {
   if (
     history.length === 0 ||
     !RESTATE_REQUEST.test(question) ||
@@ -1946,7 +1980,26 @@ export function restatesEarlier(question: string, history: readonly ChatMessage[
     return false;
   }
   const said = history.map((m) => m.content).join("\n").toLowerCase();
-  return !NEW_TARGET.test(question.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
+  // @ 的人名、机器人名不算（「@飞书 CLI」「@John」）
+  const asked = names.reduce((text, name) => (name ? text.split(`@${name}`).join(" ") : text), question);
+  // 话题里没出现过的英文词多半是新的服务名、仓库名（「总结一下 appservice 的报错」，之前聊的是 gateway-api）
+  const newWord = (asked.match(ASCII_WORDS) ?? []).some((word) => !RESTATE_WORDS.test(word) && !said.includes(word.toLowerCase()));
+  return !newWord && !NEW_TARGET.test(asked.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
+}
+
+/** 工具参数里的文字（写文档的正文、记忆的内容） */
+function stringArgs(args: Record<string, unknown>): string {
+  return Object.values(args)
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+export function restatedWriteNote(added: readonly string[]): string {
+  const shown = added.slice(0, MAX_RESTATED_ADDITIONS).map((text) => (text.length > 80 ? `${text.slice(0, 80)}…` : text));
+  return (
+    `这次是整理话题里之前的内容，可要写进去的内容里这些在话题里之前的消息中都找不到：${shown.join("、")}${added.length > shown.length ? " 等" : ""}。` +
+    "只写之前的回答和大家说过的话里写过的事实、数据和代码位置，改好再调一次；没写过的就写之前没查到。"
+  );
 }
 
 /** 整理之前内容时给模型的工具：读群成员给的文档、网页，按要求写成文档、记进群记忆、起草经验。查线上、查代码、搜网页、查经验库、看别的话题的都不给 */
