@@ -408,6 +408,14 @@ async function runTask(
       : [];
     // 整理之前内容时写文档、记群记忆、起草经验：写进去的内容和回答一样，只能用话题里之前写过的代码位置和数据（回答里多半只有个链接，检查不到写进去的）
     const checkRestatedWrite = (tool: Tool, args: Record<string, unknown>) => {
+      // 整理时读文档、网页只读这次的提问和话题里给过的链接：模型自己想到的网页读进来会被当成依据，里面的数据就能混进整理
+      const link = restate ? RESTATE_READS.get(tool.spec.name) : undefined;
+      if (link !== undefined) {
+        const value = typeof args[link] === "string" ? args[link].trim().replace(/\/+$/, "") : "";
+        if (!value || ![asked, ...history.map((m) => m.content)].some((text) => text.includes(value))) {
+          throw new Error("这次是整理话题里之前的内容，只能读这次的提问和话题里给过的文档、网页链接。没给过的不要读，按之前的回答写。");
+        }
+      }
       if (restate && (tool.writes || MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) {
         const added = restatedAdditions(stringArgs(args), saidBefore(), restateScope);
         if (added.length > 0) {
@@ -1956,8 +1964,8 @@ const NEW_WORK = new RegExp(
   [
     String.raw`(?:修复|修好|修掉|修一下|改掉|改好|重构|优化|实现|上线|发版|部署|重启|回滚)(?!方案|办法|建议|思路|计划|过程|记录|情况|结果|原理|方式|逻辑|细节|架构|时间|空间|方向|点|项|的|了|后的|前的|完的)`,
     String.raw`(?:开|提|建)个?\s*(?:mr|pr|合并请求)`,
-    // 「合并到 uat」「也合到 uat」是再开一个合并请求；「合到一起」「合并到一段」是整理
-    String.raw`(?:合并|合)到(?!一起|一块|一段|一处|一条)`,
+    // 「合并到 uat」「也合到 master」「合到 release/1.2」是再开一个合并请求；「合并到飞书文档里」「合到一起」是整理
+    String.raw`(?:合并|合)到\s*(?:[a-z][\w./-]*|主干|主分支|测试分支|预发分支?)`,
     String.raw`(?:改|修改)一?下?(?:代码|配置)`,
   ].join("|"),
   "i",
@@ -1983,11 +1991,12 @@ const RESTATE_WORDS = new RegExp(
  */
 const CLAUSE_BREAK = /[，,。;；!！?？\n]|\.(?!\S)|然后|接着|之后|顺便|另外|并且|(?<!合)并|同时|还要|还得|再(?!次)/;
 /** 说讲给谁、写成什么样的一段（「写成飞书文档」「让运营也看得懂」「发给运营」「控制在三句话」） */
-const FORMAT_CLAUSE = /用|以|按|写成|做成|整理成|弄成|变成|转成|发给|发到|讲给|说给|让|分点|列成|控制在|不超过|篇幅|字数|合并成|合成|合到一起|(?:讲|说|写)得?(?:简单|短|通俗|清楚|明白|详细|具体|口语|正式|轻松)|简单|短一?点|通俗|口语/;
+const FORMAT_CLAUSE = /用|以|按|写成|做成|整理成|弄成|变成|转成|发给|发到|讲给|说给|让|分点|列成|控制在|不超过|篇幅|字数|合并成|合成|合到一起|(?:合并|合|放|写|整理|汇总)(?:到|进)|(?:讲|说|写)得?(?:简单|短|通俗|清楚|明白|详细|具体|口语|正式|轻松)|简单|短一?点|通俗|口语/;
 /** 讲给谁、写成什么样的那段里不能有要动手、要查的词（「然后用 aiops 查一下」「用新的写法替换这个函数」） */
 const ACTION_WORD = /查|看|搜|读|找|修|改|删|加|建|开|提交|合并|部署|重启|回滚|跑|执行|运行|测|对比|比较|分析|排查|诊断|定位|确认|检查|核对|更新|调整|新增|添加|替换|升级|迁移|实现|重构|优化|处理|解决/;
 /** 这些说的是读的人看不看得懂、怎么排版，不是要动手 */
-const HARMLESS_PHRASES = /看得懂|看懂|听得懂|听懂|看得明白|看明白|加粗|合并成|合到一起/g;
+// 「合并到飞书文档里」：合并到分支（「合并到 uat」）NEW_WORK 先认出来了
+const HARMLESS_PHRASES = /看得懂|看懂|听得懂|听懂|看得明白|看明白|加粗|合并成|合到一起|(?:合并|合)(?:到|进)/g;
 /** 客气话、称呼（@ 的名字去掉以后剩下的「各位同事」） */
 const FILLER_CLAUSE = /^(?:谢谢|多谢|辛苦了?|麻烦了?|拜托|好的|ok|嗯|请|各位|大家|同事们?|各位同事)$/i;
 
@@ -2037,7 +2046,9 @@ export function restatesEarlier(question: string, history: readonly ChatMessage[
   }
   // 话题里没出现过的英文词多半是新的服务名、仓库名（「总结一下 appservice 的报错」，之前聊的是 gateway-api）
   const newWord = (asked.match(ASCII_WORDS) ?? []).some((word) => !RESTATE_WORDS.test(word) && !said.includes(word.toLowerCase()));
-  return !newWord && !NEW_TARGET.test(asked.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
+  // 「上面的排查结果」说的是之前排查出来的，不是要排查新东西
+  const target = asked.replace(/(?:排查|诊断)(?=结果|过程|情况|结论|记录|报告)/g, " ");
+  return !newWord && !NEW_TARGET.test(target.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
 }
 
 /** 工具参数里的文字（写文档的正文、记忆的内容） */
@@ -2067,6 +2078,12 @@ const RESTATE_TOOLS: ReadonlySet<string> = new Set([
   "memory_delete",
   "knowledge_propose",
   "knowledge_propose_archive",
+]);
+
+/** 整理时能读的文档、网页工具，和放链接的参数 */
+const RESTATE_READS: ReadonlyMap<string, string> = new Map([
+  ["feishu_doc_read", "document"],
+  ["fetch_url", "url"],
 ]);
 
 /** 回答里最多列几处添上的内容 */

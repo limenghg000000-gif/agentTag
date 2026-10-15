@@ -3981,6 +3981,8 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("总结一下改了什么，合并到 uat", uatTopic), false);
   assert.equal(restatesEarlier("精简一下，也合到 uat", uatTopic), false);
   assert.equal(restatesEarlier("把两段合到一起，精简一下", uatTopic), true);
+  assert.equal(restatesEarlier("把上面的排查结果总结一下，合并到飞书文档里", uatTopic), true);
+  assert.equal(restatesEarlier("把两段合并到同一个总结里", uatTopic), true);
   // 分成几段说的：有一段是别的事（删、加、更新、跑测试……）就照常给工具，认不出的宁可照常查
   for (const ask of [
     "总结一下上面的原因，然后删除这个文件",
@@ -4186,6 +4188,31 @@ test("整理成飞书文档、起草经验时，写进去的内容也只能用�
   );
   await knowledge.handle(message("把上面的结论用大白话总结成经验", { rootId: "om_root", threadId: "omt_1" }));
   assert.deepEqual(drafts, [clean]);
+});
+
+test("整理时只读提问和话题里给过的链接：模型自己找的网页不读，读进来的内容也就不会被当成依据", async () => {
+  const fetched: string[] = [];
+  const fetchUrl: Tool = {
+    ...namedTool("fetch_url"),
+    run: async (args) => {
+      fetched.push(String(args.url));
+      return "网页正文";
+    },
+  };
+  const read = (id: string, url: string) => ({ id, name: "fetch_url", arguments: JSON.stringify({ url }) });
+  const { requests, handle } = restateSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [read("c1", "https://example.com/other")] },
+      { text: "", finish: "tool_calls", toolCalls: [read("c2", "https://3.jd.hk/-103ydbW?rid=15644")] },
+      { text: "翻译好了", finish: "stop" },
+    ],
+    earlierTopic,
+    { taskTools: [fetchUrl] },
+  );
+  await handle(message("翻译成英文", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(fetched, ["https://3.jd.hk/-103ydbW?rid=15644"]);
+  const rejected = requests[1].messages.find((m) => m.role === "tool")?.content ?? "";
+  assert.match(rejected, /只能读这次的提问和话题里给过的文档、网页链接/);
 });
 
 test("整理时群记忆太多没列全的，照样能用 memory_search 查约定", async () => {
