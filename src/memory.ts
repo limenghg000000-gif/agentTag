@@ -135,6 +135,40 @@ export class MemoryStore {
     return updated;
   }
 
+  /**
+   * 这条记忆的内容还是 expected 时才改成 content，content 为空时删掉它。冲突卡片用：卡片上给大家看的是发卡片时的内容，
+   * 之后有人改过、删了，大家确认的就不是现在这条，不动它。返回 updated（改了）、removed（删了）、changed（已经不是卡片上那样了，没动）
+   */
+  async replaceIf(chatId: string, id: number, expected: string, content: string | undefined, author: MemoryAuthor = {}): Promise<"updated" | "removed" | "changed"> {
+    const text = content === undefined ? undefined : normalizeContent(content);
+    const outcome = await this.mutate(chatId, (file) => {
+      const entry = file.entries.find((e) => e.id === id);
+      if (!entry || entry.content !== expected) {
+        return { result: "changed" as const, changed: false };
+      }
+      if (text === undefined) {
+        file.entries = file.entries.filter((e) => e.id !== id);
+        return { result: "removed" as const, changed: true };
+      }
+      entry.content = text;
+      entry.updatedAt = this.now().toISOString();
+      if (author.name) {
+        entry.author = author.name;
+      }
+      if (author.openId) {
+        entry.authorId = author.openId;
+      }
+      if (author.messageId) {
+        entry.sourceMessageId = author.messageId;
+      }
+      return { result: "updated" as const, changed: true };
+    });
+    if (outcome !== "changed") {
+      this.logChange(chatId, `${outcome === "removed" ? "删除" : "修改"} #${id}（冲突卡片）`, author);
+    }
+    return outcome;
+  }
+
   /** 删除几条记忆，返回删掉的和没找到的编号 */
   async remove(chatId: string, ids: readonly number[], author: MemoryAuthor = {}): Promise<{ removed: MemoryEntry[]; missing: number[] }> {
     const result = await this.mutate(chatId, (file) => {
