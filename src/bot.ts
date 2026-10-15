@@ -1322,7 +1322,7 @@ function rememberLookup(topics: { map: Map<string, number> }, key: string): void
 }
 
 /** 追问里明说要查经验库：照样先自动查一次。「飞书知识库」说的是飞书文档，不算 */
-const ASKS_KNOWLEDGE = /经验库|(?<!飞书)知识库/;
+const ASKS_KNOWLEDGE = /经验库|(?<!飞书\s*)知识库/;
 
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);

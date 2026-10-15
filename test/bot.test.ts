@@ -4285,7 +4285,7 @@ test("话题里上次没查成经验库（超时、出错、只查成一边）�
 });
 
 test("话题查成过经验库，追问里明说要查经验库、知识库：照样先自动查一次；说「飞书知识库」的是飞书文档，不算", async () => {
-  const { requests, lookups, handle } = restateSetup(Array.from({ length: 4 }, () => ({ text: "好", finish: "stop" as const })));
+  const { requests, lookups, handle } = restateSetup(Array.from({ length: 5 }, () => ({ text: "好", finish: "stop" as const })));
   await handle(message("重新查一下现在还有没有 2001102", { messageId: "om_2", rootId: "om_root", threadId: "omt_1" }));
   assert.equal(lookups.length, 1);
   for (const [i, ask] of ["再查一下经验库有没有类似的", "知识库里有没有这个问题的记录"].entries()) {
@@ -4294,6 +4294,7 @@ test("话题查成过经验库，追问里明说要查经验库、知识库：�
     assert.match(requests[1 + i].system, /这次提问可能相关的经验（回答前自动查到的）/, ask);
   }
   await handle(message("飞书知识库里有这个接口的文档吗", { messageId: "om_5", rootId: "om_root", threadId: "omt_1" }));
+  await handle(message("飞书 知识库里有没有部署文档", { messageId: "om_6", rootId: "om_root", threadId: "omt_1" }));
   assert.equal(lookups.length, 3);
 });
 
