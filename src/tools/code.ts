@@ -21,6 +21,7 @@ export const CODE_TOOL_NAMES = [
   "code_edit_file",
   "code_diff",
   "code_open_pr",
+  "code_merge",
 ] as const;
 
 export interface CodeToolsOptions {
@@ -36,6 +37,8 @@ export interface CodeToolsOptions {
 export function createCodeTools({ workspaces, threadKey, askerName, botName }: CodeToolsOptions): Tool[] {
   const repos = workspaces.repos;
   const { requestName, refOf } = workspaces.host;
+  // 平台支持时机器人能合并：只合自己开的、开到没保护的分支的
+  const canMerge = workspaces.host.mergeCheck !== undefined && workspaces.host.mergeRequest !== undefined;
   const opened = new Map<string, Promise<Workspace>>();
   // 一个任务里每个仓库只打开（克隆或更新）一次
   const workspace = (args: Record<string, unknown>, { signal }: ToolContext) => {
@@ -292,7 +295,10 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         `群成员要「起一个新分支」时就用它：branch 填群成员说的分支名，没说就不填，机器人会起名。` +
         `同一份改动还要合到别的分支（如「合并到 uat」「uat 也要」）时，在这个话题里直接调用，target 填那个分支：机器人从那个分支拉一个新分支，把改动搬过去，再开一个到那个分支的${requestName}，之前开的不受影响，不用让群成员新开话题。` +
         `要搬的是别的话题或别人开的${requestName}，先用 code_requests 找到编号，填 from 和 target。` +
-        `只在群成员要你提交、开${requestName}或者合到某个分支时使用；机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`,
+        `只在群成员要你提交、开${requestName}或者合到某个分支时使用；` +
+        (canMerge
+          ? `它只开不合，群成员要合并（「合并到 uat」）时，开好以后再用 code_merge 合。机器人不会推到已有的分支。`
+          : `机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`),
       parameters: {
         type: "object",
         properties: {
@@ -323,14 +329,50 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         .filter(Boolean)
         .join("\n\n---\n");
       const ws = await workspace(args, ctx);
-      const from = requestNumber(args.from);
+      const from = requestNumber(args.from, "from");
       const pr = await ws.openPullRequest(title, body, { branch: optional(args.branch), target: optional(args.target), from }, ctx.signal);
       const out = new ToolOutputBuilder(ws.repo).parts(...openedLine(pr, requestName, refOf));
       return report(ctx, addChanges(out.line(""), pr.changes).build());
     },
   };
 
-  return [branches, listFiles, read, search, log, requests, edit, diff, openPr];
+  const merge: Tool = {
+    writes: true,
+    spec: {
+      name: "code_merge",
+      description:
+        `合并一个${requestName}（填编号）。只合这个话题里机器人自己开的、开到没保护的分支（如 uat、test）的；别的话题开的、别人往分支上推过提交的、改动是从别人的${requestName}搬来的都不合；` +
+        `开到受保护的分支（master、prod 这类线上分支，以 ${workspaces.host.name} 上的保护设置为准）或仓库默认分支的不合，要人审过再点，照它返回的原因告诉群成员。` +
+        `只在群成员明确要合并时用（「合并到 uat」「把 !354 合了」）：先用 code_open_pr 开好到那个分支的${requestName}，再用它合；已经开过的直接填编号。` +
+        `只说「提个 PR」「开个${requestName}」时只开不合。要等流水线通过才能合的，会设成流水线通过后自动合并。`,
+      parameters: {
+        type: "object",
+        properties: {
+          repo: repoParam,
+          number: { type: "integer", description: `要合并的${requestName}编号，如 354` },
+        },
+        required: required("number"),
+      },
+    },
+    describe: (args) => {
+      let number: number | undefined;
+      try {
+        number = requestNumber(args.number, "number");
+      } catch {
+        number = undefined;
+      }
+      return number ? `合并${requestName} ${refOf(number)}` : `合并${requestName}`;
+    },
+    async run(args, ctx) {
+      const number = requestNumber(args.number, "number");
+      if (number === undefined) {
+        throw new Error(`缺少 number 参数，填要合并的${requestName}编号`);
+      }
+      return report(ctx, await (await workspace(args, ctx)).mergeRequest(number, ctx.signal));
+    },
+  };
+
+  return [branches, listFiles, read, search, log, requests, edit, diff, openPr, ...(canMerge ? [merge] : [])];
 }
 
 /** 开好合并请求以后的第一行：哪个分支开到哪个分支，改动是不是从别处搬过来的 */
@@ -399,14 +441,14 @@ function list(value: unknown): string[] {
   return items.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
 }
 
-/** from 参数：合并请求的编号，模型有时写成「!353」「#353」 */
-function requestNumber(value: unknown): number | undefined {
+/** 合并请求的编号参数（from、number），模型有时写成「!353」「#353」 */
+function requestNumber(value: unknown, key: string): number | undefined {
   if (value === undefined || value === null || value === "") {
     return undefined;
   }
   const number = typeof value === "number" ? value : typeof value === "string" && /^\s*[!#]?\d+\s*$/.test(value) ? Number(value.replace(/\D/g, "")) : NaN;
   if (!Number.isSafeInteger(number) || number <= 0) {
-    throw new Error(`from 要填合并请求的编号，如 353：${String(value)}`);
+    throw new Error(`${key} 要填合并请求的编号，如 353：${String(value)}`);
   }
   return number;
 }

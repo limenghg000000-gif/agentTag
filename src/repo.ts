@@ -55,6 +55,32 @@ export interface CodeHost {
   listRequests?(repo: string, query: RequestQuery, signal?: AbortSignal): Promise<RequestInfo[]>;
   /** 一个合并请求的分支、状态和改动范围。把别的话题开的合并请求搬到别的分支时用，没有实现时不能搬 */
   getRequest?(repo: string, number: number, signal?: AbortSignal): Promise<RequestDetail>;
+  /** 合并前要核对的：合并请求的状态、分支、谁开的、源分支最新的提交，机器人自己的账号，要合到的分支受不受保护。没有实现时机器人不能合并 */
+  mergeCheck?(repo: string, number: number, signal?: AbortSignal): Promise<MergeCheck>;
+  /** 合并（sha 是核对过的源分支最新提交，对不上平台会拒绝；target 是核对过的目标分支，合之前被改了就不合）；要等流水线的设成流水线通过后自动合并 */
+  mergeRequest?(repo: string, number: number, options: { sha: string; target: string }, signal?: AbortSignal): Promise<MergeResult>;
+}
+
+/** 合并前核对用的 */
+export interface MergeCheck extends RequestInfo {
+  /** 源分支最新的提交 */
+  sha: string;
+  /** 开合并请求的账号（用户名） */
+  authorUsername?: string;
+  /** 机器人自己的账号（令牌对应的用户名） */
+  botUsername: string;
+  /** 从别的项目（fork）提过来的 */
+  fromFork?: boolean;
+  /** 要合到的分支在平台上受保护（按平台上的保护设置，含通配的规则） */
+  targetProtected: boolean;
+  /** 要合到的分支是仓库的默认分支 */
+  targetIsDefault: boolean;
+}
+
+/** 合并的结果：合好了，或者设成了流水线通过后自动合并 */
+export interface MergeResult {
+  state: "merged" | "auto";
+  url: string;
 }
 
 /** 列合并请求的条件 */
@@ -150,8 +176,9 @@ const GITLAB_ROLES: Record<number, string> = { 10: "Guest", 20: "Reporter", 30: 
  * 自建 GitLab：用一个访问令牌（项目或群组访问令牌、个人访问令牌都行，要 api 权限，角色至少 Developer）
  * 拉代码、推分支、开合并请求。repo 是项目路径，如 group/sub/project。
  */
-export function createGitLabHost(baseUrl: string, token: string, fetchImpl: typeof fetch = fetch): CodeHost {
+export function createGitLabHost(baseUrl: string, token: string, fetchImpl: typeof fetch = fetch, sleep: Sleep = wait): CodeHost {
   const base = baseUrl.trim().replace(/\/+$/, "");
+  let botUser: Promise<string> | undefined;
   // git 走 HTTP 时用户名随便填，密码是令牌
   const basic = Buffer.from(`oauth2:${token}`).toString("base64");
   return {
@@ -347,7 +374,173 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       const fromFork = body.source_project_id !== undefined && body.source_project_id !== body.target_project_id;
       return { ...gitLabRequest(body), baseSha, headSha, ...(fromFork ? { fromFork } : {}) };
     },
+    async mergeCheck(repo, number, signal) {
+      const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
+      const request = await readMergeRequest(project, number, signal);
+      if (!request.sha) {
+        throw new RepoError(`GitLab 没给出 !${number} 最新的提交，过一会儿再试`);
+      }
+      // 令牌对应的账号不会变，查一次就记下；没查到下次再查
+      const user = (botUser ??= gitLabGet(`${base}/api/v4/user`, signal).then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as { username?: string };
+        if (!res.ok || !body.username) {
+          throw new RepoError(`查不到机器人自己的 GitLab 账号（HTTP ${res.status}），先不合并`);
+        }
+        return body.username;
+      }));
+      user.catch(() => {
+        if (botUser === user) {
+          botUser = undefined;
+        }
+      });
+      const botUsername = await user;
+      const target = request.target_branch ?? "";
+      const res = await gitLabGet(`${project}/repository/branches/${encodeURIComponent(target)}`, signal);
+      if (res.status === 404) {
+        throw new RepoError(`!${number} 要合到的 ${target} 分支不存在了`);
+      }
+      const branch = (await res.json().catch(() => ({}))) as { protected?: unknown; default?: unknown };
+      if (!res.ok || typeof branch.protected !== "boolean") {
+        throw new RepoError(`GitLab 查 ${target} 分支是不是受保护的失败（HTTP ${res.status}），先不合并`);
+      }
+      const fromFork = request.source_project_id !== undefined && request.source_project_id !== request.target_project_id;
+      return {
+        ...gitLabRequest(request),
+        sha: request.sha,
+        ...(request.author?.username ? { authorUsername: request.author.username } : {}),
+        botUsername,
+        ...(fromFork ? { fromFork } : {}),
+        targetProtected: branch.protected,
+        targetIsDefault: branch.default === true,
+      };
+    },
+    async mergeRequest(repo, number, { sha, target }, signal) {
+      const project = `${base}/api/v4/projects/${encodeURIComponent(repo)}`;
+      // 刚开的合并请求 GitLab 要算一会儿能不能合（checking 这类），等它算完再合
+      let status = "";
+      for (let tries = 0; ; tries++) {
+        const request = await readMergeRequest(project, number, signal);
+        // 核对以后有人把合并请求改成开到别的分支（比如 master）：合并接口只核对源分支的提交，这里不核对就会合到没查过的分支上
+        if (request.target_branch !== target) {
+          throw new RepoError(`!${number} 要合到的分支改成了 ${request.target_branch ?? "别的分支"}（核对时是 ${target}），机器人不合，请重新说一遍`);
+        }
+        status = request.detailed_merge_status ?? request.merge_status ?? "";
+        if (!MERGE_CHECKING.has(status) || tries + 1 >= MERGE_CHECK_TRIES) {
+          break;
+        }
+        await sleep(MERGE_CHECK_WAIT_MS, signal);
+      }
+      const blocked = MERGE_BLOCKED[status];
+      if (blocked) {
+        throw new RepoError(`!${number} 现在合不了：${blocked}`);
+      }
+      // 要等流水线通过才能合的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
+      const pipeline = status === "ci_must_pass" || status === "ci_still_running";
+      const res = await fetchImpl(`${project}/merge_requests/${number}/merge`, {
+        method: "PUT",
+        headers: { "private-token": token, "content-type": "application/json" },
+        body: JSON.stringify({ sha, ...(pipeline ? { auto_merge: true, merge_when_pipeline_succeeds: true } : {}) }),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+      });
+      const body = (await res.json().catch(() => ({}))) as GitLabRequest & { merge_when_pipeline_succeeds?: boolean; message?: unknown };
+      if (!res.ok) {
+        const raw = body.message;
+        const detail = raw === undefined ? "" : typeof raw === "string" ? raw : JSON.stringify(raw);
+        const hint =
+          res.status === 401
+            ? "令牌无效或过期了"
+            : res.status === 403
+              ? "机器人的账号没有权限合到这个分支，要有权限的人来合"
+              : res.status === 405 || res.status === 422
+                ? "GitLab 说现在不能合（可能是草稿、有冲突、流水线没过、还要审批或者有没解决的评论）"
+                : res.status === 406
+                  ? "和要合到的分支有冲突"
+                  : res.status === 409
+                    ? "源分支刚有新的提交，和核对过的不一样，没合"
+                    : "";
+        throw new RepoError(`GitLab 合并 !${number} 失败（HTTP ${res.status}）${hint ? `：${hint}` : ""}。${detail}`.trim());
+      }
+      const url = body.web_url ?? "";
+      if (body.state === "merged") {
+        return { state: "merged", url };
+      }
+      if (pipeline || body.merge_when_pipeline_succeeds === true) {
+        return { state: "auto", url };
+      }
+      throw new RepoError(`GitLab 没有合并 !${number}（状态 ${body.state ?? "未知"}），请到 GitLab 上看一下：${url}`);
+    },
   };
+
+  function gitLabGet(url: string, signal?: AbortSignal): Promise<Response> {
+    return fetchImpl(url, {
+      headers: { "private-token": token },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+    });
+  }
+
+  async function readMergeRequest(project: string, number: number, signal?: AbortSignal): Promise<GitLabMergeRequest> {
+    const res = await gitLabGet(`${project}/merge_requests/${number}`, signal);
+    if (res.status === 404) {
+      throw new RepoError(`没有 !${number} 这个合并请求，用 code_requests 找一下`);
+    }
+    if (!res.ok) {
+      throw new RepoError(`GitLab 读合并请求 !${number} 失败（HTTP ${res.status}）`);
+    }
+    return (await res.json()) as GitLabMergeRequest;
+  }
+}
+
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      },
+      { once: true },
+    );
+  });
+}
+
+/** 合并前等 GitLab 算完能不能合：最多看几次、每次隔多久 */
+const MERGE_CHECK_TRIES = 6;
+const MERGE_CHECK_WAIT_MS = 2000;
+/** GitLab 还在算能不能合的状态（detailed_merge_status，老版本的 merge_status） */
+const MERGE_CHECKING = new Set(["unchecked", "checking", "preparing", "approvals_syncing", "cannot_be_merged_recheck", "cannot_be_merged_rechecking"]);
+/** 合不了的状态和大白话的原因；没列的（mergeable、can_be_merged、要等流水线的、不认识的）照样去合，由 GitLab 决定 */
+const MERGE_BLOCKED: Record<string, string> = {
+  conflict: "和要合到的分支有冲突，要先解决冲突",
+  cannot_be_merged: "和要合到的分支有冲突，要先解决冲突",
+  broken_status: "源分支和要合到的分支对不上（可能有冲突），GitLab 合不了",
+  need_rebase: "要先变基（rebase）到要合到的分支最新的代码",
+  draft_status: "还是草稿（Draft），要先改成正式的",
+  not_approved: "还没审批通过",
+  requested_changes: "有人要求修改",
+  discussions_not_resolved: "还有没解决的评论",
+  not_open: "已经不是开着的了",
+  blocked_status: "被别的合并请求挡着",
+  merge_request_blocked: "被别的合并请求挡着",
+  external_status_checks: "外部检查还没通过",
+  status_checks_must_pass: "外部检查还没通过",
+  security_policy_pipeline_check: "安全策略的流水线还没跑完",
+  security_policy_violations: "安全策略没通过",
+  commits_status: "源分支的提交有问题（比如还没推上去）",
+  locked_paths: "改到了被锁住的文件",
+  locked_lfs_files: "改到了被锁住的文件",
+  title_regex: "标题不符合项目要求的格式",
+  jira_association_missing: "标题或描述里要带 Jira 编号",
+};
+
+interface GitLabMergeRequest extends GitLabRequest {
+  sha?: string;
+  detailed_merge_status?: string;
+  merge_status?: string;
+  source_project_id?: number;
+  target_project_id?: number;
 }
 
 interface GitLabRequest {
@@ -357,7 +550,7 @@ interface GitLabRequest {
   state?: string;
   source_branch?: string;
   target_branch?: string;
-  author?: { name?: string } | null;
+  author?: { name?: string; username?: string } | null;
   updated_at?: string;
 }
 
@@ -557,6 +750,8 @@ interface Change {
   pushedSha?: string;
   prUrl?: string;
   prNumber?: number;
+  /** 改动是从仓库里这个合并请求搬过来的（code_open_pr 的 from）：合并前要看那个是不是机器人自己开的 */
+  portedFrom?: number;
 }
 
 /** 推上去以后放到一边的改动：切到别的分支、或者把改动搬到别的分支时存下，切回 base 分支时接着用 */
@@ -691,7 +886,10 @@ function validState(state: WorkspaceState): boolean {
   const changes: Change[] = [state, ...(state.earlier ?? [])];
   const names = [...changes.flatMap((change) => [change.base, change.branch]), state.porting?.back, state.porting?.branch];
   const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha]);
+  // 拿去查合并请求、写进接口地址的编号
+  const numbers = changes.flatMap((change) => [change.prNumber, change.portedFrom]);
   return (
+    numbers.every((n) => n === undefined || (Number.isSafeInteger(n) && (n as number) > 0)) &&
     names.every((name) => name === undefined || (typeof name === "string" && isBranchName(name))) &&
     shas.every((sha) => sha === undefined || (typeof sha === "string" && /^[0-9a-f]{40,64}$/.test(sha)))
   );
@@ -862,6 +1060,71 @@ export class Workspace {
       );
     }
     return out.build();
+  }
+
+  /**
+   * 合并一个合并请求。只合机器人自己开的、开到没保护的分支（如 uat）的；开到受保护的分支（以平台上的保护设置为准，
+   * master、prod 这类线上分支）或者仓库默认分支的不合，要人审过再点。要等流水线的设成流水线通过后自动合并
+   */
+  async mergeRequest(number: number, signal?: AbortSignal): Promise<ToolOutput> {
+    const name = this.host.requestName;
+    const ref = this.host.refOf(number);
+    if (!this.host.mergeCheck || !this.host.mergeRequest) {
+      throw new RepoError(`${this.host.name} 上机器人还不能合并${name}，请人来点`);
+    }
+    const check = await this.host.mergeCheck(this.repo, number, signal);
+    const route: Piece[] = ["（", [check.source, { branch: check.source }], " → ", [check.target, { branch: check.target }], "）"];
+    if (check.state === "merged") {
+      return this.output().parts(`${ref}「${oneLine(check.title)}」`, ...route, `已经合并过了：${check.url}`).build();
+    }
+    if (check.state === "closed") {
+      throw new RepoError(`${ref} 已经关掉了（没合并），合不了：${check.url}`);
+    }
+    if (check.fromFork) {
+      throw new RepoError(`${ref} 是从别的项目（fork）提过来的，机器人不合，请人在 ${this.host.name} 上处理：${check.url}`);
+    }
+    // 只合机器人自己推的代码：别人开的合并请求里的改动机器人没经手，由开的人或有权限的人决定
+    const isBot = (username: string | undefined) => username !== undefined && username.toLowerCase() === check.botUsername.toLowerCase();
+    if (!isBot(check.authorUsername)) {
+      throw new RepoError(
+        `${ref} 是 ${check.author ?? check.authorUsername ?? "别人"} 开的，机器人只合并自己开的${name}，请开的人或有权限的人在 ${this.host.name} 上点合并：${check.url}`,
+      );
+    }
+    // 只合这个话题自己开的、源分支上就是机器人推上去的那个提交：别人后来往分支上推了提交、别的话题开的，都不合
+    const own = [this.state, ...this.earlier].find((change) => change.prNumber === number);
+    if (!own) {
+      throw new RepoError(`${ref} 不是这个话题里开的，机器人只合并当前话题里自己开的${name}；请到开它的话题里说，或者请人在 ${this.host.name} 上点合并：${check.url}`);
+    }
+    if (!own.pushedSha || own.pushedSha !== check.sha) {
+      throw new RepoError(`${ref} 的源分支上有机器人没推过的提交（最新的不是机器人推的那个），机器人不合，请人看过再点合并：${check.url}`);
+    }
+    // 改动是从别的合并请求搬过来的：那个也得是机器人开的，别人写的改动没经人审，不替他合
+    if (own.portedFrom !== undefined) {
+      const source = await this.host.mergeCheck(this.repo, own.portedFrom, signal);
+      if (!isBot(source.authorUsername)) {
+        throw new RepoError(
+          `${ref} 的改动是从 ${this.host.refOf(own.portedFrom)}（${source.author ?? source.authorUsername ?? "别人"} 开的）搬过来的，不是机器人写的，机器人不合，请人审过再点合并：${check.url}`,
+        );
+      }
+    }
+    if (check.targetProtected || check.targetIsDefault) {
+      throw new RepoError(
+        `${ref} 要合到的 ${check.target} 是${check.targetProtected ? "受保护的分支" : "仓库的默认分支"}，合并要人审过再点，机器人不合：${check.url}`,
+        this.onBranch(check.target),
+      );
+    }
+    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target }, signal);
+    const url = merged.url || check.url;
+    const out = this.output();
+    return (
+      merged.state === "merged"
+        ? out.parts(`已合并${name} ${ref}「${oneLine(check.title)}」`, ...route, `，改动进了 ${check.target} 分支：${url}`)
+        : out.parts(
+            `${ref}「${oneLine(check.title)}」`,
+            ...route,
+            `要等流水线跑完才能合，已设成流水线通过后自动合并；流水线没过就不会合，到 ${this.host.name} 上看流水线：${url}`,
+          )
+    ).build();
   }
 
   /**
@@ -1516,6 +1779,8 @@ export class Workspace {
     }
     const derived = `${request.source}-${target.replace(/\//g, "-")}`;
     const opened = await this.port({ base: request.baseSha, tip: request.headSha }, target, title, body, requested, derived, signal);
+    this.state = { ...this.state, portedFrom: number };
+    await this.saveState();
     return { ...opened, ported: { request: { number, source: request.source, target: request.target, state: request.state } } };
   }
 
@@ -1534,6 +1799,8 @@ export class Workspace {
     /** 当前的合并请求已经合并或关掉了：不放到一边，直接丢掉 */
     drop = false,
   ): Promise<OpenedRequest> {
+    // 当前的改动本来是从别人的合并请求搬来的：再搬到别的分支也记着，合并前照样核对
+    const portedFrom = this.state.portedFrom;
     await this.fetchBranches([target], signal);
     if (requested) {
       await this.assertNewBranch(requested, signal);
@@ -1583,7 +1850,7 @@ export class Workspace {
     const parked = drop ? undefined : this.parked();
     const dropped = parked ? undefined : this.state.branch;
     const earlier = [...this.earlier, ...(parked ? [parked] : [])];
-    this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}) };
+    this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}), ...(portedFrom ? { portedFrom } : {}) };
     this.baseBranch = target;
     await this.saveState();
     if (dropped) {
@@ -1681,11 +1948,18 @@ export class Workspace {
 
   /** 这个话题当前推上去了的改动（放到一边时用）；没推过的不算 */
   private parked(): ParkedChange | undefined {
-    const { branch, pushedSha, baseSha, prUrl, prNumber } = this.state;
+    const { branch, pushedSha, baseSha, prUrl, prNumber, portedFrom } = this.state;
     if (!branch || !pushedSha) {
       return undefined;
     }
-    return { base: this.baseBranch, branch, pushedSha, ...(baseSha ? { baseSha } : {}), ...(prUrl && prNumber ? { prUrl, prNumber } : {}) };
+    return {
+      base: this.baseBranch,
+      branch,
+      pushedSha,
+      ...(baseSha ? { baseSha } : {}),
+      ...(prUrl && prNumber ? { prUrl, prNumber } : {}),
+      ...(portedFrom ? { portedFrom } : {}),
+    };
   }
 
   /** 改了代码还没推上去：工作目录有改动，或者机器人的分支上有没推的提交 */
