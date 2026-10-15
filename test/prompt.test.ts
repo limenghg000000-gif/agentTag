@@ -65,6 +65,10 @@ test("能改代码时：新分支开合并请求时起名，「合并到 uat」�
   assert.match(prompt, /新分支不用先建，code_branches 的 switch_to 只能切到已有的分支/);
   assert.match(prompt, /target 填那个分支，机器人会从那个分支拉新分支、把改动搬过去，再开一个合并请求，之前开的不受影响；不要让群成员新开话题/);
   assert.match(prompt, /你不能合并，「合并到 uat」就是开一个到 uat 的合并请求/);
+  // 把做好的修改提合并请求是动手，不重新排查；没调 code_open_pr 不能说开好了
+  assert.match(prompt, /是让你动手，不是重新排查：改动已经在合并请求里了，不用再搜代码、读代码去核对之前的结论/);
+  assert.match(prompt, /合并请求的编号和链接只写工具返回的；没调 code_open_pr、没拿到它返回的结果，不能说已经开好了/);
+  assert.match(prompt, /话题里之前的回答不算查证，追问时也要重新查（让你把已经做好的修改提合并请求、合到别的分支不是追问，见下面开合并请求那条）。/);
   assert.match(prompt, /先弄清指的是哪一个：用 code_requests 按关键词找开着的和最近合过的合并请求，再用 chat_recent_threads 看本群最近几个话题里开过什么/);
   assert.match(prompt, /不能只凭文件的提交历史一样、或者找到几个相关的旧提交就说「已经合进去了」/);
   assert.match(prompt, /列出候选问群成员是哪一个，不要猜/);
@@ -72,6 +76,8 @@ test("能改代码时：新分支开合并请求时起名，「合并到 uat」�
   // 不在写权限名单里：没有开合并请求的工具，不提怎么开，查别处的修改照样要先找到是哪个
   const readOnly = buildSystemPrompt({ ...base, toolNames: read });
   assert.ok(!readOnly.includes("新分支不用先建"));
+  assert.ok(!readOnly.includes("是让你动手"));
+  assert.match(readOnly, /话题里之前的回答不算查证，追问时也要重新查。问到的服务/);
   assert.match(readOnly, /先弄清指的是哪一个：用 code_requests/);
   assert.ok(!readOnly.includes("code_open_pr 的 from"));
   assert.match(prompt, /用 code_open_pr 的 from 填它的编号、target 填那个分支/);

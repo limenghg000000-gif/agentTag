@@ -6,9 +6,11 @@ import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
   askedInChinese,
+  asksToOpenRequest,
   BLOCKED_OPS_ANSWER,
   BLOCKED_RESTATE_ANSWER,
   blockedCodeAnswer,
+  blockedRequestAnswer,
   blockUnverifiedOps,
   type BotDeps,
   codeContent,
@@ -16,6 +18,9 @@ import {
   createCardActionHandler,
   createMessageHandler,
   DEFLECTED_ANSWER,
+  madeUpRequestAnswer,
+  madeUpRequestRefs,
+  openRequestAnswer,
   reviewCodeAnswer,
   reviewDeflectedAnswer,
   reviewOpsAnswer,
@@ -4238,4 +4243,108 @@ test("点「接着查」按钮问的就算像整理，也照常先查", async ()
   await handle(message("总结一下 3.jd.hk 的失败", { rootId: "om_root", threadId: "omt_1" }), { readOnly: true });
   assert.equal(lookups.length, 1);
   assert.ok(requests[0].tools?.some((t) => t.name === "aiops_query_logs"));
+});
+
+test("让把做好的修改开合并请求、合到 uat 才算要开：问合没合的不算", () => {
+  for (const ask of ["@飞书 CLI 把这个pr合并到uat分之吧", "也合到 uat", "提个PR", "修好以后开个 MR", "把京东短链的修复合并到 uat 分支", "帮我建一个合并请求"]) {
+    assert.equal(asksToOpenRequest(ask), true, ask);
+  }
+  for (const ask of ["这个修复合到 uat 了吗", "有没有合并到 uat", "合到 uat 没有", "!353 合到 uat 了", "这个服务怎么启动", "把两段合到一起", "开 prod 的日志看看"]) {
+    assert.equal(asksToOpenRequest(ask), false, ask);
+  }
+});
+
+test("判断是不是让开合并请求、回答是不是说开好了时，超长的空白不会让正则卡住", () => {
+  const blank = "\n".repeat(100_000);
+  const review = reviewCodeAnswer("提个 PR", ["golang/appservice"], () => false, () => false, { known: () => "", canOpen: true });
+  for (const run of [() => asksToOpenRequest(`帮我开${blank}x`), () => review(`已经${blank}x`, new Set(["code_search"]))]) {
+    const started = performance.now();
+    run();
+    assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
+  }
+});
+
+test("回答里的合并请求编号要在提问、话题或这次的工具结果里出现过；代码里的 !1 不算编号", () => {
+  const known = "已开合并请求 !353（agenttag/20261014-a1b2c3 → master）：https://lab.corp/golang/appservice/-/merge_requests/353";
+  assert.deepEqual(madeUpRequestRefs("!353 还开着，已经从 uat 开了 !354：https://lab.corp/golang/appservice/-/merge_requests/355", known), ["!354", "!355"]);
+  assert.deepEqual(madeUpRequestRefs("就是 `!353` 那个", known), []);
+  assert.deepEqual(madeUpRequestRefs("写的是 `!354`", known), ["!354"]);
+  assert.deepEqual(madeUpRequestRefs("判断写成 `if (!1)`：\n```go\nreturn !0 && !2\n```", known), []);
+});
+
+test("让开合并请求却没调 code_open_pr：编了编号、说开好了、一个代码工具没调就答，打回时叫它直接去开，不叫它去搜代码", () => {
+  const ask = "把这个pr合并到uat分之吧";
+  const known = "[赵作武] 京东短链修一下\n已开合并请求 !353（agenttag/20261014-a1b2c3 → master）";
+  const requests = { known: () => known, canOpen: true };
+  const review = reviewCodeAnswer(ask, ["golang/appservice"], () => false, () => false, requests);
+  // 一个工具没调，编了 !354
+  assert.equal(review("已经帮你开好了到 uat 的合并请求 !354", new Set()), openRequestAnswer(["!354"], []));
+  assert.match(openRequestAnswer(["!354"], []), /^（系统检查）你这次没有调用 code_open_pr，回答里的 !354 在这次的工具结果、话题和提问里都找不到，是编出来的。/);
+  assert.doesNotMatch(openRequestAnswer(["!354"], []), /code_search 查清楚|code_read_file 查清楚/);
+  assert.match(openRequestAnswer([], []), /不用再搜代码、读代码去核对之前的结论/);
+  // 查了合并请求、搜了代码，没开就说开好了
+  assert.equal(review("到 uat 的合并请求已开好，等人审", new Set(["code_requests", "code_search"])), openRequestAnswer([], []));
+  // 一个工具没调、提到了仓库
+  assert.equal(review("golang/appservice 的 !353 我这就合到 uat", new Set()), openRequestAnswer([], []));
+  // 调了 code_open_pr：按它返回的写就放行；说的是之前开过的也放行
+  const opened = { known: () => `${known}\n已从 uat 拉出新分支 agenttag/20261014-a1b2c3-uat，开了合并请求 !355`, canOpen: true };
+  const after = reviewCodeAnswer(ask, ["golang/appservice"], () => false, () => false, opened);
+  assert.equal(after("已开合并请求 !355（agenttag/20261014-a1b2c3-uat → uat），合并要人来点", new Set(["code_requests", "code_open_pr"])), undefined);
+  // 开失败了照实说：不打回
+  assert.equal(review("开到 uat 时有冲突，之前开的 !353 不受影响", new Set(["code_open_pr"])), undefined);
+  // 不是让开合并请求的：编了编号照样打回，只叫它改编号
+  const plain = reviewCodeAnswer("京东短链修好了没", ["golang/appservice"], () => false, () => false, requests);
+  assert.equal(plain("修复在 !353 里，uat 上是 !354", new Set(["code_requests"])), madeUpRequestAnswer(["!354"]));
+  // 没有开合并请求的工具（不在写权限名单里）：照旧的检查，编号照样核对
+  const noWrite = reviewCodeAnswer(ask, ["golang/appservice"], () => false, () => false, { known: () => known, canOpen: false });
+  assert.equal(noWrite("已经帮你开好了 !354", new Set()), madeUpRequestAnswer(["!354"]));
+});
+
+/** 2026-10-15 测试群：赵作武在话题里说「把这个pr合并到uat分之吧」，机器人第一轮没调工具就说开了 !354（编的），打回时叫它先搜代码，它去搜了云发单、列分支，绕了一圈 */
+function openRequestSetup(results: ChatResult[]) {
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const warnings: string[] = [];
+  const openPr: Tool = {
+    ...namedTool("code_open_pr"),
+    writes: true,
+    run: async () => "已从 uat 拉出新分支 agenttag/20261014-a1b2c3-uat，把 !353（agenttag/20261014-a1b2c3 → master，还开着）的改动搬过去，开了合并请求 !355（agenttag/20261014-a1b2c3-uat → uat）：https://lab.corp/golang/appservice/-/merge_requests/355。",
+  };
+  const history: ChatMessage[] = [
+    { role: "user", content: "[赵作武] 3.jd.hk 的短链转链失败，起一个新的分支，修复一下，提个pr" },
+    { role: "assistant", content: "已开合并请求 !353（agenttag/20261014-a1b2c3 → master）：https://lab.corp/golang/appservice/-/merge_requests/353" },
+  ];
+  const result = setup({
+    model,
+    taskTools: () => [namedTool("code_read_file"), namedTool("code_search"), namedTool("code_requests"), openPr],
+    codeRepos: ["golang/appservice"],
+    context: fakeContext({ history, source: "feishu" }).source,
+    logger: { ...quiet, warn: (line: string) => warnings.push(line) },
+  });
+  return { ...result, requests, warnings };
+}
+
+test("让把话题里的合并请求合到 uat：第一轮没调工具编了编号，打回时叫它直接调 code_open_pr，按它返回的编号回答", async () => {
+  const made = "已经帮你开好了到 uat 的合并请求 !354，合并要人来点。";
+  const done = "已开合并请求 !355（agenttag/20261014-a1b2c3-uat → uat），!353 不受影响，合并要人来点。";
+  const { requests, sent, handle } = openRequestSetup([
+    { text: made, finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_open_pr", arguments: JSON.stringify({ title: "fix(jd): 短链（uat）", body: "", from: 353, target: "uat" }) }] },
+    { text: done, finish: "stop" },
+  ]);
+  await handle(message("@飞书 CLI 把这个pr合并到uat分之吧", { rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[1].messages.at(-1), { role: "user", content: openRequestAnswer(["!354"], []) });
+  assert.match(requests[0].system, /把已经做好的修改提合并请求、合到别的分支（「把这个修复提个 PR」「把这个 PR 合并到 uat」）是让你动手，不是重新排查/);
+  assert.deepEqual(markdowns(sent), [done]);
+});
+
+test("打回以后还是写了查不到的合并请求编号：不发出去", async () => {
+  const made = "已经帮你开好了到 uat 的合并请求 !354。";
+  const { sent, handle, warnings } = openRequestSetup([
+    { text: made, finish: "stop" },
+    { text: "uat 上的是 !356，合并要人来点。", finish: "stop" },
+  ]);
+  await handle(message("@飞书 CLI 把这个pr合并到uat分之吧", { rootId: "om_root", threadId: "omt_1" }));
+  assert.deepEqual(markdowns(sent), [blockedRequestAnswer(["!356"])]);
+  assert.match(warnings.join("\n"), /回答打回重做以后还是写了查不到的合并请求编号，没有发出 message=om_1：!356/);
 });
