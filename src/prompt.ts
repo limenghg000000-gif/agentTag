@@ -27,7 +27,7 @@ export interface PromptContext {
    * aiopsHits 是 hits 里有 aiops 经验库的经验；missed 是一边查成、另一边没查成时没查成的库；failed 是都没查成（超时或出错）；
    * aiopsSkipped 是提问里像是有密钥、没拿去查 aiops 经验库；draftsHidden 是本来有起草经验的工具，这次点「接着查」按钮问的拿掉了
    */
-  knowledge?: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean };
+  knowledge?: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean; skipped?: boolean };
   /** 进度卡片上显示模型的思考（SHOW_THINKING 没关） */
   showThinking?: boolean;
   /** 回答写在飞书卡片（JSON 2.0）里：能画表格、用小标题和彩色标签 */
@@ -213,7 +213,8 @@ function knowledgeSection(
     failed,
     aiopsSkipped,
     draftsHidden,
-  }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean },
+    skipped,
+  }: { hits?: string; aiopsHits?: boolean; missed?: readonly string[]; failed?: boolean; aiopsSkipped?: boolean; draftsHidden?: boolean; skipped?: boolean },
   toolNames: readonly string[],
 ): string[] {
   const canPropose = toolNames.includes("knowledge_propose");
@@ -242,6 +243,16 @@ function knowledgeSection(
     );
   } else if (hits === "" && !missed?.length) {
     lines.push(`- 这次提问在${aiopsSkipped ? "团队" : ""}经验库里没查到相近的经验。查到新线索（报错原文、错误码、服务名）后可以用 knowledge_search 再查。`);
+  }
+  if (skipped) {
+    const search = toolNames.includes("knowledge_search");
+    const aiopsSearch = toolNames.includes("aiops_search_knowledge");
+    lines.push(
+      "- 这是同一个话题里的追问，回答前没再自动查经验库：话题第一次提问时查过，用到的经验在上面的回答里。不要说「经验库里没查到」。" +
+        (search
+          ? `追问里出现了新的问题、新的报错原文、错误码或服务名，需要参考以前的经验时自己查：团队经验库用 knowledge_search${aiopsSearch ? "，aiops 经验库用 aiops_search_knowledge（查询里只写错误码、服务名、现象，不要带密钥、密码）" : ""}。`
+          : ""),
+    );
   }
   if (aiopsSkipped && !failed) {
     lines.push(

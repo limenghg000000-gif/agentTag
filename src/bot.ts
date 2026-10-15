@@ -392,9 +392,16 @@ async function runTask(
     if (restate) {
       logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
     }
-    const knowledge = restate
-      ? undefined
-      : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
+    // 经验库只在话题第一次提问时自动查：机器人在这个话题里回答过了，后面的追问不再查（查到的经验第一次回答时已经用上了），
+    // 追问里有新线索时模型自己用 knowledge_search 查。追问里明说要查经验库、知识库的照样先查
+    const lookupSkipped = !restate && history.some((m) => m.role === "assistant") && !ASKS_KNOWLEDGE.test(question);
+    if (lookupSkipped) {
+      logger.info(`话题里回答过了，这次追问不自动查经验库 message=${msg.messageId}`);
+    }
+    const knowledge =
+      restate || lookupSkipped
+        ? undefined
+        : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
     // 记下这次成功跑完的工具和它们的结果，检查回答时只认成功拿到的结果（调用失败、工具不存在都不算查过）。
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
@@ -609,6 +616,8 @@ async function runTask(
                 // 整理之前内容时没查经验库，提示词里不说查到没查到
                 ...(restate
                   ? {}
+                  : lookupSkipped
+                  ? { skipped: true }
                   : knowledge
                   ? {
                       hits: knowledge.text,
@@ -1273,6 +1282,9 @@ export function codeContent(output: string, facts: readonly CodeFact[]): string 
 const BRANCHES_TOOL = "code_branches";
 const OPEN_PR_TOOL = "code_open_pr";
 const MERGE_TOOL = "code_merge";
+
+/** 追问里明说要查经验库：照样先自动查一次。「飞书知识库」说的是飞书文档，不算 */
+const ASKS_KNOWLEDGE = /经验库|(?<!飞书)知识库/;
 
 /** 改群记忆的工具：点按钮问的不给（见 runTask 里的 followUp） */
 const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete"]);
