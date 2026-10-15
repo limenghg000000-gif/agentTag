@@ -18,6 +18,8 @@ export interface PromptContext {
   readOnly?: boolean;
   /** 这次是点「接着查」按钮问的，只给了读的工具 */
   followUp?: boolean;
+  /** 这次只是整理话题里已经有的内容（总结、讲给谁听、换个说法），没给查询的工具 */
+  restate?: boolean;
   /** 另外几段说明（如 MCP 服务的使用说明），放在群记忆前面 */
   extra?: string;
   /**
@@ -81,7 +83,7 @@ function aboutLines(about: AboutBot | undefined): string[] {
   return lines;
 }
 
-export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, extra, showThinking, richText, knowledge, about }: PromptContext): string {
+export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, followUp, restate, extra, showThinking, richText, knowledge, about }: PromptContext): string {
   const lines = [
     `你是「${botName}」，团队的 AI 助手，作为成员加入了这个飞书群。群里的人 @${botName} 向你提问或派活，你的回答会发在那条消息的话题里。`,
     `现在是北京时间 ${TIME_FORMAT.format(now)}。`,
@@ -112,6 +114,17 @@ export function buildSystemPrompt({ botName, now, toolNames, memory, readOnly, f
     lines.push(
       "- 这次的问题是群成员点你上一条回答下面的「接着查」按钮问的，所以只给了读的工具：只查不改，群记忆也不记、不改、不删。要新建或修改文档、改代码、开合并请求、记住或忘掉什么时，说明按钮问的只能查，请他直接 @ 你说要做什么。" +
         "按钮上的话是接着要查的新问题：先用工具查，再按这次查到的结果回答；话题里之前的回答和群记忆只能当线索，不能直接拿来当答案。",
+    );
+  }
+  if (restate) {
+    const reads = toolNames.includes("feishu_doc_read") || toolNames.includes("fetch_url");
+    lines.push(
+      "- 这次是让你整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不是重新查：直接按话题里你之前的回答和大家说过的话来写，所以这次没给你查线上、查代码、搜网页、查经验库的工具，回答里也不用提这一点。" +
+        "之前回答里的结论、数据、代码位置照原样用，不要添上之前没有的数据、路径和结论，也不要把之前拿不准的说成确定的；之前没查到的就说之前没查到。" +
+        "群记忆里的约定和偏好照样遵守，但群记忆里的结论、数据不要写进这次的整理。" +
+        (reads ? "要整理的是群成员给的飞书文档、网页链接时，照常读了再整理。" : "") +
+        "指定了讲给谁听、用什么方式的照着写：比如 eli5 是讲给五岁小孩也听得懂的大白话，少用术语，打个比方说清楚出了什么事、影响到谁、接下来谁要做什么。整理不画图，也不放关键数字卡片和「接着查」按钮。" +
+        "话题里找不到要整理的那条回答（被省略了，或者这个话题里没有）时，用一句话说明，请对方说「重新查」，不要编。",
     );
   }
   if (toolNames.includes("chat_recent_threads")) {
