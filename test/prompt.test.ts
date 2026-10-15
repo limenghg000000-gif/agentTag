@@ -79,7 +79,11 @@ test("能改代码时：新分支开合并请求时起名，「合并到 uat」�
   const read = ["code_read_file", "code_search", "code_branches", "code_requests", "chat_recent_threads"];
   const prompt = buildSystemPrompt({ ...base, toolNames: [...read, "code_edit_file", "code_open_pr"] });
   assert.match(prompt, /新分支不用先建，code_branches 的 switch_to 只能切到已有的分支/);
-  assert.match(prompt, /target 填那个分支，机器人会从那个分支拉新分支、把改动搬过去，再开一个合并请求，之前开的不受影响；不要让群成员新开话题/);
+  assert.match(prompt, /target 填那个分支，机器人从同一个修复分支开一个到那个分支的合并请求，不另拉分支、不搬改动/);
+  // 从线上分支拉分支改，测试分支上只看不改
+  assert.match(prompt, /从线上分支（这个话题一开始所在的分支，程序按项目的流水线认的，不一定叫 master）拉分支改/);
+  assert.match(prompt, /uat、test 这类测试环境的分支上只看代码，不在上面改、不从它拉分支/);
+  assert.match(prompt, /等群成员说测完了、要上线（「上线」「合到 master」）再调 code_open_pr（不填 target）开到线上分支/);
   assert.match(prompt, /你不能合并，「合并到 uat」就是开一个到 uat 的合并请求/);
   // 把做好的修改提合并请求是动手，不重新排查；没调 code_open_pr 不能说开好了
   assert.match(prompt, /是让你动手，不是重新排查：改动已经在合并请求里了，不用再搜代码、读代码去核对之前的结论/);
