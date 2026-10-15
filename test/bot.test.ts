@@ -7,6 +7,7 @@ import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from 
 import {
   askedInChinese,
   BLOCKED_OPS_ANSWER,
+  BLOCKED_RESTATE_ANSWER,
   blockedCodeAnswer,
   blockUnverifiedOps,
   type BotDeps,
@@ -3936,6 +3937,7 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   assert.equal(restatesEarlier("换个说法，讲简单点", earlierTopic), true);
   assert.equal(restatesEarlier("重新整理一下，精简到三句话", earlierTopic), true);
   assert.equal(restatesEarlier("tl;dr", earlierTopic), true);
+  assert.equal(restatesEarlier("用大白话讲一下，让运营也看得懂", earlierTopic), true);
   // 提到的服务、错误码话题里之前就有：说的还是之前那个问题
   assert.equal(restatesEarlier("把 product-service-api 这个问题总结给大家", earlierTopic), true);
   assert.equal(restatesEarlier("4 个 Pod 的情况概括一下", earlierTopic), true);
@@ -3954,6 +3956,10 @@ test("要整理话题里之前的回答（总结、讲给谁听、换个说法�
   // 代码话题里之前说过，文档、链接整理时照样能读
   assert.equal(restatesEarlier("把代码核对的部分讲给开发同事听", earlierTopic), true);
   assert.equal(restatesEarlier("用大白话总结一下，写成飞书文档", earlierTopic), true);
+  // 整理完还要分析、查别的
+  assert.equal(restatesEarlier("总结一下上面，再分析 payment-service 的报错", earlierTopic), false);
+  assert.equal(restatesEarlier("总结一下上面的结论，顺便看看现在的 Pod", earlierTopic), false);
+  assert.equal(restatesEarlier("把上面的结论讲给大家听，再查一下修了没有", earlierTopic), false);
   // 不是整理
   assert.equal(restatesEarlier("这个怎么修", earlierTopic), false);
 });
@@ -3966,6 +3972,12 @@ test("整理之前内容时检查回答：代码位置和线上数据要是话�
     restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12，还有 services/goods/jingdong.go:121", known, scope),
     ["services/goods/taobao.go:12", "services/goods/jingdong.go:121", "09:30:00"],
   );
+  // 整个数对得上才算：之前写的是 15%、14 个 Pod，回答写 5%、4 个 Pod 不算写过；时间的小时带不带 0 都一样
+  const counts = "错误率 15%，涉及 14 个 Pod，查到 3.5 次重试，从 09:01:48 开始";
+  assert.deepEqual(restatedAdditions("错误率 5%，涉及 4 个 Pod，重试 5 次", counts, scope), ["5%", "4 个 Pod", "5 次"]);
+  assert.deepEqual(restatedAdditions("错误率 15%，涉及 14 个 Pod，从 9:01:48 开始", counts, scope), []);
+  assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **1/1** 就绪", scope), []);
+  assert.deepEqual(restatedAdditions("就绪 1/1", "Ready: **11/12** 就绪", scope), ["就绪 1/1"]);
   // 没配代码工具、没配 MCP 服务时不看那一类
   assert.deepEqual(restatedAdditions("09:30:00 又失败了一次，问题在 services/goods/taobao.go:12", known, { code: false, ops: false }), []);
   // 这次读到的文档、网页里有的也算
@@ -4033,21 +4045,16 @@ test("整理之前的回答时添了之前没有的数据、代码位置：打�
   assert.deepEqual(fixed.requests[1].messages.at(-1), { role: "user", content: restatedAnswerNote(["services/goods/taobao.go:12", "09:30:00"]) });
   assert.deepEqual(markdowns(fixed.sent), [clean]);
 
-  // 重做以后还编了线上的时间：不发出去
-  const time = restateSetup([
-    { text: "09:30:00 又失败了一次", finish: "stop" },
-    { text: "09:30:00 又失败了一次", finish: "stop" },
-  ]);
-  await time.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
-  assert.deepEqual(markdowns(time.sent), [BLOCKED_OPS_ANSWER]);
-
-  // 重做以后还编了代码位置：不发出去
-  const path = restateSetup([
-    { text: "问题在 services/goods/taobao.go:12", finish: "stop" },
-    { text: "问题在 services/goods/taobao.go:12", finish: "stop" },
-  ]);
-  await path.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
-  assert.deepEqual(markdowns(path.sent), [blockedCodeAnswer(["golang/appservice"])]);
+  // 重做以后还编了线上的时间、代码位置，或者编了条数、百分比这类（不带「把握」也算）：不发出去
+  for (const added of ["09:30:00 又失败了一次", "问题在 services/goods/taobao.go:12", "一共影响了 5 个 Pod，失败率 80%"]) {
+    const again = restateSetup([
+      { text: added, finish: "stop" },
+      { text: added, finish: "stop" },
+    ]);
+    await again.handle(message(ELI5_ASK, { rootId: "om_root", threadId: "omt_1" }));
+    assert.equal(again.requests.length, 2, added);
+    assert.deepEqual(markdowns(again.sent), [BLOCKED_RESTATE_ANSWER], added);
+  }
 });
 
 test("同一个话题里说要重新查、看现在的情况：照常查经验库、给查询的工具", async () => {

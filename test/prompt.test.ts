@@ -51,6 +51,7 @@ test("只是整理话题里之前的内容时：说明这次不查、照原样�
   assert.match(prompt, /这次是让你整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不是重新查/);
   assert.match(prompt, /之前回答里的结论、数据、代码位置照原样用，不要添上之前没有的数据、路径和结论/);
   assert.match(prompt, /要整理的是群成员给的飞书文档、网页链接时，照常读了再整理/);
+  assert.match(prompt, /群记忆里的约定和偏好照样遵守，但群记忆里的结论、数据不要写进这次的整理/);
   assert.match(prompt, /用一句话说明，请对方说「重新查」，不要编/);
 
   const noReads = buildSystemPrompt({ ...base, toolNames: [], restate: true });

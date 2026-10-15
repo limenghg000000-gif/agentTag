@@ -486,13 +486,13 @@ async function runTask(
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
     const readCode = () => evidence.some(linksCode);
-    // 配了代码工具（这次给没给都算）：整理之前内容时没给代码工具，回答里的代码位置照样要核对
-    const codeConfigured = allTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
+    // 整理之前内容时核对哪几样：配了代码工具（这次给没给都算）就核对代码位置，配了 MCP 服务就核对线上数据
+    const restateScope = { code: allTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX)), ops: Boolean(deps.mcp?.names.length) };
     // 整理之前内容时的依据：这次的提问、话题里之前写过的（之前的回答、群成员说的）和这次读到的文档网页。检查时再取，读到的才算上
     const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence)].join("\n");
     const reviews = [
       ...(restate
-        ? [reviewRestatedAnswer(saidBefore, { code: codeConfigured, ops: Boolean(deps.mcp?.names.length) })]
+        ? [reviewRestatedAnswer(saidBefore, restateScope)]
         : [
             ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode)] : []),
             // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
@@ -638,21 +638,22 @@ async function runTask(
     // 最后一道检查也按显示出来的文字看：<font>、<text_tag> 标签去掉
     const shown = stripRichTags(result.text);
     let blockedCode = false;
-    if (
-      deps.mcp?.names.length &&
-      result.finish !== "filtered" &&
-      blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0, restate ? saidBefore() : undefined)
-    ) {
+    // 整理之前内容时：重做以后回答里还有话题里之前没写过的代码位置、线上数据（条数、百分比这类也算），不发出去
+    const restatedAdded = restate && result.finish !== "filtered" ? restatedAdditions(shown, saidBefore(), restateScope) : [];
+    if (restatedAdded.length > 0) {
+      logger.warn(`整理之前的内容，重做以后还是添了之前没写过的内容，没有发出 message=${msg.messageId}：${restatedAdded.join("、")}`);
+      answer = BLOCKED_RESTATE_ANSWER;
+    }
+    if (!restate && deps.mcp?.names.length && result.finish !== "filtered" && blockUnverifiedOps(asked, deps.mcp.names, succeeded, shown, result.toolCalls > 0)) {
       logger.warn(`回答打回重做以后还是没查证就给出了线上数据，没有发出 message=${msg.messageId}`);
       answer = BLOCKED_OPS_ANSWER;
     }
-    if ((hasCodeTools || (restate && codeConfigured)) && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
+    if (hasCodeTools && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
       // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
-      // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发。
-      // 整理之前内容时没给代码工具：话题里之前写过的（之前的回答也算）、这次读到的文档网页里有的才算，每个路径都得写过
-      const userText = restate ? saidBefore() : [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
+      // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
+      const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
-      const investigating = restate || [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
+      const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
       // 仓库名要在路径开头：vendor/ai/aiops-mcp/src/foo.ts、node_modules/@ai/aiops-mcp/src/foo.ts 都不是这个仓库里的 src/foo.ts
       // 一次替换完：去掉一个仓库名以后，后面紧跟着的另一个仓库名（ai/aiops-mcp/ai/agent-tag/src/foo.ts）不能再当成路径开头去掉；
@@ -673,7 +674,7 @@ async function runTask(
       }
     }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
-    if (answer === BLOCKED_OPS_ANSWER || blockedCode || result.finish === "filtered") {
+    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || result.finish === "filtered") {
       state.thoughts = undefined;
     }
     state.phase = "done";
@@ -682,7 +683,7 @@ async function runTask(
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified, labelUserMessage(context.askerName, askedFull || "（@ 了你，没有写别的内容）"));
     // 被拦下、被审核拦下的回答里没有结论，不记
-    if (answer !== BLOCKED_OPS_ANSWER && !blockedCode && result.finish !== "filtered") {
+    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && result.finish !== "filtered") {
       await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
@@ -1888,18 +1889,15 @@ export function blockUnverifiedOps(
   succeeded: ReadonlySet<string>,
   answer: string,
   attempted = false,
-  earlier?: string,
 ): boolean {
-  // 整理之前内容的请求（见 restatesEarlier）给了 earlier（话题里之前的内容）：数据要是之前写过的才放行，不再整段放行
-  if (checkedLive(servers, succeeded) || (earlier === undefined && rewriteOnly(question))) {
+  if (checkedLive(servers, succeeded) || rewriteOnly(question)) {
     return false;
   }
   const conclusion = OPS_CONCLUSION.test(answer);
   const reported = attempted ? withoutToolFailures(answer) : answer;
   // 举例的句子不算（「例如 gateway-api-6978f9454f-tnc56 中，6978f9454f 是模板哈希」）；写成线上结论的照样整段查
   const text = conclusion ? reported : withoutExamples(reported);
-  const said = earlier === undefined ? question : `${question}\n${earlier}`;
-  const live = (pattern: RegExp) => hasUnverified(pattern, said, text);
+  const live = (pattern: RegExp) => hasUnverified(pattern, question, text);
   const liveTime = !TIME_QUESTION.test(question) || (conclusion && OPS_QUESTION.test(question));
   return live(OPS_STRONG) || (liveTime && live(OPS_TIME)) || (conclusion && live(OPS_WEAK));
 }
@@ -1920,6 +1918,8 @@ const RESTATE_REQUEST = new RegExp(
 );
 /** 要看现在的数据：LIVE_REQUEST 之外，「最近 1 小时」这类时间窗口，「重查」「复查」「核实」 */
 const FRESH_REQUEST = /最近\s*(?:\d+|[一二两三四五六七八九十半几]+)\s*个?\s*(?:秒|分钟?|小时|钟头|天|日|周|星期|礼拜|月)|重查|复查|核实/;
+/** 整理之外还要做新的事：「总结一下上面，再分析 xx 的报错」「顺便看看」「并排查原因」 */
+const NEW_WORK = /(?:再|另外|顺便|然后|并且?|同时|还要|还得)\s*(?:帮我?|给我)?\s*(?:分析|排查|查|看看|看一下|看下|对比|比较|诊断|定位|搜|确认|检查|核对)/;
 /**
  * 要查的对象：线上服务、日志这类（OPS_QUESTION），和代码、配置这类。话题里之前没出现过的，说明问的是新东西，不算整理。
  * 文档、网页链接不算：整理时照样给读文档、网页的工具（「总结成飞书文档」也不能因为说了文档就重查）
@@ -1931,16 +1931,19 @@ const TARGET_TERMS = new RegExp(NEW_TARGET.source, "gi");
  * 这次只是整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不用重新查。
  * 2026-10-14 测试群：转链排查答完以后，有人在同一个话题里 @ 机器人「用 eli5 方式总结给 @某某 同事」，机器人把查经验库、读剧本、查日志、读代码、查提交整个重来了一遍：
  * 提示词说话题里之前的回答不算查证、要重新查，回答前查到的经验也要先核对；模型直接整理的话，回答里的时间、Pod 数、仓库名又会被检查打回去查。
- * 要满足：话题里有上文；提问说的是整理、改写；没说要重新查、看现在的情况；提问里说到的服务名、日志、代码、配置这类对象话题里之前都出现过
- * （「把 product-service-api 这个问题总结给大家」说的还是之前那个，「整理一下 gateway 的部署配置」问另一个服务、要读配置的就不是整理）；
- * 指着「上面」「之前的回答」说的，提到什么都算整理
+ * 要满足：话题里有上文；提问说的是整理、改写；没说要重新查、看现在的情况，也没说整理完还要分析、查别的；
+ * 提问里说到的服务名、日志、代码、配置这类对象话题里之前都出现过（「把 product-service-api 这个问题总结给大家」说的还是之前那个，
+ * 「整理一下 gateway 的部署配置」「总结一下上面，再看看 payment-service」问到了新的服务、要读配置，就不是只整理）
  */
 export function restatesEarlier(question: string, history: readonly ChatMessage[]): boolean {
-  if (history.length === 0 || !RESTATE_REQUEST.test(question) || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question)) {
+  if (
+    history.length === 0 ||
+    !RESTATE_REQUEST.test(question) ||
+    LIVE_REQUEST.test(question) ||
+    FRESH_REQUEST.test(question) ||
+    NEW_WORK.test(question)
+  ) {
     return false;
-  }
-  if (EARLIER_CONTENT.test(question)) {
-    return true;
   }
   const said = history.map((m) => m.content).join("\n").toLowerCase();
   return !NEW_TARGET.test(question.replace(TARGET_TERMS, (term) => (said.includes(term.toLowerCase()) ? " " : term)));
@@ -1970,9 +1973,29 @@ export function restatedAdditions(answer: string, known: string, { code, ops }: 
   const cites = code
     ? unseenCodeCitations(answer, (cite, line) => (line === undefined ? mentions(known, cite) : mentionsLine(known, cite, line))).map((cite) => cite.text)
     : [];
-  const data = ops ? [...answer.matchAll(OPS_DATA)].map((match) => match[0]).filter((text) => !inQuestion(known, text) && !TIME_LAYOUT.test(text)) : [];
+  const said = ops ? valueForm(known) : "";
+  const data = ops ? [...answer.matchAll(OPS_DATA)].map((match) => match[0]).filter((text) => !saidValue(said, text) && !TIME_LAYOUT.test(text)) : [];
   return [...new Set([...cites, ...data])];
 }
+
+/** 比较数据用的写法：去掉空白、不分大小写，时间的小时去掉开头的 0（09:01:48 和 9:01:48 是同一个时间） */
+function valueForm(text: string): string {
+  return text.replace(/\s+/g, "").toLowerCase().replace(/(?<![\d:])0(\d:\d{2})/g, "$1");
+}
+
+/**
+ * 这个数据之前写过：整个数对得上才算，15%、14 个 Pod 里的 5%、4 个 Pod 不算（前后紧挨着数字、小数点的不算）；
+ * 就绪数只看比值（之前写的是「**1/1** 就绪」，回答写「1/1 就绪」）
+ */
+function saidValue(said: string, text: string): boolean {
+  const value = valueForm(text);
+  const exact = new RegExp(`(?<![\\d.])${escapeRegExp(value)}${/\d$/.test(value) ? "(?!\\.?\\d)" : ""}`);
+  const ratio = /(\d+)\/(\d+)/.exec(value);
+  return exact.test(said) || (ratio !== null && new RegExp(`(?<![\\d.])${ratio[1]}/${ratio[2]}(?!\\d)`).test(said));
+}
+
+export const BLOCKED_RESTATE_ANSWER =
+  "这次没能整理好：整理出来的回答里有话题里之前没写过的数据或代码位置，为免误导没有发出来。可以再说一次；要看最新情况，请说「重新查」。";
 
 export function restatedAnswerNote(added: readonly string[]): string {
   const shown = added.slice(0, MAX_RESTATED_ADDITIONS).map((text) => (text.length > 80 ? `${text.slice(0, 80)}…` : text));
