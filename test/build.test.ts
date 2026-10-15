@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { type CommandRunner, createBuildChecker, parseDockerfile, readGoRecipe } from "../src/build.js";
+import { type CommandRunner, createBuildChecker, parseDockerfile, readGoRecipe, toolchainFor } from "../src/build.js";
 
 async function repo(files: Record<string, string>): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), "agenttag-build-test-"));
@@ -16,7 +16,20 @@ async function repo(files: Record<string, string>): Promise<string> {
 
 function fakeRunner(results: { code: number; output: string; missing?: boolean }[]) {
   const calls: { command: string; args: readonly string[]; env: Record<string, string> }[] = [];
-  const run: CommandRunner = async (command, args, { env }) => {
+  const run: CommandRunner = async (command, args, { cwd, env }) => {
+    // go list：照目录里的文件答（没有编译条件，.go 都算参与编译）
+    if (command === "go" && args[0] === "list") {
+      const lines: string[] = [];
+      for (const pkg of args.filter((a) => a.startsWith("./") || a === ".")) {
+        const abs = path.join(cwd, pkg);
+        const names = (await readdir(abs).catch(() => [] as string[])).filter((n) => n.endsWith(".go") && !n.endsWith("_test.go"));
+        lines.push(`${abs}\t${names.join(" ")}`);
+      }
+      return { code: 0, output: lines.join("\n") };
+    }
+    if (command === "go" && args[0] === "env") {
+      return { code: 0, output: "go1.24.7\n" };
+    }
     calls.push({ command, args, env });
     return results.shift() ?? { code: 0, output: "" };
   };
@@ -173,4 +186,68 @@ test("编译检查：改了别的语言、构建配置、composer 依赖，说�
   assert.equal(docker.state, "unknown");
   const composer = await createBuildChecker({ run: fakeRunner([]).run }).check(dir, ["composer.json"]);
   assert.match(composer.state === "unknown" ? composer.reason : "", /composer 依赖/);
+});
+
+test("编译检查：Dockerfile 的 exec 写法、几步 go build、-C、读不懂的，和镜像里的 Go 版本", async () => {
+  assert.deepEqual(parseDockerfile('FROM golang:1.22\nRUN ["go", "build", "-o", "/app", "./cmd/api"]\n')?.targets, ["./cmd/api"]);
+  const two = parseDockerfile("FROM golang:1.22\nRUN go build -o /m ./cmd/migrate\nRUN go build -o /a ./cmd/api\n");
+  assert.deepEqual(two?.targets, ["./cmd/migrate", "./cmd/api"]);
+  assert.equal(two?.unsupported, undefined);
+  assert.match(parseDockerfile("FROM golang:1.22\nRUN go build -tags a ./x\nRUN go build ./y\n")?.unsupported ?? "", /编译条件不一样/);
+  assert.match(parseDockerfile("FROM golang:1.22\nRUN go build -C cmd/api .\n")?.unsupported ?? "", /-C/);
+  const odd = await repo({ Dockerfile: "FROM golang:1.22\nRUN sh -c 'cd x && go   build'\n" });
+  // 能读出来的照读；读不出入口的 go build 不当作没有
+  assert.ok(await readGoRecipe(odd));
+
+  assert.equal(toolchainFor("1.25"), "go1.25.0+auto");
+  assert.equal(toolchainFor("1.22.5"), "go1.22.5+auto");
+  assert.equal(toolchainFor("1.15"), "auto");
+  assert.equal(toolchainFor("1.25", "go1.25.3"), "auto");
+  assert.equal(toolchainFor("1.22", "go1.25.3"), "go1.22.0+auto");
+  assert.equal(toolchainFor(undefined), "auto");
+
+  // 照编时用镜像的版本；-C 的编过了也只算说不清
+  const dir = await repo({ "go.mod": "module x\n", Dockerfile: "FROM golang:1.22-alpine\nRUN go build -C cmd/api .\n", "cmd/api/main.go": "package main\n" });
+  const { calls, run } = fakeRunner([{ code: 0, output: "" }]);
+  const result = await createBuildChecker({ run }).check(dir, ["cmd/api/main.go"]);
+  assert.equal(calls[0].env.GOTOOLCHAIN, "go1.22.0+auto");
+  assert.equal(result.state, "unknown");
+});
+
+test("编译检查：改到的文件被编译条件排除了、改了流水线拆出去的文件、改之前也编不过，都算说不清；同时几次检查排队", async () => {
+  const dir = await repo({ "go.mod": "module x\n", "a/a.go": "package a\n", "a/a_windows.go": "//go:build windows\npackage a\n", ".gitlab-ci.yml": "include:\n  - local: ci/build.yml\n", "ci/build.yml": "x: 1\n" });
+  const listed: CommandRunner = async (command, args, options) =>
+    command === "go" && args[0] === "list" ? { code: 0, output: `${path.join(options.cwd, "a")}\ta.go` } : { code: 0, output: "" };
+  const excluded = await createBuildChecker({ run: listed }).check(dir, ["a/a_windows.go"]);
+  assert.match(excluded.state === "unknown" ? excluded.reason : "", /a\/a_windows\.go 在服务器的编译条件下没参与编译/);
+  assert.equal((await createBuildChecker({ run: listed }).check(dir, ["a/a.go"])).state, "passed");
+
+  const ci = await createBuildChecker({ run: listed }).check(dir, ["ci/build.yml"]);
+  assert.match(ci.state === "unknown" ? ci.reason : "", /构建配置（ci\/build\.yml）/);
+
+  // 报错在改的文件上，但改之前也一样编不过：不拦
+  const broken = { code: 1, output: "a/a.go:3:1: syntax error\n" };
+  const both: CommandRunner = async (command, args, options) => {
+    if (command === "git" && args[1] === "add") {
+      await cp(dir, String(args.at(-2)), { recursive: true });
+      return { code: 0, output: "" };
+    }
+    return command === "go" ? broken : { code: 0, output: "" };
+  };
+  const old = await createBuildChecker({ run: both }).check(dir, ["a/a.go"], undefined, "abc");
+  assert.equal(old.state, "unknown");
+
+  // 排队：前一次没编完，后一次不开始
+  let running = 0;
+  let most = 0;
+  const slow: CommandRunner = async (command, args, options) => {
+    running++;
+    most = Math.max(most, running);
+    await new Promise((r) => setTimeout(r, 20));
+    running--;
+    return listed(command, args, options);
+  };
+  const checker = createBuildChecker({ run: slow });
+  await Promise.all([checker.check(dir, ["a/a.go"]), checker.check(dir, ["a/a.go"])]);
+  assert.equal(most, 1);
 });

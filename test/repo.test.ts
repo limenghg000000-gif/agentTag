@@ -1548,7 +1548,12 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   // 核对时是通过的，合之前重跑失败了：不合
   responses.push(withPipeline("mergeable", { status: "failed", sha }));
   await assert.rejects(host.mergeRequest!("golang/appservice", 354, need), /^RepoError: !354 的流水线（构建）没通过（failed），机器人不合/);
+  // 机器人自己编过的（不要求流水线）：读到流水线失败也不合，还在跑的等它跑完
+  responses.push(withPipeline("mergeable", { status: "failed", sha }));
+  await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /^RepoError: !354 的流水线（构建）没通过（failed），机器人不合/);
   assert.ok(calls.slice(noPut).every((c) => c.method === "GET"));
+  responses.push(withPipeline("mergeable", { status: "running", sha }), new Response(JSON.stringify({ iid: 354, state: "opened", web_url: url, merge_when_pipeline_succeeds: true }), { status: 200 }));
+  assert.equal((await host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" })).state, "auto");
   const before = calls.length;
   responses.push(status("conflict"));
   await assert.rejects(host.mergeRequest!("golang/appservice", 354, { sha, target: "uat" }), /^RepoError: !354 现在合不了：和要合到的分支有冲突，要先解决冲突/);

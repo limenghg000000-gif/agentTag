@@ -445,17 +445,16 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         throw new RepoError(`!${number} 现在合不了：${blocked}`);
       }
       // 机器人跑不了编译：要看流水线的，就在合之前这一次读到的结果上判断，免得核对以后流水线重跑、失败了还直接合
-      if (requirePipeline) {
-        if (pipelineStatus === undefined) {
-          throw new RepoError(`!${number} 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合；请人在 GitLab 上跑一下流水线、或者审过再点合并`);
-        }
-        if (pipelineStatus !== "success" && !PIPELINE_RUNNING.has(pipelineStatus)) {
-          throw new RepoError(`!${number} 的流水线（构建）没通过（${pipelineStatus}），机器人不合，要先把问题修好`);
-        }
+      if (requirePipeline && pipelineStatus === undefined) {
+        throw new RepoError(`!${number} 的源分支最新的提交没有跑过流水线（构建），机器人看不出能不能编译通过，不合；请人在 GitLab 上跑一下流水线、或者审过再点合并`);
       }
-      // 要等流水线通过才能合的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
+      // 机器人自己编过的也一样：这次读到流水线没通过就不合
+      if (pipelineStatus !== undefined && pipelineStatus !== "success" && !PIPELINE_RUNNING.has(pipelineStatus)) {
+        throw new RepoError(`!${number} 的流水线（构建）没通过（${pipelineStatus}），机器人不合，要先把问题修好`);
+      }
+      // 要等流水线通过才能合的、流水线还在跑的：设成流水线通过后自动合并（新版本叫 auto_merge，老版本叫 merge_when_pipeline_succeeds，两个都传）
       const pipeline =
-        (requirePipeline === true && pipelineStatus !== "success") || status === "ci_must_pass" || status === "ci_still_running";
+        ((requirePipeline === true || pipelineStatus !== undefined) && pipelineStatus !== "success") || status === "ci_must_pass" || status === "ci_still_running";
       const res = await fetchImpl(`${project}/merge_requests/${number}/merge`, {
         method: "PUT",
         headers: { "private-token": token, "content-type": "application/json" },
@@ -835,9 +834,12 @@ export class CodeWorkspaces {
   private readonly logger: Logger;
   private readonly now: () => Date;
   private readonly build?: BuildChecker;
+  /** 推之前会不会编译检查（BUILD_CHECK） */
+  readonly buildCheck: boolean;
 
   constructor(opts: CodeWorkspacesOptions) {
     this.build = opts.build;
+    this.buildCheck = opts.build !== undefined;
     this.root = opts.root;
     this.host = opts.host;
     this.repos = opts.repos;

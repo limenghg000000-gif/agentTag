@@ -299,7 +299,10 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
         `只在群成员要你提交、开${requestName}或者合到某个分支时使用；` +
         (canMerge
           ? `它只开不合，群成员要合并（「合并到 uat」）时，开好以后再用 code_merge 合。机器人不会推到已有的分支。`
-          : `机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`),
+          : `机器人不会合并（「合并到 uat」就是开一个到 uat 的${requestName}，合并要人来点），也不会推到已有的分支。`) +
+        (workspaces.buildCheck
+          ? "推之前会在服务器上照项目自己的构建方式编译一下（读流水线用的 Dockerfile，编里面 go build 的那个入口，再加上改到的包；PHP 查语法）：这次改动编不过就拒绝、不推，返回编译器的报错（报错可能在没改的文件里，比如改了函数签名、调用的地方编不过），按报错用 code_read_file 看清相关代码再改，改好再调用，改不好就把报错告诉群成员，不要绕过。编过只说明能编译，不等于测过。"
+          : ""),
       parameters: {
         type: "object",
         properties: {

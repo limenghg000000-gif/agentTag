@@ -50,8 +50,10 @@ export interface GoRecipe {
   env: Record<string, string>;
   /** go build 的 -tags */
   tags?: string;
-  /** 构建镜像里的 Go 版本，如 1.25（只用来写进结果） */
+  /** 构建镜像里的 Go 版本，如 1.25：用这个版本的官方工具链编 */
   goVersion?: string;
+  /** 照着编说明不了流水线的原因（go build -C、几步 go build 条件不一样、读不懂）：编过了也只算说不清 */
+  unsupported?: string;
 }
 
 /** 报错最多带多少字给模型 */
@@ -59,16 +61,26 @@ const MAX_OUTPUT_CHARS = 4000;
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 /** 不用编译的文件：文档、图片、配置 */
 const NO_BUILD = /\.(md|markdown|txt|rst|adoc|png|jpe?g|gif|svg|ico|webp|pdf|toml|ya?ml|json|ini|conf|cfg|properties|env|csv|tsv|html?|css|sql|xml)$/i;
-/** 改了构建方式本身：照旧的方式编说明不了什么 */
-const BUILD_FILES = /(^|\/)(Dockerfile[^/]*|\.gitlab-ci\.yml|Makefile|\.dockerignore)$/;
+/** 改了构建方式本身：照旧的方式编说明不了什么（流水线拆出去的 .gitlab-ci/、.gitlab/ 下的文件也算） */
+const BUILD_FILES = /(^|\/)(Dockerfile[^/]*|Makefile|\.dockerignore)$|(^|\/)\.gitlab-ci[^/]*(\/|$)|^\.gitlab\//;
 /** Dockerfile 里照着用的环境变量。GOFLAGS（能带 -toolexec 跑任意命令）和 CGO_ENABLED（开了会调 C 编译器）不照搬，一律关掉 */
 const GO_ENV_KEYS = new Set(["GOOS", "GOARCH", "GOEXPERIMENT", "GOAMD64", "GO111MODULE"]);
 
 export function createBuildChecker(options: BuildCheckerOptions = {}): BuildChecker {
   const run = options.run ?? runCommand;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // 一次只编一个：几个话题同时推代码时排队，免得把服务器的 CPU、内存占满
+  let queue: Promise<unknown> = Promise.resolve();
   return {
-    async check(dir, files, signal, base) {
+    check(dir, files, signal, base) {
+      const next = queue.then(() => checkOnce(dir, files, signal, base));
+      queue = next.catch(() => undefined);
+      return next;
+    },
+  };
+
+  async function checkOnce(dir: string, files: readonly string[], signal?: AbortSignal, base?: string): Promise<BuildResult> {
+    {
       const goFiles = files.filter((file) => file.endsWith(".go"));
       const goModChanged = files.some((file) => file === "go.mod" || file === "go.sum");
       const phpFiles = files.filter((file) => file.endsWith(".php"));
@@ -77,12 +89,14 @@ export function createBuildChecker(options: BuildCheckerOptions = {}): BuildChec
       const unknown: string[] = [];
       const failures: string[] = [];
 
-      const buildFiles = files.filter((file) => BUILD_FILES.test(file));
+      const included = await ciIncludes(dir);
+      const isBuildFile = (file: string) => BUILD_FILES.test(file) || included.has(file);
+      const buildFiles = files.filter(isBuildFile);
       if (buildFiles.length > 0) {
         unknown.push(`改了构建配置（${buildFiles.join("、")}），服务器上的编译说明不了流水线能不能过`);
       }
       const others = files.filter(
-        (file) => !file.endsWith(".go") && !file.endsWith(".php") && file !== "go.mod" && file !== "go.sum" && file !== "composer.json" && file !== "composer.lock" && !NO_BUILD.test(file) && !BUILD_FILES.test(file),
+        (file) => !file.endsWith(".go") && !file.endsWith(".php") && file !== "go.mod" && file !== "go.sum" && file !== "composer.json" && file !== "composer.lock" && !NO_BUILD.test(file) && !isBuildFile(file),
       );
       if (others.length > 0) {
         unknown.push(`改了服务器上编不了的文件（${others.slice(0, 5).join("、")}${others.length > 5 ? " 等" : ""}）`);
@@ -110,8 +124,18 @@ export function createBuildChecker(options: BuildCheckerOptions = {}): BuildChec
         return { state: "unknown", reason: unknown.join("；") };
       }
       return { state: "passed", summary: done.length > 0 ? done.join("；") : "改的都是不用编译的文件（文档、配置）" };
-    },
-  };
+    }
+  }
+}
+
+/** .gitlab-ci.yml 里 include 的本仓库文件（local:），改了它们就是改了流水线 */
+async function ciIncludes(dir: string): Promise<Set<string>> {
+  const ci = await readText(path.join(dir, ".gitlab-ci.yml"));
+  const found = new Set<string>();
+  for (const match of (ci ?? "").matchAll(/^\s*(?:-\s*)?(?:include:\s*|local:\s*)?["']?\/?([^\s"'#:]+\.ya?ml)["']?\s*$/gm)) {
+    found.add(path.posix.normalize(match[1]));
+  }
+  return found;
 }
 
 /** 一次 go build：编几个包，或者编同一个目录里的几个文件 */
@@ -141,8 +165,8 @@ async function checkGo(
     ...(recipe?.env ?? {}),
     CGO_ENABLED: "0",
     GOFLAGS: "",
-    // 项目要的 Go 比装的新时，按 go.mod 自动从代理下载那个版本的官方工具链（有校验）；比装的旧的直接编
-    GOTOOLCHAIN: "auto",
+    // 用构建镜像里那个版本的官方工具链（从代理下载，有校验），go.mod 要更新的就用更新的；不知道镜像版本时用装的
+    GOTOOLCHAIN: toolchainFor(recipe?.goVersion, await installedGo(dir, run, timeoutMs, signal)),
     GOPROXY: goproxy || process.env.GOPROXY || "https://goproxy.cn,direct",
     // 校验下载的依赖和工具链：用官方的国内地址，服务器在国内连不上 sum.golang.org
     GOSUMDB: process.env.GOSUMDB || "sum.golang.google.cn",
@@ -155,6 +179,14 @@ async function checkGo(
     return { state: "unknown", reason: "服务器上没装 Go，没编译" };
   }
   if (head.ok) {
+    if (recipe?.unsupported) {
+      return { state: "unknown", reason: `${labels} 编过了，但${recipe.unsupported}，说不清流水线能不能过` };
+    }
+    // 改到的文件可能因为编译条件（_windows.go、build tag、要 cgo）根本没参与编译：编过了也说明不了它
+    const skipped = await excludedFiles(dir, goFiles, builds, run, env, { timeoutMs, signal });
+    if (skipped.length > 0) {
+      return { state: "unknown", reason: `${labels} 编过了，但改到的 ${skipped.join("、")} 在服务器的编译条件下没参与编译（系统、build tag 或 cgo 限定），说不清` };
+    }
     return { state: "passed", summary: `${how}${labels} 编过了` };
   }
   const output = head.output.trim();
@@ -171,11 +203,27 @@ async function checkGo(
     if (before?.ok) {
       return failed;
     }
-    if (before && !before.ok && !before.missing && !mentionsChanged(output, changed)) {
+    // 改之前也编不过：分不清报错是原来就有的还是这次加的
+    if (before && !before.missing) {
       return { state: "unknown", reason: `${labels} 编不过，但改之前也编不过（本来就有问题）：${firstLines(output)}` };
     }
   }
   return mentionsChanged(output, changed) ? failed : { state: "unknown", reason: `${labels} 编不过，但报错都不在这次改的文件上（可能本来就编不过）：${firstLines(output)}` };
+}
+
+/**
+ * GOTOOLCHAIN：镜像是 Go 1.21 以后的、和装的不是同一个小版本时，用镜像那个版本（go1.25 → go1.25.0+auto，go.mod 要更新的会再换）；
+ * 同一个小版本、更老的或者不知道的用装的
+ */
+export function toolchainFor(version: string | undefined, installed?: string): string {
+  const [major, minor, patch] = (version ?? "").split(".").map(Number);
+  if (major !== 1 || !Number.isInteger(minor) || minor < 21) {
+    return "auto";
+  }
+  if (installed && /^go1\.(\d+)/.exec(installed)?.[1] === String(minor)) {
+    return "auto";
+  }
+  return `go1.${minor}.${Number.isInteger(patch) ? patch : 0}+auto`;
 }
 
 /** 要跑的 go build：流水线编的入口，加上改到、但入口没带上的包；改了 go.mod 编整个仓库 */
@@ -199,7 +247,12 @@ async function goBuilds(dir: string, goFiles: readonly string[], goModChanged: b
   for (const file of goFiles) {
     const parent = path.posix.dirname(file);
     // 入口是这个目录里的几个文件时（比如根目录的 main.go，旁边还有别的 main），这个目录按入口编，不整个编
-    if (fileTargets.has(parent) || !(await exists(path.join(dir, parent)))) {
+    if (fileTargets.has(parent)) {
+      continue;
+    }
+    if (!(await exists(path.join(dir, parent)))) {
+      // 整个包删掉了：编整个仓库，看还有没有地方引用它
+      packages.add("./...");
       continue;
     }
     packages.add(asPackage(parent));
@@ -219,6 +272,50 @@ function asPackage(target: string): string {
   if (clean === "." || clean === "") return ".";
   if (clean.startsWith("./") || clean.endsWith("...")) return clean.startsWith(".") ? clean : `./${clean}`;
   return `./${clean}`;
+}
+
+/** 改到的 Go 文件（测试文件除外，流水线不编）里，在这些环境变量下被编译条件排除掉的 */
+async function excludedFiles(
+  dir: string,
+  goFiles: readonly string[],
+  builds: readonly GoBuild[],
+  run: CommandRunner,
+  env: Record<string, string>,
+  { timeoutMs, signal }: { timeoutMs: number; signal?: AbortSignal },
+): Promise<string[]> {
+  const targetFiles = new Set(builds.flatMap((b) => b.args).filter((a) => a.endsWith(".go")).map((a) => path.posix.normalize(a)));
+  const byDir = new Map<string, string[]>();
+  for (const file of goFiles) {
+    if (file.endsWith("_test.go") || targetFiles.has(path.posix.normalize(file))) continue;
+    const parent = path.posix.dirname(file);
+    if (!(await exists(path.join(dir, file)))) continue;
+    byDir.set(parent, [...(byDir.get(parent) ?? []), path.posix.basename(file)]);
+  }
+  if (byDir.size === 0) {
+    return [];
+  }
+  const tags = builds[0]?.args[0] === "-tags" ? ["-tags", builds[0].args[1]] : [];
+  const dirs = [...byDir.keys()];
+  const result = await run("go", ["list", "-e", ...tags, "-f", "{{.Dir}}\t{{join .GoFiles \" \"}}", ...dirs.map(asPackage)], { cwd: dir, env, signal, timeoutMs });
+  const compiled = new Map<string, Set<string>>();
+  for (const line of result.output.split("\n")) {
+    const [abs, list = ""] = line.split("\t");
+    if (abs) compiled.set(path.resolve(abs), new Set(list.split(" ").filter(Boolean)));
+  }
+  const skipped: string[] = [];
+  for (const [parent, names] of byDir) {
+    const files = compiled.get(path.resolve(dir, parent));
+    for (const name of names) {
+      if (!files?.has(name)) skipped.push(path.posix.join(parent, name));
+    }
+  }
+  return skipped;
+}
+
+/** 服务器上装的 Go 版本（如 go1.25.3），没装或者问不出来时 undefined */
+async function installedGo(dir: string, run: CommandRunner, timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
+  const result = await run("go", ["env", "GOVERSION"], { cwd: dir, env: { GOTOOLCHAIN: "local" }, signal, timeoutMs });
+  return result.code === 0 && !result.missing ? result.output.trim() || undefined : undefined;
 }
 
 async function allExist(dir: string, build: GoBuild): Promise<boolean> {
@@ -313,6 +410,9 @@ export async function readGoRecipe(dir: string): Promise<GoRecipe | undefined> {
     if (recipe) {
       return { dockerfile: rel, ...recipe };
     }
+    if (/\bgo\b[\s",]+build\b/.test(text)) {
+      return { dockerfile: rel, targets: [], env: {}, unsupported: `${rel} 里的 go build 读不懂` };
+    }
   }
   return undefined;
 }
@@ -327,6 +427,7 @@ export function parseDockerfile(text: string): Omit<GoRecipe, "dockerfile"> | un
   const args: Record<string, string> = {};
   let image = "";
   let env: Record<string, string> = {};
+  const steps: { targets: string[]; env: Record<string, string>; tags?: string; goVersion?: string; unsupported?: string }[] = [];
   for (const line of lines) {
     const [, instruction = "", rest = ""] = /^(\S+)\s*(.*)$/.exec(line) ?? [];
     const name = instruction.toUpperCase();
@@ -340,13 +441,22 @@ export function parseDockerfile(text: string): Omit<GoRecipe, "dockerfile"> | un
     } else if (name === "ENV") {
       Object.assign(env, parseEnv(rest));
     } else if (name === "RUN") {
-      const command = rest.replace(/^(--\S+\s+)+/, "");
+      let command = rest.replace(/^(--\S+\s+)+/, "");
+      // exec 写法：RUN ["go", "build", ...]
+      if (command.startsWith("[")) {
+        try {
+          const list = JSON.parse(command) as unknown;
+          if (Array.isArray(list)) command = list.map((w) => (/\s/.test(String(w)) ? `"${String(w)}"` : String(w))).join(" ");
+        } catch {
+          // 不是 JSON，当普通命令看
+        }
+      }
       const build = /(?:^|[\s;&|(])((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)go\s+build\b([^;&|]*)/.exec(command);
       if (!build) {
         continue;
       }
       const inline = parseEnv(build[1]);
-      const { targets, tags } = parseGoBuild(build[2]);
+      const { targets, tags, unsupported } = parseGoBuild(build[2]);
       const merged: Record<string, string> = {};
       // 写死的才用；$TARGETOS 这类由构建平台定的不管，留着这个阶段 ENV 里写的
       for (const source of [env, inline]) {
@@ -355,10 +465,23 @@ export function parseDockerfile(text: string): Omit<GoRecipe, "dockerfile"> | un
         }
       }
       const goVersion = /golang:(\d+\.\d+(?:\.\d+)?)/.exec(image)?.[1];
-      return { targets: targets.length > 0 ? targets : ["."], env: merged, ...(tags ? { tags } : {}), ...(goVersion ? { goVersion } : {}) };
+      steps.push({ targets: targets.length > 0 ? targets : ["."], env: merged, ...(tags ? { tags } : {}), ...(goVersion ? { goVersion } : {}), ...(unsupported ? { unsupported } : {}) });
     }
   }
-  return undefined;
+  const [first] = steps;
+  if (!first) {
+    return undefined;
+  }
+  // 几步 go build（比如先编工具再编服务）：入口都编；编译条件不一样的照一套编说明不了
+  const same = steps.every((s) => s.tags === first.tags && s.goVersion === first.goVersion && JSON.stringify(s.env) === JSON.stringify(first.env));
+  const unsupported = steps.find((s) => s.unsupported)?.unsupported ?? (same ? undefined : "Dockerfile 里几步 go build 的编译条件不一样");
+  return {
+    targets: [...new Set(steps.flatMap((s) => s.targets))],
+    env: first.env,
+    ...(first.tags ? { tags: first.tags } : {}),
+    ...(first.goVersion ? { goVersion: first.goVersion } : {}),
+    ...(unsupported ? { unsupported } : {}),
+  };
 }
 
 function parseEnv(text: string): Record<string, string> {
@@ -375,17 +498,20 @@ function parseEnv(text: string): Record<string, string> {
 }
 
 /** go build 后面的参数：去掉 -o、-ldflags 这类选项，剩下的是入口；-tags 留着 */
-function parseGoBuild(text: string): { targets: string[]; tags?: string } {
+function parseGoBuild(text: string): { targets: string[]; tags?: string; unsupported?: string } {
   const words = [...text.matchAll(/"[^"]*"|'[^']*'|\S+/g)].map((m) => unquote(m[0]));
   const withValue = new Set(["-o", "-ldflags", "-gcflags", "-asmflags", "-tags", "-mod", "-modfile", "-p", "-buildmode", "-compiler", "-gccgoflags", "-installsuffix", "-pkgdir", "-overlay", "-pgo", "-toolexec", "-C"]);
   const targets: string[] = [];
   let tags: string | undefined;
+  let unsupported: string | undefined;
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (word.startsWith("-")) {
       const [flag, inlineValue] = word.split("=", 2);
       const value = inlineValue ?? (withValue.has(flag) ? words[++i] : undefined);
       if (flag === "-tags" && value) tags = value;
+      // -C 换了目录再编：入口相对那个目录，照着编容易编错地方
+      if (flag === "-C") unsupported = "Dockerfile 里的 go build 用了 -C 换目录";
       continue;
     }
     if (word.includes("$") || word.startsWith("/")) {
@@ -393,7 +519,7 @@ function parseGoBuild(text: string): { targets: string[]; tags?: string } {
     }
     targets.push(word);
   }
-  return { targets, ...(tags ? { tags } : {}) };
+  return { targets, ...(tags ? { tags } : {}), ...(unsupported ? { unsupported } : {}) };
 }
 
 function unquote(value: string): string {
