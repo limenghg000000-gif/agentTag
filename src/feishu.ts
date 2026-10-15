@@ -39,6 +39,8 @@ export interface FeishuApi {
   listRecentMessages(container: "chat" | "thread", id: string, limit: number, sinceMs?: number): Promise<RecentMessage[]>;
   /** 下载消息里的一张图片（获取消息中的资源文件）。机器人得在这条消息所在的群里 */
   downloadImage(messageId: string, imageKey: string): Promise<DownloadedImage>;
+  /** 通讯录里这个人（open_id）的名字。要 contact:user.base:readonly，人要在应用的通讯录范围里；没有名字时为空 */
+  getUserName(openId: string): Promise<string | undefined>;
 }
 
 export interface DownloadedImage {
@@ -230,6 +232,15 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       const data = Buffer.concat(chunks);
       const header = String(res.headers?.["content-type"] ?? "").split(";")[0].trim().toLowerCase();
       return { data, mimeType: header.startsWith("image/") ? header : sniffImageType(data) };
+    },
+
+    async getUserName(openId) {
+      const data = await callFeishu(() =>
+        client.contact.v3.user.get({ path: { user_id: openId }, params: { user_id_type: "open_id" } }) as Promise<
+          ApiResponse<{ user?: { name?: string } }>
+        >,
+      );
+      return data?.user?.name || undefined;
     },
   };
 }

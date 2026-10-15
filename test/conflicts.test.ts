@@ -6,6 +6,7 @@ import { test } from "node:test";
 import type { CardActionEvent, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import { type KnowledgeBackend, KnowledgeBase, type KnowledgeEntry } from "../src/knowledge.js";
 import { MemoryStore } from "../src/memory.js";
+import type { NameLookup } from "../src/operator-names.js";
 import { buildSystemPrompt } from "../src/prompt.js";
 import { CONFLICT_ACTION, CONFLICT_TOOL, CONFLICT_TTL_MS, MAX_CONFLICTS } from "../src/tools/conflicts.js";
 import { KnowledgeDesk } from "../src/tools/knowledge.js";
@@ -67,7 +68,11 @@ const alarm: KnowledgeEntry = {
   createdAt: "2026-10-01T06:00:00.000Z",
 };
 
-async function setup({ approvers = new Set(["ou_admin"]), memory = true }: { approvers?: ReadonlySet<string> | null; memory?: boolean } = {}) {
+async function setup({
+  approvers = new Set(["ou_admin"]),
+  memory = true,
+  nameOf,
+}: { approvers?: ReadonlySet<string> | null; memory?: boolean; nameOf?: NameLookup } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "conflicts-"));
   const backend = new TableBackend();
   backend.entries.push(structuredClone(release), structuredClone(alarm));
@@ -92,6 +97,7 @@ async function setup({ approvers = new Set(["ou_admin"]), memory = true }: { app
     ...(approvers ? { approvers } : {}),
     allowedChatIds: new Set(["oc_1"]),
     ...(memory ? { memory: store } : {}),
+    ...(nameOf ? { nameOf } : {}),
     logger: quiet,
     now: () => now,
     retryDelayMs: 0,
@@ -104,15 +110,16 @@ async function setup({ approvers = new Set(["ou_admin"]), memory = true }: { app
   const elements = (c: any): any[] => c.body.elements;
   const selects = (c: any) => elements(c).filter((e) => e.tag === "select_static");
   const buttonValue = (c: any, op: string) => elements(c).find((e) => e.tag === "button" && e.behaviors[0].value.op === op)?.behaviors[0].value;
-  const event = (value: unknown, openId: string, name: string, extra: Partial<CardActionEvent["action"]> = {}, messageId = "om_card_1"): CardActionEvent => ({
+  // name 为 null：飞书回调里没带名字（线上一般都没带）
+  const event = (value: unknown, openId: string, name: string | null, extra: Partial<CardActionEvent["action"]> = {}, messageId = "om_card_1"): CardActionEvent => ({
     messageId,
     chatId: "oc_1",
-    operator: { openId, name },
+    operator: { openId, ...(name === null ? {} : { name }) },
     action: { tag: "button", value, ...extra },
   });
-  const pick = (row: number, option: string, openId = "ou_2", name = "李四") =>
+  const pick = (row: number, option: string, openId = "ou_2", name: string | null = "李四") =>
     desk.handleCardAction(event(selects(card())[row].behaviors[0].value, openId, name, { tag: "select_static", option }));
-  const apply = async (openId = "ou_admin", name = "ML") => {
+  const apply = async (openId = "ou_admin", name: string | null = "ML") => {
     await desk.handleCardAction(event(buttonValue(card(), "apply"), openId, name));
     await desk.idle();
   };
@@ -589,6 +596,48 @@ test("冲突卡片：发起人或写权限名单里的人能取消；同一个�
     assert.match(text(s.updates.at(-1)!.card), /这张卡片已经失效/);
   } finally {
     await s.cleanup();
+  }
+});
+
+test("冲突卡片：飞书回调里没有点的人的名字时，卡片上和话题里写找到的名字，找不到写「有人」，不显示 open_id", async () => {
+  const asked: [string, string][] = [];
+  const s = await setup({
+    nameOf: async (openId, messageId) => {
+      asked.push([openId, messageId]);
+      return openId === "ou_admin" ? "ML" : undefined;
+    },
+  });
+  try {
+    await s.tool().run({ conflicts: s.both }, { signal });
+    // 选下拉框用不上名字，不去找
+    await s.pick(0, "memory", "ou_2", null);
+    assert.deepEqual(asked, []);
+    // 不在名单里、也找不到名字的人点同步
+    await s.apply("ou_2", null);
+    assert.match(text(s.card()), /有人点了同步：有 2 处选了「以群记忆为准」/);
+    await s.apply("ou_admin", null);
+    assert.deepEqual(asked, [
+      ["ou_2", "om_card_1"],
+      ["ou_admin", "om_card_1"],
+    ]);
+    assert.match(text(s.card()), /ML点了「按选择同步」/);
+    assert.equal(s.backend.entries.find((entry) => entry.id === "K3")?.confirmedBy, "ML");
+    const reply = (s.sent.at(-1)!.input as { markdown: string }).markdown;
+    assert.match(reply, /ML点了「按选择同步」/);
+    assert.ok(![...s.updates.map((u) => text(u.card)), reply].some((t) => t.includes("ou_")), "卡片和话题里都不出现 open_id");
+  } finally {
+    await s.cleanup();
+  }
+  // 发起人点：用他提问时的名字，不用去找；没给找名字的、别人点的写「有人」
+  const plain = await setup();
+  try {
+    await plain.tool().run({ conflicts: [plain.both[0]] }, { signal });
+    await plain.desk.handleCardAction(plain.event(plain.buttonValue(plain.card(), "cancel"), "ou_2", null));
+    assert.match(text(plain.card()), /有人点了取消：只有发起人或写权限名单里的人能取消/);
+    await plain.apply("ou_1", null);
+    assert.match(text(plain.card()), /张三点了「按选择同步」/);
+  } finally {
+    await plain.cleanup();
   }
 });
 
