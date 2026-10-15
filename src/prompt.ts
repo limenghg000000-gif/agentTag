@@ -248,7 +248,7 @@ function knowledgeSection(
     const search = toolNames.includes("knowledge_search");
     const aiopsSearch = toolNames.includes("aiops_search_knowledge");
     lines.push(
-      "- 这是同一个话题里的追问，回答前没再自动查经验库：话题第一次提问时查过，用到的经验在上面的回答里。不要说「经验库里没查到」。" +
+      "- 这是同一个话题里的追问，回答前没再自动查经验库：这个话题之前已经查过，用到的经验在上面的回答里。不要说「经验库里没查到」。" +
         (search
           ? `追问里出现了新的问题、新的报错原文、错误码或服务名，需要参考以前的经验时自己查：团队经验库用 knowledge_search${aiopsSearch ? "，aiops 经验库用 aiops_search_knowledge（查询里只写错误码、服务名、现象，不要带密钥、密码）" : ""}。`
           : ""),

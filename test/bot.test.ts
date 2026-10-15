@@ -483,10 +483,9 @@ test("回答前先查经验库：查到的写进提示词，进度卡片多一�
   assert.ok(found.updates.some((u) => cardText(u.card).includes("查经验库（找到 1 条相近的经验）")));
   assert.deepEqual(markdowns(found.sent), ["好"]);
 
-  // 话题里大家先讨论了一阵才 @ 机器人：机器人还没回答过，照样查，带上话题的第一个问题
   await ask("那现在修好了吗", [
     { role: "user", content: "[张三] gateway-api 报 code=8" },
-    { role: "user", content: "[李四] 我也看到了" },
+    { role: "assistant", content: "原因是……" },
   ]);
   // 追问放前面：第一个问题很长时两个库只取前面一段，追问不能被截掉
   assert.match(queries[1], /^那现在修好了吗\n/);
@@ -521,8 +520,11 @@ test("话题里第三轮以后的追问：查经验库带上最近几轮提问�
   const { model } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const history: ChatMessage[] = [
     { role: "user", content: "[张三] 帮我看下这个线上报警" },
+    { role: "assistant", content: "需要更多信息" },
     { role: "user", content: "[张三] 报错是 code=8 ResourceExhausted，服务 gateway-api" },
+    { role: "assistant", content: "查到了……" },
     { role: "user", content: `[李四] ${"日志很长".repeat(100)}` },
+    { role: "assistant", content: "看了日志……" },
   ];
   const { handle } = setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source });
   await handle(message("怎么修？"));
@@ -549,7 +551,9 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   const { model } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const history: ChatMessage[] = [
     { role: "user", content: "[张三] gateway-api 报 code=8，帮我看看" },
+    { role: "assistant", content: "需要日志" },
     { role: "user", content: `[张三] ${"上一轮的说明".repeat(60)}` },
+    { role: "assistant", content: "收到" },
   ];
   const { handle } = setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source });
   await handle(message(`日志如下：${"ERROR upstream timeout ".repeat(100)}`));
@@ -573,7 +577,7 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   await setup({
     model,
     knowledge: secretKnowledge,
-    context: fakeContext({ history: [{ role: "user", content: `[张三] ${firstTurn}` }], source: "feishu" }).source,
+    context: fakeContext({ history: [{ role: "user", content: `[张三] ${firstTurn}` }, { role: "assistant", content: "收到" }], source: "feishu" }).source,
   }).handle(message("怎么修？"));
   // 截到 200 字时密码整个留着、</password> 截掉了：只看截短的认不出来
   assert.equal(firstTurn.indexOf("</password>"), 200);
@@ -581,9 +585,9 @@ test("追问时贴了一大段日志：查经验库的文字截短到两个库�
   assert.equal(leaked[0].secret, true, "告诉经验库有密钥，不会查 aiops");
   assert.ok(leaked[0].query.length <= 800, "查的文字照样截短");
 
-  // 这次的提问短：最近几轮都放得下
+  // 这次的提问短：最近几轮都放得下（换个话题问：同一个话题查成过一次就不再自动查）
   queries.length = 0;
-  await handle(message("怎么修？"));
+  await handle(message("怎么修？", { messageId: "om_2" }));
   const lines = queries[0].split("\n");
   assert.equal(lines[0], "怎么修？");
   assert.match(lines[1], /^上一轮的说明/);
@@ -619,6 +623,7 @@ test("上文里截短过的长消息、太长的图片文字：查经验库前�
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const history: ChatMessage[] = [
     { role: "user", content: `[张三] ${clipped}`, full: `[张三] ${manifest}` },
+    { role: "assistant", content: "收到" },
   ];
   await setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source }).handle(message("怎么修？"));
   assert.equal(lookups[0].secret, true, "告诉经验库有密钥，不会查 aiops");
@@ -646,6 +651,7 @@ test("上文里有手机号、这次贴了一大段日志：号码截短前打�
   const { model } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const history: ChatMessage[] = [
     { role: "user", content: `[张三] 用户 ${phone} 反馈 order-api 下单报 code=8` },
+    { role: "assistant", content: "需要日志" },
   ];
   await setup({ model, knowledge, context: fakeContext({ history, source: "feishu" }).source }).handle(
     message(`日志如下：${"ERROR upstream timeout ".repeat(100)}`),
@@ -4222,38 +4228,82 @@ test("整理时群记忆太多没列全的，照样能用 memory_search 查约�
   assert.deepEqual(requests[0].tools?.map((t) => t.name), ["feishu_doc_read", "memory_search", "knowledge_propose"]);
 });
 
-test("同一个话题里说要重新查、看现在的情况：给查询的工具；机器人回答过了，经验库不再自动查，要查时模型自己查", async () => {
-  const { requests, lookups, handle, updates } = restateSetup([{ text: "要查哪个时间段？", finish: "stop" }]);
+test("同一个话题里说要重新查、看现在的情况：照常查经验库、给查询的工具", async () => {
+  const { requests, lookups, handle } = restateSetup([{ text: "要查哪个时间段？", finish: "stop" }]);
   await handle(message("重新查一下现在还有没有 2001102", { rootId: "om_root", threadId: "omt_1" }));
-  assert.deepEqual(lookups, []);
-  assert.ok(!updates.some((u) => cardText(u.card).includes("查经验库")));
+  assert.equal(lookups.length, 1);
   const names = requests[0].tools?.map((t) => t.name) ?? [];
   assert.ok(names.includes("aiops_query_logs") && names.includes("code_search") && names.includes("knowledge_search"), names.join(","));
   assert.doesNotMatch(requests[0].system, /这次是让你整理话题里已经有的内容/);
-  assert.match(requests[0].system, /这是同一个话题里的追问，回答前没再自动查经验库/);
-  assert.match(requests[0].system, /需要参考以前的经验时自己查：团队经验库用 knowledge_search。/);
-  assert.doesNotMatch(requests[0].system, /没查到相近的经验|没查成|这次提问可能相关的经验/);
 });
 
-test("追问里明说要查经验库、知识库：照样先自动查一次；说「飞书知识库」的是飞书文档，不算", async () => {
-  for (const ask of ["再查一下经验库有没有类似的", "知识库里有没有这个问题的记录"]) {
-    const { requests, lookups, handle } = restateSetup([{ text: "好", finish: "stop" }]);
-    await handle(message(ask, { rootId: "om_root", threadId: "omt_1" }));
-    assert.equal(lookups.length, 1, ask);
-    assert.match(requests[0].system, /这次提问可能相关的经验（回答前自动查到的）/, ask);
+test("同一个话题查成过经验库：后面的追问不再自动查，提示词说没查、要查时模型自己查；换个话题照常查", async () => {
+  const { requests, lookups, handle, updates } = restateSetup([
+    { text: "要查哪个时间段？", finish: "stop" },
+    { text: "好", finish: "stop" },
+    { text: "好", finish: "stop" },
+  ]);
+  await handle(message("重新查一下现在还有没有 2001102", { messageId: "om_2", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1);
+  const before = updates.length;
+  await handle(message("最近一小时的", { messageId: "om_3", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1, "同一个话题不再查");
+  assert.ok(!updates.slice(before).some((u) => cardText(u.card).includes("查经验库")));
+  assert.match(requests[1].system, /这是同一个话题里的追问，回答前没再自动查经验库/);
+  assert.match(requests[1].system, /需要参考以前的经验时自己查：团队经验库用 knowledge_search。/);
+  assert.doesNotMatch(requests[1].system, /没查到相近的经验|没查成|这次提问可能相关的经验/);
+  assert.ok(requests[1].tools?.some((t) => t.name === "knowledge_search"));
+
+  await handle(message("order-api 下单报 code=8 是怎么回事", { messageId: "om_9" }));
+  assert.equal(lookups.length, 2, "别的话题照常查");
+});
+
+test("话题里上次没查成经验库（超时、出错、只查成一边）：下次追问补查，查成以后才不再查", async () => {
+  const lookups: string[] = [];
+  const answers: Array<() => Promise<{ text: string; ids: string[]; missed?: string[] } | undefined>> = [
+    async () => {
+      throw new Error("飞书接口限流");
+    },
+    async () => ({ text: "", ids: [], missed: ["团队经验库"] }),
+    async () => ({ text: "", ids: [] }),
+  ];
+  const knowledge = {
+    async lookup(query: string) {
+      lookups.push(query);
+      return answers.shift()!();
+    },
+    tools: () => [],
+  };
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const history: ChatMessage[] = [{ role: "user", content: "[张三] gateway-api 报 code=8" }];
+  const { handle } = setup({ model, knowledge, knowledgeLookupMs: 1000, context: fakeContext({ history, source: "feishu" }).source });
+  for (const [i, ask] of ["code=8 怎么回事", "是哪个服务", "什么时候开始的", "怎么修"].entries()) {
+    await handle(message(ask, { messageId: `om_${2 + i}`, rootId: "om_root", threadId: "omt_1" }));
   }
-  const { lookups, handle } = restateSetup([{ text: "好", finish: "stop" }]);
-  await handle(message("飞书知识库里有这个接口的文档吗", { rootId: "om_root", threadId: "omt_1" }));
-  assert.deepEqual(lookups, []);
+  assert.equal(lookups.length, 3, "前两次没查成，第三次查成了，第四次不再查");
+  assert.match(requests[3].system, /这是同一个话题里的追问，回答前没再自动查经验库/);
 });
 
-test("点「接着查」按钮问的就算像整理，也照常给查询的工具（话题里回答过了，经验库不再自动查）", async () => {
+test("话题查成过经验库，追问里明说要查经验库、知识库：照样先自动查一次；说「飞书知识库」的是飞书文档，不算", async () => {
+  const { requests, lookups, handle } = restateSetup(Array.from({ length: 4 }, () => ({ text: "好", finish: "stop" as const })));
+  await handle(message("重新查一下现在还有没有 2001102", { messageId: "om_2", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 1);
+  for (const [i, ask] of ["再查一下经验库有没有类似的", "知识库里有没有这个问题的记录"].entries()) {
+    await handle(message(ask, { messageId: `om_${3 + i}`, rootId: "om_root", threadId: "omt_1" }));
+    assert.equal(lookups.length, 2 + i, ask);
+    assert.match(requests[1 + i].system, /这次提问可能相关的经验（回答前自动查到的）/, ask);
+  }
+  await handle(message("飞书知识库里有这个接口的文档吗", { messageId: "om_5", rootId: "om_root", threadId: "omt_1" }));
+  assert.equal(lookups.length, 3);
+});
+
+test("点「接着查」按钮问的就算像整理，也照常先查", async () => {
   const { requests, lookups, handle } = restateSetup([
     { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
     { text: "好", finish: "stop" },
   ]);
   await handle(message("总结一下 3.jd.hk 的失败", { rootId: "om_root", threadId: "omt_1" }), { readOnly: true });
-  assert.deepEqual(lookups, []);
+  assert.equal(lookups.length, 1);
   assert.ok(requests[0].tools?.some((t) => t.name === "aiops_query_logs"));
 });
 
