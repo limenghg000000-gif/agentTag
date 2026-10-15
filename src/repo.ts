@@ -73,8 +73,8 @@ export interface MergeCheck extends RequestInfo {
   fromFork?: boolean;
   /** 要合到的分支在平台上受保护（按平台上的保护设置，含通配的规则） */
   targetProtected: boolean;
-  /** 要合到的分支是仓库的默认分支 */
-  targetIsDefault: boolean;
+  /** 受保护的分支在平台上允许开发者合并（GitLab「允许合并」里有 Developers）；只许维护者合的是 false */
+  targetDevelopersCanMerge?: boolean;
 }
 
 /** 合并的结果：合好了，或者设成了流水线通过后自动合并 */
@@ -399,7 +399,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
       if (res.status === 404) {
         throw new RepoError(`!${number} 要合到的 ${target} 分支不存在了`);
       }
-      const branch = (await res.json().catch(() => ({}))) as { protected?: unknown; default?: unknown };
+      const branch = (await res.json().catch(() => ({}))) as { protected?: unknown; developers_can_merge?: unknown };
       if (!res.ok || typeof branch.protected !== "boolean") {
         throw new RepoError(`GitLab 查 ${target} 分支是不是受保护的失败（HTTP ${res.status}），先不合并`);
       }
@@ -411,7 +411,7 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         botUsername,
         ...(fromFork ? { fromFork } : {}),
         targetProtected: branch.protected,
-        targetIsDefault: branch.default === true,
+        ...(branch.protected ? { targetDevelopersCanMerge: branch.developers_can_merge === true } : {}),
       };
     },
     async mergeRequest(repo, number, { sha, target }, signal) {
@@ -752,6 +752,8 @@ interface Change {
   prNumber?: number;
   /** 改动是从仓库里这个合并请求搬过来的（code_open_pr 的 from）：合并前要看那个是不是机器人自己开的 */
   portedFrom?: number;
+  /** 搬的时候那个合并请求源分支的提交：合并前核对它就是机器人自己推的那个，搬之前别人往那边推过的不合 */
+  portedSha?: string;
 }
 
 /** 推上去以后放到一边的改动：切到别的分支、或者把改动搬到别的分支时存下，切回 base 分支时接着用 */
@@ -885,7 +887,7 @@ function validState(state: WorkspaceState): boolean {
   }
   const changes: Change[] = [state, ...(state.earlier ?? [])];
   const names = [...changes.flatMap((change) => [change.base, change.branch]), state.porting?.back, state.porting?.branch];
-  const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha]);
+  const shas = changes.flatMap((change) => [change.baseSha, change.pushedSha, change.portedSha]);
   // 拿去查合并请求、写进接口地址的编号
   const numbers = changes.flatMap((change) => [change.prNumber, change.portedFrom]);
   return (
@@ -1063,8 +1065,8 @@ export class Workspace {
   }
 
   /**
-   * 合并一个合并请求。只合机器人自己开的、开到没保护的分支（如 uat）的；开到受保护的分支（以平台上的保护设置为准，
-   * master、prod 这类线上分支）或者仓库默认分支的不合，要人审过再点。要等流水线的设成流水线通过后自动合并
+   * 合并一个合并请求。只合机器人自己开的、开到没保护的分支或者受保护但允许开发者合并的分支（如 uat）的；开到只许维护者合的
+   * 受保护分支（以平台上的保护设置为准，master、prod 这类线上分支）不合，要人审过再点；看的是 Roles，不看分支名、是不是默认分支。要等流水线的设成流水线通过后自动合并
    */
   async mergeRequest(number: number, signal?: AbortSignal): Promise<ToolOutput> {
     const name = this.host.requestName;
@@ -1098,18 +1100,33 @@ export class Workspace {
     if (!own.pushedSha || own.pushedSha !== check.sha) {
       throw new RepoError(`${ref} 的源分支上有机器人没推过的提交（最新的不是机器人推的那个），机器人不合，请人看过再点合并：${check.url}`);
     }
-    // 改动是从别的合并请求搬过来的：那个也得是机器人开的，别人写的改动没经人审，不替他合
+    // 改动是从别的合并请求搬过来的：那个也得是这个话题里机器人自己开的、本身不是搬来的。
+    // 别的话题开的看不到它的来历（可能又是从别人的合并请求搬来的，一层层搬下去），不替它合
     if (own.portedFrom !== undefined) {
-      const source = await this.host.mergeCheck(this.repo, own.portedFrom, signal);
+      const from = own.portedFrom;
+      const origin = [this.state, ...this.earlier].find((change) => change !== own && change.prNumber === from);
+      if (!origin || origin.portedFrom !== undefined) {
+        throw new RepoError(
+          `${ref} 的改动是从 ${this.host.refOf(from)} 搬过来的，${origin ? "那个本身也是搬来的" : "那个不是这个话题里开的"}，机器人查不清是谁写的，不合，请人审过再点合并：${check.url}`,
+        );
+      }
+      // 搬的是那边源分支当时的提交：得是机器人自己推上去的那个，搬之前别人往那边推过提交的不合
+      if (!own.portedSha || own.portedSha !== origin.pushedSha) {
+        throw new RepoError(
+          `${ref} 的改动是从 ${this.host.refOf(from)} 搬过来的，搬的时候那边的源分支上有机器人没推过的提交，机器人不合，请人审过再点合并：${check.url}`,
+        );
+      }
+      const source = await this.host.mergeCheck(this.repo, from, signal);
       if (!isBot(source.authorUsername)) {
         throw new RepoError(
           `${ref} 的改动是从 ${this.host.refOf(own.portedFrom)}（${source.author ?? source.authorUsername ?? "别人"} 开的）搬过来的，不是机器人写的，机器人不合，请人审过再点合并：${check.url}`,
         );
       }
     }
-    if (check.targetProtected || check.targetIsDefault) {
+    // 只看平台上的「允许合并」（Roles）：允许开发者合的（uat、test 这类）机器人能合，只许维护者合的（线上分支，叫 master、prod 或别的）要人点
+    if (check.targetProtected && check.targetDevelopersCanMerge !== true) {
       throw new RepoError(
-        `${ref} 要合到的 ${check.target} 是${check.targetProtected ? "受保护的分支" : "仓库的默认分支"}，合并要人审过再点，机器人不合：${check.url}`,
+        `${ref} 要合到的 ${check.target} 是受保护的分支，只许维护者合并，合并要人审过再点，机器人不合：${check.url}`,
         this.onBranch(check.target),
       );
     }
@@ -1779,7 +1796,7 @@ export class Workspace {
     }
     const derived = `${request.source}-${target.replace(/\//g, "-")}`;
     const opened = await this.port({ base: request.baseSha, tip: request.headSha }, target, title, body, requested, derived, signal);
-    this.state = { ...this.state, portedFrom: number };
+    this.state = { ...this.state, portedFrom: number, portedSha: request.headSha };
     await this.saveState();
     return { ...opened, ported: { request: { number, source: request.source, target: request.target, state: request.state } } };
   }
@@ -1800,7 +1817,7 @@ export class Workspace {
     drop = false,
   ): Promise<OpenedRequest> {
     // 当前的改动本来是从别人的合并请求搬来的：再搬到别的分支也记着，合并前照样核对
-    const portedFrom = this.state.portedFrom;
+    const { portedFrom, portedSha } = this.state;
     await this.fetchBranches([target], signal);
     if (requested) {
       await this.assertNewBranch(requested, signal);
@@ -1850,7 +1867,7 @@ export class Workspace {
     const parked = drop ? undefined : this.parked();
     const dropped = parked ? undefined : this.state.branch;
     const earlier = [...this.earlier, ...(parked ? [parked] : [])];
-    this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}), ...(portedFrom ? { portedFrom } : {}) };
+    this.state = { base: target, baseSha: targetSha, branch, ...(earlier.length > 0 ? { earlier } : {}), ...(portedFrom ? { portedFrom } : {}), ...(portedSha ? { portedSha } : {}) };
     this.baseBranch = target;
     await this.saveState();
     if (dropped) {
@@ -1948,7 +1965,7 @@ export class Workspace {
 
   /** 这个话题当前推上去了的改动（放到一边时用）；没推过的不算 */
   private parked(): ParkedChange | undefined {
-    const { branch, pushedSha, baseSha, prUrl, prNumber, portedFrom } = this.state;
+    const { branch, pushedSha, baseSha, prUrl, prNumber, portedFrom, portedSha } = this.state;
     if (!branch || !pushedSha) {
       return undefined;
     }
@@ -1959,6 +1976,7 @@ export class Workspace {
       ...(baseSha ? { baseSha } : {}),
       ...(prUrl && prNumber ? { prUrl, prNumber } : {}),
       ...(portedFrom ? { portedFrom } : {}),
+      ...(portedSha ? { portedSha } : {}),
     };
   }
 

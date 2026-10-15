@@ -4314,7 +4314,7 @@ test("能合并时：「把 !354 合了」「直接合了吧」也算让动手�
   assert.equal(review("!354 已合并到 uat", new Set()), openRequestAnswer([], [], true));
   assert.equal(review("好的，帮你合好了", new Set(["code_requests"])), openRequestAnswer([], [], true));
   assert.match(openRequestAnswer([], [], true), /^（系统检查）你这次没有调用 code_open_pr 和 code_merge，这个合并请求没有开出来，也没有合并。/);
-  assert.match(openRequestAnswer([], [], true), /用 code_merge 填编号合掉；它只合机器人自己开的、开到没保护的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了/);
+  assert.match(openRequestAnswer([], [], true), /用 code_merge 填编号合掉；它只合机器人自己开的、开到允许开发者合并的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了/);
   assert.doesNotMatch(openRequestAnswer([], []), /code_merge/);
   // 开了合并请求、没调 code_merge 就说合好了
   assert.equal(review("已开合并请求 !354，已经合进 uat 了", new Set(["code_open_pr"])), mergedClaimAnswer());

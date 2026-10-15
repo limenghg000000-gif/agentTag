@@ -1452,7 +1452,7 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
     new Response(JSON.stringify({ username: "agent-boot" }), { status: 200 }),
     new Response(JSON.stringify({ name: "uat", protected: false, default: false }), { status: 200 }),
     new Response(JSON.stringify(mr({ target_branch: "release/1.0", author: { name: "张三", username: "zhangsan" }, source_project_id: 9 })), { status: 200 }),
-    new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false }), { status: 200 }),
+    new Response(JSON.stringify({ name: "release/1.0", protected: true, default: false, developers_can_merge: true }), { status: 200 }),
     new Response(JSON.stringify(mr({ target_branch: "gone" })), { status: 200 }),
     new Response("{}", { status: 404 }),
   ];
@@ -1464,12 +1464,16 @@ test("GitLab 合并前核对：读合并请求、机器人自己的账号（查�
   await assert.rejects(host.mergeCheck!("golang/appservice", 354), /查不到机器人自己的 GitLab 账号（HTTP 401），先不合并/);
   const uat = await host.mergeCheck!("golang/appservice", 354);
   assert.deepEqual(
-    [uat.state, uat.source, uat.target, uat.sha, uat.authorUsername, uat.botUsername, uat.fromFork, uat.targetProtected, uat.targetIsDefault],
-    ["opened", "fix/jd_uat", "uat", "c".repeat(40), "agent-boot", "agent-boot", undefined, false, false],
+    [uat.state, uat.source, uat.target, uat.sha, uat.authorUsername, uat.botUsername, uat.fromFork, uat.targetProtected],
+    ["opened", "fix/jd_uat", "uat", "c".repeat(40), "agent-boot", "agent-boot", undefined, false],
   );
   // 账号查到了就记下，不再查
   const release = await host.mergeCheck!("golang/appservice", 354);
-  assert.deepEqual([release.authorUsername, release.botUsername, release.fromFork, release.targetProtected], ["zhangsan", "agent-boot", true, true]);
+  assert.deepEqual(
+    [release.authorUsername, release.botUsername, release.fromFork, release.targetProtected, release.targetDevelopersCanMerge],
+    ["zhangsan", "agent-boot", true, true, true],
+  );
+  assert.equal(uat.targetDevelopersCanMerge, undefined);
   await assert.rejects(host.mergeCheck!("golang/appservice", 354), /!354 要合到的 gone 分支不存在了/);
   assert.deepEqual(calls, [
     "https://lab.corp/api/v4/projects/golang%2Fappservice/merge_requests/354",
@@ -1536,7 +1540,7 @@ test("GitLab 合并：等它算完能不能合再合，带上核对过的提交�
   assert.equal(naps.length, 5);
 });
 
-test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到没保护的分支的；其余都不合", async () => {
+test("合并合并请求：只合这个话题自己开的、源分支还是机器人推的那个提交、开到允许开发者合并的分支的；其余都不合", async () => {
   const checks: Record<number, MergeCheck> = {};
   const merged: { number: number; sha: string; target: string }[] = [];
   let result: MergeResult = { state: "merged", url: "https://example.com/pr/1" };
@@ -1564,7 +1568,6 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
     botUsername: "Agent-Boot",
     sha,
     targetProtected: false,
-    targetIsDefault: false,
   };
   checks[1] = base;
   const out = await ws.mergeRequest(1);
@@ -1576,13 +1579,19 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
   assert.deepEqual(merged, [{ number: 1, sha, target: "uat" }]);
   result = { state: "auto", url: "https://example.com/pr/1" };
   assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）要等流水线跑完才能合，已设成流水线通过后自动合并/);
+  // 受保护、但 GitLab 上允许开发者合并的（uat 常这样设）：能合
+  result = { state: "merged", url: "https://example.com/pr/1" };
+  checks[1] = { ...base, targetProtected: true, targetDevelopersCanMerge: true };
+  assert.match((await ws.mergeRequest(1)).text, /^已合并合并请求 !1/);
+  merged.length = 0;
   checks[1] = { ...base, state: "merged" };
   assert.match((await ws.mergeRequest(1)).text, /^!1「改说明」（.+ → uat）已经合并过了/);
   merged.length = 0;
   checks[9] = { ...base, number: 9 };
   for (const [number, bad, message] of [
-    [1, { targetProtected: true, target: "master" }, /^RepoError: !1 要合到的 master 是受保护的分支，合并要人审过再点，机器人不合/],
-    [1, { targetIsDefault: true, target: "main" }, /^RepoError: !1 要合到的 main 是仓库的默认分支，合并要人审过再点/],
+    [1, { targetProtected: true, target: "prod" }, /^RepoError: !1 要合到的 prod 是受保护的分支，只许维护者合并，合并要人审过再点，机器人不合/],
+    [1, { targetProtected: true, targetDevelopersCanMerge: false, target: "prod" }, /是受保护的分支，只许维护者合并/],
+    // 允许开发者合并，但是默认分支：也不合
     [1, { author: "张三", authorUsername: "zhangsan" }, /^RepoError: !1 是 张三 开的，机器人只合并自己开的合并请求/],
     [1, { authorUsername: undefined }, /机器人只合并自己开的合并请求/],
     [1, { fromFork: true }, /是从别的项目（fork）提过来的，机器人不合/],
@@ -1601,7 +1610,7 @@ test("合并合并请求：只合这个话题自己开的、源分支还是机�
   await assert.rejects(plain.mergeRequest(1), /Fake 上机器人还不能合并合并请求，请人来点/);
 });
 
-test("合并从别的合并请求搬过来的：那个也是机器人开的才合，别人开的不合", async () => {
+test("合并从别的合并请求搬过来的：那个不是这个话题里开的就不合，再搬一次也记着", async () => {
   await runGit(["checkout", "-q", "-b", "fix/merge-src", "main"], { cwd: portSeed });
   await writeFile(path.join(portSeed, "a.go"), "package a\n\nfunc A() int {\n\treturn 8\n}\n");
   await runGit(["commit", "-q", "-am", "A 返回 8"], { cwd: portSeed, env: author });
@@ -1623,22 +1632,58 @@ test("合并从别的合并请求搬过来的：那个也是机器人开的才�
   const ws = await all.open("om_m5", portRepo);
   const pr = await ws.openPullRequest("A 返回 8（uat）", "", { from: 40, target: "uat" });
   const sha = (await runGit(["rev-parse", `refs/heads/${pr.branch}`], { cwd: portRemote })).stdout.trim();
-  const mine: MergeCheck = { ...source, number: pr.number, url: "", source: pr.branch, target: "uat", authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false, targetIsDefault: false };
+  const mine: MergeCheck = { ...source, number: pr.number, url: "", source: pr.branch, target: "uat", authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false };
   checks[pr.number] = mine;
   checks[40] = { ...mine, number: 40, author: "张三", authorUsername: "zhangsan" };
-  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40（张三 开的）搬过来的，不是机器人写的，机器人不合/);
+  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40 搬过来的，那个不是这个话题里开的/);
   // 下次打开（状态从文件读回来）也记得是搬过来的
-  await assert.rejects((await all.open("om_m5", portRepo)).mergeRequest(pr.number), /是从 !40（张三 开的）搬过来的/);
+  await assert.rejects((await all.open("om_m5", portRepo)).mergeRequest(pr.number), /是从 !40 搬过来的/);
   // 再搬到别的分支（test）也记着是从 !40 搬来的
   await runGit(["push", "-q", "origin", "uat:test"], { cwd: portSeed });
   const again = await ws.openPullRequest("A 返回 8（test）", "", { target: "test" });
   const againSha = (await runGit(["rev-parse", `refs/heads/${again.branch}`], { cwd: portRemote })).stdout.trim();
   checks[again.number] = { ...mine, number: again.number, source: again.branch, target: "test", sha: againSha };
-  await assert.rejects(ws.mergeRequest(again.number), /是从 !40（张三 开的）搬过来的/);
+  await assert.rejects(ws.mergeRequest(again.number), /是从 !40 搬过来的/);
+  // !40 是机器人开的，但不是这个话题开的：看不到它是不是又从别人的合并请求搬来的，也不合
   checks[40] = { ...mine, number: 40 };
-  assert.match((await ws.mergeRequest(pr.number)).text, /^已合并合并请求 !1/);
-  assert.deepEqual(merged, [pr.number]);
+  await assert.rejects(ws.mergeRequest(pr.number), /^RepoError: !1 的改动是从 !40 搬过来的，那个不是这个话题里开的，机器人查不清是谁写的，不合/);
+  assert.deepEqual(merged, []);
   await runGit(["push", "-q", "origin", "--delete", "test"], { cwd: portSeed });
+});
+
+test("合并本话题里搬过来的改动：搬的时候那边源分支得是机器人推的那个提交", async () => {
+  const { host } = fakeHost();
+  const merged: number[] = [];
+  const checks: Record<number, MergeCheck> = {};
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number) => checks[number],
+    mergeRequest: async (_repo: string, number: number) => {
+      merged.push(number);
+      return { state: "merged", url: "" };
+    },
+  });
+  const all = workspaces(host);
+  const ws = await all.open("om_m6", "acme/demo");
+  const [s40, s41, other] = ["a", "b", "c"].map((c) => c.repeat(40));
+  const check = (number: number, sha: string): MergeCheck => ({
+    number, title: "x", url: `https://example.com/pr/${number}`, state: "opened", source: `fix/${number}`, target: "uat",
+    authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false,
+  });
+  checks[40] = check(40, s40);
+  checks[41] = check(41, s41);
+  await runGit(["branch", "fix/41"], { cwd: ws.dir });
+  const stateFile = path.join(ws.dir, ".git", ".agenttag.json");
+  const state = (portedSha: string) => ({
+    base: "main", branch: "fix/41", pushedSha: s41, prUrl: "https://example.com/pr/41", prNumber: 41, portedFrom: 40, portedSha,
+    earlier: [{ base: "main", branch: "fix/40", pushedSha: s40, prUrl: "https://example.com/pr/40", prNumber: 40 }],
+  });
+  // 搬之前别人往 !40 的分支上推过提交：搬来的不是机器人推的那个
+  await writeFile(stateFile, JSON.stringify(state(other)));
+  await assert.rejects((await all.open("om_m6", "acme/demo")).mergeRequest(41), /^RepoError: !41 的改动是从 !40 搬过来的，搬的时候那边的源分支上有机器人没推过的提交/);
+  assert.deepEqual(merged, []);
+  await writeFile(stateFile, JSON.stringify(state(s40)));
+  assert.match((await (await all.open("om_m6", "acme/demo")).mergeRequest(41)).text, /^已合并合并请求 !41/);
+  assert.deepEqual(merged, [41]);
 });
 
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {

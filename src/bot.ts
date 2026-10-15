@@ -1740,7 +1740,7 @@ export function reviewCodeAnswer(
 export interface RequestCheck {
   known: () => string;
   canOpen: boolean;
-  /** 这次有 code_merge（机器人能合并没保护的分支） */
+  /** 这次有 code_merge（机器人能合并允许开发者合并的分支） */
   canMerge?: boolean;
   /** code_merge 这次真的合进去了（调用失败、只设成流水线通过后自动合并的不算） */
   merged?: () => boolean;
@@ -1805,7 +1805,7 @@ const OPEN_REQUEST_HINT =
   "按它返回的编号和链接回答；开不了（报错、冲突、这个分支上已经开过）就照实说是什么原因。";
 
 const MERGE_HINT =
-  "群成员要合并的，开好以后（已经开过的直接）用 code_merge 填编号合掉；它只合机器人自己开的、开到没保护的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了。";
+  "群成员要合并的，开好以后（已经开过的直接）用 code_merge 填编号合掉；它只合机器人自己开的、开到允许开发者合并的分支的，拒绝了就照它返回的原因说，没调 code_merge 不能说已经合好了。";
 
 /** 没调 code_merge 就说合好了 */
 export function mergedClaimAnswer(): string {
