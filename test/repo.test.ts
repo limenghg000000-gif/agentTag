@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } fro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import type { BuildChecker, BuildResult } from "../src/build.js";
 import {
   type CodeHost,
   type CommitQuery,
@@ -1728,6 +1729,46 @@ test("合并本话题里搬过来的改动：搬的时候那边源分支得是�
   await writeFile(stateFile, JSON.stringify(state(s40)));
   assert.match((await (await all.open("om_m6", "acme/demo")).mergeRequest(41)).text, /^已合并合并请求 !41/);
   assert.deepEqual(merged, [41]);
+});
+
+test("推之前编译：改到的代码编不过不推、把报错给模型；编过了的合并时不用等流水线", async () => {
+  const { host } = fakeHost();
+  const merged: { number: number; requirePipeline?: boolean }[] = [];
+  let sha = "";
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number): Promise<MergeCheck> => ({
+      number, title: "改说明", url: "https://example.com/pr/1", state: "opened", source: "x", target: "uat",
+      authorUsername: "agent-boot", botUsername: "agent-boot", sha, targetProtected: false,
+    }),
+    mergeRequest: async (_repo: string, number: number, options: { requirePipeline?: boolean }) => {
+      merged.push({ number, requirePipeline: options.requirePipeline });
+      return { state: "merged", url: "" };
+    },
+  });
+  const results: BuildResult[] = [{ state: "failed", output: "go build ./src 编不过：\nsrc/a.ts:1: undefined: logs" }, { state: "passed", summary: "go build ./src 编过了" }];
+  const seen: string[][] = [];
+  const build: BuildChecker = {
+    check: async (_dir, files) => {
+      seen.push([...files]);
+      return results.shift()!;
+    },
+  };
+  const all = new CodeWorkspaces({ root: path.join(tmp, `ws${rootCount++}`), host, repos: ["acme/demo"], logger: quiet, build });
+  const ws = await all.open("om_b1", "acme/demo");
+  await ws.editFile("src/a.ts", "export const a = 1;", "export const a = 2;");
+  await assert.rejects(ws.openPullRequest("改 a", ""), /^RepoError: 推之前在服务器上编译了一下，这次改的代码编不过，没推、也没开合并请求[\s\S]*undefined: logs/);
+  assert.equal(ws.pullRequest, undefined);
+  assert.deepEqual(seen, [["src/a.ts"]]);
+  // 改好再开：编过了，开好的结果里写着
+  const pr = await ws.openPullRequest("改 a", "");
+  assert.deepEqual(pr.checked, { state: "passed", summary: "go build ./src 编过了" });
+  sha = (await runGit(["rev-parse", `refs/heads/${pr.branch}`], { cwd: remote })).stdout.trim();
+  // 源分支最新的就是编过的那个：合并时不用等流水线
+  await ws.mergeRequest(pr.number);
+  assert.deepEqual(merged, [{ number: pr.number, requirePipeline: false }]);
+  // 别人后来推了新提交（对不上）的照旧拒绝；编过的记录在重新打开后还在
+  sha = "d".repeat(40);
+  await assert.rejects((await all.open("om_b1", "acme/demo")).mergeRequest(pr.number), /有机器人没推过的提交/);
 });
 
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {

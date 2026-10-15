@@ -42,6 +42,10 @@ export interface Config {
     host: { kind: "gitlab"; url: string; token: string } | { kind: "github"; token: string };
     /** 拉代码的工作目录（每个话题一个子目录） */
     workspaceDir: string;
+    /** 推代码之前在服务器上编译检查（BUILD_CHECK，默认 on）：Go 用 go build，PHP 用 php -l；没装工具的跳过 */
+    build: boolean;
+    /** 编译时 go 下载依赖用的代理（BUILD_GOPROXY），不配用 goproxy.cn */
+    goproxy?: string;
   };
   /** 通过 MCP 接入的服务（MCP_SERVERS），没配时为空数组 */
   mcp: McpServerConfig[];
@@ -457,6 +461,12 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     }
     return repo;
   });
+  const buildEnv = env.BUILD_CHECK?.trim().toLowerCase();
+  if (buildEnv && buildEnv !== "on" && buildEnv !== "off") {
+    throw new Error(`BUILD_CHECK 只能是 on 或 off，当前为 ${env.BUILD_CHECK}`);
+  }
+  const goproxy = env.BUILD_GOPROXY?.trim();
+  const build = { build: buildEnv !== "off", ...(goproxy ? { goproxy } : {}) };
   const gitlabUrl = env.GITLAB_URL?.trim();
   if (gitlabUrl) {
     if (!/^https?:\/\/[^/\s]+/.test(gitlabUrl)) {
@@ -469,14 +479,14 @@ function loadCodeConfig(env: NodeJS.ProcessEnv): Omit<NonNullable<Config["code"]
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 GitLab 的项目路径（如 group/project），多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN } };
+    return { repos, branches, host: { kind: "gitlab", url: gitlabUrl, token: env.GITLAB_TOKEN }, ...build };
   }
   if (env.GITHUB_TOKEN) {
     const bad = repos.find((r) => !/^[\w.-]+\/[\w.-]+$/.test(r));
     if (bad) {
       throw new Error(`CODE_REPOS 要写成 owner/repo，多个用逗号分隔，这一项不对：${bad}`);
     }
-    return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN } };
+    return { repos, branches, host: { kind: "github", token: env.GITHUB_TOKEN }, ...build };
   }
   throw new Error("配了 CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN（接 GitHub 时配 GITHUB_TOKEN）");
 }

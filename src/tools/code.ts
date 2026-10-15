@@ -1,3 +1,4 @@
+import type { BuildResult } from "../build.js";
 import {
   addChanges,
   type CodeWorkspaces,
@@ -332,6 +333,9 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
       const from = requestNumber(args.from, "from");
       const pr = await ws.openPullRequest(title, body, { branch: optional(args.branch), target: optional(args.target), from }, ctx.signal);
       const out = new ToolOutputBuilder(ws.repo).parts(...openedLine(pr, requestName, refOf));
+      if (pr.checked) {
+        out.line(checkedLine(pr.checked));
+      }
       return report(ctx, addChanges(out.line(""), pr.changes).build());
     },
   };
@@ -373,6 +377,15 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
   };
 
   return [branches, listFiles, read, search, log, requests, edit, diff, openPr, ...(canMerge ? [merge] : [])];
+}
+
+/** 推之前编译的结果：编过了、还是没编（合并时要看平台上的流水线） */
+function checkedLine(checked: BuildResult): string {
+  return checked.state === "passed"
+    ? `推之前在服务器上编译检查过：${checked.summary}。`
+    : checked.state === "unknown"
+      ? `推之前没能确认能编过（${checked.reason}），合并时要看平台上的流水线。`
+      : "推之前编译没通过。";
 }
 
 /** 开好合并请求以后的第一行：哪个分支开到哪个分支，改动是不是从别处搬过来的 */
