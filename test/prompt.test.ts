@@ -46,6 +46,19 @@ test("有功能清单时：问能做什么按清单一项一行说，不写技�
   assert.ok(!prompt.includes("没给你的工具不要提"));
 });
 
+test("只是整理话题里之前的内容时：说明这次不查、照原样用之前的结论和数据，找不到之前的回答就请对方说「重新查」", () => {
+  const prompt = buildSystemPrompt({ ...base, toolNames: ["feishu_doc_read", "knowledge_propose"], restate: true });
+  assert.match(prompt, /这次是让你整理话题里已经有的内容（总结、换个说法、讲给谁听、翻译、精简），不是重新查/);
+  assert.match(prompt, /之前回答里的结论、数据、代码位置照原样用，不要添上之前没有的数据、路径和结论/);
+  assert.match(prompt, /要整理的是群成员给的飞书文档、网页链接时，照常读了再整理/);
+  assert.match(prompt, /群记忆里的约定和偏好照样遵守，但群记忆里的结论、数据不要写进这次的整理/);
+  assert.match(prompt, /用一句话说明，请对方说「重新查」，不要编/);
+
+  const noReads = buildSystemPrompt({ ...base, toolNames: [], restate: true });
+  assert.doesNotMatch(noReads, /照常读了再整理/);
+  assert.doesNotMatch(buildSystemPrompt({ ...base }), /这次是让你整理话题里已经有的内容/);
+});
+
 test("能改代码时：新分支开合并请求时起名，「合并到 uat」在同一话题里开到 uat，提到别处的修改先找到是哪个合并请求", () => {
   const read = ["code_read_file", "code_search", "code_branches", "code_requests", "chat_recent_threads"];
   const prompt = buildSystemPrompt({ ...base, toolNames: [...read, "code_edit_file", "code_open_pr"] });
