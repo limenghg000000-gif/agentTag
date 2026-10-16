@@ -1,7 +1,7 @@
 import { posix } from "node:path";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { raceAbort, timeoutSignal } from "./abort.js";
-import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
+import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, safeDescribe, truncate } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { asksForFeatures, availableFeatures, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
 import { imageKeysOf } from "./feishu.js";
@@ -35,6 +35,7 @@ import {
 } from "./progress.js";
 import { type AboutBot, buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
+import { createEarlierResultsTool, EARLIER_RESULTS_TOOL, type EarlierResult, EarlierResults, listEarlierResults } from "./topic-results.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { containsSecret, maskPersonal } from "./knowledge.js";
@@ -410,6 +411,9 @@ async function runTask(
   let toolCount: number | undefined;
   // 这次成功拿到的工具结果：检查回答里的代码位置、图里的数时用
   const evidence: ToolEvidence[] = [];
+  // 这次新查到的结果（不算写操作的回执、记忆这类模型自己写的）：任务结束时记到这个话题下，追问要的是这次查到的东西时按编号取原文
+  const fresh: EarlierResult[] = [];
+  const topicKey = `${msg.chatId}:${threadKeyOf(msg)}`;
   // 核对过的回答（拆成段）：回答定下来时就核对，记下来的、显示的都用它
   let segments: AnswerSegment[] | undefined;
   try {
@@ -460,6 +464,11 @@ async function runTask(
     // 经验库一个话题只自动查成一次：这个话题已经查成过（不管查没查到），后面的追问不再查（查到的经验那次回答已经用上了），
     // 追问里有新线索时模型自己用 knowledge_search 查。没查成过的（超时、出错、只查成一边、那次是整理不查、重启后记不得）照样查。
     // 追问里明说要查经验库、知识库的也照样先查
+    // 要现在、最新、最近一段时间的情况（「现在还有报错吗」「重新查」「最近 1 小时」）不给：取到的旧结果会算成这次查过，几个小时前的数据就当成现在的发出去了
+    const before = earlierResults(deps).list(topicKey);
+    const earlier = followUp || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question) ? [] : before;
+    // 这个话题之前查过（记着查到的结果）、这次没说要从头查：接着之前的结论只补查缺的那块，不从定位服务开始把之前的步骤重走一遍
+    const continuing = before.length > 0 && !restate && !REDO_REQUEST.test(question);
     const topics = lookedUpTopics(deps);
     const lookupSkipped = !restate && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
     if (lookupSkipped) {
@@ -478,6 +487,8 @@ async function runTask(
     const attempted = new Set<string>();
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
+    // 这次取出来的之前查到的结果：取到代码工具的结果算读过代码，原文算整理的依据（代码工具的证据里只有代码位置，没有列出来的路径原文）
+    const restored: EarlierResult[] = [];
     // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
     let mergedNow = false;
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
@@ -547,7 +558,7 @@ async function runTask(
             toolTexts.push(seenByModel(output, limit));
           }
           const seenFacts = output.length <= limit ? facts : facts.filter((fact) => fact.at <= limit);
-          evidence.push(
+          const found: ToolEvidence =
             code
               ? {
                   tool: tool.spec.name,
@@ -561,8 +572,12 @@ async function runTask(
                   output: seenByModel(output, limit),
                   ...(mcpNames.has(tool.spec.name) ? { links: true } : {}),
                   ...(tool.writes || MODEL_ECHO_TOOLS.has(tool.spec.name) ? { echo: true } : {}),
-                },
-          );
+                };
+          evidence.push(found);
+          if (!tool.writes && !MODEL_ECHO_TOOLS.has(tool.spec.name)) {
+            // 取原文时给模型的是当时它看到的那一版，带着「后面 N 字已省略」，「列全」时才知道没列全
+            fresh.push({ tool: tool.spec.name, describe: safeDescribe(tool, args), at: now(), text: truncate(output, limit), evidence: found });
+          }
           return output;
         },
       }),
@@ -582,6 +597,23 @@ async function runTask(
           },
         }),
       ),
+      // 这个话题之前查到的结果：取到的原样算进这次的证据和查过的工具（就像这次查到的），回答里的数据、代码位置照样核对。
+      // 整理时之前的回答里没写的（「把查到的链接整理一下发出来」）也从这里取，取到的算整理的依据。点按钮问的是接着要查的新问题，不给
+      earlier.length > 0
+        ? [
+            createEarlierResultsTool({
+              results: earlier,
+              now,
+              onUse: (result) => {
+                restored.push(result);
+                evidence.push(result.evidence);
+                attempted.add(result.tool);
+                succeeded.add(result.tool);
+                toolTexts.push(result.text);
+              },
+            }),
+          ]
+        : [],
     );
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
@@ -643,11 +675,11 @@ async function runTask(
     const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
-    const readCode = () => evidence.some(linksCode);
+    const readCode = () => evidence.some(linksCode) || restored.some((result) => isCodeTool(result.tool));
     // 整理之前内容时核对哪几样：配了代码工具（这次给没给都算）就核对代码位置，配了 MCP 服务就核对线上数据
     const restateScope = { code: allTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX)), ops: Boolean(deps.mcp?.names.length) };
     // 整理之前内容时的依据：这次的提问、话题里之前写过的（之前的回答、群成员说的）和这次读到的文档网页。检查时再取，读到的才算上
-    const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence)].join("\n");
+    const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence), ...restored.map((result) => result.text)].join("\n");
     // 合并请求编号的依据：这次的提问、话题里之前的消息和这次的工具结果。检查时再取，查到的才算上
     // 群记忆、回答前查到的经验里写着的编号也算（群成员记下的「uat 的合并请求是 !360」）
     const requestsKnown = () =>
@@ -659,14 +691,19 @@ async function runTask(
         : [
             ...(hasCodeTools ? [reviewCodeAnswer(asked, deps.codeRepos ?? [], seen, readCode, requests)] : []),
             // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
-            ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded)] : []),
+            ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded, toolNames.includes(EARLIER_RESULTS_TOOL))] : []),
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
           ]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
     ];
-    const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
+    // 话题里查过以后的追问（没说深度思考、没问为什么）：补查一轮就能答的不用想，查到第二轮才开思考
+    const thinkLater = continuing && !deep && !DIG_REQUEST.test(question) && deps.mcp?.thinksAfter !== undefined;
+    if (thinkLater) {
+      logger.info(`话题里之前查过，这次追问补查一轮不开思考，要接着查第二轮才开 message=${msg.messageId}`);
+    }
+    const thinksAfter = thinkLater ? thinkFromSecondRound(deps.mcp, taskTools) : deps.mcp?.thinksAfter?.bind(deps.mcp);
     // 卡片上显示思考、不是用英文问的（群里一般说中文）：每次查完、下一轮要思考之前，提醒模型用中文想。
     // 系统提示词开头虽然写了，隔着几万字英文的日志、代码，模型常常就用英文想了（2026-10-12 转链排查的第 3 轮）；
     // 等它想成英文再提醒，卡片上已经有一轮英文
@@ -704,6 +741,8 @@ async function runTask(
         ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         restate,
+        ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
+        ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
@@ -873,6 +912,8 @@ async function runTask(
       answer = `抱歉，这次没能完成：${describeError(err)}。`;
     }
   }
+  // 停止了、出错了也记：查到的结果是真的，接着问时用得上
+  earlierResults(deps).add(topicKey, fresh);
 
   state.endedAt = now();
   for (const step of state.steps) {
@@ -1395,6 +1436,18 @@ export function codeContent(output: string, facts: readonly CodeFact[]): string 
 const BRANCHES_TOOL = "code_branches";
 const OPEN_PR_TOOL = "code_open_pr";
 const MERGE_TOOL = "code_merge";
+
+/** 每个话题之前查到的工具结果（见 EarlierResults），按 deps 分开，测试之间互不影响 */
+const EARLIER_RESULTS = new WeakMap<BotDeps, EarlierResults>();
+
+function earlierResults(deps: BotDeps): EarlierResults {
+  let store = EARLIER_RESULTS.get(deps);
+  if (!store) {
+    store = new EarlierResults(deps.now ?? Date.now);
+    EARLIER_RESULTS.set(deps, store);
+  }
+  return store;
+}
 
 /** 每个机器人记在内存里的「哪些话题查成过经验库」，重启就忘（忘了就再查一次，多查不出错） */
 const LOOKED_UP_TOPICS = new WeakMap<BotDeps, Map<string, number>>();
@@ -2052,11 +2105,14 @@ const TIME_LAYOUT = /2006-01-02|15:04:05/;
  */
 const OPS_QUESTION = /[a-z][a-z0-9]*(?:-[a-z0-9]+)+|日志|报错|告警|异常|pod|重启|崩溃|oom|cpu|内存|超时|5xx|诊断|排查|命名空间|namespace|副本|链路|指标|监控/i;
 
-export function unverifiedOpsAnswer(servers: readonly string[]): string {
+export function unverifiedOpsAnswer(servers: readonly string[], earlier = false): string {
   const tools = servers.map((name) => `${name}_`).join("、");
   return (
     "（系统检查）这个问题像是在问线上服务，或者你的回答里有线上的情况（命名空间候选、具体时间、Pod 名、日志条数、「没有报错」这类），但这次没有成功调用过工具，没有经过查证。" +
     `问线上服务的情况，每次都要用 ${tools} 开头的工具重新查，话题里之前的回答只能当线索，不能照搬其中的命名空间、Pod 和数据。` +
+    (earlier
+      ? `问的是这个话题里之前查到的东西（把链接、报错原文发出来这类）时，也可以用 ${EARLIER_RESULTS_TOOL} 按编号取之前查到的原文，照原文回答并说明是那时查到的。`
+      : "") +
     "先查，再只按这次查到的结果回答；调用次数每次提问都重新算，话题里之前说过额度用完、到上限的，这次照样能查。这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
     "如果这个问题本来就不用查线上（比如解释概念、整理用户自己给的内容），照原来的意思再回答一次就行。不要提这段检查。"
   );
@@ -2071,12 +2127,12 @@ export function unverifiedOpsAnswer(servers: readonly string[]): string {
  * 成功调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；只调了群记忆工具的照样打回。
  * 提问里本来就有的数字和说法不算（比如让机器人润色一段带数字的文字）
  */
-export function reviewOpsAnswer(question: string, servers: readonly string[], succeeded: ReadonlySet<string>) {
+export function reviewOpsAnswer(question: string, servers: readonly string[], succeeded: ReadonlySet<string>, earlier = false) {
   return (answer: string): string | undefined => {
     if (checkedLive(servers, succeeded)) {
       return undefined;
     }
-    return OPS_QUESTION.test(question) || hasUnverified(OPS_DATA, question, answer) ? unverifiedOpsAnswer(servers) : undefined;
+    return OPS_QUESTION.test(question) || hasUnverified(OPS_DATA, question, answer) ? unverifiedOpsAnswer(servers, earlier) : undefined;
   };
 }
 
@@ -2214,6 +2270,30 @@ const REWRITE_REQUEST = /总结|整理|汇总|归纳|概括|润色|翻译|改写
 // 「以上」「之前」「刚才」也用来说数量和时间（「5 分钟以上的慢请求」「刚才的报错」「这段时间」），要跟着内容、结果这类词才算
 const EARLIER_CONTENT =
   /上面|上述|你的回答|这段(?!时间)|(?:以上|前面|之前|刚才|刚刚)(?:查到|说|聊|讲|提到|的(?:回答|结果|内容|情况|信息|结论)|内容|信息|结果|情况|结论)/;
+/** 说了要从头查：「重新查」「从头排查」「复查」。这时不接着之前的结论往下查 */
+const REDO_REQUEST = /重新(?:查|排查|分析|定位|诊断|检查|看|来|跑|找)|从头|从零|重查|复查|核实|再(?:查|排查)一遍/;
+/** 要推理的追问：问原因、要排查分析。这时调了 aiops 照常开思考 */
+const DIG_REQUEST = /为什么|为啥|怎么回事|原因|根因|(?:排查|诊断|定位|分析)(?!结果|过程|情况|结论|记录|报告|出|到|的)|对不上|矛盾|怎么(?:解决|修|处理|办)/;
+
+/**
+ * 话题里查过以后的追问：调 MCP 服务的工具（读剧本不算）查到第二轮才打开思考。之前是调过一次 aiops 后面每轮都想，
+ * 追问「换成上午的看看」这种补查一轮就能答的也要多等思考的时间；要接着查第二轮，说明又在排查了，照常想
+ */
+function thinkFromSecondRound(mcp: BotDeps["mcp"], tools: readonly Tool[]): ((name: string, round: number) => boolean) | undefined {
+  const thinksAfter = mcp?.thinksAfter?.bind(mcp);
+  if (!thinksAfter) {
+    return undefined;
+  }
+  const instructions = new Set(tools.filter((tool) => tool.instructionsOnly).map((tool) => tool.spec.name));
+  const rounds = new Set<number>();
+  return (name, round) => {
+    if (!instructions.has(name) && thinksAfter(name)) {
+      rounds.add(round);
+    }
+    return rounds.size >= 2;
+  };
+}
+
 // 「重新整理」「现在把上面的翻译成英文」里的「重新」「现在」说的是改写这个动作，不算要重新查
 const LIVE_REQUEST =
   /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版|说|讲|解释|梳理|表述|描述|简化|精简|提炼|转述)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;
@@ -2387,7 +2467,7 @@ export function restatedWriteNote(added: readonly string[]): string {
   );
 }
 
-/** 整理之前内容时给模型的工具：读群成员给的文档、网页，按要求写成文档、记进群记忆、起草经验。查线上、查代码、搜网页、查经验库、看别的话题的都不给 */
+/** 整理之前内容时给模型的工具：读群成员给的文档、网页，按要求写成文档、记进群记忆、起草经验，取这个话题之前查到的原文。查线上、查代码、搜网页、查经验库、看别的话题的都不给 */
 const RESTATE_TOOLS: ReadonlySet<string> = new Set([
   "feishu_doc_read",
   "feishu_doc_create",
@@ -2399,6 +2479,7 @@ const RESTATE_TOOLS: ReadonlySet<string> = new Set([
   "memory_delete",
   "knowledge_propose",
   "knowledge_propose_archive",
+  EARLIER_RESULTS_TOOL,
 ]);
 
 /** 整理时能读的文档、网页工具，和放链接的参数 */
