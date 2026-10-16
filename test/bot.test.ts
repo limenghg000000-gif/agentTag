@@ -4662,3 +4662,57 @@ test("话题之前查到过结果，但这次要现在、最新、最近一段�
     assert.doesNotMatch(request.system, /这个话题之前查到过/, ask);
   }
 });
+
+test("话题里查过以后的追问：补查一轮不开思考，查到第二轮才开；读剧本不算一轮；问为什么、说重新查、第一次问照旧开", async () => {
+  const playbook: Tool = {
+    spec: { name: "aiops_playbook", description: "读剧本", parameters: { type: "object", properties: { name: { type: "string" } } } },
+    instructionsOnly: true,
+    describe: () => "aiops · 读剧本 转链",
+    run: async () => "（以下是 aiops 服务端下发的剧本「convert_link」）转链服务 product-service-api 在 prod",
+  };
+  const queryLogs: Tool = { ...namedTool("aiops_query_logs"), describe: () => "aiops · 查日志", run: async () => NOT_PROMOTED_LOGS };
+  const playbookCall = (id: string) => ({ id, name: "aiops_playbook", arguments: '{"name":"convert_link"}' });
+  const results: ChatResult[] = [
+    // 第一次问：查一轮以后就开思考
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] },
+    { text: FIRST_ANSWER, finish: "stop" },
+    // 换个时间段：读剧本、查一轮就答，都不开思考
+    { text: "", finish: "tool_calls", toolCalls: [playbookCall("c2")] },
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c3")] },
+    { text: "上午也都是商品不在推广中", finish: "stop" },
+    // 要接着查第二轮：第二轮查完才开
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c4")] },
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c5")] },
+    { text: "昨天也是一样的", finish: "stop" },
+    // 问为什么：查一轮以后就开
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c6")] },
+    { text: "京东联盟那边把这些商品下了推广", finish: "stop" },
+    // 说重新查：从头排查，照旧开
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c7")] },
+    { text: FIRST_ANSWER, finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { handle } = setup({
+    model,
+    mcp: { names: ["aiops"], tools: () => [playbook, queryLogs], prompt: () => undefined, thinksAfter: (name: string) => name.startsWith("aiops_") },
+  });
+  const thread = { rootId: "om_1", threadId: "omt_1" };
+
+  await handle(message("给我查一下转链日志，找一下查不到cps商品的京东链接", { messageId: "om_1" }));
+  assert.deepEqual(requests.map((req) => req.thinking), [undefined, true]);
+  assert.doesNotMatch(requests[0].system, /这个话题之前已经查过/);
+
+  await handle(message("换成上午 10 点到 11 点的看看", { messageId: "om_2", ...thread }));
+  assert.deepEqual(requests.slice(2).map((req) => req.thinking), [undefined, undefined, undefined]);
+  assert.match(requests[2].system, /这个话题之前已经查过。追问要的是新东西/);
+
+  await handle(message("昨天的也翻翻", { messageId: "om_3", ...thread }));
+  assert.deepEqual(requests.slice(5).map((req) => req.thinking), [undefined, undefined, true]);
+
+  await handle(message("为什么这些商品不在推广中", { messageId: "om_4", ...thread }));
+  assert.deepEqual(requests.slice(8).map((req) => req.thinking), [undefined, true]);
+
+  await handle(message("重新查一下", { messageId: "om_5", ...thread }));
+  assert.deepEqual(requests.slice(10).map((req) => req.thinking), [undefined, true]);
+  assert.doesNotMatch(requests[10].system, /这个话题之前已经查过/);
+});

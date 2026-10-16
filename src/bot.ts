@@ -401,7 +401,10 @@ async function runTask(
     // 追问里有新线索时模型自己用 knowledge_search 查。没查成过的（超时、出错、只查成一边、那次是整理不查、重启后记不得）照样查。
     // 追问里明说要查经验库、知识库的也照样先查
     // 要现在、最新、最近一段时间的情况（「现在还有报错吗」「重新查」「最近 1 小时」）不给：取到的旧结果会算成这次查过，几个小时前的数据就当成现在的发出去了
-    const earlier = followUp || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question) ? [] : earlierResults(deps).list(topicKey);
+    const before = earlierResults(deps).list(topicKey);
+    const earlier = followUp || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question) ? [] : before;
+    // 这个话题之前查过（记着查到的结果）、这次没说要从头查：接着之前的结论只补查缺的那块，不从定位服务开始把之前的步骤重走一遍
+    const continuing = before.length > 0 && !restate && !REDO_REQUEST.test(question);
     const topics = lookedUpTopics(deps);
     const lookupSkipped = !restate && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
     if (lookupSkipped) {
@@ -594,7 +597,12 @@ async function runTask(
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
     ];
-    const thinksAfter = deps.mcp?.thinksAfter?.bind(deps.mcp);
+    // 话题里查过以后的追问（没说深度思考、没问为什么）：补查一轮就能答的不用想，查到第二轮才开思考
+    const thinkLater = continuing && !deep && !DIG_REQUEST.test(question) && deps.mcp?.thinksAfter !== undefined;
+    if (thinkLater) {
+      logger.info(`话题里之前查过，这次追问补查一轮不开思考，要接着查第二轮才开 message=${msg.messageId}`);
+    }
+    const thinksAfter = thinkLater ? thinkFromSecondRound(deps.mcp, taskTools) : deps.mcp?.thinksAfter?.bind(deps.mcp);
     // 卡片上显示思考、不是用英文问的（群里一般说中文）：每次查完、下一轮要思考之前，提醒模型用中文想。
     // 系统提示词开头虽然写了，隔着几万字英文的日志、代码，模型常常就用英文想了（2026-10-12 转链排查的第 3 轮）；
     // 等它想成英文再提醒，卡片上已经有一轮英文
@@ -629,6 +637,7 @@ async function runTask(
         followUp,
         restate,
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
+        ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
         showThinking: deps.showThinking !== false,
         richText: streaming,
@@ -2154,6 +2163,30 @@ const REWRITE_REQUEST = /总结|整理|汇总|归纳|概括|润色|翻译|改写
 // 「以上」「之前」「刚才」也用来说数量和时间（「5 分钟以上的慢请求」「刚才的报错」「这段时间」），要跟着内容、结果这类词才算
 const EARLIER_CONTENT =
   /上面|上述|你的回答|这段(?!时间)|(?:以上|前面|之前|刚才|刚刚)(?:查到|说|聊|讲|提到|的(?:回答|结果|内容|情况|信息|结论)|内容|信息|结果|情况|结论)/;
+/** 说了要从头查：「重新查」「从头排查」「复查」。这时不接着之前的结论往下查 */
+const REDO_REQUEST = /重新(?:查|排查|分析|定位|诊断|检查|看|来|跑|找)|从头|从零|重查|复查|核实|再(?:查|排查)一遍/;
+/** 要推理的追问：问原因、要排查分析。这时调了 aiops 照常开思考 */
+const DIG_REQUEST = /为什么|为啥|怎么回事|原因|根因|(?:排查|诊断|定位|分析)(?!结果|过程|情况|结论|记录|报告|出|到|的)|对不上|矛盾|怎么(?:解决|修|处理|办)/;
+
+/**
+ * 话题里查过以后的追问：调 MCP 服务的工具（读剧本不算）查到第二轮才打开思考。之前是调过一次 aiops 后面每轮都想，
+ * 追问「换成上午的看看」这种补查一轮就能答的也要多等思考的时间；要接着查第二轮，说明又在排查了，照常想
+ */
+function thinkFromSecondRound(mcp: BotDeps["mcp"], tools: readonly Tool[]): ((name: string, round: number) => boolean) | undefined {
+  const thinksAfter = mcp?.thinksAfter?.bind(mcp);
+  if (!thinksAfter) {
+    return undefined;
+  }
+  const instructions = new Set(tools.filter((tool) => tool.instructionsOnly).map((tool) => tool.spec.name));
+  const rounds = new Set<number>();
+  return (name, round) => {
+    if (!instructions.has(name) && thinksAfter(name)) {
+      rounds.add(round);
+    }
+    return rounds.size >= 2;
+  };
+}
+
 // 「重新整理」「现在把上面的翻译成英文」里的「重新」「现在」说的是改写这个动作，不算要重新查
 const LIVE_REQUEST =
   /重新(?!总结|整理|汇总|归纳|概括|润色|翻译|改写|复述|写|组织|排版|说|讲|解释|梳理|表述|描述|简化|精简|提炼|转述)|再查|再看|现在(?!把|帮|请|就|给)|目前|最新|实时|查一下|查查|(?:排查|诊断|查询|检查|定位)(?!结果|过程|情况|结论|记录|报告|出|到|的)/;

@@ -61,9 +61,9 @@ export interface AgentRequest {
   requireTool?: boolean;
   /**
    * 调过某个工具以后，后面几轮打开思考（没传 thinking 时才看）：比如调过 aiops 的工具就是在排查线上问题，
-   * 每拿到一次结果都要想清楚下一步查什么。返回 true 的工具调过一次，这次任务后面每一轮都开着
+   * 每拿到一次结果都要想清楚下一步查什么。返回 true 的工具调过一次，这次任务后面每一轮都开着。round 是调这个工具的那一轮（从 1 数）
    */
-  thinkAfter?: (toolName: string) => boolean;
+  thinkAfter?: (toolName: string, round: number) => boolean;
   /**
    * 模型给出最终回答时检查一遍，比如「回答里提到了仓库的文件，这次却一次代码工具都没调」。
    * 返回一段话时，这版回答不发出去，把这段话交给模型让它重做；每个任务只重做一次。usedTools 是这次任务调过的工具名
@@ -195,7 +195,7 @@ export async function runAgent({
     toolCalls += result.toolCalls.length;
     for (const call of result.toolCalls) {
       usedTools.add(call.name);
-      investigating ||= thinkAfter?.(call.name) ?? false;
+      investigating ||= thinkAfter?.(call.name, round + 1) ?? false;
     }
     signal.throwIfAborted();
     result.toolCalls.forEach((call, i) => {
