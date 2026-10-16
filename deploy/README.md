@@ -45,12 +45,13 @@ cd ~/agentTag && git checkout --detach <提交号> && npm run build && systemctl
 
 ### GitHub 仓库
 
-设置 → Secrets and variables → Actions：
+设置 → Environments → 新建环境 `gitlab-sync`：
 
-- Secrets 加 `GITLAB_PUSH_TOKEN`：上面的项目访问令牌；
-- Variables 加 `GITLAB_REPO_URL`：`https://lab.yuebai.site/ai/agent-tag.git`（要同步到 master 以外的分支时再加 `GITLAB_BRANCH`）。
+- Deployment branches and tags 选「Selected branches and tags」，只加 `main`；
+- Environment secrets 加 `GITLAB_PUSH_TOKEN`：上面的项目访问令牌；
+- Environment variables 加 `GITLAB_REPO_URL`：`https://lab.yuebai.site/ai/agent-tag.git`（要同步到 master 以外的分支时再加 `GITLAB_BRANCH`）。
 
-两个都配了才同步，没配时那一步跳过。配好以后可以在 Actions → CI → Run workflow 手动跑一次，不用等下一次合并。
+令牌一定放在这个环境里，不要放仓库级的 Secrets：环境只给 main 用，别的分支就算改了流水线文件也拿不到它。两个都配了才同步，没配时那一步跳过。配好以后可以在 Actions → CI → Run workflow 手动跑一次 main，不用等下一次合并。
 
 ### 服务器
 
@@ -69,5 +70,5 @@ Runner 装在 `~/bin/gitlab-runner`，作为这个用户的 systemd 服务常驻
 
 - 流水线只给 master 建，Runner 又设成受保护：机器人自己推的分支、合并请求里的代码不会在服务器上跑。
 - Runner 和机器人是同一个用户，读得到 `.env`。能往 master 推代码就等于能在服务器上执行命令，所以 master 只给 Maintainer 推。
-- GitHub 往 GitLab 推用的项目令牌只有 `write_repository` 权限，只能动这一个项目；GitHub 那边存成加密的 Secret，日志里会被遮住。
+- GitHub 往 GitLab 推用的项目令牌只有 `write_repository` 权限，只能动这一个项目；GitHub 那边存在只给 main 用的环境里，日志里会被遮住。
 - 流水线日志里只有部署步骤的输出，不打机器人的运行日志（里面有群里的对话）。要看原因去服务器上看 `journalctl --user -u agenttag-feishu`。

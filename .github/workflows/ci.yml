@@ -27,10 +27,12 @@ jobs:
       - run: npm test
       - run: npm run build
 
-  # 仓库变量 GITLAB_REPO_URL（GitLab 项目的 https 地址，以 .git 结尾）和密钥 GITLAB_PUSH_TOKEN（那个项目的项目令牌）都配了才推，没配就跳过
+  # 环境 gitlab-sync 里的变量 GITLAB_REPO_URL（GitLab 项目的 https 地址，以 .git 结尾）和密钥 GITLAB_PUSH_TOKEN（那个项目的项目令牌）都配了才推，没配就跳过。
+  # 令牌放在环境里、环境只允许 main 用：别的分支改了这个文件也拿不到令牌（能往 GitLab master 推就能在服务器上执行命令）
   sync-gitlab:
     needs: test
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    environment: gitlab-sync
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # 一次只推一个，按合并的先后推
@@ -48,7 +50,7 @@ jobs:
           GITLAB_PUSH_TOKEN: ${{ secrets.GITLAB_PUSH_TOKEN }}
         run: |
           if [ -z "$GITLAB_REPO_URL" ] || [ -z "$GITLAB_PUSH_TOKEN" ]; then
-            echo "::notice::没配仓库变量 GITLAB_REPO_URL 或密钥 GITLAB_PUSH_TOKEN，这次不推到 GitLab"
+            echo "::notice::环境 gitlab-sync 里没配变量 GITLAB_REPO_URL 或密钥 GITLAB_PUSH_TOKEN，这次不推到 GitLab"
             exit 0
           fi
           case "$GITLAB_REPO_URL" in
