@@ -191,6 +191,7 @@ const proactive = new ProactiveReplier({
   followsThreads: follower !== undefined,
   // 话题里勾了「同时发送到群」的追问，群里那份不再主动接话：话题里那份归跟聊
   superseded: (msg) => unaddressedTwins.hasThreadTwin(msg),
+  topicBusy: (threadKey) => tasks.busy(threadKey),
 });
 await proactive.init();
 /** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
@@ -266,6 +267,8 @@ const followUp = createFollowUp({
   handle: (msg, options) => {
     // 和收到的消息一样记进补漏轮询：点按钮可能让一个已经不再跟踪的话题又活了，后面的 @ 漏了事件还能补上
     catchUp.watch(msg);
+    // 也让主动接话知道话题里有人说了话：判断着要按群记忆接的那句不再插进来
+    proactive.noteActivity(msg);
     // 和 @ 的消息一样排在同一话题里还在判断的消息后面，之后跟着这个话题
     return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options), false) : handleMessage(msg, options);
   },

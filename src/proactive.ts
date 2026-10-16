@@ -58,6 +58,8 @@ export interface ProactiveOptions {
   followsThreads?: boolean;
   /** 判断完要回之前再问一下：这条后来发现是话题里「同时发送到群」的副本的话不回（话题里那份归跟聊） */
   superseded?: (msg: NormalizedMessage) => boolean;
+  /** 这个话题里机器人有没有正在做的任务（见 TaskRegistry.busy）：话题里按群记忆接话时，判断的这会儿有人 @ 它、点了「接着查」，就不插这一句 */
+  topicBusy?: (threadKey: string) => boolean;
   maxPerHour?: number;
   logger?: Logger;
   now?: () => number;
@@ -294,7 +296,8 @@ export class ProactiveReplier {
       where: "话题里",
       wanted: () => this.wantsInTopic(msg),
       judge: () => this.judgeInTopic(msg, memory, recent),
-      dropped: () => false,
+      // 判断的这会儿话题里开始了别的任务（有人 @ 它、点了「接着查」按钮）：不在它回答的前后插一句
+      dropped: () => this.opts.topicBusy?.(threadKeyOf(msg)) ?? false,
       movedOn: () => this.movedOnInTopic(msg),
       hint: "\n\n（没 @ 我，答案在群记忆里我就接一句。这个话题里不需要的话说「只在 @ 我时回」，整个群都不要就在群里 @ 我说「别主动插话」。）",
     });
@@ -308,7 +311,7 @@ export class ProactiveReplier {
       where: string;
       wanted: () => boolean;
       judge: () => Promise<string | undefined>;
-      /** 判断完发现这条不该回了（群副本） */
+      /** 判断完发现这条不该回了（群副本；话题里开始了别的任务） */
       dropped: () => boolean;
       /** 判断的这会儿有人接了话 */
       movedOn: () => boolean;

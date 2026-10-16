@@ -41,6 +41,7 @@ async function setup(
     judgeTimeoutMs?: number;
     followsThreads?: boolean;
     noMemory?: boolean;
+    topicBusy?: (threadKey: string) => boolean;
   } = {},
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "proactive-"));
@@ -85,6 +86,7 @@ async function setup(
       ...(opts.superseded ? { superseded: opts.superseded } : {}),
       ...(opts.judgeTimeoutMs ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
       ...(opts.followsThreads !== undefined ? { followsThreads: opts.followsThreads } : {}),
+      ...(opts.topicBusy ? { topicBusy: opts.topicBusy } : {}),
       logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error: (line: string) => logs.push(line) },
       now: () => now,
     });
@@ -592,6 +594,36 @@ test("话题里和群主界面共用每小时回复的次数", async () => {
     assert.equal(t.replies.length, 1);
     assert.equal(t.requests.length, 1);
     assert.match(t.logs.join("\n"), /这一小时已经主动回了 1 次/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("话题里：判断的这会儿话题里开始了别的任务（有人 @ 它、点了「接着查」）就不插这一句", async () => {
+  let release!: (text: string) => void;
+  let busy = false;
+  const keys: string[] = [];
+  const t = await setup({
+    judge: () => new Promise<string>((resolve) => (release = resolve)),
+    topicBusy: (key) => {
+      keys.push(key);
+      return busy;
+    },
+  });
+  try {
+    const pending = t.replier.considerInTopic(topicMsg("om_1"), TOPIC_RECENT);
+    await new Promise((resolve) => setImmediate(resolve));
+    busy = true;
+    release("接：测试环境数据库是 db-test-2.internal（群记忆 #3）");
+    await pending;
+    assert.deepEqual(t.replies, []);
+    assert.deepEqual(keys, ["om_root"]);
+    busy = false;
+    const again = t.replier.considerInTopic(topicMsg("om_2", { createTime: START + 1000 }), TOPIC_RECENT);
+    await new Promise((resolve) => setImmediate(resolve));
+    release("接：测试环境数据库是 db-test-2.internal（群记忆 #3）");
+    await again;
+    assert.equal(t.replies.length, 1);
   } finally {
     await t.cleanup();
   }
