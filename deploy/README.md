@@ -18,9 +18,10 @@
 | 构建没过 | 不重启，切回原来那一版，流水线标红 |
 | 重启后 2 分钟内没等到启动日志 | 切回上一版再重启，流水线标红 |
 | 要部署的比服务器上的旧 | 跳过（流水线顺序乱了、或者有人手动部署过更新的） |
-| `~/agentTag` 里有没提交的改动 | 不部署，流水线标红，先在服务器上处理掉 |
+| `~/agentTag` 里有没提交的改动或多出来的文件（`.env`、`data/` 这些 `.gitignore` 里的不算） | 不部署，流水线标红，先在服务器上处理掉 |
+| 上一次部署中途被停了（超时、被取消） | 下一次不跳过：从上一次之前那一版算起，重装依赖、重新构建、重启 |
 
-部署以后服务器上的 `~/agentTag` 停在部署的那个提交上，`git status` 显示 `HEAD detached`，这是正常的。
+部署以后服务器上的 `~/agentTag` 停在部署的那个提交上，`git status` 显示 `HEAD detached`，这是正常的。部署成功的提交记在 `.git/agenttag-deployed`，部署进行中记在 `.git/agenttag-deploy-pending`，都不用手动动。
 
 ## 回滚
 
@@ -32,7 +33,7 @@
 cd ~/agentTag && git checkout --detach <提交号> && npm run build && systemctl --user restart agenttag-feishu
 ```
 
-手动切过以后，流水线再部署更新的提交时照常往前走。
+手动切过以后，流水线再部署更新的提交时照常往前走（因为跟部署记录对不上，那一次会重装依赖、重新构建）。
 
 ## 一次性设置
 
@@ -49,7 +50,7 @@ cd ~/agentTag && git checkout --detach <提交号> && npm run build && systemctl
 
 - Deployment branches and tags 选「Selected branches and tags」，只加 `main`；
 - Environment secrets 加 `GITLAB_PUSH_TOKEN`：上面的项目访问令牌；
-- Environment variables 加 `GITLAB_REPO_URL`：`https://lab.yuebai.site/ai/agent-tag.git`（要同步到 master 以外的分支时再加 `GITLAB_BRANCH`）。
+- Environment variables 加 `GITLAB_REPO_URL`：`https://lab.yuebai.site/ai/agent-tag.git`。只同步到 master。
 
 令牌一定放在这个环境里，不要放仓库级的 Secrets：环境只给 main 用，别的分支就算改了流水线文件也拿不到它。两个都配了才同步，没配时那一步跳过。配好以后可以在 Actions → CI → Run workflow 手动跑一次 main，不用等下一次合并。
 
@@ -64,7 +65,9 @@ bash deploy/install-runner.sh
 
 脚本会从 GitLab 官方下载 Runner；服务器上下载太慢的话，先在别处下好同一个文件放到 `~/bin/gitlab-runner`（加执行权限），或者用 `RUNNER_URL=<下载地址>` 指定，脚本就不再下载。
 
-Runner 装在 `~/bin/gitlab-runner`，作为这个用户的 systemd 服务常驻（`systemctl --user status gitlab-runner`，日志 `journalctl --user -u gitlab-runner -f`）。配置在 `~/.gitlab-runner/config.toml`，里面有 Runner 令牌，权限 600。装好后 GitLab 的 Runner 页面上它显示在线。
+Runner 装在 `~/bin/gitlab-runner`，作为这个用户的 systemd 服务 `agenttag-runner` 常驻（`systemctl --user status agenttag-runner`，日志 `journalctl --user -u agenttag-runner -f`）。配置在 `~/.agenttag-runner/config.toml`，里面有 Runner 令牌，权限 600；跟这个用户以前给别的项目装的 Runner（如果有）互不相干。装好后 GitLab 的 Runner 页面上它显示在线。
+
+不用先手动构建、重启：第一次自动部署时服务器上还没有部署成功的记录，脚本会重装依赖、重新构建、重启一遍。
 
 ## 安全
 

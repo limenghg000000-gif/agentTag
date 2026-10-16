@@ -5,14 +5,16 @@
 # 用法：bash deploy/install-runner.sh
 #   按提示粘贴在 GitLab 上新建 Runner 时给的令牌（输入不显示，也不进 shell 历史）。
 #   重复跑没关系：已经注册过就只更新 systemd 服务。
+#   配置和服务名都是单独的一份：这个用户以前给别的项目装过 Runner 也不会搅在一起。
 set -euo pipefail
 
 GITLAB_URL="${GITLAB_URL:-https://lab.yuebai.site}"
 RUNNER_TAG="${RUNNER_TAG:-agenttag-ecs}"
 BIN="$HOME/bin/gitlab-runner"
-CONFIG="$HOME/.gitlab-runner/config.toml"
-WORK_DIR="$HOME/gitlab-runner"
-UNIT="$HOME/.config/systemd/user/gitlab-runner.service"
+CONFIG="$HOME/.agenttag-runner/config.toml"
+WORK_DIR="$HOME/agenttag-runner"
+NAME=agenttag-runner
+UNIT="$HOME/.config/systemd/user/$NAME.service"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 node_bin=$(command -v node) || {
@@ -71,12 +73,12 @@ RestartSec=10
 WantedBy=default.target
 EOF
 systemctl --user daemon-reload
-systemctl --user enable --now gitlab-runner
-systemctl --user restart gitlab-runner
+systemctl --user enable --now "$NAME"
+systemctl --user restart "$NAME"
 
 if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
   echo "注意：这个用户没开 linger，退出登录后 Runner 会停。用有 sudo 的账号执行：sudo loginctl enable-linger $USER"
 fi
 sleep 3
-systemctl --user --no-pager --lines=5 status gitlab-runner || true
+systemctl --user --no-pager --lines=5 status "$NAME" || true
 echo "装好了。到 GitLab 项目的 设置 → CI/CD → Runner 里，这台 Runner 应该显示在线（绿点）。"

@@ -46,7 +46,6 @@ jobs:
       - name: 推到 GitLab
         env:
           GITLAB_REPO_URL: ${{ vars.GITLAB_REPO_URL }}
-          GITLAB_BRANCH: ${{ vars.GITLAB_BRANCH || 'master' }}
           GITLAB_PUSH_TOKEN: ${{ secrets.GITLAB_PUSH_TOKEN }}
         run: |
           if [ -z "$GITLAB_REPO_URL" ] || [ -z "$GITLAB_PUSH_TOKEN" ]; then
@@ -60,9 +59,16 @@ jobs:
           esac
           auth=$(printf 'oauth2:%s' "$GITLAB_PUSH_TOKEN" | base64 -w0)
           echo "::add-mask::$auth"
-          # 只往后加，从不强推：GitLab 上有人直接合了东西、和这边对不上时这一步会失败，要人来看
+          gitlab() { git -c http.extraHeader="Authorization: Basic $auth" "$@"; }
+          # 只往后加，从不强推：GitLab 上有人直接合了东西、和这边对不上时这一步会失败，要人来看。
+          # 只推 master：GitLab 流水线和部署脚本都只认 master。
           for i in 1 2 3; do
-            if git -c http.extraHeader="Authorization: Basic $auth" push "$GITLAB_REPO_URL" "$GITHUB_SHA:refs/heads/$GITLAB_BRANCH"; then
+            # 两次合并挨得近时，后合并的那次可能先推上去了：GitLab 的 master 已经包含这次的提交，就算推过了
+            if gitlab fetch --quiet --no-tags "$GITLAB_REPO_URL" refs/heads/master && git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "GitLab 的 master 上已经有这次的提交（后合并的那次先推了），不用再推"
+              exit 0
+            fi
+            if gitlab push "$GITLAB_REPO_URL" "$GITHUB_SHA:refs/heads/master"; then
               exit 0
             fi
             echo "推送失败，$((i * 15)) 秒后重试"
