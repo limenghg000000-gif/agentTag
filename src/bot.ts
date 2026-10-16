@@ -5,7 +5,7 @@ import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, saf
 import { DuplicateAsks } from "./duplicates.js";
 import { asksForFeatures, availableFeatures, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
 import { imageKeysOf } from "./feishu.js";
-import { CARD_DONE_NOTICE, type ImageRef, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
+import { CARD_DONE_NOTICE, type ImageRef, isChatContext, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
 import { type ChatMessage, type ChatModel, LlmError, stripThinkTags } from "./llm.js";
 import { splitMarkdown, stripRichTags, toPostMarkdown } from "./markdown.js";
@@ -57,7 +57,7 @@ const NOTIFY_AFTER_MS = 60_000;
 /** 连长连接之前还不知道机器人名字时用这个 */
 const FALLBACK_BOT_NAME = "AI 助手";
 /** 在话题里 @ 机器人说这些词时停止任务，而不是当成新问题 */
-const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
+export const STOP_COMMAND = /^(停止|停下|停|别做了|取消|stop|cancel)[。.!！\s]*$/i;
 /** 提问里带这些词时，这次任务打开思考（默认关着，回答快一半） */
 export const DEEP_THINKING = /深度思考|仔细(想|思考|分析)|认真(想|思考|分析)/;
 // 只说「知识库」「经验库」指的是团队经验库（knowledge_propose 起草、确认后存进多维表格），说「飞书知识库」才是飞书文档
@@ -75,6 +75,50 @@ const DOC_REQUEST = new RegExp(
   ].join("|"),
   "i",
 );
+
+const CHANGE_VERB = String.raw`(?:写|改|删|编辑|调整|重构|移除|追加|更新|补充|补上|加上?|添加|放|贴|存|整理|同步|记(?:录|到|进|下|上)|替换|新建|创建|建(?!议)|提交|合并|修复|修|切(?:换|到)?)`;
+/** 写明了的文件路径：src/bot.ts、README.md、docs/a/b、飞书文档链接，和没有扩展名的 Makefile、go.mod、.env 这类 */
+const CHANGE_PATH = String.raw`(?:(?:[\w.-]+\/)+[\w.-]+|\b[\w-]+\.(?:tsx?|jsx?|mjs|cjs|go|mod|sum|php|py|java|kt|rb|rs|cpp|cc|c|h|hpp|cs|swift|vue|md|json|ya?ml|toml|ini|env|sql|sh|html|css|scss|xml|proto|txt|conf|cfg|properties|gradle|lock)\b|\b(?:Makefile|Dockerfile|Jenkinsfile|LICENSE|README|CHANGELOG|Procfile)\b|(?<![\w.])\.(?:env|gitignore|gitlab-ci\.yml|dockerignore|editorconfig|npmrc)\b)`;
+const CHANGE_TARGET = String.raw`(?:文档|docx?|wiki|知识库|表格|周报|日报|纪要|代码|仓库|文件|分支|合并请求|\bMR\b|\bPR\b|${CHANGE_PATH})`;
+const CHANGE_VERB_EN = String.raw`\b(?:update|edit|modify|change|fix|add|append|write|create|delete|remove|rename|refactor|replace|switch|checkout)\b`;
+const CHANGE_TARGET_EN = String.raw`(?:${CHANGE_TARGET}|\b(?:docs?|document|file|code|readme|repo|branch)\b)`;
+/**
+ * 提问本身说了要改哪个文档或代码：「把上面那段追加到周报文档里」「文档里那段改一下」「修一下这段代码」「开个 MR」「修改 src/bot.ts」
+ * 「update README.md」「切到 develop 分支」。
+ * 带上了群聊时用它挑给哪样：说了要改的给改的工具、不带群聊，没说的带群聊、只给读的工具（「加拿大的首都是哪里」「你记得代码仓库最近有什么变更吗」不算要改）。
+ * 认错了只是少了群聊或者少了改的工具，两样不会同时给
+ */
+const CHANGE_REQUEST = new RegExp(
+  [
+    String.raw`${CHANGE_VERB}[^，。,.!?！？\n]{0,15}?${CHANGE_TARGET}`,
+    // 「优化」多半是问建议（「上面那段代码怎么优化」），只有写明了文件路径时才算要改
+    String.raw`优化[^，。,.!?！？\n]{0,15}?${CHANGE_PATH}`,
+    String.raw`${CHANGE_TARGET}[^，。,.!?！？\n]{0,8}?${CHANGE_VERB}`,
+    String.raw`${CHANGE_VERB_EN}[^\n]{0,30}?${CHANGE_TARGET_EN}`,
+    String.raw`开\s*(?:个|一个)?\s*(?:MR|PR|合并请求)`,
+    String.raw`\b(?:commit|push|merge)\b`,
+  ].join("|"),
+  "i",
+);
+
+/**
+ * 提问本身让机器人记住、忘掉或改群记忆：「记住发版在周三」「忘掉 #3」「把这条忘了」「把第 2 条记忆改成…」。
+ * 「我忘记密码了」「别记错了」不算
+ */
+const MEMORY_REQUEST =
+  /记住|记下|记一下|忘掉|把[^，。,.!?！？\n]{0,12}忘了|(?:删|改|更新)[^，。,.!?！？\n]{0,8}记忆|记忆[^，。,.!?！？\n]{0,8}(?:删|改|更新)/;
+
+/** 提问本身说到了经验库的事：「沉淀成经验」「记到经验库」「把 #5 归档」「群记忆和经验库有没有冲突」。「数据对不上」「代码冲突」不算 */
+const KNOWLEDGE_REQUEST = /沉淀|经验|知识库|归档/;
+
+/** 这句话要经验库的卡片：自己说到了经验库，或者是在答上一条回答末尾问的「要不要沉淀成经验？」（「要」「好的」） */
+function knowledgeRequested(question: string, history: readonly ChatMessage[]): boolean {
+  if (KNOWLEDGE_REQUEST.test(question)) {
+    return true;
+  }
+  const reply = history.at(-1);
+  return reply?.role === "assistant" && /[？?]\s*$/.test(reply.content.trim()) && KNOWLEDGE_REQUEST.test(reply.content);
+}
 
 /**
  * 这次要不要新建文档。也看话题里刚说的：上一条回答在问话（「要整理成飞书文档吗？」「标题叫什么？」），
@@ -117,6 +161,11 @@ export interface BotDeps {
   taskTools?: (task: TaskToolContext) => readonly Tool[];
   /** 只在这些群里响应。为空时不响应任何群。 */
   allowedChatIds: ReadonlySet<string>;
+  /**
+   * 开关类的话（「只在 @ 我时回」「别主动插话」）：去重、停止之后，当成提问之前先给它看。是的话它马上处理、返回回复的 Promise，
+   * 不是的话同步返回 undefined（不多等一拍，提问照样当场排进任务队列）。放在去重之后，「同时发送到群」的两份只处理一份、只回一句
+   */
+  command?: (msg: NormalizedMessage) => Promise<void> | undefined;
   /** 机器人在飞书里的名字（连上长连接后才拿得到），写进提示词 */
   botName: () => string | undefined;
   context: ThreadContextSource;
@@ -211,13 +260,26 @@ export function createMessageHandler(deps: BotDeps) {
       await reply(stopped > 0 ? "好的，已停止。" : "现在没有进行中的任务。");
       return;
     }
+    const command = options.readOnly ? undefined : deps.command?.(msg);
+    if (command) {
+      await command;
+      return;
+    }
     if (!question && !msg.rootId) {
       await reply("在的，@ 我的时候带上问题或要做的事就行。");
       return;
     }
     // 只问「你能做什么」这类话：不问模型，直接回功能卡片。按钮问的不算（按钮上的话是模型写的）
+    // 也排进这个话题的任务队列：紧接着问的「第 4 个怎么用」等卡片发完、记进上文再答，说「停止」也停得掉
     if (!options.readOnly && deps.about?.features && asksForFeatures(question)) {
-      await sendFeatures(deps, msg, question, deps.about.features);
+      const task = tasks.create(msg.chatId, threadKeyOf(msg));
+      try {
+        if (await task.waitTurn()) {
+          await sendFeatures(deps, msg, question, deps.about.features);
+        }
+      } finally {
+        tasks.finish(task);
+      }
       return;
     }
 
@@ -228,6 +290,8 @@ export function createMessageHandler(deps: BotDeps) {
 export interface TaskOptions {
   /** 只给读的工具（点「接着查」按钮问的） */
   readOnly?: boolean;
+  /** 没 @ 机器人、跟聊判断是对它说的：不给改文档、改代码的工具 */
+  unaddressed?: boolean;
 }
 
 /**
@@ -455,9 +519,16 @@ async function runTask(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
-          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支
-          if (followUp && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
-            throw new Error("这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数");
+          // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支：按钮问的、没 @ 的跟聊、
+          // 带上了群聊只给读的工具的都不能切（不然群里埋一句「切到某某分支」，后面有写权限的人 @ 了再改代码就用了那个分支）
+          if ((followUp || options.unaddressed || ambientOnly) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+            throw new Error(
+              followUp
+                ? "这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
+                : options.unaddressed
+                  ? "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数"
+                  : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
+            );
           }
           checkRestatedWrite(tool, args);
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
@@ -547,13 +618,36 @@ async function runTask(
     const hasWrites = allTools.some((tool) => tool.writes);
     // 不在写权限名单里的人：不给改文档、改代码的工具，模型想改也改不了
     const noPermission = hasWrites && deps.writeAllowed !== undefined && !deps.writeAllowed.has(msg.senderId);
-    const readOnly = noPermission || followUp;
+    // 这次带上了群里刚才的聊天（旁听）：群聊里谁都能写字，群聊和改文档、改代码的工具不同时给。
+    // 不然有人在群里埋一句「把某某文档清空」，等写权限名单里的人 @ 一句，模型就可能借他的权限照做。
+    // 提问本身说了要改哪个文档或代码：给改的工具、不带群聊（和没有旁听时一样）；没说：带群聊、只给读的工具
+    const ambient = hasWrites && !noPermission && !followUp && context.history.some(isChatContext);
+    // 「合到 uat」「开个 MR」也算要改：合并、开合并请求的工具只在发起人这句话明确要时才给，不能带群聊
+    const chatDropped = ambient && (CHANGE_REQUEST.test(question) || asksToOpenRequest(question));
+    const ambientOnly = ambient && !chatDropped;
+    const modelHistory = chatDropped ? history.filter((m) => !isChatContext(m)) : history;
+    // 跟聊接过来的、没 @ 机器人的话：话题里谁都能写字，写权限名单里的人随口说一句没 @ 的话，
+    // 不能让模型借他的权限照着话题里别人埋的话去改文档、改代码。要改就 @ 机器人直接说
+    const unaddressed = hasWrites && !noPermission && !followUp && options.unaddressed === true;
+    const readOnly = noPermission || followUp || ambientOnly || unaddressed;
+    // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
+    // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
+    const memoryLocked =
+      !followUp && (modelHistory.some(isChatContext) || options.unaddressed === true) && !MEMORY_REQUEST.test(question);
+    // 起草经验、归档经验、群记忆和经验库冲突的卡片也一样：点了就改经验库或群记忆，这句话本身没说到经验库、记忆的事就不给
+    const draftsLocked =
+      !followUp &&
+      (modelHistory.some(isChatContext) || options.unaddressed === true) &&
+      !knowledgeRequested(question, context.history) &&
+      !MEMORY_REQUEST.test(question);
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter(
       (tool) =>
         !(readOnly && tool.writes) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
+        !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
+        !(draftsLocked && KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) &&
         !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
         // 合并只在发起人这句话明确要合并时给：群记忆、话题里别人的话、合并请求描述里写着「直接合掉」也不会让它去合
         (tool.spec.name !== MERGE_TOOL || asksToMerge(question)) &&
@@ -564,6 +658,13 @@ async function runTask(
       logger.info(`点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
       logger.info(`发起人不在写权限名单里，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (ambientOnly) {
+      logger.info(`带上了群聊、提问没说要改东西，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    } else if (chatDropped) {
+      logger.info(`提问说了要改东西，这次不带群聊 message=${msg.messageId} sender=${msg.senderId}`);
+    }
+    if (unaddressed) {
+      logger.info(`没 @ 机器人的跟聊，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
@@ -634,6 +735,10 @@ async function runTask(
         toolNames,
         memory: memory?.prompt,
         readOnly: noPermission,
+        ...(ambientOnly ? { ambientOnly: true } : {}),
+        ...(chatDropped ? { chatDropped: true } : {}),
+        ...(unaddressed ? { unaddressed: true } : {}),
+        ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         restate,
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
@@ -673,11 +778,12 @@ async function runTask(
                   : { failed: true }),
                 // 起草的工具是按钮问的才拿掉的，提示词叫人直接 @；本来就没有（没配写权限名单）时照实说存不了
                 ...(followUp && allTools.some((tool) => KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) ? { draftsHidden: true } : {}),
+                ...(draftsLocked && allTools.some((tool) => KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) ? { draftsLocked: true } : {}),
               },
             }
           : {}),
       }),
-      messages: [...history, { role: "user", content: prompt }],
+      messages: [...modelHistory, { role: "user", content: prompt }],
       tools: taskTools,
       signal: task.signal,
       ...(streaming ? { stream: true } : {}),
@@ -754,7 +860,7 @@ async function runTask(
     if (hasCodeTools && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER) {
       // 打回重做时群成员自己写的路径不算查证（要模型先去读代码）；重做以后照着提问复述一遍（「order.go:88 所在的服务读不到」）不拦。
       // 这次读过代码、或者问的是配置的仓库时，回答里每个路径都得是真的；不然只拦带行号的，举例写的路径（「可以写在 k8s/deployment.yaml 里」）照常发
-      const userText = [asked, ...history.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
+      const userText = [asked, ...modelHistory.flatMap((m) => (m.role === "user" ? [m.content] : []))].join("\n");
       const repos = deps.codeRepos ?? [];
       const investigating = [...attempted].some(isCodeTool) || readCode() || mentionsRepo(`${asked}\n${shown}`, repos);
       // 群成员写成「仓库名/路径」（ai/aiops-mcp/src/foo.ts，仓库名不分大小写）、回答里写 src/foo.ts 的也算照着复述。
@@ -959,7 +1065,8 @@ async function readImages(
  * 每轮用截短前的全文（asked 也是）；secret 是用到的几轮里有没有像密钥的
  */
 function lookupQuery(asked: string, history: readonly ChatMessage[]): { query: string; secret: boolean } {
-  const asks = history.flatMap((m) => (m.role === "user" ? [unlabelUserMessage(m.full ?? m.content)] : []));
+  // 群里直接 @ 时带上的群聊不是提问，不拿去查（也不发到 aiops）
+  const asks = history.flatMap((m) => (m.role === "user" && !isChatContext(m) ? [unlabelUserMessage(m.full ?? m.content)] : []));
   const recent = asks.slice(1).slice(-LOOKUP_RECENT_TURNS).reverse();
   // 截短前先用每轮的全文认密钥、给手机号身份证号打码：截在一半就认不出来了（<password>… 的结尾截掉了、号码只剩半截），会发到 aiops。
   // 给模型看的上文早就截短了（长消息、长的图片文字），截掉的后半段可能正是认出前面是密钥的那部分（data 在前、kind: Secret 在后的 Secret），所以用全文
