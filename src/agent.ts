@@ -288,7 +288,7 @@ async function runTool(
   }
 }
 
-function safeDescribe(tool: Tool, args: Record<string, unknown>): string {
+export function safeDescribe(tool: Tool, args: Record<string, unknown>): string {
   try {
     return tool.describe(args);
   } catch {

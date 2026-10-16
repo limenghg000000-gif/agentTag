@@ -49,16 +49,15 @@ export class EarlierResults {
     private readonly limits = { chars: MAX_CHARS_PER_TOPIC, topics: MAX_TOPICS, keepMs: KEEP_MS },
   ) {}
 
-  /** 这个话题之前查到的结果，从早到晚。超过保留时间的不算 */
+  /** 这个话题之前查到的结果，从早到晚。超过保留时间的不算；读过的话题挪到最新，话题太多时先忘最久没用的 */
   list(key: string): readonly EarlierResult[] {
     const results = this.topics.get(key);
     if (!results) {
       return [];
     }
     const fresh = results.filter((result) => this.now() - result.at < this.limits.keepMs);
-    if (fresh.length === 0) {
-      this.topics.delete(key);
-    } else if (fresh.length < results.length) {
+    this.topics.delete(key);
+    if (fresh.length > 0) {
       this.topics.set(key, fresh);
     }
     return fresh;
@@ -76,6 +75,12 @@ export class EarlierResults {
     }
     this.topics.delete(key);
     this.topics.set(key, kept);
+    // 别的话题过了保留时间的也一起忘掉：查到的日志里可能有用户 id、链接，不在内存里多留
+    for (const [other, saved] of this.topics) {
+      if (saved.every((result) => this.now() - result.at >= this.limits.keepMs)) {
+        this.topics.delete(other);
+      }
+    }
     for (const oldest of this.topics.keys()) {
       if (this.topics.size <= this.limits.topics) {
         break;
@@ -85,9 +90,10 @@ export class EarlierResults {
   }
 }
 
+/** 大概占多少字：原文、核对用的原文（截短过的两份不一样），代码位置每处按 64 字算 */
 function sizeOf(result: EarlierResult): number {
-  const { output } = result.evidence;
-  return result.text.length + (output !== undefined && output !== result.text ? output.length : 0);
+  const { output, facts } = result.evidence;
+  return result.text.length + (output !== undefined && output !== result.text ? output.length : 0) + (facts?.length ?? 0) * 64;
 }
 
 /** 系统提示里列出来的那几行：编号、时间、调的什么、多少字。编号就是取原文时的 index */
@@ -106,6 +112,8 @@ export interface EarlierResultsToolOptions {
 /** 按编号取这个话题之前查到的结果原文。每个任务按所在的话题单独创建，看不到别的话题 */
 export function createEarlierResultsTool({ results, onUse, now = Date.now }: EarlierResultsToolOptions): Tool {
   const longest = results.reduce((max, result) => Math.max(max, result.text.length), 0);
+  // 一次任务里同一条只给一次原文：再要就说上面有，不再把几万字原文塞一遍
+  const given = new Set<number>();
   return {
     spec: {
       name: EARLIER_RESULTS_TOOL,
@@ -131,6 +139,10 @@ export function createEarlierResultsTool({ results, onUse, now = Date.now }: Ear
           results.length > 0 ? `没有这一条：之前查到的结果编号是 1～${results.length}` : "这个话题之前没有查到过结果，要查就用别的工具查",
         );
       }
+      if (given.has(index)) {
+        return `第 ${index} 条这次已经取过了，原文在前面那次的结果里，照那里的回答。`;
+      }
+      given.add(index);
       onUse(result);
       return (
         `第 ${index} 条：${TIME_FORMAT.format(result.at)}（${ago(now() - result.at)}）查到的，当时调的是「${result.describe}」。` +

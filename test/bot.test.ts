@@ -4646,3 +4646,19 @@ test("整理时从之前代码工具的结果里取路径和行号：整理的�
   await handle(message("把刚才的结果整理一下发出来", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
   assert.equal(markdowns(sent).at(-1), listed);
 });
+
+test("话题之前查到过结果，但这次要现在、最新、最近一段时间的情况：不给之前的结果，照常重新查", async () => {
+  const asks = ["现在还有不在推广中的链接吗", "重新查一下", "最近 1 小时有没有新的", "最新的情况呢"];
+  const { requests, handle } = earlierSetup([
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] },
+    { text: FIRST_ANSWER, finish: "stop" },
+    ...asks.map(() => ({ text: "要查哪段时间？", finish: "stop" as const })),
+  ]);
+  await handle(message("给我查一下转链日志", { messageId: "om_1" }));
+  for (const [i, ask] of asks.entries()) {
+    await handle(message(ask, { messageId: `om_${i + 2}`, rootId: "om_1", threadId: "omt_1" }));
+    const request = requests[2 + i];
+    assert.ok(!request.tools?.some((t) => t.name === "topic_earlier_results"), ask);
+    assert.doesNotMatch(request.system, /这个话题之前查到过/, ask);
+  }
+});

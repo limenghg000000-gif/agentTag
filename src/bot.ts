@@ -1,7 +1,7 @@
 import { posix } from "node:path";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { raceAbort, timeoutSignal } from "./abort.js";
-import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, truncate } from "./agent.js";
+import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, safeDescribe, truncate } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { asksForFeatures, availableFeatures, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
 import { imageKeysOf } from "./feishu.js";
@@ -400,7 +400,8 @@ async function runTask(
     // 经验库一个话题只自动查成一次：这个话题已经查成过（不管查没查到），后面的追问不再查（查到的经验那次回答已经用上了），
     // 追问里有新线索时模型自己用 knowledge_search 查。没查成过的（超时、出错、只查成一边、那次是整理不查、重启后记不得）照样查。
     // 追问里明说要查经验库、知识库的也照样先查
-    const earlier = followUp ? [] : earlierResults(deps).list(topicKey);
+    // 要现在、最新、最近一段时间的情况（「现在还有报错吗」「重新查」「最近 1 小时」）不给：取到的旧结果会算成这次查过，几个小时前的数据就当成现在的发出去了
+    const earlier = followUp || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question) ? [] : earlierResults(deps).list(topicKey);
     const topics = lookedUpTopics(deps);
     const lookupSkipped = !restate && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
     if (lookupSkipped) {
@@ -501,7 +502,7 @@ async function runTask(
           evidence.push(found);
           if (!tool.writes && !MODEL_ECHO_TOOLS.has(tool.spec.name)) {
             // 取原文时给模型的是当时它看到的那一版，带着「后面 N 字已省略」，「列全」时才知道没列全
-            fresh.push({ tool: tool.spec.name, describe: tool.describe(args), at: now(), text: truncate(output, limit), evidence: found });
+            fresh.push({ tool: tool.spec.name, describe: safeDescribe(tool, args), at: now(), text: truncate(output, limit), evidence: found });
           }
           return output;
         },
