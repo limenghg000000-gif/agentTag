@@ -30,7 +30,7 @@ function msg(messageId: string, extra: Partial<NormalizedMessage> = {}): Normali
 /** @ 了机器人、开了这个话题的那条 */
 const asked = msg("om_root", { mentionedBot: true, rootId: undefined, threadId: undefined, content: "最近一小时 gateway 报错多少" });
 
-function setup(judge: string | Error = "是", busy = false) {
+function setup(judge: string | Error = "是", busy = false, declined?: (msg: NormalizedMessage, recent: readonly string[]) => Promise<void>) {
   let now = START;
   const requests: ChatRequest[] = [];
   const handled: string[] = [];
@@ -67,6 +67,7 @@ function setup(judge: string | Error = "是", busy = false) {
     reply: async (m, markdown) => {
       replies.push(`${m.messageId} ${markdown}`);
     },
+    ...(declined ? { declined } : {}),
     logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error() {} },
     now: () => now,
   });
@@ -154,6 +155,34 @@ test("判断不是对机器人说的（群成员之间说话、表态）不回�
   assert.deepEqual(t.handled, []);
   assert.deepEqual(t.replies, []);
   assert.match(t.logs.join("\n"), /不是对机器人说的，不回.*message=om_2/);
+});
+
+test("判断不是对机器人说的：交给 declined 看群记忆，带上判断时读到的话题最近几条；判断失败、机器人在做事时不交", async () => {
+  const declined: Array<{ id: string; recent: readonly string[] }> = [];
+  const onDeclined = async (m: NormalizedMessage, recent: readonly string[]) => {
+    declined.push({ id: m.messageId, recent });
+  };
+  const t = setup("否", false, onDeclined);
+  t.follower.track(asked);
+  await t.follower.consider(msg("om_2", { content: "测试库地址是哪个来着" }));
+  assert.deepEqual(t.handled, []);
+  assert.deepEqual(declined, [
+    { id: "om_2", recent: ["[张三] 最近一小时 gateway 报错多少", "[机器人] 最近一小时 gateway 报错 132 次，主要是 code=8"] },
+  ]);
+  // 是对它说的照常回答，不交
+  const yes = setup("是", false, onDeclined);
+  yes.follower.track(asked);
+  await yes.follower.consider(msg("om_3"));
+  assert.deepEqual(yes.handled, ["om_3"]);
+  // 判断失败的、机器人在做事时的不交
+  await setup(new Error("百炼超时"), false, onDeclined).follower.consider(msg("om_4"));
+  const busy = setup("否", true, onDeclined);
+  busy.follower.track(asked);
+  await busy.follower.consider(msg("om_5"));
+  assert.deepEqual(
+    declined.map((d) => d.id),
+    ["om_2"],
+  );
 });
 
 test("判断出错时不回：宁可漏回一句，也不在别人说话时插嘴", async () => {

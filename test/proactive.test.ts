@@ -40,6 +40,7 @@ async function setup(
     listChat?: () => Promise<ThreadMessage[]>;
     judgeTimeoutMs?: number;
     followsThreads?: boolean;
+    noMemory?: boolean;
   } = {},
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "proactive-"));
@@ -72,7 +73,7 @@ async function setup(
       enabledChatIds: new Set(opts.enabled ?? ["oc_1"]),
       stateFile,
       api: { listChatMessages: opts.listChat ?? (async () => chat) },
-      memory: { list: async () => structuredClone(memoryEntries) },
+      memory: { list: async () => (opts.noMemory ? [] : structuredClone(memoryEntries)) },
       model,
       botName: () => "飞书 CLI",
       botOpenId: () => BOT,
@@ -489,6 +490,108 @@ test("状态文件坏了：打一行警告，按都没停算", async () => {
     await restarted.init();
     assert.equal(restarted.active("oc_1"), true);
     assert.match(t.logs.join("\n"), /格式不对，先按所有群都没停算/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+/** 跟聊判断过不是对机器人说的话题消息 */
+function topicMsg(messageId: string, extra: Partial<NormalizedMessage> = {}): NormalizedMessage {
+  return msg(messageId, { rootId: "om_root", threadId: "omt_1", senderName: "李四", content: "@王五 测试库地址是哪个来着", ...extra });
+}
+const TOPIC_RECENT = ["[张三] gateway 最近报错多吗", "[机器人] 最近一小时 132 次，主要是 code=8"];
+
+test("话题里不是对它说的、答案在群记忆里：在话题里接一句，只看群记忆和话题最近几条，提示词只许照抄群记忆", async () => {
+  const t = await setup({ judge: "接：测试环境数据库是 db-test-2.internal（群记忆 #3）" });
+  try {
+    const topic = topicMsg("om_1", { mentions: [] });
+    t.replier.noteActivity(topic);
+    await t.replier.considerInTopic(topic, TOPIC_RECENT);
+    assert.equal(t.requests.length, 1);
+    const [request] = t.requests;
+    assert.equal(request.thinking, false);
+    assert.equal(request.tools, undefined);
+    assert.match(request.system, /也不是在跟你说话/);
+    assert.match(request.system, /只能照抄群记忆里的原文/);
+    const content = request.messages[0].content;
+    assert.match(content, /群记忆：\n.*#3 测试环境数据库是 db-test-2\.internal/s);
+    assert.match(content, /话题里最近的消息：\n\[张三\] gateway 最近报错多吗\n\[机器人\] 最近一小时 132 次/);
+    assert.match(content, /新消息（没有 @ 你，也不是对你说的）：\[李四\] @王五 测试库地址是哪个来着$/);
+    // 不读群主界面的群聊
+    assert.doesNotMatch(content, /刚才的群聊/);
+    assert.equal(t.replies.length, 1);
+    assert.match(t.replies[0], /^om_1 测试环境数据库是 db-test-2\.internal（群记忆 #3）/);
+    // 当天第一次：说怎么关，话题里说「只在 @ 我时回」
+    assert.match(t.replies[0], /这个话题里不需要的话说「只在 @ 我时回」/);
+    assert.deepEqual(t.replied, ["om_1"]);
+    assert.match(t.logs.join("\n"), /主动接话：话题里接一句 chat=oc_1 message=om_1/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("话题里：没开主动接话的群、停了的群、群记忆是空的、@所有人、只是表态的，不问模型", async () => {
+  const t = await setup({ judge: "接：不该出现" });
+  try {
+    await t.replier.considerInTopic(topicMsg("om_1", { chatId: "oc_2" }), TOPIC_RECENT);
+    await t.replier.considerInTopic(topicMsg("om_2", { mentionAll: true }), TOPIC_RECENT);
+    await t.replier.considerInTopic(topicMsg("om_3", { content: "好的收到" }), TOPIC_RECENT);
+    // 群主界面的消息不走这里
+    await t.replier.considerInTopic(msg("om_4"), TOPIC_RECENT);
+    await t.replier.toggleIfAsked(msg("om_5", { mentionedBot: true, content: "别主动插话" }));
+    await t.replier.considerInTopic(topicMsg("om_6"), TOPIC_RECENT);
+    assert.equal(t.requests.length, 0);
+    assert.equal(t.replies.length, 1);
+    assert.match(t.replies[0], /^om_5 好的，这个群里我不主动接话了/);
+  } finally {
+    await t.cleanup();
+  }
+  const empty = await setup({ judge: "接：不该出现", noMemory: true });
+  try {
+    await empty.replier.considerInTopic(topicMsg("om_1"), TOPIC_RECENT);
+    assert.equal(empty.requests.length, 0);
+    assert.deepEqual(empty.replies, []);
+  } finally {
+    await empty.cleanup();
+  }
+});
+
+test("话题里：判断的这会儿话题里又有人说话了就不接（别的话题、群主界面的不算）", async () => {
+  let release!: (text: string) => void;
+  const t = await setup({ judge: () => new Promise<string>((resolve) => (release = resolve)) });
+  try {
+    const first = topicMsg("om_1");
+    t.replier.noteActivity(first);
+    const pending = t.replier.considerInTopic(first, TOPIC_RECENT);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.replier.noteActivity(topicMsg("om_2", { senderId: "ou_3", content: "db-test-2 啊", createTime: START + 2000 }));
+    release("接：测试环境数据库是 db-test-2.internal（群记忆 #3）");
+    await pending;
+    assert.deepEqual(t.replies, []);
+    assert.match(t.logs.join("\n"), /判断的这会儿话题里又有人说话了，这条不接 chat=oc_1 message=om_1/);
+
+    const second = topicMsg("om_3", { createTime: START + 3000 });
+    t.replier.noteActivity(second);
+    const again = t.replier.considerInTopic(second, TOPIC_RECENT);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.replier.noteActivity(msg("om_4", { senderId: "ou_3", createTime: START + 4000 }));
+    t.replier.noteActivity(topicMsg("om_5", { rootId: "om_other", threadId: "omt_9", createTime: START + 4000 }));
+    release("接：测试环境数据库是 db-test-2.internal（群记忆 #3）");
+    await again;
+    assert.equal(t.replies.length, 1);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("话题里和群主界面共用每小时回复的次数", async () => {
+  const t = await setup({ judge: "接：测试环境数据库是 db-test-2.internal（群记忆 #3）", maxPerHour: 1 });
+  try {
+    await t.replier.consider(msg("om_1"));
+    await t.replier.considerInTopic(topicMsg("om_2"), TOPIC_RECENT);
+    assert.equal(t.replies.length, 1);
+    assert.equal(t.requests.length, 1);
+    assert.match(t.logs.join("\n"), /这一小时已经主动回了 1 次/);
   } finally {
     await t.cleanup();
   }

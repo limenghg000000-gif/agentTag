@@ -4,7 +4,7 @@ import { DEFAULT_PROACTIVE_MAX_PER_HOUR } from "./config.js";
 import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
 import { JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
-import { type Logger, recentChat } from "./history.js";
+import { type Logger, recentChat, threadKeyOf } from "./history.js";
 import type { ChatModel } from "./llm.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 
@@ -23,9 +23,12 @@ const JUDGE_TIMEOUT_MS = 20_000;
 /** 去掉图片标记以后少于这么多字的不判断（「好」「ok」「👍」） */
 const MIN_CHARS = 4;
 
-/** 只是表个态的不判断 */
+/**
+ * 只是表个态的不判断（「好的收到」「收到，谢谢」「嗯嗯」这样连着说几个的也算）。
+ * 里面每一项只配一个词、不带 +：外面已经能重复，里外都重复时一长串「嗯嗯嗯…x」会让匹配慢到卡住
+ */
 const ACKNOWLEDGEMENT =
-  /^(?:好的?|好滴|好嘞|嗯+|哦+|噢+|收到|了解|明白了?|知道了|可以|行|ok|okay|谢谢(?:大家|你)?|感谢|多谢|辛苦了?|哈+|呵+|赞|👍+|🙏+|\[[^\]]{1,8}\])[!！。.~～\s]*$/i;
+  /^(?:(?:好的?|好滴|好嘞|嗯|哦|噢|收到|了解|明白了?|知道了|可以|行|ok|okay|谢谢(?:大家|你)?|感谢|多谢|辛苦了?|哈|呵|赞|👍|🙏|\[[^\]]{1,8}\])[!！。.~～,，、\s]*)+$/iu;
 
 /** @ 机器人说这些，这个群不再主动接话：「别主动插话」「不要主动说话」「不用主动回复了」（「只在 @ 我时回」这类也算，见 MUTE_COMMAND） */
 export const PAUSE_COMMAND = /^(?:别|不要|不用|停止|关掉)\s*主动\s*(?:插话|说话|回复|回答|回)了?[。.!！~～\s]*$/;
@@ -87,6 +90,8 @@ export class ProactiveReplier {
   private readonly latest = new Map<string, { messageId: string; at: number }>();
   /** 有人回复过的消息（话题里回、引用回）：有人接了就不接 */
   private readonly replied = new Set<string>();
+  /** 每个话题里最新一条人发的消息：话题里按群记忆接话时，判断的这会儿话题里有人说话了就不接 */
+  private readonly latestInTopic = new Map<string, { messageId: string; at: number }>();
   private readonly files = new FileQueue();
   private readonly logger: Logger;
   private readonly now: () => number;
@@ -126,10 +131,24 @@ export class ProactiveReplier {
       remember(this.replied, msg.rootId);
     }
     const at = msg.createTime || this.now();
+    if (inTopic(msg)) {
+      const key = threadKeyOf(msg);
+      const last = this.latestInTopic.get(key);
+      if (!last || at >= last.at) {
+        remember(this.latestInTopic, key, { messageId: msg.messageId, at });
+      }
+      return;
+    }
     const last = this.latest.get(msg.chatId);
-    if (!inTopic(msg) && (!last || at >= last.at)) {
+    if (!last || at >= last.at) {
       this.latest.set(msg.chatId, { messageId: msg.messageId, at });
     }
+  }
+
+  /** 话题里这条之后又有人说了话 */
+  private movedOnInTopic(msg: NormalizedMessage): boolean {
+    const last = this.latestInTopic.get(threadKeyOf(msg));
+    return last !== undefined && last.messageId !== msg.messageId && last.at > msg.createTime;
   }
 
   /** 这条之后群主界面又有人说了话，或者有人回复了这条 */
@@ -154,11 +173,30 @@ export class ProactiveReplier {
     if (msg.createTime && msg.createTime < (this.resumedAt.get(msg.chatId) ?? 0)) {
       return false;
     }
+    return this.worthJudging(msg);
+  }
+
+  /** 人发的、没 @ 别人、去掉图片还有几个字、不只是表个态 */
+  private worthJudging(msg: NormalizedMessage): boolean {
     if (!msg.senderId.startsWith("ou_") || msg.senderId === this.opts.botOpenId() || msg.mentions.length > 0) {
       return false;
     }
     const text = msg.content.replace(/!\[image\]\([^)]*\)/g, "").trim();
     return text.length >= MIN_CHARS && !ACKNOWLEDGEMENT.test(text);
+  }
+
+  /**
+   * 话题里这条没 @ 机器人的消息要不要按群记忆判断：主动接话的群里、真在话题里、打开以后说的、不是 @所有人，
+   * 其余和群主界面的一样（跟聊已经判断过不是对它说的）
+   */
+  private wantsInTopic(msg: NormalizedMessage): boolean {
+    if (msg.mentionedBot || msg.mentionAll || !inTopic(msg) || !this.active(msg.chatId)) {
+      return false;
+    }
+    if (msg.createTime && msg.createTime < (this.resumedAt.get(msg.chatId) ?? 0)) {
+      return false;
+    }
+    return this.worthJudging(msg);
   }
 
   /**
@@ -224,6 +262,60 @@ export class ProactiveReplier {
 
   /** 判断要不要接这条（调用前先用 wants 筛过），要接就在它下面开话题回一句 */
   async consider(msg: NormalizedMessage): Promise<void> {
+    await this.run(msg, {
+      where: "",
+      wanted: () => this.wants(msg),
+      judge: () => this.judge(msg),
+      // 话题里的原消息到了（勾了「同时发送到群」）：群里这份不接，话题里那份归跟聊
+      dropped: () => this.opts.superseded?.(msg) ?? false,
+      movedOn: () => this.movedOn(msg),
+      hint: "\n\n（没 @ 我，我看到了就接一句。不需要的话 @ 我说「别主动插话」。）",
+    });
+  }
+
+  /**
+   * 跟聊判断出来不是对机器人说的话题消息：答案就在群记忆里、一两句说得清时，在话题里接一句（Claude Tag 在话题里也会结合频道记忆）。
+   * 只在开了主动接话的群里，和群主界面的主动接话共用每小时判断、回复的次数；群记忆是空的不问模型。recent 是跟聊判断时读到的话题最近几条
+   */
+  async considerInTopic(msg: NormalizedMessage, recent: readonly string[]): Promise<void> {
+    if (!this.wantsInTopic(msg) || !this.opts.memory) {
+      return;
+    }
+    let memory: string;
+    try {
+      memory = renderMemoryForPrompt(await this.opts.memory.list(msg.chatId), JUDGE_MEMORY_CHARS).text;
+    } catch {
+      return;
+    }
+    if (!memory) {
+      return;
+    }
+    await this.run(msg, {
+      where: "话题里",
+      wanted: () => this.wantsInTopic(msg),
+      judge: () => this.judgeInTopic(msg, memory, recent),
+      dropped: () => false,
+      movedOn: () => this.movedOnInTopic(msg),
+      hint: "\n\n（没 @ 我，答案在群记忆里我就接一句。这个话题里不需要的话说「只在 @ 我时回」，整个群都不要就在群里 @ 我说「别主动插话」。）",
+    });
+  }
+
+  /** 判断、回一句：两种主动接话共用的上限、排队、判断完再看一眼 */
+  private async run(
+    msg: NormalizedMessage,
+    step: {
+      /** 写进日志：「」是群主界面，「话题里」是话题 */
+      where: string;
+      wanted: () => boolean;
+      judge: () => Promise<string | undefined>;
+      /** 判断完发现这条不该回了（群副本） */
+      dropped: () => boolean;
+      /** 判断的这会儿有人接了话 */
+      movedOn: () => boolean;
+      /** 当天第一次主动回时加在后面，说怎么关 */
+      hint: string;
+    },
+  ): Promise<void> {
     const chatId = msg.chatId;
     if (recent(this.replies, chatId, this.now()) >= this.maxPerHour) {
       this.logCap(chatId, `这一小时已经主动回了 ${this.maxPerHour} 次`);
@@ -242,11 +334,11 @@ export class ProactiveReplier {
     try {
       // 在判断队列里排着的这会儿可能有人说了「别主动插话」：轮到时再看一遍，停了就不再把这条发给模型
       const judged = await this.queue.run(() => {
-        if (!this.wants(msg)) {
+        if (!step.wanted()) {
           paused = true;
           return Promise.resolve(undefined);
         }
-        return this.judge(msg);
+        return step.judge();
       });
       if (paused) {
         unpush(this.judged, chatId, judgedAt);
@@ -263,14 +355,14 @@ export class ProactiveReplier {
       this.logger.warn(`主动接话：判断失败，这条不接 message=${msg.messageId}：${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    this.logger.info(`主动接话：${said ? "接一句" : "不接"} chat=${chatId} message=${msg.messageId} 用时=${this.now() - startedAt}ms`);
+    this.logger.info(`主动接话：${step.where}${said ? "接一句" : "不接"} chat=${chatId} message=${msg.messageId} 用时=${this.now() - startedAt}ms`);
     // 判断的这会儿可能有人说了「别主动插话」，或者别的消息先回了、到了上限，或者话题里的原消息到了
-    if (!said || !this.active(chatId) || recent(this.replies, chatId, this.now()) >= this.maxPerHour || this.opts.superseded?.(msg)) {
+    if (!said || !this.active(chatId) || recent(this.replies, chatId, this.now()) >= this.maxPerHour || step.dropped()) {
       return;
     }
-    // 判断的这会儿群里又有人说话、或者有人回了这条：可能已经有人接了，判断时没看到，不接
-    if (this.movedOn(msg)) {
-      this.logger.info(`主动接话：判断的这会儿群里又有人说话了，这条不接 chat=${chatId} message=${msg.messageId}`);
+    // 判断的这会儿又有人说话、或者有人回了这条：可能已经有人接了，判断时没看到，不接
+    if (step.movedOn()) {
+      this.logger.info(`主动接话：判断的这会儿${step.where || "群里"}又有人说话了，这条不接 chat=${chatId} message=${msg.messageId}`);
       return;
     }
     // 先占上这一次（几条同时判断完时不超过上限），发不出去再退回来
@@ -278,7 +370,7 @@ export class ProactiveReplier {
     push(this.replies, chatId, at);
     const today = new Date(at).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
     const hinting = this.hinted.get(chatId) !== today;
-    const hint = hinting ? "\n\n（没 @ 我，我看到了就接一句。不需要的话 @ 我说「别主动插话」。）" : "";
+    const hint = hinting ? step.hint : "";
     try {
       await this.opts.reply(msg, said + hint);
     } catch (err) {
@@ -323,12 +415,29 @@ export class ProactiveReplier {
       thinking: false,
       signal,
     });
-    const said = /^[\s*「"']*接\s*[:：]\s*([\s\S]+)$/.exec(result.text.trim())?.[1].trim();
-    if (!said) {
-      return undefined;
-    }
-    const line = said.replace(/</g, "＜").replace(/>/g, "＞");
-    return line.length <= REPLY_MAX_CHARS ? line : `${line.slice(0, REPLY_MAX_CHARS)}…`;
+    return saidLine(result.text);
+  }
+
+  /** 话题里的：只看群记忆和话题最近几条，只在答案就在群记忆里时接 */
+  private judgeInTopic(msg: NormalizedMessage, memory: string, recentLines: readonly string[]): Promise<string | undefined> {
+    return withDeadline(this.opts.judgeTimeoutMs ?? JUDGE_TIMEOUT_MS, async (signal) => {
+      const content = [
+        "群记忆：",
+        memory,
+        "",
+        "话题里最近的消息：",
+        ...(recentLines.length > 0 ? recentLines : ["（读不到）"]),
+        "",
+        `新消息（没有 @ 你，也不是对你说的）：[${msg.senderName || "群成员"}] ${clip(msg.content.trim())}`,
+      ].join("\n");
+      const result = await this.opts.model.chat({
+        system: topicJudgePrompt(this.opts.botName() || "机器人"),
+        messages: [{ role: "user", content }],
+        thinking: false,
+        signal,
+      });
+      return saidLine(result.text);
+    });
   }
 
   private logCap(chatId: string, reason: string): void {
@@ -376,6 +485,16 @@ function inTopic(msg: NormalizedMessage): boolean {
   return Boolean(msg.rootId && msg.threadId);
 }
 
+/** 模型回的「接：…」里要发的那句话（尖括号换成全角：不能变成 @所有人 这类标签），「不接」时返回 undefined */
+function saidLine(text: string): string | undefined {
+  const said = /^[\s*「"']*接\s*[:：]\s*([\s\S]+)$/.exec(text.trim())?.[1].trim();
+  if (!said) {
+    return undefined;
+  }
+  const line = said.replace(/</g, "＜").replace(/>/g, "＞");
+  return line.length <= REPLY_MAX_CHARS ? line : `${line.slice(0, REPLY_MAX_CHARS)}…`;
+}
+
 function clip(text: string): string {
   return text.length <= JUDGE_MESSAGE_CHARS ? text : `${text.slice(0, JUDGE_MESSAGE_CHARS)}…`;
 }
@@ -389,6 +508,17 @@ function judgePrompt(botName: string): string {
     "2. 有人明确说了一件你能帮上的事（查线上报错、看代码、整理文档、找以前定过的事），群里还没人接：用一句话问要不要你来，说清你会怎么帮。不要自己开始查，也不要先给结论。",
     "不接的：闲聊、表态、通知、转发、群成员之间已经在处理的事、意思不清楚的、你帮不上的。拿不准就不接。",
     "不能编：线上数据、代码位置、数字、结论只能照抄群记忆或刚才群聊里的原文；没有的话最多只问要不要帮忙。",
+    "只输出一行。不接就输出「不接」；接就输出「接：」加上要发的话，不超过 100 字。",
+  ].join("\n");
+}
+
+function topicJudgePrompt(botName: string): string {
+  return [
+    `你是飞书群里的机器人「${botName}」。你之前在这个话题里回答过问题。`,
+    "下面这条话题里的新消息没有 @ 你，也不是在跟你说话（群成员之间在聊）。判断要不要用群记忆接一句。大多数时候不接。",
+    "只在这种情况接：有人问了问题、在找一件事，或者说的和群记忆对不上，而答案就在下面的群记忆里，一两句话说得清：直接说，写明出处（「群记忆 #3」）。",
+    "不接的：群记忆里没有答案的、话题里已经有人答了的、闲聊、表态、群成员之间在分工商量的、意思不清楚的。拿不准就不接。",
+    "不能编：只能照抄群记忆里的原文，不加群记忆里没有的数据、结论，也不要说要帮忙查。",
     "只输出一行。不接就输出「不接」；接就输出「接：」加上要发的话，不超过 100 字。",
   ].join("\n");
 }

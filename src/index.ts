@@ -170,9 +170,12 @@ const follower = config.followThreads
       // 没 @ 的话不给改文档、改代码的工具：要改就 @ 机器人直接说
       handle: (msg) => handleMessage(msg, { unaddressed: true }),
       reply: replyInThread,
+      // 不是对它说的：开了主动接话的群里，答案在群记忆里时接一句
+      declined: (msg, recent) => proactive.considerInTopic(msg, recent),
     })
   : undefined;
-// 主动接话：PROACTIVE_CHAT_IDS 里的群，群主界面没 @ 的消息看情况接一句；接了以后那个话题交给跟聊
+// 主动接话：PROACTIVE_CHAT_IDS 里的群，群主界面没 @ 的消息看情况接一句；接了以后那个话题交给跟聊。
+// 跟着的话题里不是对它说的话，答案在群记忆里时也接一句
 const proactive = new ProactiveReplier({
   allowedChatIds: config.feishu.allowedChatIds,
   enabledChatIds: config.proactive.chatIds,

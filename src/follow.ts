@@ -46,6 +46,11 @@ export interface ThreadFollowerOptions {
   handle: (msg: NormalizedMessage) => Promise<void>;
   /** 在消息所在的话题里回一句 */
   reply: (msg: NormalizedMessage, markdown: string) => Promise<unknown>;
+  /**
+   * 判断出来不是对机器人说的（判断失败、超时的不算；机器人正在做这个话题里的事时也不交）：交给它看群记忆里有没有答案（见 ProactiveReplier.considerInTopic）。
+   * recent 是判断时读到的话题最近几条，省得再读一遍
+   */
+  declined?: (msg: NormalizedMessage, recent: readonly string[]) => Promise<void>;
   logger?: Logger;
   now?: () => number;
   /** 判断一条最多等多久（读话题上文加问模型），默认 20 秒 */
@@ -310,13 +315,14 @@ export class ThreadFollower {
     }
     const startedAt = this.now();
     let answer: boolean;
+    let recent: readonly string[];
     try {
       // 在全局判断队列里排着的这会儿也可能有人说了「只在 @ 我时回」「停止」：轮到时再看一遍，不再把这条发给模型
       let dropped = false;
       const judged = await this.queue.run(() => {
         if (this.cancelled(key, order) || !this.wants(msg)) {
           dropped = true;
-          return Promise.resolve(false);
+          return Promise.resolve({ yes: false, recent: [] });
         }
         return this.judge(msg, busy);
       });
@@ -328,7 +334,8 @@ export class ThreadFollower {
         this.logger.warn(`跟聊：要判断的消息太多（${this.queue.load}），这条不判断、不回 message=${msg.messageId}`);
         return undefined;
       }
-      answer = judged.value;
+      answer = judged.value.yes;
+      recent = judged.value.recent;
     } catch (err) {
       // 拿不准就不回：判断失败时宁可漏回一句，也不在别人说话时插嘴
       this.logger.warn(`跟聊：判断失败，这条不回 message=${msg.messageId}：${err instanceof Error ? err.message : String(err)}`);
@@ -338,12 +345,13 @@ export class ThreadFollower {
       `跟聊：没 @ 的话题消息${answer ? "是对机器人说的，接着回" : "不是对机器人说的，不回"} chat=${msg.chatId} thread=${msg.rootId} ` +
         `message=${msg.messageId} 用时=${this.now() - startedAt}ms`,
     );
-    if (!answer) {
-      return undefined;
-    }
     if (this.cancelled(key, order)) {
       this.logger.info(`跟聊：判断的这会儿话题里有人 @ 机器人说了停止或只在 @ 时回，这条不接着回 message=${msg.messageId}`);
       return undefined;
+    }
+    if (!answer) {
+      // 不是对它说的：开了主动接话的群里再看看答案在不在群记忆里。不挡话题里后面的消息判断，也不算机器人回答过
+      return !busy && this.opts.declined ? { done: this.opts.declined(msg, recent) } : undefined;
     }
     this.track(msg);
     return { done: this.opts.handle(msg) };
@@ -354,11 +362,11 @@ export class ThreadFollower {
   }
 
   /** 读话题上文也算在时限里：飞书接口卡住时，这条判断照样按时结束，不一直占着判断的名额、挡着话题里后面的消息 */
-  private judge(msg: NormalizedMessage, busy: boolean): Promise<boolean> {
+  private judge(msg: NormalizedMessage, busy: boolean): Promise<{ yes: boolean; recent: string[] }> {
     return withDeadline(this.opts.judgeTimeoutMs ?? JUDGE_TIMEOUT_MS, (signal) => this.judgeWithin(msg, busy, signal));
   }
 
-  private async judgeWithin(msg: NormalizedMessage, busy: boolean, signal: AbortSignal): Promise<boolean> {
+  private async judgeWithin(msg: NormalizedMessage, busy: boolean, signal: AbortSignal): Promise<{ yes: boolean; recent: string[] }> {
     const context = await this.opts.context.load(msg);
     const recent = context.history.slice(-JUDGE_MESSAGES).map((m) => {
       const text = m.role === "assistant" ? `[机器人] ${m.content}` : m.content;
@@ -379,7 +387,7 @@ export class ThreadFollower {
       thinking: false,
       signal,
     });
-    return /^[「"'*\s]*是/.test(result.text);
+    return { yes: /^[「"'*\s]*是/.test(result.text), recent };
   }
 }
 
