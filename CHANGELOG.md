@@ -6,6 +6,13 @@ AgentTag 每个版本在技术上改了什么，写给开发和维护机器人�
 
 每个版本按这几类分：**新增**（新功能、新配置项）、**改进**（原有功能的行为变了）、**修复**（修好的问题）、**安全**（权限、转义、校验这类）。部署要注意的（要开的飞书权限、要改的 `.env`）写在对应条目里。
 
+## [0.16.1] - 2026-10-16
+
+### 改进
+
+- 部署改成自动的：GitHub Actions（`.github/workflows/ci.yml`）每个 PR 和 main 都跑类型检查、`npm test`、构建；main 都过了，把这一版推到公司 GitLab（仓库变量 `GITLAB_REPO_URL` 和密钥 `GITLAB_PUSH_TOKEN` 都配了才推，只往后加不强推，推不上重试 3 次）。GitLab 上的 `.gitlab-ci.yml` 只给 master 建流水线，在机器人服务器上标签 `agenttag-ecs` 的 shell Runner 里先测试，再跑 `deploy/deploy.sh`：切到这次的提交（只往前），`package-lock.json` 里的依赖变了才 `npm ci`，构建，重启 `agenttag-feishu`，120 秒内等到「飞书长连接已建立，版本 X」才算上线；构建没过不重启，启动等不到就切回上一版再重启，两种都让流水线标红。部署后服务器上的代码停在部署的那个提交上（`git status` 显示 detached）。部署要先做一次性设置：GitLab 项目令牌（Maintainer，只给 `write_repository`）放进 GitHub 的 Secrets，服务器上用 `deploy/install-runner.sh` 把 Runner 装成同一用户的 systemd 服务，Runner 设成受保护、不跑没打标签的作业，步骤见 `deploy/README.md`。（#63）
+- 读网页时请求头的 User-Agent 改成 `Mozilla/5.0 (compatible; AgentTag/版本号)`，不再带代码仓库地址。（#63）
+
 ## [0.16.0] - 2026-10-16
 
 ### 新增

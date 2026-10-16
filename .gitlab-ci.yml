@@ -1,0 +1,46 @@
+# 公司 GitLab（ai/agent-tag）上的流水线。
+# 代码在 GitHub 上评审、合并，合并后 GitHub 那边把 main 推到这里的 master（见 .github/workflows/ci.yml），
+# 这里在机器人服务器上的 GitLab Runner 里先跑测试，过了再更新服务器上的代码、构建、重启、核对启动日志。
+# Runner 怎么装见 deploy/README.md。
+#
+# 只给 master 建流水线：机器人自己推的分支、合并请求都不跑，没评审过的代码不会在服务器上执行。
+# Runner 还要设成「受保护」，只接受保护分支的任务，两道一起拦。
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web")'
+    - when: never
+
+stages:
+  - test
+  - deploy
+
+default:
+  tags:
+    - agenttag-ecs
+
+variables:
+  NPM_REGISTRY: https://registry.npmmirror.com
+
+# 在 Runner 自己的目录里装依赖、跑测试，不碰正在跑的机器人
+test:
+  stage: test
+  timeout: 20m
+  cache:
+    key: npm
+    paths:
+      - .npm/
+  script:
+    - npm ci --cache .npm --prefer-offline --no-audit --no-fund --registry="$NPM_REGISTRY"
+    - npm run typecheck
+    - npm test
+
+# 更新 ~/agentTag 到这次的提交、构建、重启；起不来自动退回上一版。一次只跑一个
+deploy:
+  stage: deploy
+  timeout: 20m
+  resource_group: agenttag-server
+  environment:
+    name: production
+  script:
+    - bash deploy/deploy.sh
