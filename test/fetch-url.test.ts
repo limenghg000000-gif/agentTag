@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
 import { gzipSync } from "node:zlib";
 import { createFetchUrlTool, htmlToText, isPublicAddress } from "../src/tools/fetch-url.js";
+import { VERSION } from "../src/version.js";
 
 const GBK_NIHAO = Buffer.from([0xc4, 0xe3, 0xba, 0xc3]); // 「你好」的 GBK 编码
 
@@ -28,6 +29,10 @@ const server = createServer((req, res) => {
       res.statusCode = 302;
       res.setHeader("location", "/page");
       res.end();
+      return;
+    case "/ua":
+      res.setHeader("content-type", "text/plain; charset=utf-8");
+      res.end(`UA=${req.headers["user-agent"] ?? ""}`);
       return;
     case "/image":
       res.setHeader("content-type", "image/png");
@@ -60,6 +65,13 @@ test("按网页声明的编码解码，支持 gzip，跟随重定向", async () 
   assert.match(await local.run({ url: `${base}/gbk` }, ctx), /你好/);
   assert.match(await local.run({ url: `${base}/gzip` }, ctx), /压缩过的文本/);
   assert.match(await local.run({ url: `${base}/redirect` }, ctx), /网址：.*\/page\n标题：测试页/);
+});
+
+test("请求头里的 User-Agent 只有名字和版本，不带代码仓库地址", async () => {
+  const output = await local.run({ url: `${base}/ua` }, ctx);
+  const ua = /^UA=(.*)$/m.exec(output)?.[1];
+  assert.equal(ua, `Mozilla/5.0 (compatible; AgentTag/${VERSION})`);
+  assert.doesNotMatch(ua, /github|gitlab|https?:/i);
 });
 
 test("非文本内容、HTTP 错误和不合法的网址报错", async () => {

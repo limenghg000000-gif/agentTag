@@ -1349,7 +1349,7 @@ test("之前开的合并请求合并了或关掉了：新改动另开一个，�
   // 真的合进 uat（合并提交），之后改同一行：只试合进去以后的新改动，不会和已经在 uat 上的那份冲突
   await runGit(["fetch", "-q", "--unshallow", "origin", "+refs/heads/uat:refs/remotes/origin/uat", "+refs/heads/fix/c:refs/remotes/origin/fix/c"], { cwd: ws3.dir });
   const tree = (await runGit(["merge-tree", "--write-tree", "refs/remotes/origin/uat", "refs/remotes/origin/fix/c"], { cwd: ws3.dir })).stdout.trim();
-  const merge = (await runGit(["commit-tree", tree, "-p", "refs/remotes/origin/uat", "-p", "refs/remotes/origin/fix/c", "-m", "Merge fix/c into uat"], { cwd: ws3.dir })).stdout.trim();
+  const merge = (await runGit(["commit-tree", tree, "-p", "refs/remotes/origin/uat", "-p", "refs/remotes/origin/fix/c", "-m", "Merge fix/c into uat"], { cwd: ws3.dir, env: author })).stdout.trim();
   await runGit(["push", "-q", "origin", `${merge}:refs/heads/uat`], { cwd: ws3.dir });
   states[6] = "merged";
   await ws3.editFile("c.txt", "c\n", "cc\n");
@@ -1932,7 +1932,7 @@ test("开到 uat 前把改动放到 uat 上编一下：编不过不推；编过�
   // 编过以后 uat 又进了别的提交：编的不是现在的 uat 了，要看流水线
   await runGit(["fetch", "-q", "origin", "+refs/heads/uat:refs/remotes/origin/uat"], { cwd: ws.dir });
   const tree = (await runGit(["rev-parse", "refs/remotes/origin/uat^{tree}"], { cwd: ws.dir })).stdout.trim();
-  const moved = (await runGit(["commit-tree", tree, "-p", "refs/remotes/origin/uat", "-m", "别人合进 uat"], { cwd: ws.dir })).stdout.trim();
+  const moved = (await runGit(["commit-tree", tree, "-p", "refs/remotes/origin/uat", "-m", "别人合进 uat"], { cwd: ws.dir, env: author })).stdout.trim();
   await runGit(["push", "-q", "origin", `${moved}:refs/heads/uat`], { cwd: ws.dir });
   await ws.mergeRequest(pr.number);
   assert.deepEqual(merged.at(-1), { number: pr.number, requirePipeline: true });

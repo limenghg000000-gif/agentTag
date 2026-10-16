@@ -1,0 +1,77 @@
+# 每个 PR 和 main 上自动跑类型检查、单元测试、构建。
+# main 上都过了，再把这一版推到公司 GitLab（ai/agent-tag 的 master），那边的流水线负责部署到服务器，见 .gitlab-ci.yml 和 deploy/README.md。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # 手动重跑一次（比如刚配好 GitLab 的变量和令牌，不想等下一次合并）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # 环境 gitlab-sync 里的变量 GITLAB_REPO_URL（GitLab 项目的 https 地址，以 .git 结尾）和密钥 GITLAB_PUSH_TOKEN（那个项目的项目令牌）都配了才推，没配就跳过。
+  # 令牌放在环境里、环境只允许 main 用：别的分支改了这个文件也拿不到令牌（能往 GitLab master 推就能在服务器上执行命令）
+  sync-gitlab:
+    needs: test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    environment: gitlab-sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 一次只推一个，按合并的先后推
+    concurrency:
+      group: sync-gitlab
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 推到 GitLab
+        env:
+          GITLAB_REPO_URL: ${{ vars.GITLAB_REPO_URL }}
+          GITLAB_PUSH_TOKEN: ${{ secrets.GITLAB_PUSH_TOKEN }}
+        run: |
+          if [ -z "$GITLAB_REPO_URL" ] || [ -z "$GITLAB_PUSH_TOKEN" ]; then
+            echo "::notice::环境 gitlab-sync 里没配变量 GITLAB_REPO_URL 或密钥 GITLAB_PUSH_TOKEN，这次不推到 GitLab"
+            exit 0
+          fi
+          case "$GITLAB_REPO_URL" in
+            https://*@*) echo "::error::GITLAB_REPO_URL 里不要带用户名和令牌，令牌放密钥 GITLAB_PUSH_TOKEN"; exit 1 ;;
+            https://*) ;;
+            *) echo "::error::GITLAB_REPO_URL 要写 https 地址"; exit 1 ;;
+          esac
+          auth=$(printf 'oauth2:%s' "$GITLAB_PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          gitlab() { git -c http.extraHeader="Authorization: Basic $auth" "$@"; }
+          # 只往后加，从不强推：GitLab 上有人直接合了东西、和这边对不上时这一步会失败，要人来看。
+          # 只推 master：GitLab 流水线和部署脚本都只认 master。
+          for i in 1 2 3; do
+            # 两次合并挨得近时，后合并的那次可能先推上去了：GitLab 的 master 已经包含这次的提交，就算推过了
+            if gitlab fetch --quiet --no-tags "$GITLAB_REPO_URL" refs/heads/master && git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "GitLab 的 master 上已经有这次的提交（后合并的那次先推了），不用再推"
+              exit 0
+            fi
+            if gitlab push "$GITLAB_REPO_URL" "$GITHUB_SHA:refs/heads/master"; then
+              exit 0
+            fi
+            echo "推送失败，$((i * 15)) 秒后重试"
+            sleep $((i * 15))
+          done
+          exit 1
