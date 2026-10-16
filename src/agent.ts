@@ -296,7 +296,8 @@ function safeDescribe(tool: Tool, args: Record<string, unknown>): string {
   }
 }
 
-function truncate(text: string, limit: number): string {
+/** 工具结果交给模型前截短：后面写明省略了多少字。之前查到的结果（topic_earlier_results）存的也是截短后这一版 */
+export function truncate(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit)}\n\n（内容过长，后面 ${text.length - limit} 字已省略）`;
 }
 

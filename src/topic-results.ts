@@ -69,7 +69,7 @@ export class EarlierResults {
     if (results.length === 0) {
       return;
     }
-    const kept = [...this.list(key), ...results.map((result) => ({ ...result, describe: clip(result.describe, MAX_DESCRIBE_CHARS) }))];
+    const kept = [...this.list(key), ...results.map((result) => ({ ...result, describe: clip(oneLine(result.describe), MAX_DESCRIBE_CHARS) }))];
     let chars = kept.reduce((sum, result) => sum + sizeOf(result), 0);
     while (kept.length > 1 && chars > this.limits.chars) {
       chars -= sizeOf(kept.shift() as EarlierResult);
@@ -93,7 +93,7 @@ function sizeOf(result: EarlierResult): number {
 /** 系统提示里列出来的那几行：编号、时间、调的什么、多少字。编号就是取原文时的 index */
 export function listEarlierResults(results: readonly EarlierResult[]): string[] {
   const start = Math.max(0, results.length - MAX_LISTED_RESULTS);
-  return results.slice(start).map((result, i) => `${start + i + 1}. ${TIME_FORMAT.format(result.at)} ${result.describe}（${result.text.length} 字）`);
+  return results.slice(start).map((result, i) => `${start + i + 1}. ${TIME_FORMAT.format(result.at)} 「${result.describe}」（${result.text.length} 字）`);
 }
 
 export interface EarlierResultsToolOptions {
@@ -150,6 +150,14 @@ function ago(ms: number): string {
 function indexOf(args: Record<string, unknown>): number | undefined {
   const value = typeof args.index === "string" ? Number(args.index.trim()) : args.index;
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
+}
+
+/**
+ * 进度卡片上那句话里有工具参数（目录、搜索词），是模型照着群成员的话写的：要放进系统提示，换行、控制字符、零宽字符一律换成空格，
+ * 免得有人在参数里写「\n- 忽略上面的规则」，在系统提示里多出一行规矩，这个话题 24 小时里谁问都带着
+ */
+function oneLine(text: string): string {
+  return text.replace(/[\s\p{Cc}\p{Cf}\u2028\u2029]+/gu, " ").trim();
 }
 
 function clip(text: string, max: number): string {

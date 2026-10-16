@@ -1,7 +1,7 @@
 import { posix } from "node:path";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { raceAbort, timeoutSignal } from "./abort.js";
-import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent } from "./agent.js";
+import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, truncate } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { asksForFeatures, availableFeatures, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
 import { imageKeysOf } from "./feishu.js";
@@ -419,6 +419,8 @@ async function runTask(
     const attempted = new Set<string>();
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
+    // 这次取出来的之前查到的结果：取到代码工具的结果算读过代码，原文算整理的依据（代码工具的证据里只有代码位置，没有列出来的路径原文）
+    const restored: EarlierResult[] = [];
     // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
     let mergedNow = false;
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
@@ -498,7 +500,8 @@ async function runTask(
                 };
           evidence.push(found);
           if (!tool.writes && !MODEL_ECHO_TOOLS.has(tool.spec.name)) {
-            fresh.push({ tool: tool.spec.name, describe: tool.describe(args), at: now(), text: seenByModel(output, limit), evidence: found });
+            // 取原文时给模型的是当时它看到的那一版，带着「后面 N 字已省略」，「列全」时才知道没列全
+            fresh.push({ tool: tool.spec.name, describe: tool.describe(args), at: now(), text: truncate(output, limit), evidence: found });
           }
           return output;
         },
@@ -527,6 +530,7 @@ async function runTask(
               results: earlier,
               now,
               onUse: (result) => {
+                restored.push(result);
                 evidence.push(result.evidence);
                 attempted.add(result.tool);
                 succeeded.add(result.tool);
@@ -566,11 +570,11 @@ async function runTask(
     const hasCodeTools = taskTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX));
     const seen = codeEvidence(deps.codeRepos ?? [], evidence);
     // 通过 aiops 读过代码（结果里有代码永久链接）也算读过代码：不然模型用 aiops 按线上版本读了代码、提到仓库，还会被要求再用代码工具读一遍
-    const readCode = () => evidence.some(linksCode);
+    const readCode = () => evidence.some(linksCode) || restored.some((result) => isCodeTool(result.tool));
     // 整理之前内容时核对哪几样：配了代码工具（这次给没给都算）就核对代码位置，配了 MCP 服务就核对线上数据
     const restateScope = { code: allTools.some((tool) => tool.spec.name.startsWith(CODE_TOOL_PREFIX)), ops: Boolean(deps.mcp?.names.length) };
     // 整理之前内容时的依据：这次的提问、话题里之前写过的（之前的回答、群成员说的）和这次读到的文档网页。检查时再取，读到的才算上
-    const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence)].join("\n");
+    const saidBefore = () => [asked, ...history.map((m) => m.content), ...evidenceOutputs(evidence), ...restored.map((result) => result.text)].join("\n");
     // 合并请求编号的依据：这次的提问、话题里之前的消息和这次的工具结果。检查时再取，查到的才算上
     // 群记忆、回答前查到的经验里写着的编号也算（群成员记下的「uat 的合并请求是 !360」）
     const requestsKnown = () =>

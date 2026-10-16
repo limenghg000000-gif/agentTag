@@ -4502,7 +4502,7 @@ test("查完日志的回答没列链接，追问「把链接发出来」：按�
   assert.ok(followUp.tools?.some((t) => t.name === "topic_earlier_results"));
   assert.match(followUp.system, /这个话题之前查到过下面这些结果/);
   // 只列查到的数据，记忆这类模型自己写的不算
-  assert.match(followUp.system, /\n  1\. \S+ \d{2}:\d{2} aiops · 查日志 商品不在推广中（\d+ 字）/);
+  assert.match(followUp.system, /\n  1\. \S+ \d{2}:\d{2} 「aiops · 查日志 商品不在推广中」（\d+ 字）/);
   assert.doesNotMatch(followUp.system, /\n  2\. /);
   assert.match(String(requests[3].messages.at(-1)?.content), /topic_earlier_results 按编号取之前查到的原文/);
   const fetched = requests[4].messages.find((m) => m.role === "tool")?.content ?? "";
@@ -4585,5 +4585,64 @@ test("「把查到的链接整理一下发出来」：按整理走，从之前�
   assert.equal(queries.length, 1);
   assert.match(requests[2].system, /这次是让你整理话题里已经有的内容/);
   assert.deepEqual(requests[2].tools?.map((t) => t.name), ["memory_search", "topic_earlier_results"]);
+  assert.equal(markdowns(sent).at(-1), listed);
+});
+
+test("之前查到的结果被截短过：取原文时带着「后面 N 字已省略」，「列全」时知道没列全", async () => {
+  const long: Tool = {
+    ...namedTool("aiops_query_logs"),
+    maxOutputChars: 40,
+    run: async () => `${NOT_PROMOTED_LOGS}\n${"12:58:00 debug materialId=https://u.jd.com/more msg=商品不在推广中\n".repeat(5)}`,
+  };
+  const { requests, handle } = earlierSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] },
+      { text: FIRST_ANSWER, finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [earlierCall("c2", 1)] },
+      { text: "只取到前面一段", finish: "stop" },
+    ],
+    { mcp: { names: ["aiops"], tools: () => [long], prompt: () => undefined } },
+  );
+  await handle(message("给我查一下转链日志", { messageId: "om_1" }));
+  await handle(message("列全", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  const fetched = requests[3].messages.find((m) => m.role === "tool")?.content ?? "";
+  assert.match(fetched, /（内容过长，后面 \d+ 字已省略）$/);
+});
+
+/** 代码工具查到的：之前那次搜到的文件，追问时取出来照着说 */
+function earlierCodeSetup(results: ChatResult[], history: ChatMessage[] = []) {
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const search: Tool = { ...namedTool("code_search"), run: async () => "services/goods/jingdong.go:1319: func (t *JingDong) ConvertLink(strUrl string)" };
+  const result = setup({ model, taskTools: () => [search], codeRepos: ["golang/appservice"], context: fakeContext({ history, source: "feishu" }).source });
+  return { ...result, requests };
+}
+
+test("取出来的是代码工具之前查到的：算读过代码，回答提到仓库不会被当成没读代码打回", async () => {
+  const answer = "golang/appservice 里刚才那次搜到 1 处，就是 ConvertLink 那个函数。";
+  const { requests, sent, handle } = earlierCodeSetup([
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: JSON.stringify({ query: "ConvertLink" }) }] },
+    { text: "搜到了转链入口", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [earlierCall("c2", 1)] },
+    { text: answer, finish: "stop" },
+  ]);
+  await handle(message("看看转链入口在哪", { messageId: "om_1" }));
+  await handle(message("刚才搜到的是哪个函数", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  assert.equal(requests.length, 4, "没有打回重做");
+  assert.equal(markdowns(sent).at(-1), answer);
+});
+
+test("整理时从之前代码工具的结果里取路径和行号：整理的检查认取到的原文", async () => {
+  const listed = "整理一下：转链入口在 services/goods/jingdong.go:1319。";
+  const { sent, handle } = earlierCodeSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_search", arguments: JSON.stringify({ query: "ConvertLink" }) }] },
+      { text: "搜到了转链入口", finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [earlierCall("c2", 1)] },
+      { text: listed, finish: "stop" },
+    ],
+    [{ role: "assistant", content: "搜到了转链入口" }],
+  );
+  await handle(message("看看转链入口在哪", { messageId: "om_1" }));
+  await handle(message("把刚才的结果整理一下发出来", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
   assert.equal(markdowns(sent).at(-1), listed);
 });
