@@ -4451,3 +4451,139 @@ test("打回以后还是写了查不到的合并请求编号：不发出去", as
   assert.deepEqual(markdowns(sent), [blockedRequestAnswer(["!356"])]);
   assert.match(warnings.join("\n"), /回答打回重做以后还是写了查不到的合并请求编号，没有发出 message=om_1：!356/);
 });
+
+/** 2026-10-16 测试群：「找一下查不到 cps 商品的京东链接」查完只给了结论，追问「不在推广中的链接发出来」时又把日志查了一遍 */
+const NOT_PROMOTED_LOGS =
+  "11:59:36 debug materialId=https://3.cn/37p41-Ig?jkl=@G8nDlB3GcH@ user_id=2372982 msg=商品不在推广中\n" +
+  "12:57:15 debug materialId=https://u.jd.com/FGRs5E6 user_id=1756222 msg=商品不在推广中";
+
+function earlierSetup(results: ChatResult[], overrides: Partial<BotDeps> = {}) {
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const queries: string[] = [];
+  const queryLogs: Tool = {
+    ...namedTool("aiops_query_logs"),
+    describe: (args) => `aiops · 查日志 ${String(args.query ?? "")}`,
+    run: async (args) => {
+      queries.push(String(args.query));
+      return NOT_PROMOTED_LOGS;
+    },
+  };
+  const memorySearch: Tool = { ...namedTool("memory_search"), run: async () => "#1 转链问题找开发看" };
+  const result = setup({
+    model,
+    taskTools: () => [memorySearch],
+    mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined },
+    ...overrides,
+  });
+  return { ...result, requests, queries };
+}
+
+const queryCall = (id: string) => ({ id, name: "aiops_query_logs", arguments: JSON.stringify({ query: "商品不在推广中" }) });
+const earlierCall = (id: string, index: number) => ({ id, name: "topic_earlier_results", arguments: JSON.stringify({ index }) });
+const FIRST_ANSWER = "这批失败都是京东联盟返回 2001104 商品不在推广中，不是我们转链的问题。";
+
+test("查完日志的回答没列链接，追问「把链接发出来」：按编号取上次查到的原文回答，不重新查日志，也不被打回", async () => {
+  const listed = "11:59 那次查到的：https://3.cn/37p41-Ig?jkl=@G8nDlB3GcH@（11:59:36）、https://u.jd.com/FGRs5E6（12:57:15）";
+  const { requests, sent, updates, queries, handle } = earlierSetup([
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c1"), { id: "c2", name: "memory_search", arguments: "{}" }] },
+    { text: FIRST_ANSWER, finish: "stop" },
+    // 追问：第一轮照着上文直接写了时间（没查），打回时告诉它可以取之前查到的原文
+    { text: "11:59:36 那条就是", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [earlierCall("c3", 1)] },
+    { text: listed, finish: "stop" },
+  ]);
+  await handle(message("给我查一下转链日志，找一下查不到cps商品的京东链接", { messageId: "om_1" }));
+  assert.equal(queries.length, 1);
+  assert.ok(!requests[0].tools?.some((t) => t.name === "topic_earlier_results"), "第一次问时这个话题还没有查到过的结果");
+
+  await handle(message("不在推广中的链接发出来", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  assert.equal(queries.length, 1, "追问没有重新查日志");
+  const followUp = requests[2];
+  assert.ok(followUp.tools?.some((t) => t.name === "topic_earlier_results"));
+  assert.match(followUp.system, /这个话题之前查到过下面这些结果/);
+  // 只列查到的数据，记忆这类模型自己写的不算
+  assert.match(followUp.system, /\n  1\. \S+ \d{2}:\d{2} aiops · 查日志 商品不在推广中（\d+ 字）/);
+  assert.doesNotMatch(followUp.system, /\n  2\. /);
+  assert.match(String(requests[3].messages.at(-1)?.content), /topic_earlier_results 按编号取之前查到的原文/);
+  const fetched = requests[4].messages.find((m) => m.role === "tool")?.content ?? "";
+  assert.match(fetched, /^第 1 条：.*查到的，当时调的是「aiops · 查日志 商品不在推广中」/);
+  assert.ok(fetched.includes(NOT_PROMOTED_LOGS));
+  assert.equal(markdowns(sent).at(-1), listed);
+  assert.match(cardText(updates.at(-1)!.card), /看之前查到的第 1 条结果/);
+});
+
+test("之前查到的结果：没有的编号如实说明；整理之前内容时也给，点按钮问的、别的话题不给", async () => {
+  const { requests, handle } = earlierSetup([
+    { text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] },
+    { text: FIRST_ANSWER, finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [earlierCall("c2", 3)] },
+    { text: "只有一条", finish: "stop" },
+    { text: "好", finish: "stop" },
+    { text: "好", finish: "stop" },
+    { text: "好", finish: "stop" },
+  ], { context: fakeContext({ history: [{ role: "assistant", content: FIRST_ANSWER }], source: "feishu" }).source });
+  await handle(message("给我查一下转链日志", { messageId: "om_1" }));
+  await handle(message("第三条的详情", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  assert.match(requests[3].messages.find((m) => m.role === "tool")?.content ?? "", /没有这一条：之前查到的结果编号是 1～1/);
+
+  const offered = (i: number) => requests[i].tools?.some((t) => t.name === "topic_earlier_results") ?? false;
+  await handle(message("jkl 相关最近提交", { messageId: "om_3", rootId: "om_1", threadId: "omt_1" }), { readOnly: true });
+  assert.equal(offered(4), false, "按钮上的话是接着要查的新问题");
+  assert.doesNotMatch(requests[4].system, /这个话题之前查到过/);
+  await handle(message("用大白话总结一下", { messageId: "om_4", rootId: "om_1", threadId: "omt_1" }));
+  assert.match(requests[5].system, /这次是让你整理话题里已经有的内容/);
+  assert.equal(offered(5), true, "之前的回答里没写的，整理时也能取之前查到的原文");
+  assert.match(requests[5].system, /要的东西之前的回答里没写、但之前查到过（比如链接、报错原文），用 topic_earlier_results 按编号取原文照着写/);
+  await handle(message("别的服务有没有报错", { messageId: "om_5" }));
+  assert.equal(offered(6), false, "别的话题看不到");
+});
+
+test("停止了也记下已经查到的结果，接着问时用得上", async () => {
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  const requests: ChatRequest[] = [];
+  const model: ChatModel = {
+    model: "fake",
+    chat: (req) => {
+      requests.push(req);
+      if (requests.length === 1) {
+        return Promise.resolve({ text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] });
+      }
+      if (requests.length === 2) {
+        // 查完日志、第二轮还在想的时候点了停止
+        return new Promise((_, reject) => {
+          started();
+          req.signal?.addEventListener("abort", () => reject(req.signal?.reason), { once: true });
+        });
+      }
+      return Promise.resolve({ text: "好", finish: "stop" });
+    },
+  };
+  const { handle, queries } = earlierSetup([], { model });
+  const first = handle(message("给我查一下转链日志", { messageId: "om_1" }));
+  await running;
+  await handle(message("停止", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  await first;
+  await handle(message("链接发出来", { messageId: "om_3", rootId: "om_1", threadId: "omt_1" }));
+  assert.equal(queries.length, 1);
+  assert.ok(requests.at(-1)!.tools?.some((t) => t.name === "topic_earlier_results"));
+});
+
+test("「把查到的链接整理一下发出来」：按整理走，从之前查到的原文里取链接和时间，整理的检查认这些", async () => {
+  const listed = "整理好了，11:59 那次查到的：https://3.cn/37p41-Ig?jkl=@G8nDlB3GcH@（11:59:36）、https://u.jd.com/FGRs5E6（12:57:15）";
+  const { requests, sent, queries, handle } = earlierSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] },
+      { text: FIRST_ANSWER, finish: "stop" },
+      { text: "", finish: "tool_calls", toolCalls: [earlierCall("c2", 1)] },
+      { text: listed, finish: "stop" },
+    ],
+    { context: fakeContext({ history: [{ role: "assistant", content: FIRST_ANSWER }], source: "feishu" }).source },
+  );
+  await handle(message("给我查一下转链日志，找一下查不到cps商品的京东链接", { messageId: "om_1" }));
+  await handle(message("把查到的链接整理一下发出来", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  assert.equal(queries.length, 1);
+  assert.match(requests[2].system, /这次是让你整理话题里已经有的内容/);
+  assert.deepEqual(requests[2].tools?.map((t) => t.name), ["memory_search", "topic_earlier_results"]);
+  assert.equal(markdowns(sent).at(-1), listed);
+});
