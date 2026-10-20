@@ -11,7 +11,7 @@ import { FEATURES_FILE, loadConfig, RELEASE_NOTES_FILE } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { createFeishuApi } from "./feishu.js";
-import { ThreadFollower } from "./follow.js";
+import { JUDGE_MEMORY_CHARS, ThreadFollower } from "./follow.js";
 import { createFollowUp } from "./follow-up.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
@@ -23,7 +23,7 @@ import { createOpenAICompatibleEmbedder, createOpenAICompatibleModel, createOpen
 import { McpHub } from "./mcp.js";
 import { createNameLookup } from "./operator-names.js";
 import type { AboutBot } from "./prompt.js";
-import { MemoryStore } from "./memory.js";
+import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import { ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
 import { createBuildChecker } from "./build.js";
@@ -171,8 +171,10 @@ const follower = config.followThreads
       // 没 @ 的话不给改文档、改代码的工具：要改就 @ 机器人直接说
       handle: (msg) => handleMessage(msg, { unaddressed: true }),
       reply: replyInThread,
-      // 不是对它说的：开了主动接话的群里，答案在群记忆里时接一句
-      declined: (msg, recent) => proactive.considerInTopic(msg, recent),
+      // 判断时带上群记忆：群里定的规矩（哪类消息不用 @ 也要回）、答案都在里面
+      memory: (chatId) => memory.list(chatId).then((entries) => renderMemoryForPrompt(entries, JUDGE_MEMORY_CHARS).text),
+      // 不是对它说的、答案在群记忆里：开了主动接话的群里，再想一遍、核对出处后接一句
+      chimeIn: { active: (chatId) => proactive.active(chatId), speak: (msg, ask, said) => proactive.speakInTopic(msg, ask, said) },
       // 跟着的、静音的话题记在文件里：部署重启后，回答过的话题里接着问照样不用 @
       stateFile: config.followStateFile,
     })
@@ -190,6 +192,11 @@ const proactive = new ProactiveReplier({
   botName: () => channel.botIdentity?.name,
   botOpenId: () => channel.botIdentity?.openId,
   reply: replyInThread,
+  // 机器人没跟着的话题里的消息：判断时看话题最近几条
+  topic: context,
+  skipTopic: (threadKey) => follower?.owns(threadKey) ?? false,
+  // 群记忆里定过规矩的那类事：像被 @ 一样去做，只给读的工具；之后跟着这个话题
+  work: (msg) => answerUnaddressed(msg),
   onReplied: (msg) => follower?.track(msg),
   followsThreads: follower !== undefined,
   // 话题里勾了「同时发送到群」的追问，群里那份不再主动接话：话题里那份归跟聊
@@ -198,6 +205,11 @@ const proactive = new ProactiveReplier({
 });
 await proactive.init();
 await follower?.init();
+/** 没 @ 机器人、照群里定的规矩要它处理的消息：只给读的工具，之后跟着这个话题；同一话题里排在还在判断的消息后面 */
+const answerUnaddressed = (msg: NormalizedMessage): Promise<void> =>
+  follower
+    ? follower.answerInTurn(msg, () => handleMessage(msg, { unaddressed: true }), false)
+    : handleMessage(msg, { unaddressed: true });
 /** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
 const answerMention = (msg: NormalizedMessage): Promise<void> =>
   follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);

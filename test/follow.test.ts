@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
-import { MUTE_COMMAND, MUTED_REPLY, ThreadFollower } from "../src/follow.js";
+import { MUTE_COMMAND, MUTED_REPLY, ThreadFollower, type ThreadFollowerOptions } from "../src/follow.js";
 
 const DAY = 24 * 60 * 60_000;
 import type { ThreadContext } from "../src/history.js";
@@ -38,7 +38,7 @@ const asked = msg("om_root", { mentionedBot: true, rootId: undefined, threadId: 
 function setup(
   judge: string | Error = "是",
   busy = false,
-  declined?: (msg: NormalizedMessage, recent: readonly string[]) => Promise<void>,
+  extra: { chimeIn?: ThreadFollowerOptions["chimeIn"]; memory?: string } = {},
   stateFile?: string,
 ) {
   let now = START;
@@ -77,7 +77,8 @@ function setup(
     reply: async (m, markdown) => {
       replies.push(`${m.messageId} ${markdown}`);
     },
-    ...(declined ? { declined } : {}),
+    ...(extra.chimeIn ? { chimeIn: extra.chimeIn } : {}),
+    ...(extra.memory !== undefined ? { memory: async () => extra.memory ?? "" } : {}),
     ...(stateFile ? { stateFile } : {}),
     logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error() {} },
     now: () => now,
@@ -149,7 +150,10 @@ test("判断是对机器人说的才交给处理函数：关着思考调一次�
   assert.equal(request.thinking, false);
   assert.equal(request.tools, undefined);
   assert.match(request.system, /飞书 CLI/);
-  assert.match(request.system, /拿不准时算不是/);
+  assert.match(request.system, /拿不准时回答「否」/);
+  // 没配群记忆、没开主动接话：不带群记忆，也不给「接：」这个选择
+  assert.doesNotMatch(request.system, /回答「接：」/);
+  assert.doesNotMatch(request.messages[0].content, /群记忆/);
   const transcript = request.messages[0].content;
   assert.match(transcript, /\[张三\] 最近一小时 gateway 报错多少/);
   assert.match(transcript, /\[机器人\] 最近一小时 gateway 报错 132 次/);
@@ -166,32 +170,53 @@ test("判断不是对机器人说的（群成员之间说话、表态）不回�
   assert.match(t.logs.join("\n"), /不是对机器人说的，不回.*message=om_2/);
 });
 
-test("判断不是对机器人说的：交给 declined 看群记忆，带上判断时读到的话题最近几条；判断失败、机器人在做事时不交", async () => {
-  const declined: Array<{ id: string; recent: readonly string[] }> = [];
-  const onDeclined = async (m: NormalizedMessage, recent: readonly string[]) => {
-    declined.push({ id: m.messageId, recent });
-  };
-  const t = setup("否", false, onDeclined);
+test("带上群记忆一起判断：群里定的规矩也在里面，是对它说的照常回答", async () => {
+  const t = setup("是", false, { memory: "【规矩】\n- #5 部署相关的问题不用 @ 也直接回答（张三）" });
+  t.follower.track(asked);
+  await t.follower.consider(msg("om_2", { content: "今天能部署吗" }));
+  assert.deepEqual(t.handled, ["om_2"]);
+  const [request] = t.requests;
+  assert.match(request.system, /群里定的规矩（哪类消息不用 @ 也要它回、哪类别管）优先照着做/);
+  assert.match(request.messages[0].content, /^群记忆：\n【规矩】\n- #5 部署相关的问题不用 @ 也直接回答（张三）\n\n话题里最近的消息：/);
+});
+
+test("不是对它说的、答案在群记忆里：开了主动接话的群里模型可以说「接：」，交给主动接话再想一遍；没开、在做事、群记忆是空的不给这个选择", async () => {
+  const spoken: Array<{ id: string; said: string; memory: string; content: string }> = [];
+  const chimeIn = (active: boolean) => ({
+    active: () => active,
+    speak: async (m: NormalizedMessage, ask: { content: string; memory: string }, said: string) => {
+      spoken.push({ id: m.messageId, said, memory: ask.memory, content: ask.content });
+    },
+  });
+  const memory = "【背景】\n- #3 测试环境数据库是 db-test-2.internal（李四）";
+  const t = setup("接：测试库是 db-test-2.internal（群记忆 #3）", false, { chimeIn: chimeIn(true), memory });
   t.follower.track(asked);
   await t.follower.consider(msg("om_2", { content: "测试库地址是哪个来着" }));
   assert.deepEqual(t.handled, []);
-  assert.deepEqual(declined, [
-    { id: "om_2", recent: ["[张三] 最近一小时 gateway 报错多少", "[机器人] 最近一小时 gateway 报错 132 次，主要是 code=8"] },
-  ]);
-  // 是对它说的照常回答，不交
-  const yes = setup("是", false, onDeclined);
-  yes.follower.track(asked);
-  await yes.follower.consider(msg("om_3"));
-  assert.deepEqual(yes.handled, ["om_3"]);
-  // 判断失败的、机器人在做事时的不交
-  await setup(new Error("百炼超时"), false, onDeclined).follower.consider(msg("om_4"));
-  const busy = setup("否", true, onDeclined);
-  busy.follower.track(asked);
-  await busy.follower.consider(msg("om_5"));
-  assert.deepEqual(
-    declined.map((d) => d.id),
-    ["om_2"],
-  );
+  assert.equal(spoken.length, 1);
+  assert.equal(spoken[0].id, "om_2");
+  assert.equal(spoken[0].said, "测试库是 db-test-2.internal（群记忆 #3）");
+  assert.equal(spoken[0].memory, memory);
+  assert.equal(spoken[0].content, t.requests[0].messages[0].content);
+  assert.match(t.requests[0].system, /回答「接：」加上要说的一句话/);
+  assert.match(t.logs.join("\n"), /不是对机器人说的，答案在群记忆里，看要不要接一句.*message=om_2/);
+
+  // 没开主动接话、机器人在这个话题里做事、群记忆是空的：不给「接：」，模型说了也不算
+  for (const [label, follower] of [
+    ["没开主动接话", setup("接：测试库是 db-test-2.internal（群记忆 #3）", false, { chimeIn: chimeIn(false), memory })],
+    ["在做事", setup("接：测试库是 db-test-2.internal（群记忆 #3）", true, { chimeIn: chimeIn(true), memory })],
+    ["群记忆是空的", setup("接：测试库是 db-test-2.internal（群记忆 #3）", false, { chimeIn: chimeIn(true), memory: "" })],
+  ] as const) {
+    follower.follower.track(asked);
+    await follower.follower.consider(msg("om_3", { content: "测试库地址是哪个来着" }));
+    assert.doesNotMatch(follower.requests[0].system, /回答「接：」/, label);
+    assert.deepEqual(follower.handled, [], label);
+  }
+  assert.equal(spoken.length, 1);
+
+  // 判断失败的不交
+  await setup(new Error("百炼超时"), false, { chimeIn: chimeIn(true), memory }).follower.consider(msg("om_4"));
+  assert.equal(spoken.length, 1);
 });
 
 test("判断出错时不回：宁可漏回一句，也不在别人说话时插嘴", async () => {
@@ -305,7 +330,7 @@ test("配了记录文件：重启后接着跟回答过的话题，说过「只�
   const dir = await mkdtemp(path.join(tmpdir(), "follow-"));
   const file = path.join(dir, "follow.json");
   try {
-    const before = setup("是", false, undefined, file);
+    const before = setup("是", false, {}, file);
     before.follower.track(asked);
     before.follower.track(msg("om_muted_at", { mentionedBot: true, rootId: "om_muted", threadId: "omt_9" }));
     await before.follower.consider(msg("om_quiet", { rootId: "om_muted", threadId: "omt_9", content: "别插话" }));
@@ -315,7 +340,7 @@ test("配了记录文件：重启后接着跟回答过的话题，说过「只�
     assert.deepEqual(saved.muted, ["om_muted"]);
 
     // 重启：新的跟聊从文件里接着跟
-    const after = setup("是", false, undefined, file);
+    const after = setup("是", false, {}, file);
     after.advance(60_000);
     await after.follower.init();
     assert.equal(after.follower.wants(msg("om_2", { createTime: START + 60_000 })), true);
@@ -328,7 +353,7 @@ test("配了记录文件：重启后接着跟回答过的话题，说过「只�
     await after.follower.flush();
 
     // 停了几天才重启的照样跟
-    const late = setup("是", false, undefined, file);
+    const late = setup("是", false, {}, file);
     late.advance(3 * DAY);
     await late.follower.init();
     assert.equal(late.follower.wants(msg("om_4", { createTime: START + 3 * DAY })), true);
@@ -341,14 +366,14 @@ test("记录文件还没有时从空的开始、不报警；读坏了打一行�
   const dir = await mkdtemp(path.join(tmpdir(), "follow-"));
   const file = path.join(dir, "follow.json");
   try {
-    const fresh = setup("是", false, undefined, file);
+    const fresh = setup("是", false, {}, file);
     await fresh.follower.init();
     assert.equal(fresh.follower.wants(msg("om_2")), false);
     assert.ok(!fresh.logs.some((line) => line.includes("读不了") || line.includes("格式不对")));
 
     for (const broken of ["{", "null", "[]"]) {
       await writeFile(file, broken, "utf8");
-      const t = setup("是", false, undefined, file);
+      const t = setup("是", false, {}, file);
       await t.follower.init();
       assert.equal(t.follower.wants(msg("om_2")), false);
       if (broken !== "[]") {
@@ -357,7 +382,7 @@ test("记录文件还没有时从空的开始、不报警；读坏了打一行�
     }
 
     // 读坏了以后照样能记：下一次 @ 写回好的
-    const t = setup("是", false, undefined, file);
+    const t = setup("是", false, {}, file);
     await t.follower.init();
     t.follower.track(asked);
     await t.follower.flush();
