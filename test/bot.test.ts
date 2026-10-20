@@ -833,6 +833,10 @@ test("带上了群聊、没 @ 的跟聊：这句话没让记住或忘掉时不�
   // @ 了、没带群聊的照常给
   await ask(message("我们哪天发版？", { messageId: "om_3", rootId: "om_root" }));
   assert.deepEqual(plain.requests[2].tools?.map((t) => t.name), ["memory_save", "memory_update", "memory_delete"]);
+  // 主动接话照群里的规矩去做的：这句话本身说了忘掉也不给
+  await ask(message("忘掉 #1", { messageId: "om_4", senderId: "ou_2" }), { unaddressed: true, proactive: true });
+  assert.deepEqual(plain.requests[3].tools?.map((t) => t.name) ?? [], []);
+  assert.match(plain.requests[3].system, /这次群记忆只能看/);
 });
 
 test("群里还没有记忆时也告诉模型可以记", async () => {
@@ -1452,9 +1456,12 @@ test("带上了群聊、没 @ 的跟聊：这句话没说到经验库时不给�
   assert.deepEqual(plain.requests[0].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get"]);
   await ask(message("这个归档吧，已经过时了", { messageId: "om_2", rootId: "om_root" }), { unaddressed: true });
   assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+  // 主动接话照群里的规矩去做的：这句话本身说了也不给
+  await ask(message("这个归档吧，已经过时了", { messageId: "om_4", senderId: "ou_2" }), { unaddressed: true, proactive: true });
+  assert.deepEqual(plain.requests[2].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get"]);
   // @ 了、没带群聊的照常给
   await ask(message("gateway 最近报错多吗", { messageId: "om_3", rootId: "om_root" }));
-  assert.deepEqual(plain.requests[2].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
+  assert.deepEqual(plain.requests[3].tools?.map((t) => t.name), ["knowledge_search", "knowledge_get", "knowledge_propose", "knowledge_propose_archive"]);
 
   // 上一条回答末尾问了「要不要沉淀成经验？」，没 @ 回一句「要」也算
   const asked = fakeModel(() => ({ text: "好", finish: "stop" }));

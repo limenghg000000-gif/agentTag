@@ -294,6 +294,11 @@ export interface TaskOptions {
   readOnly?: boolean;
   /** 没 @ 机器人、跟聊判断是对它说的：不给改文档、改代码的工具 */
   unaddressed?: boolean;
+  /**
+   * 主动接话照群里的规矩去做的（没 @、也不是在跟机器人说话）：除了只给读的工具，
+   * 这句话本身说了要记住、忘掉也不给记、改、删群记忆和起草经验的工具
+   */
+  proactive?: boolean;
 }
 
 /**
@@ -636,13 +641,15 @@ async function runTask(
     // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
     // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
     const memoryLocked =
-      !followUp && (modelHistory.some(isChatContext) || options.unaddressed === true) && !MEMORY_REQUEST.test(question);
+      options.proactive === true ||
+      (!followUp && (modelHistory.some(isChatContext) || options.unaddressed === true) && !MEMORY_REQUEST.test(question));
     // 起草经验、归档经验、群记忆和经验库冲突的卡片也一样：点了就改经验库或群记忆，这句话本身没说到经验库、记忆的事就不给
     const draftsLocked =
-      !followUp &&
-      (modelHistory.some(isChatContext) || options.unaddressed === true) &&
-      !knowledgeRequested(question, context.history) &&
-      !MEMORY_REQUEST.test(question);
+      options.proactive === true ||
+      (!followUp &&
+        (modelHistory.some(isChatContext) || options.unaddressed === true) &&
+        !knowledgeRequested(question, context.history) &&
+        !MEMORY_REQUEST.test(question));
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     const taskTools = allTools.filter(
