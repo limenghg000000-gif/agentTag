@@ -4087,6 +4087,7 @@ const FEATURE_LIST = {
     { name: "查线上问题", summary: "查日志、告警。", how: [], examples: [{ text: "现在有哪些告警", tryable: true }], needs: ["aiops_"] },
     { name: "沉淀经验", summary: "存进经验库。", how: [], examples: [{ text: "沉淀到经验库", tryable: false }], needs: ["knowledge_propose"] },
     { name: "智能卡片", summary: "表格、图表。", how: [], examples: [{ text: "画成折线图", tryable: false }], needs: ["智能卡片"] },
+    { name: "不 @ 也能接话", summary: "话题里接着问不用 @。", how: [], examples: [{ text: "只在 @ 我时回", tryable: false }], needs: ["接话"] },
     { name: "想仔细点、停下", summary: "深度思考；随时停。", how: [], examples: [{ text: "停止", tryable: false }], needs: [] },
   ],
   limits: ["私聊不回。"],
@@ -4136,7 +4137,7 @@ test("只问「你能做什么」：不问模型，直接在话题里回功能�
   assert.deepEqual(context.remembered, [{ question: "[群成员] 你能做什么？", answer: saved[0]![3]! }]);
 });
 
-test("功能卡片看的是现在用得上的工具：aiops 没连上不列查线上，经验库没有起草工具不列沉淀经验，开着流式卡片才列智能卡片", async () => {
+test("功能卡片看的是现在用得上的工具：aiops 没连上不列查线上，经验库没有起草工具不列沉淀经验，开着流式卡片才列智能卡片，开着跟聊这些才列不 @ 也能接话", async () => {
   const draft = namedTool("knowledge_propose");
   const shown = async (overrides: Partial<BotDeps>) => {
     const { sent, handle } = setup({ tools: [namedTool("web_search")], about: { features: FEATURE_LIST }, ...overrides });
@@ -4150,6 +4151,9 @@ test("功能卡片看的是现在用得上的工具：aiops 没连上不列查�
   assert.doesNotMatch(await shown({ knowledge: knowledge([namedTool("knowledge_search")]) }), /沉淀经验/);
   assert.match(await shown({ knowledge: knowledge([namedTool("knowledge_search"), draft]) }), /沉淀经验/);
   assert.match(await shown({ cardKit }), /智能卡片/);
+  // 跟聊、@ 时带群聊、主动接话都关了
+  assert.doesNotMatch(await shown({}), /不 @ 也能接话/);
+  assert.match(await shown({ chatAlong: true }), /不 @ 也能接话/);
 });
 
 test("功能卡片发不出去时改发文字版；按钮问的、带了别的事的照常交给模型", async () => {

@@ -144,6 +144,7 @@ const handleMessage = createMessageHandler({
   ...(mcp ? { mcp } : {}),
   ...(knowledge ? { knowledge } : {}),
   ...(images ? { images } : {}),
+  chatAlong: config.followThreads || config.chatContext || config.proactive.chatIds.size > 0,
   showThinking: config.showThinking,
   about: aboutBot(),
   ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient) } : {}),

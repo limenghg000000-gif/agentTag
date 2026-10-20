@@ -3,7 +3,7 @@ import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendRe
 import { raceAbort, timeoutSignal } from "./abort.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, safeDescribe, truncate } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
-import { asksForFeatures, availableFeatures, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
+import { asksForFeatures, availableFeatures, CHAT_ALONG_FEATURE, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
 import { imageKeysOf } from "./feishu.js";
 import { CARD_DONE_NOTICE, type ImageRef, isChatContext, labelUserMessage, type Logger, type ThreadContext, threadKeyOf, unlabelUserMessage } from "./history.js";
 import { inlineImages, pickImages } from "./images.js";
@@ -200,6 +200,8 @@ export interface BotDeps {
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
   writeAllowed?: ReadonlySet<string>;
+  /** 话题里跟聊、@ 时带上群聊、主动接话至少开着一样。功能清单里「需要：接话」的那一项只在这时列出来 */
+  chatAlong?: boolean;
   /** 把提问和话题里的图片识别成文字。不传时图片换成「没能看到」的说明 */
   images?: { read(refs: readonly ImageRef[], signal?: AbortSignal): Promise<ReadonlyMap<string, string>> };
   /** 团队经验库：回答前先检索，起草后发确认卡片。不传时没有这些 */
@@ -320,7 +322,7 @@ async function sendFeatures(deps: BotDeps, msg: NormalizedMessage, question: str
 
 /**
  * 机器人现在用得上的工具：和回答时一样现建一套看名字（MCP 没连上的服务没有工具，没配写权限名单时经验库没有起草的工具），
- * 群记忆只写开头 memory_；配了看图的模型加上「看图」，开着流式卡片加上「智能卡片」
+ * 群记忆只写开头 memory_；配了看图的模型加上「看图」，开着流式卡片加上「智能卡片」，开着跟聊、群聊、主动接话里的一样加上「接话」
  */
 function configuredTools(deps: BotDeps, msg: NormalizedMessage): string[] {
   const task: TaskToolContext = { chatId: msg.chatId, threadKey: threadKeyOf(msg), senderId: msg.senderId, messageId: msg.messageId };
@@ -332,6 +334,7 @@ function configuredTools(deps: BotDeps, msg: NormalizedMessage): string[] {
     ...(deps.recentThreads ? [RECENT_THREADS_TOOL] : []),
     ...(deps.images ? [VISION_FEATURE] : []),
     ...(deps.cardKit ? [RICH_UI_FEATURE] : []),
+    ...(deps.chatAlong ? [CHAT_ALONG_FEATURE] : []),
   ];
 }
 
@@ -755,6 +758,7 @@ async function runTask(
                       ...toolNames,
                       ...(deps.images ? [VISION_FEATURE] : []),
                       ...(streaming ? [RICH_UI_FEATURE] : []),
+                      ...(deps.chatAlong ? [CHAT_ALONG_FEATURE] : []),
                     ]),
                   }
                 : deps.about,
