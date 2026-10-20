@@ -25,6 +25,8 @@ export interface RecentMessage {
   message: NormalizedMessage;
   /** 是不是本机器人发的 */
   fromBot: boolean;
+  /** 是不是机器人、应用发的（本机器人和别的机器人都算） */
+  fromApp?: boolean;
 }
 
 /** 机器人用到的飞书读接口。单独抽出来，测试时可以换成假的。 */
@@ -37,6 +39,8 @@ export interface FeishuApi {
    * sinceMs 只对群有效（飞书的话题列表不支持按时间过滤），调用方自己再按 createTime 筛一遍。
    */
   listRecentMessages(container: "chat" | "thread", id: string, limit: number, sinceMs?: number): Promise<RecentMessage[]>;
+  /** 群主界面里 sinceMs 到 untilMs 之间的消息（带发言人名字），按时间从早到晚，最多取离 untilMs 最近的 limit 条 */
+  listChatMessages(chatId: string, sinceMs: number, untilMs: number, limit: number): Promise<ThreadMessage[]>;
   /** 下载消息里的一张图片（获取消息中的资源文件）。机器人得在这条消息所在的群里 */
   downloadImage(messageId: string, imageKey: string): Promise<DownloadedImage>;
   /** 通讯录里这个人（open_id）的名字。要 contact:user.base:readonly，人要在应用的通讯录范围里；没有名字时为空 */
@@ -201,7 +205,26 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       const items = (res.data?.items ?? []).filter(
         (item): item is ApiItem & { message_id: string } => Boolean(item.message_id) && !item.deleted,
       );
-      return Promise.all(items.map(async (item) => ({ message: await toNormalized(item), fromBot: isFromBot(item) })));
+      return Promise.all(
+        items.map(async (item) => ({ message: await toNormalized(item), fromBot: isFromBot(item), fromApp: item.sender?.sender_type === "app" })),
+      );
+    },
+
+    async listChatMessages(chatId, sinceMs, untilMs, limit) {
+      const res = (await client.im.v1.message.list({
+        params: {
+          container_id_type: "chat",
+          container_id: chatId,
+          sort_type: "ByCreateTimeDesc",
+          page_size: Math.min(50, limit),
+          start_time: String(Math.floor(sinceMs / 1000)),
+          // 截到这一秒为止：群里很热闹、或者补漏晚了几秒时，最新的一页全是 @ 之后的消息，就拿不到之前的了
+          end_time: String(Math.ceil(untilMs / 1000)),
+          with_sender_name: true,
+        },
+      })) as ApiResponse<{ items?: ApiItem[] }>;
+      check(res);
+      return (await convertAll(res.data?.items ?? [])).reverse();
     },
 
     async getMessage(messageId) {

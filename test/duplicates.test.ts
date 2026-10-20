@@ -58,3 +58,26 @@ test("没有发送时间时按收到的时间比；记录几分钟后清掉", ()
   now += 10 * 60_000;
   assert.equal(asks.check(msg("om_3", "你好", { createTime: 0 })).action, "handle");
 });
+
+test("群里的副本先到、后来收到话题里那条：hasThreadTwin 认得出副本", () => {
+  const asks = new DuplicateAsks(() => 0);
+  const copy = msg("om_g", "那换成按小时看呢", { mentionedBot: false });
+  asks.check(copy);
+  assert.equal(asks.hasThreadTwin(copy), false);
+  asks.check(msg("om_t", "那换成按小时看呢", { mentionedBot: false, rootId: "om_root", createTime: 1_000_300 }));
+  assert.equal(asks.hasThreadTwin(copy), true);
+  // 别人说的同一句、隔得久的不算
+  assert.equal(asks.hasThreadTwin(msg("om_x", "那换成按小时看呢", { senderId: "ou_2" })), false);
+  assert.equal(asks.hasThreadTwin(msg("om_y", "那换成按小时看呢", { createTime: 1_000_000 + 60_000 })), false);
+});
+
+test("copiesOnly：只把一条在话题里、一条在群主界面的认成重复；两个话题里各说一遍「继续」不算", () => {
+  const asks = new DuplicateAsks(() => 0, true);
+  assert.deepEqual(asks.check(msg("om_a", "继续", { rootId: "om_root_a" })), { action: "handle" });
+  assert.deepEqual(asks.check(msg("om_b", "继续", { rootId: "om_root_b" })), { action: "handle" });
+  assert.deepEqual(asks.check(msg("om_g", "继续")), { action: "skip", duplicateOf: "om_a" });
+  // 不加 copiesOnly 时（@ 机器人的提问）照旧
+  const plain = new DuplicateAsks(() => 0);
+  plain.check(msg("om_a", "继续", { rootId: "om_root_a" }));
+  assert.deepEqual(plain.check(msg("om_b", "继续", { rootId: "om_root_b" })), { action: "skip", duplicateOf: "om_a" });
+});

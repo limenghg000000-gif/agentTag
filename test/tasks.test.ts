@@ -72,3 +72,18 @@ test("idle 等所有任务结束", async () => {
   await waiting;
   assert.equal(tasks.size, 0);
 });
+
+test("话题里有进行中或排队的任务时算在忙，都结束了不算", async () => {
+  const tasks = new TaskRegistry();
+  assert.equal(tasks.busy("t1"), false);
+  const a = tasks.create("oc_1", "t1");
+  const b = tasks.create("oc_1", "t1");
+  assert.equal(tasks.busy("t1"), true);
+  assert.equal(tasks.busy("t2"), false);
+  tasks.finish(a);
+  await tick();
+  assert.equal(tasks.busy("t1"), true);
+  tasks.finish(b);
+  await tick();
+  assert.equal(tasks.busy("t1"), false);
+});

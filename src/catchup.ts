@@ -46,6 +46,13 @@ export interface CatchUpOptions {
   handled: HandledMessages;
   /** 补上的消息交给它处理，和事件走同一个处理函数 */
   handle: (msg: NormalizedMessage) => Promise<void>;
+  /** 跟聊和主动接话（见 ThreadFollower、ProactiveReplier）：没 @ 机器人的消息，它们要看的也补上，交给它们判断要不要回 */
+  follow?: {
+    wants(msg: NormalizedMessage, fromApp?: boolean): boolean;
+    consider(msg: NormalizedMessage): Promise<void>;
+  };
+  /** 读到的每条人发的消息（白名单群里的，补不补都算）都报给它 */
+  observe?: (msg: NormalizedMessage) => void;
   intervalMs?: number;
   logger?: Logger;
   now?: () => number;
@@ -63,6 +70,8 @@ export class CatchUpPoller {
   private readonly chatIds: ReadonlySet<string>;
   private readonly handled: HandledMessages;
   private readonly handle: (msg: NormalizedMessage) => Promise<void>;
+  private readonly follow: CatchUpOptions["follow"];
+  private readonly observe: CatchUpOptions["observe"];
   private readonly intervalMs: number;
   private readonly logger: Logger;
   private readonly now: () => number;
@@ -78,6 +87,8 @@ export class CatchUpPoller {
     this.chatIds = opts.chatIds;
     this.handled = opts.handled;
     this.handle = opts.handle;
+    this.follow = opts.follow;
+    this.observe = opts.observe;
     this.intervalMs = opts.intervalMs ?? DEFAULT_CATCHUP_INTERVAL_MS;
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? Date.now;
@@ -114,12 +125,12 @@ export class CatchUpPoller {
     let picked = 0;
 
     for (const chatId of this.chatIds) {
-      for (const { message, fromBot } of await this.api.listRecentMessages("chat", chatId, PAGE_SIZE, from)) {
+      for (const { message, fromBot, fromApp } of oldestFirst(await this.api.listRecentMessages("chat", chatId, PAGE_SIZE, from))) {
         // 机器人回复过的消息会变成话题的第一条，接着盯这个话题里的追问
         if (message.threadId && this.handled.has(message.messageId)) {
           this.threads.set(message.threadId, now);
         }
-        picked += this.pickUp(message, fromBot, from, until);
+        picked += this.pickUp(message, fromBot, fromApp ?? false, from, until);
       }
     }
     for (const [threadId, lastActive] of this.threads) {
@@ -127,8 +138,8 @@ export class CatchUpPoller {
         this.threads.delete(threadId);
         continue;
       }
-      for (const { message, fromBot } of await this.api.listRecentMessages("thread", threadId, PAGE_SIZE)) {
-        picked += this.pickUp(message, fromBot, from, until);
+      for (const { message, fromBot, fromApp } of oldestFirst(await this.api.listRecentMessages("thread", threadId, PAGE_SIZE))) {
+        picked += this.pickUp(message, fromBot, fromApp ?? false, from, until);
       }
     }
     return picked;
@@ -158,18 +169,40 @@ export class CatchUpPoller {
       });
   }
 
-  private pickUp(message: NormalizedMessage, fromBot: boolean, from: number, until: number): number {
-    // 和事件那边的规则一致：只处理白名单群里 @ 了机器人的消息，@所有人 不算
-    if (fromBot || !message.mentionedBot || message.mentionAll || !this.chatIds.has(message.chatId)) {
+  private pickUp(message: NormalizedMessage, fromBot: boolean, fromApp: boolean, from: number, until: number): number {
+    // 和事件那边的规则一致：只处理白名单群里 @ 了机器人的消息，@所有人 不算；
+    // 没 @ 的只补跟聊要跟的（机器人回答过的话题里的追问）和主动接话要看的（打开了的群主界面的消息），由它们判断要不要回
+    if (fromBot || !this.chatIds.has(message.chatId)) {
+      return 0;
+    }
+    if (!fromApp) {
+      this.observe?.(message);
+    }
+    if (message.mentionAll) {
+      return 0;
+    }
+    const follow = !message.mentionedBot;
+    if (follow && !this.follow?.wants(message, fromApp)) {
       return 0;
     }
     if (message.createTime < from || message.createTime > until || !this.handled.claim(message.messageId)) {
       return 0;
     }
-    this.logger.info(`补漏：事件没送到，由轮询补上 chat=${message.chatId} message=${message.messageId}`);
+    this.logger.info(
+      `补漏：${follow ? "没 @ 机器人的消息" : ""}事件没送到，由轮询补上 chat=${message.chatId} message=${message.messageId}`,
+    );
     this.watch(message);
     // 不等任务做完，任务可能要跑一两分钟，别耽误下一轮轮询
-    void this.handle(message).catch((err) => this.logger.error(`补漏处理失败 message=${message.messageId}`, err));
+    const done = follow ? this.follow!.consider(message) : this.handle(message);
+    void done.catch((err) => this.logger.error(`补漏处理失败 message=${message.messageId}`, err));
     return 1;
   }
+}
+
+/**
+ * 接口按从新到旧返回，补的时候从旧到新：同一个话题里先说的先交出去（跟聊按交进来的顺序判断），
+ * 不然事件断了一阵以后，后说的「停止」会排在前面那句之前，停不到它
+ */
+function oldestFirst<T extends { message: NormalizedMessage }>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) => a.message.createTime - b.message.createTime);
 }

@@ -191,6 +191,39 @@ test("SHOW_THINKING：默认在进度卡片上显示思考，off 关掉，写错
   assert.throws(() => loadConfig({ ...base, SHOW_THINKING: "yes" }), /SHOW_THINKING 只能是 on 或 off/);
 });
 
+test("FOLLOW_THREADS、CHAT_CONTEXT：默认开，off 关掉，写错时报错", () => {
+  assert.equal(loadConfig(base).followThreads, true);
+  assert.equal(loadConfig(base).chatContext, true);
+  assert.equal(loadConfig({ ...base, FOLLOW_THREADS: " OFF " }).followThreads, false);
+  assert.equal(loadConfig({ ...base, CHAT_CONTEXT: "off" }).chatContext, false);
+  assert.throws(() => loadConfig({ ...base, FOLLOW_THREADS: "yes" }), /FOLLOW_THREADS 只能是 on 或 off/);
+  assert.throws(() => loadConfig({ ...base, CHAT_CONTEXT: "1" }), /CHAT_CONTEXT 只能是 on 或 off/);
+});
+
+test("PROACTIVE_CHAT_IDS：默认没有群；只算群白名单里的，别的列出来提醒；PROACTIVE_MAX_PER_HOUR 默认 3", () => {
+  const off = loadConfig(base).proactive;
+  assert.equal(off.chatIds.size, 0);
+  assert.deepEqual(off.ignored, []);
+  assert.equal(off.maxPerHour, 3);
+  assert.equal(off.stateFile, path.resolve("data", "proactive.json"));
+
+  const on = loadConfig({
+    ...base,
+    FEISHU_ALLOWED_CHAT_IDS: "oc_1,oc_2",
+    PROACTIVE_CHAT_IDS: " oc_2 , oc_9,oc_2 ",
+    PROACTIVE_MAX_PER_HOUR: "5",
+    DATA_DIR: "/srv/bot",
+  }).proactive;
+  assert.deepEqual([...on.chatIds], ["oc_2"]);
+  assert.deepEqual(on.ignored, ["oc_9"]);
+  assert.equal(on.maxPerHour, 5);
+  assert.equal(on.stateFile, path.resolve("/srv/bot", "proactive.json"));
+
+  for (const bad of ["0", "61", "2.5", "很多"]) {
+    assert.throws(() => loadConfig({ ...base, PROACTIVE_MAX_PER_HOUR: bad }), /PROACTIVE_MAX_PER_HOUR 要填 1～60 的整数/);
+  }
+});
+
 test("MCP_SERVERS：不配时没有 MCP 服务；配了 aiops 时默认开 20 个只读工具（含 promote_case），令牌从 MCP_AIOPS_TOKEN 读", () => {
   assert.deepEqual(loadConfig(base).mcp, []);
   const [aiops, ...rest] = loadConfig({ ...base, MCP_SERVERS: " aiops=https://aiops.example.com/mcp ", MCP_AIOPS_TOKEN: " t0k " }).mcp;

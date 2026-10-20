@@ -101,6 +101,11 @@ export class TaskRegistry {
     await Promise.race([Promise.all(this.tails.values()), sleep(timeoutMs, undefined, { ref: false })]);
   }
 
+  /** 这个话题里有没有进行中（含排队）的任务 */
+  busy(threadKey: string): boolean {
+    return this.tails.has(threadKey);
+  }
+
   get size(): number {
     return this.tasks.size;
   }

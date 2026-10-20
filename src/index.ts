@@ -9,7 +9,9 @@ import { CardAnswerStore } from "./card-answers.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { FEATURES_FILE, loadConfig, RELEASE_NOTES_FILE } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
+import { DuplicateAsks } from "./duplicates.js";
 import { createFeishuApi } from "./feishu.js";
+import { ThreadFollower } from "./follow.js";
 import { createFollowUp } from "./follow-up.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
@@ -22,6 +24,7 @@ import { McpHub } from "./mcp.js";
 import { createNameLookup } from "./operator-names.js";
 import type { AboutBot } from "./prompt.js";
 import { MemoryStore } from "./memory.js";
+import { ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
@@ -45,8 +48,8 @@ const channel = createLarkChannel({
   appSecret: config.feishu.appSecret,
   domain: config.feishu.domain,
   loggerLevel: LoggerLevel.info,
-  // 群里只响应 @ 机器人的消息，@所有人 不响应；单聊暂不开
-  policy: { requireMention: true, dmMode: "disabled" },
+  // 群里没 @ 机器人的消息也交过来，由下面按跟聊和主动接话的规则筛（两个都关时一律不管）；@所有人 不响应；单聊暂不开
+  policy: { requireMention: false, dmMode: "disabled" },
   // 关掉按群排队合并：同一个群里几个人同时 @，各自独立处理。同一话题里的任务由 TaskRegistry 排队
   safety: { chatQueue: { enabled: false } },
 });
@@ -117,8 +120,14 @@ const images = config.vision
       vision: createOpenAICompatibleVisionModel({ baseURL: config.llm.baseURL, apiKey: config.llm.apiKey, ...config.vision }),
     })
   : undefined;
+const model = createOpenAICompatibleModel(config.llm);
+/** 在这条消息下面开话题回一句（跟聊、主动接话的简短回复） */
+const replyInThread = (msg: NormalizedMessage, markdown: string) =>
+  channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
+// 在群里直接 @ 时带上群里刚才的聊天（CHAT_CONTEXT）
+const context = new ThreadContextLoader(feishuApi, console, undefined, cardAnswers, config.chatContext);
 const handleMessage = createMessageHandler({
-  model: createOpenAICompatibleModel(config.llm),
+  model,
   tools,
   // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分
   taskTools: ({ chatId, senderId, threadKey, askerName }) => [
@@ -128,6 +137,8 @@ const handleMessage = createMessageHandler({
       : []),
   ],
   allowedChatIds: config.feishu.allowedChatIds,
+  // 群主界面说「别主动插话」开关主动接话，话题里说「只在 @ 我时回」停掉跟聊（下面创建，收到消息时已经有了）
+  command: (msg) => proactive.toggle(msg) ?? follower?.mute(msg),
   ...(workspaces ? { codeRepos: workspaces.repos } : {}),
   ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
   ...(mcp ? { mcp } : {}),
@@ -139,13 +150,66 @@ const handleMessage = createMessageHandler({
   // 卡片里的回答飞书读不出来，记下来读话题历史时用：流式卡片的回答、功能卡片（不开流式卡片也会回）
   cardAnswers,
   botName: () => channel.botIdentity?.name,
-  context: new ThreadContextLoader(feishuApi, console, undefined, cardAnswers),
+  context,
   recentThreads,
   memory,
   tasks,
   send: (to, input, opts) => channel.send(to, input, opts),
   updateCard: (messageId, card) => channel.updateCard(messageId, card),
 });
+
+// 话题里跟聊：机器人回答过的话题里，没 @ 它的追问先判断是不是对它说的，是才回
+const follower = config.followThreads
+  ? new ThreadFollower({
+      allowedChatIds: config.feishu.allowedChatIds,
+      context,
+      model,
+      botName: () => channel.botIdentity?.name,
+      botOpenId: () => channel.botIdentity?.openId,
+      busy: (threadKey) => tasks.busy(threadKey),
+      // 没 @ 的话不给改文档、改代码的工具：要改就 @ 机器人直接说
+      handle: (msg) => handleMessage(msg, { unaddressed: true }),
+      reply: replyInThread,
+      // 不是对它说的：开了主动接话的群里，答案在群记忆里时接一句
+      declined: (msg, recent) => proactive.considerInTopic(msg, recent),
+    })
+  : undefined;
+// 主动接话：PROACTIVE_CHAT_IDS 里的群，群主界面没 @ 的消息看情况接一句；接了以后那个话题交给跟聊。
+// 跟着的话题里不是对它说的话，答案在群记忆里时也接一句
+const proactive = new ProactiveReplier({
+  allowedChatIds: config.feishu.allowedChatIds,
+  enabledChatIds: config.proactive.chatIds,
+  stateFile: config.proactive.stateFile,
+  maxPerHour: config.proactive.maxPerHour,
+  api: feishuApi,
+  memory,
+  model,
+  botName: () => channel.botIdentity?.name,
+  botOpenId: () => channel.botIdentity?.openId,
+  reply: replyInThread,
+  onReplied: (msg) => follower?.track(msg),
+  followsThreads: follower !== undefined,
+  // 话题里勾了「同时发送到群」的追问，群里那份不再主动接话：话题里那份归跟聊
+  superseded: (msg) => unaddressedTwins.hasThreadTwin(msg),
+  topicBusy: (threadKey) => tasks.busy(threadKey),
+});
+await proactive.init();
+/** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
+const answerMention = (msg: NormalizedMessage): Promise<void> =>
+  follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);
+/** 没 @ 机器人的群消息归谁判断：跟着的话题里的归跟聊，群主界面的归主动接话，都不要就不管 */
+const listenerFor = (msg: NormalizedMessage, fromApp = false) =>
+  follower?.wants(msg, fromApp) ? follower : proactive.wants(msg, fromApp) ? proactive : undefined;
+// 话题里勾了「同时发送到群」，没 @ 的话也会收到两份：只判断一份
+const unaddressedTwins = new DuplicateAsks(Date.now, true);
+const considerUnaddressed = async (msg: NormalizedMessage, listener: { consider(msg: NormalizedMessage): Promise<void> }) => {
+  const verdict = unaddressedTwins.check(msg);
+  if (verdict.action === "skip") {
+    console.log(`没 @ 的消息 ${msg.messageId} 和 ${verdict.duplicateOf} 是同一句话（多半勾了「同时发送到群」），只判断一份`);
+    return;
+  }
+  await listener.consider(msg);
+};
 
 // 事件和补漏轮询可能拿到同一条消息，谁先认领谁处理
 const handled = new HandledMessages();
@@ -159,11 +223,34 @@ const catchUp = new CatchUpPoller({
   handled,
   handle: (msg) => {
     alarm.record(msg);
-    return handleMessage(msg);
+    return answerMention(msg);
+  },
+  // 补上的消息也让主动接话知道群里有人说过话（判断完要回之前看一眼）
+  observe: (msg) => proactive.noteActivity(msg),
+  follow: {
+    wants: (msg, fromApp) => listenerFor(msg, fromApp) !== undefined,
+    consider: async (msg) => {
+      const listener = listenerFor(msg);
+      if (listener) {
+        await considerUnaddressed(msg, listener);
+      }
+    },
   },
   intervalMs: config.catchUpIntervalMs || undefined,
 });
 channel.on("message", async (msg: NormalizedMessage) => {
+  // 主动接话判断完要回之前，看判断的这会儿群里有没有人接了话
+  proactive.noteActivity(msg);
+  if (!msg.mentionedBot) {
+    // 没 @ 机器人的：只看跟聊在跟的话题里的、打开了主动接话的群主界面的，别的（包括白名单外的群）一律不管，也不记日志
+    const listener = listenerFor(msg);
+    if (!listener || !handled.claim(msg.messageId)) {
+      return;
+    }
+    catchUp.watch(msg);
+    await considerUnaddressed(msg, listener);
+    return;
+  }
   if (!handled.claim(msg.messageId)) {
     // 轮询已经补上了这条：事件只是晚到，不是被别处分走
     alarm.arrivedLate(msg.messageId);
@@ -171,7 +258,7 @@ channel.on("message", async (msg: NormalizedMessage) => {
     return;
   }
   catchUp.watch(msg);
-  await handleMessage(msg);
+  await answerMention(msg);
 });
 // 回答下面的「接着查」按钮：机器人替点的人在话题里发一句，再当成他问的处理（只给读的工具）
 const followUp = createFollowUp({
@@ -180,7 +267,10 @@ const followUp = createFollowUp({
   handle: (msg, options) => {
     // 和收到的消息一样记进补漏轮询：点按钮可能让一个已经不再跟踪的话题又活了，后面的 @ 漏了事件还能补上
     catchUp.watch(msg);
-    return handleMessage(msg, options);
+    // 也让主动接话知道话题里有人说了话：判断着要按群记忆接的那句不再插进来
+    proactive.noteActivity(msg);
+    // 和 @ 的消息一样排在同一话题里还在判断的消息后面，之后跟着这个话题
+    return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options), false) : handleMessage(msg, options);
   },
 });
 channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) }));
@@ -211,6 +301,28 @@ console.log(
     ? "卡片即回答：思考和回答边生成边写进进度卡片（要开 cardkit:card:write 权限，建不了卡片时自动退回原来的方式），STREAM_CARD=off 可以关掉"
     : "卡片即回答没开（STREAM_CARD=off）：进度卡片只显示进度，回答另外发",
 );
+console.log(
+  follower
+    ? "话题里跟聊：回答过的话题里，没 @ 的追问先判断是不是对机器人说的，是才回；话题里说「只在 @ 我时回」就不跟了（FOLLOW_THREADS=off 可以关掉）"
+    : "话题里跟聊没开（FOLLOW_THREADS=off）：只回 @ 机器人的消息",
+);
+console.log(
+  config.chatContext
+    ? "群里直接 @ 时带上之前半小时内的群聊（最多 20 条），「看下上面那个报错」接得上（CHAT_CONTEXT=off 可以关掉）"
+    : "群里直接 @ 时不带群聊（CHAT_CONTEXT=off）",
+);
+if (config.proactive.chatIds.size > 0) {
+  const paused = [...config.proactive.chatIds].filter((chatId) => !proactive.active(chatId));
+  console.log(
+    `主动接话：群 ${[...config.proactive.chatIds].join(", ")} 里没 @ 的消息看情况接一句，每个群每小时最多 ${config.proactive.maxPerHour} 次` +
+      (paused.length > 0 ? `；${paused.join(", ")} 有人说过「别主动插话」，现在停着（@ 机器人说「可以主动说话」再打开）` : ""),
+  );
+} else {
+  console.log("主动接话没开：只回 @ 机器人的消息和跟着的话题（PROACTIVE_CHAT_IDS 填群的 chat_id 可以打开）");
+}
+if (config.proactive.ignored.length > 0) {
+  console.warn(`PROACTIVE_CHAT_IDS 里这些群不在 FEISHU_ALLOWED_CHAT_IDS 里，不生效：${config.proactive.ignored.join(", ")}`);
+}
 if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
   catchUp.start();
   console.log(

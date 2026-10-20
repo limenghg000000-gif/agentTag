@@ -142,6 +142,92 @@ test("机器人回复过的消息变成话题后，也盯着话题里的追问",
   assert.equal(t.poller.watchedThreads, 1);
 });
 
+test("话题里跟聊：没 @ 机器人的话题消息，跟聊要跟的也补上，交给跟聊判断；不要的、应用发的照样不补", async () => {
+  const considered: string[] = [];
+  const handledIds: string[] = [];
+  const asked: string[] = [];
+  const logs: string[] = [];
+  const handled = new HandledMessages();
+  handled.claim("om_root");
+  const thread = (id: string, at: number, extra: Partial<NormalizedMessage> = {}) =>
+    msg(id, at, { rootId: "om_root", threadId: "omt_1", mentionedBot: false, ...extra });
+  const poller = new CatchUpPoller({
+    api: {
+      async listRecentMessages(container) {
+        if (container === "chat") {
+          return [user(msg("om_root", START + 10_000, { threadId: "omt_1" }))];
+        }
+        return [
+          user(thread("om_follow", START + 50_000)),
+          user(thread("om_to_others", START + 51_000, { content: "张三你看下" })),
+          { message: thread("om_app", START + 52_000), fromBot: false, fromApp: true },
+          user(thread("om_mention", START + 53_000, { mentionedBot: true })),
+        ];
+      },
+    },
+    chatIds: new Set(["oc_1"]),
+    handled,
+    handle: async (m) => {
+      handledIds.push(m.messageId);
+    },
+    follow: {
+      wants(m, fromApp) {
+        asked.push(`${m.messageId}${fromApp ? " app" : ""}`);
+        return !fromApp && m.messageId === "om_follow";
+      },
+      async consider(m) {
+        considered.push(m.messageId);
+      },
+    },
+    logger: { ...quiet, info: (line: string) => logs.push(line) },
+    now: () => START + 60_000,
+    since: START,
+  });
+
+  assert.equal(await poller.pollOnce(), 2);
+  assert.deepEqual(considered, ["om_follow"]);
+  assert.deepEqual(handledIds, ["om_mention"]);
+  assert.deepEqual(asked, ["om_follow", "om_to_others", "om_app app"]);
+  assert.match(logs.join("\n"), /补漏：没 @ 机器人的消息事件没送到，由轮询补上 chat=oc_1 message=om_follow/);
+  // 补过的不再补
+  assert.equal(await poller.pollOnce(), 0);
+});
+
+test("接口按从新到旧返回，补的时候从旧到新交出去：同一个话题里先说的先处理", async () => {
+  const t = setup({
+    chat: [user(msg("om_new", START + 30_000)), user(msg("om_mid", START + 20_000)), user(msg("om_old", START + 10_000))],
+  });
+  t.advance(60_000);
+  assert.equal(await t.poller.pollOnce(), 3);
+  assert.deepEqual(t.handledIds, ["om_old", "om_mid", "om_new"]);
+});
+
+test("读到的每条人发的消息都报给 observe（补不补都算），机器人和应用发的、白名单外的不报", async () => {
+  const observed: string[] = [];
+  const poller = new CatchUpPoller({
+    api: {
+      async listRecentMessages() {
+        return [
+          user(msg("om_plain", START + 10_000, { mentionedBot: false })),
+          user(msg("om_at", START + 11_000)),
+          { message: msg("om_bot", START + 12_000), fromBot: true },
+          { message: msg("om_app", START + 13_000, { mentionedBot: false }), fromBot: false, fromApp: true },
+          user(msg("om_other_chat", START + 14_000, { chatId: "oc_9", mentionedBot: false })),
+        ];
+      },
+    },
+    chatIds: new Set(["oc_1"]),
+    handled: new HandledMessages(),
+    handle: async () => {},
+    observe: (m) => observed.push(m.messageId),
+    logger: quiet,
+    now: () => START + 60_000,
+    since: START,
+  });
+  await poller.pollOnce();
+  assert.deepEqual(observed, ["om_plain", "om_at"]);
+});
+
 test("事件收到的话题消息也开始盯这个话题；很久没动静的话题不再盯", async () => {
   const t = setup();
   t.poller.watch(msg("om_1", START, { rootId: "om_root", threadId: "omt_1" }));
