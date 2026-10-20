@@ -100,6 +100,9 @@
 | `src/llm.ts` | 模型调用层：`ChatModel` 接口和 OpenAI 兼容实现（含工具调用），换模型服务只动这里或环境变量 |
 | `src/markdown.ts` | 长回答按行切分，代码块不被切坏 |
 | `test/` | 单元测试（`npm test`） |
+| `.github/workflows/ci.yml` | GitHub 上每个 PR 和 main 跑类型检查、单元测试、构建；main 过了推到公司 GitLab |
+| `.gitlab-ci.yml` | 公司 GitLab 上的流水线：在机器人服务器上的 Runner 里测试，过了就部署 |
+| `deploy/` | 自动部署：服务器上的部署脚本（`deploy.sh`）、装 Runner 的脚本（`install-runner.sh`），怎么设置见 `deploy/README.md` |
 
 ## 第一步：在飞书开放平台创建应用
 
@@ -162,6 +165,8 @@ npm run dev            # 开发模式，改代码自动重启
 npm run build
 npm start
 ```
+
+线上那台服务器是自动部署的：代码合并到 main 以后，同步到公司 GitLab，流水线在服务器上测试、更新、重启，起不来自动退回上一版。怎么走的、怎么设置、怎么回滚见 [deploy/README.md](deploy/README.md)。
 
 ## 配置项
 

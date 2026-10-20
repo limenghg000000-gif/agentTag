@@ -4,6 +4,7 @@ import https from "node:https";
 import { BlockList, isIP } from "node:net";
 import { pipeline, type Readable } from "node:stream";
 import zlib from "node:zlib";
+import { VERSION } from "../version.js";
 import type { Tool } from "./tool.js";
 
 const MAX_REDIRECTS = 5;
@@ -13,7 +14,8 @@ const TIMEOUT_MS = 20_000;
 const CONNECT_TIMEOUT_MS = 6_000;
 /** 返回给模型的正文字数上限 */
 const MAX_TEXT_CHARS = 12000;
-const USER_AGENT = "Mozilla/5.0 (compatible; AgentTag/0.1; +https://github.com/limenghg000000-gif/agentTag)";
+/** 只写名字和版本，不带代码仓库地址：被访问的网站日志里能看到这一串 */
+const USER_AGENT = `Mozilla/5.0 (compatible; AgentTag/${VERSION})`;
 
 /**
  * 内网、本机、云服务器元数据（阿里云 100.100.100.200 在 100.64.0.0/10 里）等地址一律不让访问：
