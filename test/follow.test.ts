@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
-import { FOLLOW_WINDOW_MS, MUTE_COMMAND, MUTED_REPLY, ThreadFollower } from "../src/follow.js";
+import { MUTE_COMMAND, MUTED_REPLY, ThreadFollower } from "../src/follow.js";
+
+const DAY = 24 * 60 * 60_000;
 import type { ThreadContext } from "../src/history.js";
 import type { ChatModel, ChatRequest } from "../src/llm.js";
 
@@ -127,15 +129,13 @@ test("白名单外的群 @ 了也不跟", () => {
   assert.equal(t.follower.wants(msg("om_2", { chatId: "oc_alert" })), false);
 });
 
-test("最后一次 @ 之后 2 小时不再跟；期间每次 @ 或接着回过都重新算", () => {
+test("回答过的话题一直跟，不限时间（和 Claude Tag 一样）：隔了几个小时、几天回来接着问都不用 @", () => {
   const t = setup();
   t.follower.track(asked);
-  t.advance(FOLLOW_WINDOW_MS - 1000);
-  t.follower.track(msg("om_2", { mentionedBot: true }));
-  t.advance(FOLLOW_WINDOW_MS - 1000);
-  assert.equal(t.follower.wants(msg("om_3")), true);
-  t.advance(2000);
-  assert.equal(t.follower.wants(msg("om_4")), false);
+  t.advance(2 * 60 * 60_000 + 43 * 60_000);
+  assert.equal(t.follower.wants(msg("om_2", { createTime: START + 2 * 60 * 60_000 + 43 * 60_000 })), true);
+  t.advance(30 * DAY);
+  assert.equal(t.follower.wants(msg("om_3", { createTime: START + 31 * DAY })), true);
 });
 
 test("判断是对机器人说的才交给处理函数：关着思考调一次模型，带上话题最近几条和这条新消息", async () => {
@@ -291,17 +291,17 @@ test("在群里直接 @ 它说「只在 @ 我时回」：它回复这条时开�
   assert.equal(t.follower.wants(msg("om_3", { rootId: "om_top" })), false);
 });
 
-test("静音的话题过了 2 小时再 @ 它，也不会重新跟（机器人运行期间一直记着）", async () => {
+test("静音的话题过了几天再 @ 它，也不会重新跟", async () => {
   const t = setup();
   t.follower.track(asked);
   await t.follower.consider(msg("om_2", { content: "别插话" }));
-  t.advance(FOLLOW_WINDOW_MS + 1000);
-  assert.equal(t.follower.wants(msg("om_3", { createTime: START + FOLLOW_WINDOW_MS })), false);
-  t.follower.track(msg("om_4", { mentionedBot: true, createTime: START + FOLLOW_WINDOW_MS }));
-  assert.equal(t.follower.wants(msg("om_5", { createTime: START + FOLLOW_WINDOW_MS + 1000 })), false);
+  t.advance(3 * DAY);
+  assert.equal(t.follower.wants(msg("om_3", { createTime: START + 3 * DAY })), false);
+  t.follower.track(msg("om_4", { mentionedBot: true, createTime: START + 3 * DAY }));
+  assert.equal(t.follower.wants(msg("om_5", { createTime: START + 3 * DAY + 1000 })), false);
 });
 
-test("配了记录文件：重启后接着跟 2 小时内回答过的话题，说过「只在 @ 我时回」的照样不跟", async () => {
+test("配了记录文件：重启后接着跟回答过的话题，说过「只在 @ 我时回」的照样不跟", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "follow-"));
   const file = path.join(dir, "follow.json");
   try {
@@ -324,14 +324,14 @@ test("配了记录文件：重启后接着跟 2 小时内回答过的话题，�
     // 静音的话题重启后再 @ 它，也不会重新跟
     after.follower.track(msg("om_muted_at2", { mentionedBot: true, rootId: "om_muted", threadId: "omt_9", createTime: START + 60_000 }));
     assert.equal(after.follower.wants(msg("om_3", { rootId: "om_muted", threadId: "omt_9", createTime: START + 61_000 })), false);
-    assert.ok(after.logs.some((line) => line.includes("接着跟重启前 2 小时内回答过的 1 个话题，1 个话题说过只在 @ 时回")));
+    assert.ok(after.logs.some((line) => line.includes("接着跟重启前回答过的 1 个话题，1 个话题说过只在 @ 时回")));
     await after.follower.flush();
 
-    // 最后一次 @ 过了 2 小时才重启的不再跟
+    // 停了几天才重启的照样跟
     const late = setup("是", false, undefined, file);
-    late.advance(FOLLOW_WINDOW_MS + 1000);
+    late.advance(3 * DAY);
     await late.follower.init();
-    assert.equal(late.follower.wants(msg("om_4", { createTime: START + FOLLOW_WINDOW_MS + 1000 })), false);
+    assert.equal(late.follower.wants(msg("om_4", { createTime: START + 3 * DAY })), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

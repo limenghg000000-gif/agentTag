@@ -5,9 +5,10 @@ import { FileQueue, writeAtomically } from "./file-store.js";
 import { type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import type { ChatModel } from "./llm.js";
 
-/** 话题里最后一次 @ 机器人（或机器人接着回过）之后，跟多久 */
-export const FOLLOW_WINDOW_MS = 2 * 60 * 60_000;
-/** 最多同时跟多少个话题、记多少个静音的话题，超出时先忘掉最早的 */
+/**
+ * 最多同时跟多少个话题、记多少个静音的话题，超出时先忘掉最早的（最后一次 @ 或接着回过最早的那个）。
+ * 跟聊不限时间（和 Claude Tag 一样）：回答过的话题隔多久回来接着问都不用 @
+ */
 const MAX_THREADS = 2000;
 /** 最多同时判断几条，多的排队（事件断了一阵、补漏轮询一次补上很多条时，别把模型的并发占满） */
 const MAX_JUDGING = 3;
@@ -61,7 +62,7 @@ export interface ThreadFollowerOptions {
   stateFile?: string;
 }
 
-/** 写进 stateFile 的内容：跟着的话题（还没过期的）和静音的话题，都按最近的排在后面 */
+/** 写进 stateFile 的内容：跟着的话题和静音的话题，都按最近的排在后面 */
 interface FollowState {
   threads?: Record<string, Followed>;
   muted?: string[];
@@ -154,7 +155,7 @@ export class ThreadFollower {
   }
 
   /**
-   * 读出重启前跟着的话题（过了 2 小时的不要）和静音的话题。文件不在就是都没有；读坏了打一行警告，从空的开始。
+   * 读出重启前跟着的话题和静音的话题。文件不在就是都没有；读坏了打一行警告，从空的开始。
    * 补漏轮询只看启动以后发的消息，停机那会儿话题里说的不会翻出来回
    */
   async init(): Promise<void> {
@@ -186,20 +187,15 @@ export class ThreadFollower {
         remember(this.muted, key);
       }
     }
-    const now = this.now();
     const threads = Object.entries(state.threads ?? {})
       .filter(
-        ([key, followed]) =>
-          typeof followed?.since === "number" &&
-          typeof followed.lastAt === "number" &&
-          now - followed.lastAt <= FOLLOW_WINDOW_MS &&
-          !this.muted.has(key),
+        ([key, followed]) => typeof followed?.since === "number" && typeof followed.lastAt === "number" && !this.muted.has(key),
       )
       .sort(([, a], [, b]) => a.lastAt - b.lastAt);
     for (const [key, followed] of threads) {
       remember(this.threads, key, { since: followed.since, lastAt: followed.lastAt });
     }
-    this.logger.info(`跟聊：接着跟重启前 2 小时内回答过的 ${this.threads.size} 个话题，${this.muted.size} 个话题说过只在 @ 时回`);
+    this.logger.info(`跟聊：接着跟重启前回答过的 ${this.threads.size} 个话题，${this.muted.size} 个话题说过只在 @ 时回`);
   }
 
   /** 等排着的写文件做完（测试和退出前用） */
@@ -214,8 +210,7 @@ export class ThreadFollower {
     }
     const key = threadKeyOf(msg);
     const now = this.now();
-    const followed = this.threads.get(key);
-    const since = followed && now - followed.lastAt <= FOLLOW_WINDOW_MS ? followed.since : msg.createTime || now;
+    const since = this.threads.get(key)?.since ?? (msg.createTime || now);
     remember(this.threads, key, { since, lastAt: now });
     this.save();
   }
@@ -237,10 +232,6 @@ export class ThreadFollower {
     }
     const followed = this.threads.get(msg.rootId);
     if (!followed || this.muted.has(msg.rootId)) {
-      return false;
-    }
-    if (this.now() - followed.lastAt > FOLLOW_WINDOW_MS) {
-      this.threads.delete(msg.rootId);
       return false;
     }
     return msg.createTime >= followed.since;
@@ -479,9 +470,7 @@ export class ThreadFollower {
   }
 
   private snapshot(): FollowState {
-    const now = this.now();
-    const threads = Object.fromEntries([...this.threads].filter(([, followed]) => now - followed.lastAt <= FOLLOW_WINDOW_MS));
-    return { threads, muted: [...this.muted] };
+    return { threads: Object.fromEntries(this.threads), muted: [...this.muted] };
   }
 }
 
