@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { FOLLOW_WINDOW_MS, MUTE_COMMAND, MUTED_REPLY, ThreadFollower } from "../src/follow.js";
@@ -30,7 +33,12 @@ function msg(messageId: string, extra: Partial<NormalizedMessage> = {}): Normali
 /** @ 了机器人、开了这个话题的那条 */
 const asked = msg("om_root", { mentionedBot: true, rootId: undefined, threadId: undefined, content: "最近一小时 gateway 报错多少" });
 
-function setup(judge: string | Error = "是", busy = false, declined?: (msg: NormalizedMessage, recent: readonly string[]) => Promise<void>) {
+function setup(
+  judge: string | Error = "是",
+  busy = false,
+  declined?: (msg: NormalizedMessage, recent: readonly string[]) => Promise<void>,
+  stateFile?: string,
+) {
   let now = START;
   const requests: ChatRequest[] = [];
   const handled: string[] = [];
@@ -68,6 +76,7 @@ function setup(judge: string | Error = "是", busy = false, declined?: (msg: Nor
       replies.push(`${m.messageId} ${markdown}`);
     },
     ...(declined ? { declined } : {}),
+    ...(stateFile ? { stateFile } : {}),
     logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error() {} },
     now: () => now,
   });
@@ -290,6 +299,72 @@ test("静音的话题过了 2 小时再 @ 它，也不会重新跟（机器人�
   assert.equal(t.follower.wants(msg("om_3", { createTime: START + FOLLOW_WINDOW_MS })), false);
   t.follower.track(msg("om_4", { mentionedBot: true, createTime: START + FOLLOW_WINDOW_MS }));
   assert.equal(t.follower.wants(msg("om_5", { createTime: START + FOLLOW_WINDOW_MS + 1000 })), false);
+});
+
+test("配了记录文件：重启后接着跟 2 小时内回答过的话题，说过「只在 @ 我时回」的照样不跟", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "follow-"));
+  const file = path.join(dir, "follow.json");
+  try {
+    const before = setup("是", false, undefined, file);
+    before.follower.track(asked);
+    before.follower.track(msg("om_muted_at", { mentionedBot: true, rootId: "om_muted", threadId: "omt_9" }));
+    await before.follower.consider(msg("om_quiet", { rootId: "om_muted", threadId: "omt_9", content: "别插话" }));
+    await before.follower.flush();
+    const saved = JSON.parse(await readFile(file, "utf8")) as { threads: Record<string, unknown>; muted: string[] };
+    assert.deepEqual(Object.keys(saved.threads), ["om_root"]);
+    assert.deepEqual(saved.muted, ["om_muted"]);
+
+    // 重启：新的跟聊从文件里接着跟
+    const after = setup("是", false, undefined, file);
+    after.advance(60_000);
+    await after.follower.init();
+    assert.equal(after.follower.wants(msg("om_2", { createTime: START + 60_000 })), true);
+    // 开始跟的起点也接着用：@ 之前发的照样不跟
+    assert.equal(after.follower.wants(msg("om_old", { createTime: START - 1000 })), false);
+    // 静音的话题重启后再 @ 它，也不会重新跟
+    after.follower.track(msg("om_muted_at2", { mentionedBot: true, rootId: "om_muted", threadId: "omt_9", createTime: START + 60_000 }));
+    assert.equal(after.follower.wants(msg("om_3", { rootId: "om_muted", threadId: "omt_9", createTime: START + 61_000 })), false);
+    assert.ok(after.logs.some((line) => line.includes("接着跟重启前 2 小时内回答过的 1 个话题，1 个话题说过只在 @ 时回")));
+    await after.follower.flush();
+
+    // 最后一次 @ 过了 2 小时才重启的不再跟
+    const late = setup("是", false, undefined, file);
+    late.advance(FOLLOW_WINDOW_MS + 1000);
+    await late.follower.init();
+    assert.equal(late.follower.wants(msg("om_4", { createTime: START + FOLLOW_WINDOW_MS + 1000 })), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("记录文件还没有时从空的开始、不报警；读坏了打一行警告，也从空的开始", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "follow-"));
+  const file = path.join(dir, "follow.json");
+  try {
+    const fresh = setup("是", false, undefined, file);
+    await fresh.follower.init();
+    assert.equal(fresh.follower.wants(msg("om_2")), false);
+    assert.ok(!fresh.logs.some((line) => line.includes("读不了") || line.includes("格式不对")));
+
+    for (const broken of ["{", "null", "[]"]) {
+      await writeFile(file, broken, "utf8");
+      const t = setup("是", false, undefined, file);
+      await t.follower.init();
+      assert.equal(t.follower.wants(msg("om_2")), false);
+      if (broken !== "[]") {
+        assert.ok(t.logs.some((line) => line.includes("格式不对")), broken);
+      }
+    }
+
+    // 读坏了以后照样能记：下一次 @ 写回好的
+    const t = setup("是", false, undefined, file);
+    await t.follower.init();
+    t.follower.track(asked);
+    await t.follower.flush();
+    assert.deepEqual(Object.keys((JSON.parse(await readFile(file, "utf8")) as { threads: object }).threads), ["om_root"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("开始跟之前发的消息不跟：补漏轮询回看时翻出 @ 之前没 @ 的消息，不拿来判断", () => {

@@ -64,6 +64,8 @@ export interface Config {
   streamCard: boolean;
   /** 话题里跟聊（FOLLOW_THREADS，默认 on）：机器人回答过的话题里，追问不用再 @ */
   followThreads: boolean;
+  /** 跟着哪些话题、哪些话题说过「只在 @ 我时回」记在这个文件里，重启后接着用 */
+  followStateFile: string;
   /** 带上群里刚才的聊天（CHAT_CONTEXT，默认 on）：在群里直接 @ 时，把这之前半小时内的群聊一起给模型 */
   chatContext: boolean;
   /** 主动接话（PROACTIVE_CHAT_IDS，默认没有群）：这些群里没 @ 的群消息，机器人看情况接一句 */
@@ -347,6 +349,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     showThinking: showThinking === "on",
     streamCard: streamCard === "on",
     followThreads: followThreads === "on",
+    followStateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "follow.json"),
     chatContext: chatContext === "on",
     proactive: {
       chatIds: new Set(proactiveChatIds.filter((id) => allowedChatIds.has(id))),

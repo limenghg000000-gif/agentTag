@@ -172,6 +172,8 @@ const follower = config.followThreads
       reply: replyInThread,
       // 不是对它说的：开了主动接话的群里，答案在群记忆里时接一句
       declined: (msg, recent) => proactive.considerInTopic(msg, recent),
+      // 跟着的、静音的话题记在文件里：部署重启后，回答过的话题里接着问照样不用 @
+      stateFile: config.followStateFile,
     })
   : undefined;
 // 主动接话：PROACTIVE_CHAT_IDS 里的群，群主界面没 @ 的消息看情况接一句；接了以后那个话题交给跟聊。
@@ -194,6 +196,7 @@ const proactive = new ProactiveReplier({
   topicBusy: (threadKey) => tasks.busy(threadKey),
 });
 await proactive.init();
+await follower?.init();
 /** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
 const answerMention = (msg: NormalizedMessage): Promise<void> =>
   follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);
@@ -406,6 +409,8 @@ const shutdown = async () => {
   await Promise.race([knowledge?.idle(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   await mcp?.stop();
   await channel.disconnect();
+  // 跟着的话题正在写文件的，写完再退出
+  await follower?.flush();
   process.exit(0);
 };
 process.once("SIGINT", shutdown);
