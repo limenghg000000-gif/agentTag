@@ -45,8 +45,8 @@ async function setup(
     noMemory?: boolean;
     topicBusy?: (threadKey: string) => boolean;
     skipTopic?: (threadKey: string) => boolean;
-    /** 配了就能「做」：记下交给它的消息 */
-    work?: boolean;
+    /** 配了就能「做」：记下交给它的消息；给 Error 时交给它就失败 */
+    work?: boolean | Error;
   } = {},
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "proactive-"));
@@ -111,6 +111,9 @@ async function setup(
         ? {
             work: async (m: NormalizedMessage) => {
               worked.push(m.messageId);
+              if (opts.work instanceof Error) {
+                throw opts.work;
+              }
             },
           }
         : {}),
@@ -270,7 +273,10 @@ test("要说的话出处对不上就不接：说的群记忆编号没有、数�
 });
 
 test("核对出处：群记忆编号要在给模型看的群记忆里，两位以上的数字、版本号、时间要在材料里原样出现过", () => {
-  const ask = { memory: "【背景】\n- #3 测试环境数据库是 db-test-2.internal，端口 3306（李四）\n- #12 每周三 18:30 发版", content: "群记忆：…\n新消息（没有 @ 你）：[张三] 1.8.2 的包在哪" };
+  const ask = {
+    memory: "【背景】\n- #3 测试环境数据库是 db-test-2.internal，端口 3306（李四）\n- #12 每周三 18:30 发版，群记忆 #7 已经作废",
+    content: "群记忆：…\n新消息（没有 @ 你）：[张三] 1.8.2 的包在哪",
+  };
   ask.content = `${ask.memory}\n${ask.content}`;
   assert.deepEqual(unsupported("测试库端口 3306（群记忆 #3）", ask), []);
   assert.deepEqual(unsupported("每周三 18:30 发版（群记忆 #12），1.8.2 的包问下李四", ask), []);
@@ -278,6 +284,10 @@ test("核对出处：群记忆编号要在给模型看的群记忆里，两位�
   assert.deepEqual(unsupported("问一下李四，第 2 个就是", ask), []);
   assert.deepEqual(unsupported("见群记忆 #1", ask), ["群记忆 #1"]);
   assert.deepEqual(unsupported("端口 3307，18:00 发版（群记忆 #3）", ask), ["3307", "18:00"]);
+  // 整个数对得上才算：3306 里的 33、1.8.2 里的 1.8 不算
+  assert.deepEqual(unsupported("端口 33，版本 1.8", ask), ["33", "1.8"]);
+  // 编号要是那一条的开头：#12 里顺带提到的 #7 不算
+  assert.deepEqual(unsupported("见群记忆 #7", ask), ["群记忆 #7"]);
 });
 
 test("读群聊卡住也算在判断时限里：到点就不回、不问模型", async () => {
@@ -734,6 +744,39 @@ test("话题里：再想一遍的这会儿话题里开始了别的任务（有�
   }
 });
 
+test("跟聊判断出来是群里定过规矩的那类事：再想一遍还是「做」才交给处理函数，算每小时的次数", async () => {
+  const t = await setup({ confirm: "做", work: true, maxPerHour: 1 });
+  try {
+    await t.replier.workInTopic(topicMsg("om_1"), TOPIC_ASK);
+    assert.deepEqual(t.worked, ["om_1"]);
+    assert.equal(t.confirms.length, 1);
+    assert.equal(t.confirms[0].system, TOPIC_ASK.system);
+    // 次数用完了
+    await t.replier.workInTopic(topicMsg("om_2", { createTime: START + 1000 }), TOPIC_ASK);
+    assert.deepEqual(t.worked, ["om_1"]);
+  } finally {
+    await t.cleanup();
+  }
+  for (const confirm of ["否", "接：测试环境数据库是 db-test-2.internal（群记忆 #3）"]) {
+    const t2 = await setup({ confirm, work: true });
+    try {
+      await t2.replier.workInTopic(topicMsg("om_1"), TOPIC_ASK);
+      assert.deepEqual(t2.worked, [], confirm);
+      assert.deepEqual(t2.replies, [], confirm);
+    } finally {
+      await t2.cleanup();
+    }
+  }
+  // 没配处理函数：不问模型
+  const plain = await setup({ confirm: "做" });
+  try {
+    await plain.replier.workInTopic(topicMsg("om_1"), TOPIC_ASK);
+    assert.equal(plain.confirms.length, 0);
+  } finally {
+    await plain.cleanup();
+  }
+});
+
 test("机器人没跟着的话题里的消息也判断：看群记忆和话题最近几条，在话题里接；跟聊管的话题不碰", async () => {
   const t = await setup({ judge: "接：测试环境数据库是 db-test-2.internal（群记忆 #3）", skipTopic: (key) => key === "om_followed" });
   try {
@@ -783,6 +826,17 @@ test("群记忆里定过规矩的那类事：模型说「做」、再想一遍�
     } finally {
       await t2.cleanup();
     }
+  }
+
+  // 交给处理函数没做成：不占每小时的次数
+  const failing = await setup({ judge: "做", work: new Error("发不出去"), maxPerHour: 1 });
+  try {
+    await failing.replier.consider(msg("om_1"));
+    await failing.replier.consider(msg("om_2"));
+    assert.deepEqual(failing.worked, ["om_1", "om_2"]);
+    assert.match(failing.logs.join("\n"), /主动接话：照群里的规矩去做没做成 chat=oc_1 message=om_1/);
+  } finally {
+    await failing.cleanup();
   }
 
   // 没配处理函数：提示词里没有「做」，模型说了也不算

@@ -318,6 +318,24 @@ export class ProactiveReplier {
     });
   }
 
+  /**
+   * 跟聊判断出来不是对机器人说的话题消息、但正是群里定过规矩要它处理的那类事：同样再想一遍、算每小时的次数，
+   * 再像被 @ 一样去做（见 work）。ask 是跟聊判断时的材料
+   */
+  async workInTopic(msg: NormalizedMessage, ask: JudgeAsk): Promise<void> {
+    if (!this.opts.work || !this.wantsInTopic(msg)) {
+      return;
+    }
+    await this.run(msg, {
+      where: "话题里",
+      wanted: () => this.wantsInTopic(msg),
+      judge: () => this.confirm(msg, "话题里", ask, { work: true }),
+      dropped: () => this.opts.topicBusy?.(threadKeyOf(msg)) ?? false,
+      movedOn: () => this.movedOnInTopic(msg),
+      hint: "",
+    });
+  }
+
   /** 判断、回一句：两种主动接话共用的上限、排队、判断完再看一眼 */
   private async run(
     msg: NormalizedMessage,
@@ -388,8 +406,13 @@ export class ProactiveReplier {
     const at = this.now();
     push(this.replies, chatId, at);
     if ("work" in move) {
-      // 回答在这条下面的话题里，之后跟着这个话题（处理函数里记），每小时的次数照算
-      await this.opts.work?.(msg);
+      // 回答在这条下面的话题里，之后跟着这个话题（处理函数里记），每小时的次数照算；没做成的退回来
+      try {
+        await this.opts.work?.(msg);
+      } catch (err) {
+        unpush(this.replies, chatId, at);
+        this.logger.warn(`主动接话：照群里的规矩去做没做成 chat=${chatId} message=${msg.messageId}`, err);
+      }
       return;
     }
     const said = move.say;
@@ -548,19 +571,24 @@ function saidLine(text: string): string | undefined {
   return line.length <= REPLY_MAX_CHARS ? line : `${line.slice(0, REPLY_MAX_CHARS)}…`;
 }
 
+/** 要核对的数字：两位以上的数字，带点或冒号的（版本号、IP、时间） */
+const NUMBER = /\d+(?:[.:]\d+)+|\d+/g;
+
 /**
- * 要说的话里对不上材料的地方：说「群记忆 #几」的，给模型看的群记忆里要有这一条；
- * 两位以上的数字、带点或冒号的（版本号、IP、时间）要在材料里原样出现过。对得上返回空数组
+ * 要说的话里对不上材料的地方：说「群记忆 #几」的，给模型看的群记忆里要有这一条（是那一条的开头，不是别的条目里顺带提到的）；
+ * 两位以上的数字、版本号、IP、时间要在材料里作为完整的一个数出现过（3306 里的 33、1.8.2 里的 1.8 不算）。对得上返回空数组
  */
 export function unsupported(said: string, ask: Pick<JudgeAsk, "content" | "memory">): string[] {
   const missing: string[] = [];
+  const ids = new Set([...ask.memory.matchAll(/^- #(\d+) /gm)].map(([, id]) => id));
   for (const [, id] of said.matchAll(/群记忆\s*#\s*(\d+)/g)) {
-    if (!new RegExp(`#${id}(?!\\d)`).test(ask.memory)) {
+    if (!ids.has(id)) {
       missing.push(`群记忆 #${id}`);
     }
   }
-  for (const [number] of said.replace(/群记忆\s*#\s*\d+/g, "").matchAll(/\d+(?:[.:]\d+)+|\d{2,}/g)) {
-    if (!ask.content.includes(number)) {
+  const known = new Set([...ask.content.matchAll(NUMBER)].map(([number]) => number));
+  for (const [number] of said.replace(/群记忆\s*#\s*\d+/g, "").matchAll(NUMBER)) {
+    if ((number.length >= 2 || /[.:]/.test(number)) && !known.has(number)) {
       missing.push(number);
     }
   }

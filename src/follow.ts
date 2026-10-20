@@ -63,13 +63,15 @@ export interface ThreadFollowerOptions {
   /** 在消息所在的话题里回一句 */
   reply: (msg: NormalizedMessage, markdown: string) => Promise<unknown>;
   /**
-   * 话题里不是对机器人说的、答案在群记忆里时接一句（见 ProactiveReplier.speakInTopic）。
-   * active 说这个群能不能这样接（开了主动接话、没停），能的话判断时多给模型一个选择「接：」；
-   * 模型选了它就交给 speak：开口前再想一遍、核对出处、算每小时的次数。机器人正在做这个话题里的事时不给这个选择
+   * 话题里不是对机器人说的、答案在群记忆里时接一句（见 ProactiveReplier.speakInTopic），是群里定过规矩要它处理的那类事时去做。
+   * active 说这个群能不能这样接（开了主动接话、没停），能的话判断时多给模型两个选择「接：」「做」；
+   * 模型选了就交给 speak、work：再想一遍、核对出处、算每小时的次数。机器人正在做这个话题里的事、群记忆是空的时不给这两个选择
    */
   chimeIn?: {
     active: (chatId: string) => boolean;
     speak: (msg: NormalizedMessage, ask: JudgeAsk, said: string) => Promise<void>;
+    /** 不是对机器人说的，但正是群记忆里定过规矩要它处理的那类事：再想一遍、算每小时的次数后像被 @ 一样去做（见 ProactiveReplier.workInTopic） */
+    work: (msg: NormalizedMessage, ask: JudgeAsk) => Promise<void>;
   };
   logger?: Logger;
   now?: () => number;
@@ -422,7 +424,13 @@ export class ThreadFollower {
       this.logger.warn(`跟聊：判断失败，这条不回 message=${msg.messageId}：${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }
-    const outcome = verdict.answer ? "是对机器人说的，接着回" : verdict.said ? "不是对机器人说的，答案在群记忆里，看要不要接一句" : "不是对机器人说的，不回";
+    const outcome = verdict.answer
+      ? "是对机器人说的，接着回"
+      : verdict.work
+        ? "不是对机器人说的，是群里定过规矩要它处理的那类事，看要不要去做"
+        : verdict.said
+          ? "不是对机器人说的，答案在群记忆里，看要不要接一句"
+          : "不是对机器人说的，不回";
     this.logger.info(
       `跟聊：没 @ 的话题消息${outcome} chat=${msg.chatId} thread=${msg.rootId} message=${msg.messageId} 用时=${this.now() - startedAt}ms`,
     );
@@ -431,8 +439,16 @@ export class ThreadFollower {
       return undefined;
     }
     if (!verdict.answer) {
-      // 不是对它说的、答案在群记忆里：交给主动接话，再想一遍、核对出处后接一句。不挡话题里后面的消息判断，也不算机器人回答过
-      return verdict.said && verdict.ask && this.opts.chimeIn ? { done: this.opts.chimeIn.speak(msg, verdict.ask, verdict.said) } : undefined;
+      // 不是对它说的、答案在群记忆里（或者是群里定过规矩的那类事）：交给主动接话，再想一遍、核对出处、算每小时的次数后接一句（去做）。
+      // 不挡话题里后面的消息判断，也不算机器人回答过
+      const chimeIn = this.opts.chimeIn;
+      if (!chimeIn || !verdict.ask) {
+        return undefined;
+      }
+      if (verdict.work) {
+        return { done: chimeIn.work(msg, verdict.ask) };
+      }
+      return verdict.said ? { done: chimeIn.speak(msg, verdict.ask, verdict.said) } : undefined;
     }
     this.track(msg);
     return { done: this.opts.handle(msg) };
@@ -473,8 +489,15 @@ export class ThreadFollower {
     if (/^[「"'*\s]*是/.test(result.text)) {
       return { answer: true };
     }
-    const said = chime ? /^[\s*「"']*接\s*[:：]\s*([\s\S]+)$/.exec(result.text.trim())?.[1].trim() : undefined;
-    return said ? { answer: false, said, ask: { system, content, memory } } : { answer: false };
+    if (!chime) {
+      return { answer: false };
+    }
+    const ask = { system, content, memory };
+    if (/^[\s*「"']*做[」"'\s。.!！]*$/.test(result.text.trim())) {
+      return { answer: false, work: true, ask };
+    }
+    const said = /^[\s*「"']*接\s*[:：]\s*([\s\S]+)$/.exec(result.text.trim())?.[1].trim();
+    return said ? { answer: false, said, ask } : { answer: false };
   }
 
   /** 记下跟着、静音的话题（配了 stateFile 时）。写失败只打警告：最多是重启后要再 @ 一次 */
@@ -534,10 +557,14 @@ export function remember<V>(store: Map<string, V> | Set<string>, key: string, va
   }
 }
 
-/** 跟聊判断的结果：answer 是对机器人说的；不是的话，said 是模型想按群记忆接的那句（ask 是这次判断的材料，再想一遍用） */
+/**
+ * 跟聊判断的结果：answer 是对机器人说的；不是的话，said 是模型想按群记忆接的那句，work 是群里定过规矩要它处理的那类事
+ * （ask 是这次判断的材料，再想一遍用）
+ */
 interface Verdict {
   answer: boolean;
   said?: string;
+  work?: boolean;
   ask?: JudgeAsk;
 }
 
@@ -550,14 +577,15 @@ function judgePrompt(botName: string, chime: boolean): string {
   return [
     `你在判断飞书群一个话题里的新消息要不要群里的机器人「${botName}」回应。`,
     "机器人之前在这个话题里回答过问题，所以群成员接着跟它说话时可能不再 @ 它。",
-    "话题里 [机器人] 开头的是机器人说的，其他是群成员说的，方括号里是发言人。给了群记忆的话，里面群里定的规矩（哪类消息不用 @ 也要它回、哪类别管）优先照着做。",
-    "回答「是」：在跟机器人说话、要它回应的，比如接着机器人的回答追问，让它继续做、换个做法、再查一下，纠正它说的，补充它要的信息；或者群里定的规矩说这类消息要它回。",
+    "话题里 [机器人] 开头的是机器人说的，其他是群成员说的，方括号里是发言人。给了群记忆的话，里面群里定的规矩（哪类消息别管）优先照着做。",
+    "回答「是」：在跟机器人说话、要它回应的，比如接着机器人的回答追问，让它继续做、换个做法、再查一下，纠正它说的，补充它要的信息。",
     ...(chime
       ? [
+          "回答「做」：不是在跟机器人说话，但群记忆里有规矩说这类事不用 @ 也要它处理（比如「线上报错直接帮忙查」），这条正是这类事。",
           "回答「接：」加上要说的一句话：不是在跟机器人说话，但有人问了问题、在找一件事，或者说的和群记忆对不上，而答案就在群记忆里、一两句话说得清。直接说，写明出处（「群记忆 #3」），只能照抄群记忆里的原文，不超过 100 字。",
         ]
       : []),
-    `回答「否」：群成员之间互相说话、商量、分工，只是表个态（好的、收到、谢谢、👍、哈哈），和机器人在做的事无关的闲聊${chime ? "，群记忆里也没有答案的" : ""}。`,
-    `拿不准时回答「否」。只输出一行：${chime ? "是、否，或者「接：」加一句话" : "一个字，是或者否"}。`,
+    `回答「否」：群成员之间互相说话、商量、分工，只是表个态（好的、收到、谢谢、👍、哈哈），和机器人在做的事无关的闲聊${chime ? "，群记忆里也没有答案、也不归规矩管的" : ""}。`,
+    `拿不准时回答「否」。只输出一行：${chime ? "是、否、做，或者「接：」加一句话" : "一个字，是或者否"}。`,
   ].join("\n");
 }

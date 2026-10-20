@@ -173,8 +173,13 @@ const follower = config.followThreads
       reply: replyInThread,
       // 判断时带上群记忆：群里定的规矩（哪类消息不用 @ 也要回）、答案都在里面
       memory: (chatId) => memory.list(chatId).then((entries) => renderMemoryForPrompt(entries, JUDGE_MEMORY_CHARS).text),
-      // 不是对它说的、答案在群记忆里：开了主动接话的群里，再想一遍、核对出处后接一句
-      chimeIn: { active: (chatId) => proactive.active(chatId), speak: (msg, ask, said) => proactive.speakInTopic(msg, ask, said) },
+      // 不是对它说的、答案在群记忆里（或者是群里定过规矩的那类事）：开了主动接话的群里，再想一遍、核对出处后接一句（去做）
+      chimeIn: {
+        active: (chatId) => proactive.active(chatId),
+        speak: (msg, ask, said) => proactive.speakInTopic(msg, ask, said),
+        // 群里定过规矩的那类事：同样再想一遍、算每小时的次数，再像被 @ 一样去做
+        work: (msg, ask) => proactive.workInTopic(msg, ask),
+      },
       // 跟着的、静音的话题记在文件里：部署重启后，回答过的话题里接着问照样不用 @
       stateFile: config.followStateFile,
     })
@@ -205,11 +210,14 @@ const proactive = new ProactiveReplier({
 });
 await proactive.init();
 await follower?.init();
-/** 没 @ 机器人、照群里定的规矩要它处理的消息：只给读的工具，之后跟着这个话题；同一话题里排在还在判断的消息后面 */
+/**
+ * 没 @ 机器人、照群里定的规矩要它处理的消息：只给读的工具，记、改、删群记忆也不给；之后跟着这个话题；
+ * 同一话题里排在还在判断的消息后面
+ */
 const answerUnaddressed = (msg: NormalizedMessage): Promise<void> =>
   follower
-    ? follower.answerInTurn(msg, () => handleMessage(msg, { unaddressed: true }), false)
-    : handleMessage(msg, { unaddressed: true });
+    ? follower.answerInTurn(msg, () => handleMessage(msg, { unaddressed: true, proactive: true }), false)
+    : handleMessage(msg, { unaddressed: true, proactive: true });
 /** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
 const answerMention = (msg: NormalizedMessage): Promise<void> =>
   follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);

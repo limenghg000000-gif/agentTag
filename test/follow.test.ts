@@ -176,16 +176,20 @@ test("带上群记忆一起判断：群里定的规矩也在里面，是对它�
   await t.follower.consider(msg("om_2", { content: "今天能部署吗" }));
   assert.deepEqual(t.handled, ["om_2"]);
   const [request] = t.requests;
-  assert.match(request.system, /群里定的规矩（哪类消息不用 @ 也要它回、哪类别管）优先照着做/);
+  assert.match(request.system, /群里定的规矩（哪类消息别管）优先照着做/);
   assert.match(request.messages[0].content, /^群记忆：\n【规矩】\n- #5 部署相关的问题不用 @ 也直接回答（张三）\n\n话题里最近的消息：/);
 });
 
 test("不是对它说的、答案在群记忆里：开了主动接话的群里模型可以说「接：」，交给主动接话再想一遍；没开、在做事、群记忆是空的不给这个选择", async () => {
   const spoken: Array<{ id: string; said: string; memory: string; content: string }> = [];
+  const worked: string[] = [];
   const chimeIn = (active: boolean) => ({
     active: () => active,
     speak: async (m: NormalizedMessage, ask: { content: string; memory: string }, said: string) => {
       spoken.push({ id: m.messageId, said, memory: ask.memory, content: ask.content });
+    },
+    work: async (m: NormalizedMessage) => {
+      worked.push(m.messageId);
     },
   });
   const memory = "【背景】\n- #3 测试环境数据库是 db-test-2.internal（李四）";
@@ -217,6 +221,22 @@ test("不是对它说的、答案在群记忆里：开了主动接话的群里�
   // 判断失败的不交
   await setup(new Error("百炼超时"), false, { chimeIn: chimeIn(true), memory }).follower.consider(msg("om_4"));
   assert.equal(spoken.length, 1);
+
+  // 群里定过规矩的那类事：模型说「做」，交给主动接话再想一遍、算次数后去做，不直接交给处理函数
+  const rule = setup("做", false, { chimeIn: chimeIn(true), memory: "【规矩】\n- #5 线上报错不用 @ 也直接帮忙查（张三）" });
+  rule.follower.track(asked);
+  await rule.follower.consider(msg("om_5", { content: "gateway 又报 502 了" }));
+  assert.deepEqual(worked, ["om_5"]);
+  assert.deepEqual(rule.handled, []);
+  assert.match(rule.requests[0].system, /回答「做」：不是在跟机器人说话，但群记忆里有规矩说这类事不用 @ 也要它处理/);
+  assert.match(rule.logs.join("\n"), /是群里定过规矩要它处理的那类事，看要不要去做.*message=om_5/);
+  // 没开主动接话：没有「做」这个选择，模型说了也不算
+  const off = setup("做", false, { chimeIn: chimeIn(false), memory: "【规矩】\n- #5 线上报错不用 @ 也直接帮忙查（张三）" });
+  off.follower.track(asked);
+  await off.follower.consider(msg("om_6", { content: "gateway 又报 502 了" }));
+  assert.doesNotMatch(off.requests[0].system, /回答「做」/);
+  assert.deepEqual(worked, ["om_5"]);
+  assert.deepEqual(off.handled, []);
 });
 
 test("判断出错时不回：宁可漏回一句，也不在别人说话时插嘴", async () => {
