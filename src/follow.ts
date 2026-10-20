@@ -1,5 +1,7 @@
+import { readFile } from "node:fs/promises";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { STOP_COMMAND } from "./bot.js";
+import { FileQueue, writeAtomically } from "./file-store.js";
 import { type Logger, type ThreadContext, threadKeyOf } from "./history.js";
 import type { ChatModel } from "./llm.js";
 
@@ -55,6 +57,14 @@ export interface ThreadFollowerOptions {
   now?: () => number;
   /** 判断一条最多等多久（读话题上文加问模型），默认 20 秒 */
   judgeTimeoutMs?: number;
+  /** 跟着的话题和说过「只在 @ 我时回」的话题记在这个文件里，重启后接着跟、照样不跟。不给就只记在内存里 */
+  stateFile?: string;
+}
+
+/** 写进 stateFile 的内容：跟着的话题（还没过期的）和静音的话题，都按最近的排在后面 */
+interface FollowState {
+  threads?: Record<string, Followed>;
+  muted?: string[];
 }
 
 interface Followed {
@@ -121,7 +131,7 @@ export class JudgeQueue {
  */
 export class ThreadFollower {
   private readonly threads = new Map<string, Followed>();
-  /** 说过「只在 @ 我时回」的话题：机器人运行期间一直记着，不随跟聊过期 */
+  /** 说过「只在 @ 我时回」的话题：一直记着（配了 stateFile 时重启后也记着），不随跟聊过期 */
   private readonly muted = new Set<string>();
   /** 每个话题最后一条在判断的消息「判断完、交出去」的 Promise：同一话题里后来的等它 */
   private readonly turns = new Map<string, Promise<void>>();
@@ -133,10 +143,68 @@ export class ThreadFollower {
   private readonly queue = new JudgeQueue();
   private readonly logger: Logger;
   private readonly now: () => number;
+  private readonly files = new FileQueue();
+  /** 已经排上、还没开始写的那次：开始写时取当时的状态，这期间再有变化不用再排一次 */
+  private saveQueued = false;
+  private lastSave: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: ThreadFollowerOptions) {
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? Date.now;
+  }
+
+  /**
+   * 读出重启前跟着的话题（过了 2 小时的不要）和静音的话题。文件不在就是都没有；读坏了打一行警告，从空的开始。
+   * 补漏轮询只看启动以后发的消息，停机那会儿话题里说的不会翻出来回
+   */
+  async init(): Promise<void> {
+    const file = this.opts.stateFile;
+    if (!file) {
+      return;
+    }
+    let raw: string;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.logger.warn(`跟聊：读不了 ${file}，重启前跟着的话题要再 @ 一次才接着跟`, err);
+      }
+      return;
+    }
+    let state: FollowState;
+    try {
+      state = JSON.parse(raw) as FollowState;
+      if (typeof state !== "object" || state === null) {
+        throw new Error("不是 JSON 对象");
+      }
+    } catch (err) {
+      this.logger.warn(`跟聊：${file} 格式不对，重启前跟着的话题要再 @ 一次才接着跟`, err);
+      return;
+    }
+    for (const key of Array.isArray(state.muted) ? state.muted : []) {
+      if (typeof key === "string") {
+        remember(this.muted, key);
+      }
+    }
+    const now = this.now();
+    const threads = Object.entries(state.threads ?? {})
+      .filter(
+        ([key, followed]) =>
+          typeof followed?.since === "number" &&
+          typeof followed.lastAt === "number" &&
+          now - followed.lastAt <= FOLLOW_WINDOW_MS &&
+          !this.muted.has(key),
+      )
+      .sort(([, a], [, b]) => a.lastAt - b.lastAt);
+    for (const [key, followed] of threads) {
+      remember(this.threads, key, { since: followed.since, lastAt: followed.lastAt });
+    }
+    this.logger.info(`跟聊：接着跟重启前 2 小时内回答过的 ${this.threads.size} 个话题，${this.muted.size} 个话题说过只在 @ 时回`);
+  }
+
+  /** 等排着的写文件做完（测试和退出前用） */
+  flush(): Promise<void> {
+    return this.lastSave;
   }
 
   /** 机器人处理了这条消息（@ 它的、点按钮接着问的、跟聊判断要回的）：之后跟着这个话题 */
@@ -149,6 +217,7 @@ export class ThreadFollower {
     const followed = this.threads.get(key);
     const since = followed && now - followed.lastAt <= FOLLOW_WINDOW_MS ? followed.since : msg.createTime || now;
     remember(this.threads, key, { since, lastAt: now });
+    this.save();
   }
 
   /**
@@ -178,7 +247,7 @@ export class ThreadFollower {
   }
 
   /**
-   * 说「只在 @ 我时回」：这个话题不再跟聊（机器人运行期间一直不跟），回一句。返回 true 表示是这句话、已经处理了。
+   * 说「只在 @ 我时回」：这个话题不再跟聊（一直不跟，配了 stateFile 时重启后也不跟），回一句。返回 true 表示是这句话、已经处理了。
    * @ 了它说的都算，在群里直接 @ 它说的，就是它回复这条时开的那个话题；
    * 没 @ 它时，只认它在跟着的话题里说的
    */
@@ -205,6 +274,7 @@ export class ThreadFollower {
     const key = threadKeyOf(msg);
     this.threads.delete(key);
     remember(this.muted, key);
+    this.save();
     this.logger.info(`跟聊：话题里说了只在 @ 时回，这个话题不再跟聊 chat=${msg.chatId} thread=${key} message=${msg.messageId}`);
     return this.opts.reply(msg, MUTED_REPLY).then(() => undefined);
   }
@@ -388,6 +458,30 @@ export class ThreadFollower {
       signal,
     });
     return { yes: /^[「"'*\s]*是/.test(result.text), recent };
+  }
+
+  /** 记下跟着、静音的话题（配了 stateFile 时）。写失败只打警告：最多是重启后要再 @ 一次 */
+  private save(): void {
+    const file = this.opts.stateFile;
+    if (!file || this.saveQueued) {
+      return;
+    }
+    this.saveQueued = true;
+    this.lastSave = this.files
+      .run(file, () => {
+        this.saveQueued = false;
+        return writeAtomically(file, `${JSON.stringify(this.snapshot())}\n`);
+      })
+      .catch((err) => {
+        this.saveQueued = false;
+        this.logger.warn(`跟聊：写 ${file} 失败，重启后跟着的话题要再 @ 一次才接着跟`, err);
+      });
+  }
+
+  private snapshot(): FollowState {
+    const now = this.now();
+    const threads = Object.fromEntries([...this.threads].filter(([, followed]) => now - followed.lastAt <= FOLLOW_WINDOW_MS));
+    return { threads, muted: [...this.muted] };
   }
 }
 

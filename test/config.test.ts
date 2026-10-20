@@ -198,6 +198,9 @@ test("FOLLOW_THREADS、CHAT_CONTEXT：默认开，off 关掉，写错时报错",
   assert.equal(loadConfig({ ...base, CHAT_CONTEXT: "off" }).chatContext, false);
   assert.throws(() => loadConfig({ ...base, FOLLOW_THREADS: "yes" }), /FOLLOW_THREADS 只能是 on 或 off/);
   assert.throws(() => loadConfig({ ...base, CHAT_CONTEXT: "1" }), /CHAT_CONTEXT 只能是 on 或 off/);
+  // 跟着的话题记在 DATA_DIR 下，重启后接着跟
+  assert.equal(loadConfig(base).followStateFile, path.resolve("data", "follow.json"));
+  assert.equal(loadConfig({ ...base, DATA_DIR: "/srv/bot" }).followStateFile, path.resolve("/srv/bot", "follow.json"));
 });
 
 test("PROACTIVE_CHAT_IDS：默认没有群；只算群白名单里的，别的列出来提醒；PROACTIVE_MAX_PER_HOUR 默认 3", () => {
