@@ -357,3 +357,10 @@ test("更新通知的「文档中心」链接（DOCS_LINK）要是 https 地址�
   assert.throws(() => loadConfig({ ...base, DOCS_LINK: "http://docs.example.com" }), /DOCS_LINK 要写成 https/);
   assert.throws(() => loadConfig({ ...base, ANNOUNCE: "off", DOCS_LINK: "docs.example.com" }), /DOCS_LINK 要写成 https/);
 });
+
+test("SCHEDULED_TASKS：默认开，记在 DATA_DIR/schedules.json；off 关掉，写错时报错", () => {
+  assert.equal(loadConfig(base).schedules?.file, path.resolve("data", "schedules.json"));
+  assert.equal(loadConfig({ ...base, DATA_DIR: "/srv/bot" }).schedules?.file, "/srv/bot/schedules.json");
+  assert.equal(loadConfig({ ...base, SCHEDULED_TASKS: " OFF " }).schedules, undefined);
+  assert.throws(() => loadConfig({ ...base, SCHEDULED_TASKS: "yes" }), /SCHEDULED_TASKS 只能是 on 或 off/);
+});

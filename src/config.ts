@@ -79,6 +79,11 @@ export interface Config {
     /** 群里说「别主动插话」后记在这个文件里，重启后照样停着 */
     stateFile: string;
   };
+  /** 定时任务（SCHEDULED_TASKS，默认 on）：群里 @ 机器人建，到点在原来的群里跑。关掉时为空 */
+  schedules?: {
+    /** 定时任务记在这个文件里，重启后接着跑 */
+    file: string;
+  };
   /** 卡片即回答时记下卡片里的回答的目录（每个群一个 JSON 文件），读话题历史时用 */
   cardAnswersDir: string;
   /** 按群记下最近几个话题的问答的目录（每个群一个 JSON 文件），chat_recent_threads 用 */
@@ -288,6 +293,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`CHAT_CONTEXT 只能是 on 或 off，当前为 ${env.CHAT_CONTEXT}`);
   }
 
+  const schedules = (env.SCHEDULED_TASKS?.trim() || "on").toLowerCase();
+  if (schedules !== "on" && schedules !== "off") {
+    throw new Error(`SCHEDULED_TASKS 只能是 on 或 off，当前为 ${env.SCHEDULED_TASKS}`);
+  }
+
   const proactiveMaxEnv = env.PROACTIVE_MAX_PER_HOUR?.trim();
   const proactiveMax = proactiveMaxEnv ? Number(proactiveMaxEnv) : Number.POSITIVE_INFINITY;
   if (proactiveMaxEnv && (!Number.isInteger(proactiveMax) || proactiveMax < 1 || proactiveMax > 60)) {
@@ -356,6 +366,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       maxPerHour: proactiveMax,
       stateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "proactive.json"),
     },
+    ...(schedules === "on" ? { schedules: { file: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "schedules.json") } } : {}),
     cardAnswersDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "card-answers"),
     recentThreadsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "recent-threads"),
     ...(knowledgeOff ? {} : { knowledge: loadKnowledgeConfig(env, baseURL) }),

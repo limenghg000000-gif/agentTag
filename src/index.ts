@@ -26,11 +26,14 @@ import type { AboutBot } from "./prompt.js";
 import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
+import { describeSchedule, escapePost, label, type RunResult, type ScheduledTask, Scheduler } from "./schedules.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { createCardKitApi } from "./stream-card.js";
 import { TaskRegistry } from "./tasks.js";
+import { CHAT_HISTORY_TOOL, createChatHistoryTool } from "./tools/chat-history.js";
 import { CODE_TOOL_NAMES, createCodeTools } from "./tools/code.js";
+import { createScheduleTools, SCHEDULE_TOOL_NAMES } from "./tools/schedules.js";
 import { KnowledgeDesk } from "./tools/knowledge.js";
 import { createDocTools, DOC_TOOL_NAMES } from "./tools/docs.js";
 import { createFetchUrlTool } from "./tools/fetch-url.js";
@@ -130,10 +133,23 @@ const answerMessage = createMessageHandler({
   model,
   tools,
   // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分
-  taskTools: ({ chatId, senderId, threadKey, askerName }) => [
+  taskTools: ({ chatId, senderId, threadKey, askerName, messageId }) => [
     ...createDocTools({ docs, chatId, requesterOpenId: senderId }),
+    // 读本群一段时间的聊天记录（周报、「今天大家讨论了什么」）：只能读本群，读过以后这次不能再改已有的文档和代码
+    createChatHistoryTool({ api: feishuApi, chatId, cardAnswers }),
     ...(workspaces
       ? createCodeTools({ workspaces, threadKey, askerName, botName: () => channel.botIdentity?.name ?? "机器人" })
+      : []),
+    // 定时任务记在提问的人名下，到点按他的权限跑；暂停、取消别人建的要在写权限名单里（没配名单时谁都能）
+    ...(scheduler
+      ? createScheduleTools({
+          scheduler,
+          chatId,
+          senderId,
+          ...(askerName ? { askerName } : {}),
+          messageId,
+          canManageAll: !config.feishu.writeAllowedUsers || config.feishu.writeAllowedUsers.has(senderId),
+        })
       : []),
   ],
   allowedChatIds: config.feishu.allowedChatIds,
@@ -226,6 +242,66 @@ const proactive = new ProactiveReplier({
 });
 await proactive.init();
 await follower?.init();
+// 定时任务：群里 @ 机器人建，记在 data/schedules.json；到点在原来的群里发一条，按建的人的权限跑（连上飞书以后才开始看）
+const scheduler = config.schedules
+  ? new Scheduler({
+      file: config.schedules.file,
+      allowedChatIds: config.feishu.allowedChatIds,
+      run: (task, late) => runScheduledTask(task, late),
+      notify: (chatId, markdown) => channel.send(chatId, { markdown }),
+    })
+  : undefined;
+try {
+  await scheduler?.init();
+} catch (err) {
+  console.error(`定时任务文件 ${config.schedules?.file} 读不了，请检查 DATA_DIR 和目录权限（不用定时任务可以设 SCHEDULED_TASKS=off）。`, err);
+  process.exit(1);
+}
+
+/**
+ * 定时任务到点：在原来的群里发一条「⏰ 定时任务 T3」（一次性的和纯提醒 @ 建的人），纯提醒到这里就完了；
+ * 要做事的把这条当成建任务的人 @ 机器人说了建任务时写好的那句话，交给同一个处理函数，按他现在的权限跑，回答发在这条下面的话题里
+ */
+async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunResult> {
+  const creator = task.creator.name ? escapePost(task.creator.name) : undefined;
+  const about = `定时任务 ${label(task)} · ${describeSchedule(task)}${creator ? ` · ${creator}建的` : ""}`;
+  const lateNote = late >= 5 * 60_000 ? `\n（比定的时间晚了 ${Math.round(late / 60_000)} 分钟：那会儿机器人在重启或者在忙）` : "";
+  // 一次性的、纯提醒的多半是给建的人看的，@ 他；周期任务每次都 @ 太吵
+  const notifyCreator = task.remind || task.at !== undefined;
+  const mentions = notifyCreator ? { mentions: [{ key: "", openId: task.creator.openId, name: creator ?? "" }] } : undefined;
+  if (task.remind) {
+    await channel.send(task.chatId, { markdown: `⏰ **提醒**：${escapePost(task.prompt)}\n（${about}）${lateNote}` }, mentions);
+    return "done";
+  }
+  const { messageId } = await channel.send(task.chatId, { markdown: `⏰ **${about}**\n${escapePost(task.prompt)}${lateNote}` }, mentions);
+  const msg: NormalizedMessage = {
+    messageId,
+    chatId: task.chatId,
+    chatType: "group",
+    senderId: task.creator.openId,
+    ...(task.creator.name ? { senderName: task.creator.name } : {}),
+    content: task.prompt,
+    rawContentType: "text",
+    resources: [],
+    mentions: [],
+    mentionAll: false,
+    mentionedBot: true,
+    createTime: Date.now(),
+  };
+  // 结果话题里接着问不用 @（和回答过的话题一样）
+  follower?.track(msg);
+  let result: RunResult = "failed";
+  await handleMessage(msg, {
+    scheduled: {
+      label: label(task),
+      schedule: describeSchedule(task),
+      ...(task.creator.name ? { creatorName: task.creator.name } : {}),
+      ...(task.readOnly ? { readOnly: true } : {}),
+      onEnd: (phase) => (result = phase),
+    },
+  });
+  return result;
+}
 /**
  * 没 @ 机器人、照群里定的规矩要它处理的消息：只给读的工具，记、改、删群记忆也不给；之后跟着这个话题；
  * 同一话题里排在还在判断的消息后面
@@ -326,7 +402,7 @@ try {
 }
 console.log(
   `飞书长连接已建立，版本 ${VERSION}，机器人「${channel.botIdentity?.name}」，模型 ${config.llm.model}，` +
-    `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, ...(workspaces ? CODE_TOOL_NAMES : [])].join(", ")}，` +
+    `工具 ${[...tools.map((tool) => tool.spec.name), ...DOC_TOOL_NAMES, CHAT_HISTORY_TOOL, ...(workspaces ? CODE_TOOL_NAMES : []), ...(scheduler ? SCHEDULE_TOOL_NAMES : [])].join(", ")}，` +
     `群记忆存放在 ${config.memoryDir}`,
 );
 console.log(
@@ -409,6 +485,15 @@ if (config.knowledge) {
 } else {
   console.log("团队经验库：已关闭（KNOWLEDGE=off）");
 }
+if (scheduler) {
+  scheduler.start();
+  console.log(
+    `定时任务：群里 @ 机器人说「每周一 9 点汇总上周进展」「明天下午 3 点提醒我…」就能建，记在 ${config.schedules!.file}；` +
+      "到点在原来的群里发一条、按建的人的权限跑（不改代码），每 30 秒看一次（SCHEDULED_TASKS=off 关掉）",
+  );
+} else {
+  console.log("定时任务：已关闭（SCHEDULED_TASKS=off）");
+}
 if (backup) {
   backup.start();
   console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
@@ -442,6 +527,8 @@ if (config.feishu.allowedChatIds.size === 0) {
 }
 
 const shutdown = async () => {
+  // 不再看新到点的定时任务；正在跑的下面停掉，等它记完结果再退出
+  const schedulerStopped = scheduler?.stop();
   // 停掉进行中的任务，让它们把卡片更新成「已停止」再退出
   await catchUp.stop();
   await backup?.stop();
@@ -449,6 +536,7 @@ const shutdown = async () => {
   await Promise.race([announcer?.stop(), new Promise((resolve) => setTimeout(resolve, 5_000))]);
   tasks.stopAll();
   await tasks.idle(5000);
+  await Promise.race([schedulerStopped, new Promise((resolve) => setTimeout(resolve, 5_000))]);
   // 已经点了确认、正在写经验库的，写完再退出（最多等 10 秒）
   await Promise.race([knowledge?.idle(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   await mcp?.stop();

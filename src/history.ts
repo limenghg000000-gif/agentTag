@@ -82,7 +82,8 @@ export class ThreadContextLoader {
     private readonly chatContext = false,
   ) {}
 
-  async load(msg: NormalizedMessage): Promise<ThreadContext> {
+  /** chat: false 时不带群里刚才的聊天（定时任务到点跑的） */
+  async load(msg: NormalizedMessage, { chat: withChat = true }: { chat?: boolean } = {}): Promise<ThreadContext> {
     const key = threadKeyOf(msg);
     if (msg.threadId) {
       try {
@@ -96,7 +97,7 @@ export class ThreadContextLoader {
     const local = history.length > 0;
     let images: ImageRef[] = [];
     // 在群里直接 @（不在话题里）：带上群里刚才的聊天，「看下上面那个报错」这类问题才接得上
-    const chat = !msg.threadId && !local ? await this.loadChat(msg) : [];
+    const chat = withChat && !msg.threadId && !local ? await this.loadChat(msg) : [];
     if (chat.length > 0) {
       history.push({ role: "user", content: renderChat(chat) });
       images = imagesOf(chat);
