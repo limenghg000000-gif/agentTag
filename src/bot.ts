@@ -39,10 +39,12 @@ import { createEarlierResultsTool, EARLIER_RESULTS_TOOL, type EarlierResult, Ear
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
 import { containsSecret, maskPersonal } from "./knowledge.js";
+import { CHAT_HISTORY_TOOL } from "./tools/chat-history.js";
 import { CONFLICT_TOOL } from "./tools/conflicts.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
+import { SCHEDULE_LIST_TOOL, SCHEDULE_TOOL_NAMES } from "./tools/schedules.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
@@ -108,6 +110,26 @@ const CHANGE_REQUEST = new RegExp(
 const MEMORY_REQUEST =
   /记住|记下|记一下|忘掉|把[^，。,.!?！？\n]{0,12}忘了|(?:删|改|更新)[^，。,.!?！？\n]{0,8}记忆|记忆[^，。,.!?！？\n]{0,8}(?:删|改|更新)/;
 
+/**
+ * 提问本身要建定时任务、要它以后或定期做事：「每周一 9 点汇总」「明天提醒我」「工作日每天查一下」「定时任务」。
+ * 说了这些的不当成整理之前的内容（「每周一总结一下这个话题」要建任务，不是现在就总结）
+ */
+const SCHEDULE_ASK = /定时|计划任务|周期任务|提醒|闹钟|到点|每(?:天|日|晚|早|周|星期|礼拜|个?月|隔|个?小时|年)|工作日|cron/i;
+/**
+ * 提问说到了定时任务或者以后的某个时间（「明天下午 3 点」「下周一」「T3」「半小时后」）：给定时任务的工具。
+ * 认多了只是多给几个工具，模型照工具说明只在明确要以后做事时才建；认少了它就说做不到
+ */
+const SCHEDULE_TALK = new RegExp(
+  [
+    SCHEDULE_ASK.source,
+    String.raw`(?:大?后|今|明)天|下(?:周|个?星期|个?礼拜|个?月)|(?:周|星期|礼拜)[一二三四五六日天末]`,
+    String.raw`\d{1,2}\s*(?:点|[:：]\d{2})|(?:半|一|两|几|\d+)\s*个?\s*(?:分钟|小时|钟头)\s*(?:后|以后|之后)`,
+    String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`,
+  ].join("|"),
+  "i",
+);
+const SCHEDULE_TOOLS: ReadonlySet<string> = new Set(SCHEDULE_TOOL_NAMES);
+
 /** 提问本身说到了经验库的事：「沉淀成经验」「记到经验库」「把 #5 归档」「群记忆和经验库有没有冲突」。「数据对不上」「代码冲突」不算 */
 const KNOWLEDGE_REQUEST = /沉淀|经验|知识库|归档/;
 
@@ -137,7 +159,8 @@ function docRequested(question: string, history: readonly ChatMessage[]): boolea
 }
 
 export interface ThreadContextSource {
-  load(msg: NormalizedMessage): Promise<ThreadContext>;
+  /** chat: false 时不带群里刚才的聊天（定时任务到点跑的：没人在群里 @，群聊和这件事无关） */
+  load(msg: NormalizedMessage, opts?: { chat?: boolean }): Promise<ThreadContext>;
   /** questionFull：提问截短前的全文（和 question 一样时可以不给） */
   remember(msg: NormalizedMessage, question: string, answer: string, questionFull?: string): void;
 }
@@ -235,6 +258,15 @@ export function createMessageHandler(deps: BotDeps) {
       logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
       return;
     }
+    const question = msg.content.trim();
+    const reply = (markdown: string) =>
+      send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
+    if (options.scheduled) {
+      // 定时任务到点跑的：内容是建任务时写好的，不当成「停止」「别主动插话」这类指令，也不和别的提问去重（两个任务同一分钟跑同一句话照样各跑各的）
+      logger.info(`定时任务 ${options.scheduled.label} 到点跑 chat=${msg.chatId} message=${msg.messageId} creator=${msg.senderId}`);
+      await runTask(deps, msg, question, reply, cardKit, options);
+      return;
+    }
     logger.info(`收到提问 chat=${msg.chatId} message=${msg.messageId} thread=${threadKeyOf(msg)} sender=${msg.senderId}`);
 
     // 话题里回复时勾了「同时发送到群」会收到两条一样的 @，只处理话题里那条，写操作不做两遍
@@ -249,10 +281,6 @@ export function createMessageHandler(deps: BotDeps) {
         `message=${msg.messageId} 和群里先到的 ${verdict.duplicateOf} 是同一句话，改为处理话题里这条，停掉副本的任务 ${stopped} 个`,
       );
     }
-
-    const question = msg.content.trim();
-    const reply = (markdown: string) =>
-      send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
 
     // 点「接着查」按钮问的不当成指令：按钮上的话是模型写的，写个「停止」不能停掉话题里别的任务
     if (!options.readOnly && STOP_COMMAND.test(question)) {
@@ -299,6 +327,24 @@ export interface TaskOptions {
    * 这句话本身说了要记住、忘掉也不给记、改、删群记忆和起草经验的工具
    */
   proactive?: boolean;
+  /**
+   * 定时任务到点跑的（见 schedules.ts）：msg 是机器人在群里发的那条「⏰ 定时任务 T3」，发起人是建任务的人，内容是建任务时写好的那句话。
+   * 不当成指令、不去重、不带群聊；按建的人现在的权限跑，但这句话没说要改文档的只给读的工具，代码一律只读；不能再建定时任务
+   */
+  scheduled?: ScheduledRun;
+}
+
+export interface ScheduledRun {
+  /** 编号，如 T3 */
+  label: string;
+  /** 什么时间跑，如「每周一 09:00」 */
+  schedule: string;
+  /** 建任务的人的名字 */
+  creatorName?: string;
+  /** 建的时候就只能读（建的人当时不在写权限名单里、带着群聊建的）：到点也只给读的工具 */
+  readOnly?: boolean;
+  /** 跑完时告诉调用方结果 */
+  onEnd?: (phase: "done" | "failed" | "stopped") => void;
 }
 
 /**
@@ -357,6 +403,7 @@ async function runTask(
   options: TaskOptions,
 ): Promise<void> {
   const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
+  const scheduled = options.scheduled;
   const task = tasks.create(msg.chatId, threadKeyOf(msg));
   // 提问的时间：排队的时间也算进「等了多久」
   const askedAt = now();
@@ -434,7 +481,8 @@ async function runTask(
       card?.update(render());
     }
 
-    const context = await deps.context.load(msg);
+    // 定时任务到点跑的不带群里刚才的聊天：没人在群里 @，群聊和这件事无关，群聊里谁都能写字
+    const context = scheduled ? await deps.context.load(msg, { chat: false }) : await deps.context.load(msg);
     source = context.source;
     // 主模型只看文字：图片先识别成文字再放进提问和上文。2026-10-09 有人贴告警截图问「这个线上报警是咋回事」，
     // 模型只看到一行图片编号，自己挑了别的服务去查
@@ -465,6 +513,8 @@ async function runTask(
     // 只是整理话题里已经有的内容（总结、讲给谁听、换个说法）：不查经验库、不给查询的工具，直接按上文写。按钮上的话是接着要查的新问题，不算
     const restate =
       !followUp &&
+      !scheduled &&
+      !SCHEDULE_ASK.test(question) &&
       restatesEarlier(question, history, [deps.botName() || FALLBACK_BOT_NAME, ...msg.mentions.flatMap((mention) => (mention.name ? [mention.name] : []))]);
     if (restate) {
       logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
@@ -499,6 +549,9 @@ async function runTask(
     const restored: EarlierResult[] = [];
     // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
     let mergedNow = false;
+    // 这次读过本群的聊天记录（chat_history）：群里谁都能写字，读过以后不能再改已有的文档和代码（新建文档可以，内容大家都看得到）；
+    // 群记忆只有这句话本身让记住、忘掉时才能记。和「带上群聊时只给读的工具」一个道理
+    let readChat = false;
     const mcpTools = deps.mcp?.tools(taskContext) ?? [];
     const knowledgeTools = deps.knowledge?.tools(taskContext, mcpTools.map((tool) => tool.spec.name)) ?? [];
     // MCP 服务（aiops）读代码时给的永久链接算查到的代码；网页、搜索结果里的链接是别人的仓库，不算
@@ -529,16 +582,24 @@ async function runTask(
         run: async (args, ctx) => {
           // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支：按钮问的、没 @ 的跟聊、
           // 带上了群聊只给读的工具的都不能切（不然群里埋一句「切到某某分支」，后面有写权限的人 @ 了再改代码就用了那个分支）
-          if ((followUp || options.unaddressed || ambientOnly) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+          if ((followUp || options.unaddressed || ambientOnly || scheduled) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
             throw new Error(
               followUp
                 ? "这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
-                : options.unaddressed
+                : scheduled
+                  ? "这次是定时任务到点跑的，代码只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
+                  : options.unaddressed
                   ? "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数"
                   : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
             );
           }
           checkRestatedWrite(tool, args);
+          if (
+            readChat &&
+            ((tool.writes && tool.spec.name !== "feishu_doc_create") || (MEMORY_WRITE_TOOLS.has(tool.spec.name) && !MEMORY_REQUEST.test(question)))
+          ) {
+            throw new Error(READ_CHAT_NOTE);
+          }
           // 剧本这类说明不是查到的数据：不算查过线上，里面举例的路径（/build/internal/cache/map.go:42）也不能拿来当证据
           if (tool.instructionsOnly) {
             return tool.run(args, ctx);
@@ -548,7 +609,8 @@ async function runTask(
           let facts: CodeFact[] = [];
           let output: string;
           try {
-            output = await tool.run(args, { ...ctx, onFacts: (found) => (facts = [...facts, ...found]) });
+            // writable：这次有没有改文档、改代码的工具。建定时任务时记下来，到点跑的时候不会比建的时候权限大
+            output = await tool.run(args, { ...ctx, onFacts: (found) => (facts = [...facts, ...found]), writable: hasWrites && !readOnly });
           } catch (err) {
             // 代码工具找到了文件、只是读不了（太大、二进制）：报错里带着这个文件，算查到了路径，不算查到哪一行
             if (err instanceof ToolError) {
@@ -557,6 +619,9 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === CHAT_HISTORY_TOOL) {
+            readChat = true;
+          }
           if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
             mergedNow = true;
           }
@@ -637,24 +702,39 @@ async function runTask(
     // 跟聊接过来的、没 @ 机器人的话：话题里谁都能写字，写权限名单里的人随口说一句没 @ 的话，
     // 不能让模型借他的权限照着话题里别人埋的话去改文档、改代码。要改就 @ 机器人直接说
     const unaddressed = hasWrites && !noPermission && !followUp && options.unaddressed === true;
-    const readOnly = noPermission || followUp || ambientOnly || unaddressed;
+    // 定时任务到点跑的：没人看着，建任务时写好的这句话没说要改文档的只给读的工具；建的时候就只能读（不在写权限名单里、带着群聊建的）的照样只能读
+    const scheduledReadOnly =
+      scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || !(CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question)));
+    const readOnly = noPermission || followUp || ambientOnly || unaddressed || scheduledReadOnly;
     // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
     // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
     const memoryLocked =
       options.proactive === true ||
-      (!followUp && (modelHistory.some(isChatContext) || options.unaddressed === true) && !MEMORY_REQUEST.test(question));
+      (!followUp && (modelHistory.some(isChatContext) || options.unaddressed === true || scheduled !== undefined) && !MEMORY_REQUEST.test(question));
     // 起草经验、归档经验、群记忆和经验库冲突的卡片也一样：点了就改经验库或群记忆，这句话本身没说到经验库、记忆的事就不给
     const draftsLocked =
       options.proactive === true ||
       (!followUp &&
-        (modelHistory.some(isChatContext) || options.unaddressed === true) &&
+        (modelHistory.some(isChatContext) || options.unaddressed === true || scheduled !== undefined) &&
         !knowledgeRequested(question, context.history) &&
         !MEMORY_REQUEST.test(question));
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
+    // 定时任务的工具：这句话本身说到了定时任务才给；主动接话、整理、定时任务自己跑的都不给，按钮问的、没 @ 的跟聊只给看的
+    const scheduleTalk = SCHEDULE_TALK.test(question);
     const taskTools = allTools.filter(
       (tool) =>
         !(readOnly && tool.writes) &&
+        // 定时任务到点跑的不改代码、不开合并请求、不合并
+        !(scheduled && tool.writes && isCodeTool(tool.spec.name)) &&
+        !(
+          SCHEDULE_TOOLS.has(tool.spec.name) &&
+          (!scheduleTalk ||
+            options.proactive === true ||
+            scheduled !== undefined ||
+            restate ||
+            ((followUp || options.unaddressed === true) && tool.spec.name !== SCHEDULE_LIST_TOOL))
+        ) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
         !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
         !(draftsLocked && KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) &&
@@ -748,6 +828,7 @@ async function runTask(
         ...(ambientOnly ? { ambientOnly: true } : {}),
         ...(chatDropped ? { chatDropped: true } : {}),
         ...(unaddressed ? { unaddressed: true } : {}),
+        ...(scheduled ? { scheduled: { label: scheduled.label, schedule: scheduled.schedule, creatorName: scheduled.creatorName ?? context.askerName, readOnly: scheduledReadOnly } } : {}),
         ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         restate,
@@ -763,6 +844,8 @@ async function runTask(
                     ...deps.about,
                     features: availableFeatures(deps.about.features, [
                       ...toolNames,
+                      // 定时任务的工具只在这句话说到定时时给，问「你会什么」时照样要列上定时做事
+                      ...allTools.filter((tool) => SCHEDULE_TOOLS.has(tool.spec.name)).map((tool) => tool.spec.name),
                       ...(deps.images ? [VISION_FEATURE] : []),
                       ...(streaming ? [RICH_UI_FEATURE] : []),
                       ...(deps.chatAlong ? [CHAT_ALONG_FEATURE] : []),
@@ -957,6 +1040,7 @@ async function runTask(
     }
   } finally {
     tasks.finish(task);
+    scheduled?.onEnd?.(state.phase === "done" ? "done" : state.phase === "stopped" ? "stopped" : "failed");
   }
   logger.info(
     `${state.phase === "stopped" ? "已停止" : "已回复"} message=${msg.messageId} 上下文=${source} ` +
@@ -1418,10 +1502,15 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
 }
 
 /**
- * 结果里的内容是模型自己写进去的工具：记忆（记的、查的都是之前模型写的）、最近话题（之前的回答）。
+ * 结果里的内容是模型自己写进去的工具：记忆（记的、查的都是之前模型写的）、最近话题（之前的回答）、定时任务（回执和列表里是模型写的任务内容）。
  * 它们结果里的数不算查到的数：模型先记一句「CPU 99%」，不能再拿回执里的 99 去画图
  */
-const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL]);
+const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL, ...SCHEDULE_TOOL_NAMES]);
+
+/** 读过本群聊天记录以后还要改已有文档、代码，或者没让记却要记群记忆时，交给模型的说明 */
+export const READ_CHAT_NOTE =
+  "这次读了群里的聊天记录（群里谁都能写字），按规矩不能再改已有的文档和代码，群记忆也只在提问的人这句话让你记住、忘掉时才能记：" +
+  "把结果写在回答里（要文档的可以新建一篇）；要改已有的文档或代码，请他 @ 你时直接说改哪里、改成什么。";
 
 /** 结果里有代码原文的代码工具 */
 const CODE_SOURCE_TOOLS: ReadonlySet<string> = new Set(["code_read_file", "code_search"]);
