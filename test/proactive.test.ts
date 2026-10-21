@@ -64,6 +64,8 @@ async function setup(
   const logs: string[] = [];
   const worked: string[] = [];
   const looked: string[] = [];
+  /** 查经验库时的查询词和要不要当成密钥 */
+  const queries: { query: string; secret: boolean }[] = [];
   const chat: ThreadMessage[] = [
     { messageId: "om_0", fromBot: false, senderName: "李四", senderId: "ou_2", msgType: "text", content: "测试库换成 db-test-2 了", createTime: START - 60_000 },
   ];
@@ -122,8 +124,9 @@ async function setup(
         : {}),
       ...(opts.knowledge
         ? {
-            knowledge: async (m: NormalizedMessage) => {
+            knowledge: async (query: string, m: NormalizedMessage, _signal: AbortSignal, options: { secret: boolean }) => {
               looked.push(m.messageId);
+              queries.push({ query, secret: options.secret });
               if (opts.knowledge instanceof Error) {
                 throw opts.knowledge;
               }
@@ -153,6 +156,7 @@ async function setup(
     confirms,
     worked,
     looked,
+    queries,
     replies,
     replied,
     logs,
@@ -958,6 +962,32 @@ test("跟聊交过来、想按群记忆接一句的，再想一遍之前也查�
     assert.equal(t.replies.length, 1);
   } finally {
     await t.cleanup();
+  }
+});
+
+test("查经验库的查询词：这条在前，带上之前最近 3 条群成员说的；截短过的长消息不带，用全文认密钥，手机号打码", async () => {
+  const chat: ThreadMessage[] = [
+    { messageId: "om_a", fromBot: false, senderName: "李四", senderId: "ou_2", msgType: "text", content: "MODEL_API_KEY=sk-3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c 先这么配", createTime: START - 50_000 },
+    { messageId: "om_b", fromBot: false, senderName: "王五", senderId: "ou_3", msgType: "text", content: `日志如下：${"x".repeat(600)}`, createTime: START - 40_000 },
+    { messageId: "om_c", fromBot: false, senderName: "李四", senderId: "ou_2", msgType: "text", content: "gateway 报 code=8，签名校验失败", createTime: START - 30_000 },
+  ];
+  const t = await setup({ judge: "接：要我来查吗？", knowledge: { text: "", ids: [] }, listChat: async () => chat });
+  try {
+    await t.replier.consider(msg("om_1", { content: "13812345678 这个号又报错了" }));
+    assert.equal(t.queries.length, 1);
+    // 新的在前；600 多字的那条截短过，不带；手机号打码
+    assert.equal(t.queries[0].query, "*** 这个号又报错了\ngateway 报 code=8，签名校验失败\nMODEL_API_KEY=sk-3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c 先这么配");
+    // 带上的那几条里像是有密钥：不发到 aiops
+    assert.equal(t.queries[0].secret, true);
+  } finally {
+    await t.cleanup();
+  }
+  const plain = await setup({ judge: "接：要我来查吗？", knowledge: { text: "", ids: [] } });
+  try {
+    await plain.replier.consider(msg("om_1", { content: "这个又报错了" }));
+    assert.deepEqual(plain.queries, [{ query: "这个又报错了\n测试库换成 db-test-2 了", secret: false }]);
+  } finally {
+    await plain.cleanup();
   }
 });
 

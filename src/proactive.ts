@@ -5,7 +5,7 @@ import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
 import { JUDGE_MEMORY_CHARS, type JudgeAsk, JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
 import { type Logger, recentChat, type ThreadContext, threadKeyOf } from "./history.js";
-import { normalizeId } from "./knowledge.js";
+import { containsSecret, maskPersonal, normalizeId } from "./knowledge.js";
 import type { ChatModel } from "./llm.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 
@@ -25,6 +25,10 @@ const JUDGE_TIMEOUT_MS = 20_000;
 const CONFIRM_TIMEOUT_MS = 60_000;
 /** 要开口前查经验库最多等多久：没查完就只按群记忆和聊天再想一遍 */
 const KNOWLEDGE_TIMEOUT_MS = 10_000;
+/** 查经验库时带上这条之前最近几条群成员说的（「这个又报错了」这类，服务名、报错原文在前面几条里） */
+const KNOWLEDGE_QUERY_TURNS = 3;
+/** 查经验库的查询词最长多少字 */
+const KNOWLEDGE_QUERY_CHARS = 500;
 /** 去掉图片标记以后少于这么多字的不判断（「好」「ok」「👍」） */
 const MIN_CHARS = 4;
 
@@ -64,7 +68,12 @@ export interface ProactiveOptions {
    * 查团队经验库和 aiops 经验库（和回答前自动查的是同一个）。要开口说话的（回一句、问一句），再想一遍之前查一次，
    * 查到的一起给模型看，可以说「之前遇到过（经验 K3）」。不给就只看群记忆和聊天
    */
-  knowledge?: (msg: NormalizedMessage, signal: AbortSignal) => Promise<{ text: string; ids: readonly string[] } | undefined>;
+  knowledge?: (
+    query: string,
+    msg: NormalizedMessage,
+    signal: AbortSignal,
+    options: { secret: boolean },
+  ) => Promise<{ text: string; ids: readonly string[] } | undefined>;
   /** 判断用的模型：先关着思考调一次，要接时打开思考再调一次 */
   model: ChatModel;
   botName: () => string | undefined;
@@ -481,8 +490,9 @@ export class ProactiveReplier {
     if (!lookup) {
       return ask;
     }
+    const { query, secret } = knowledgeQuery(msg, ask.recent ?? []);
     try {
-      const found = await withDeadline(KNOWLEDGE_TIMEOUT_MS, (signal) => lookup(msg, signal));
+      const found = await withDeadline(KNOWLEDGE_TIMEOUT_MS, (signal) => lookup(query, msg, signal, { secret }));
       if (!found?.text) {
         return ask;
       }
@@ -535,7 +545,7 @@ export class ProactiveReplier {
       "",
       `新消息（${topic ? "话题里，" : ""}没有 @ 你）：[${msg.senderName || "群成员"}] ${clip(msg.content.trim())}`,
     ].join("\n");
-    return { system: judgePrompt(this.opts.botName() || "机器人", topic, this.opts.work !== undefined), content, memory };
+    return { system: judgePrompt(this.opts.botName() || "机器人", topic, this.opts.work !== undefined), content, memory, recent: recentLines };
   }
 
   private async chatLines(msg: NormalizedMessage): Promise<string[]> {
@@ -605,6 +615,20 @@ function saidLine(text: string): string | undefined {
   }
   const line = said.replace(/</g, "＜").replace(/>/g, "＞");
   return line.length <= REPLY_MAX_CHARS ? line : `${line.slice(0, REPLY_MAX_CHARS)}…`;
+}
+
+/**
+ * 要开口前查经验库的查询词：这条在前，再带上之前最近几条群成员说的（新的在前，去掉 [发言人]）。机器人说的不带（和回答前查的一样只看提问），
+ * 截短过的长消息也不带：截掉的后半段可能正是认出前面是密钥的那部分。用全文认密钥，像密钥的不发到 aiops；手机号这类打码
+ */
+function knowledgeQuery(msg: NormalizedMessage, recent: readonly string[]): { query: string; secret: boolean } {
+  const earlier = recent
+    .filter((line) => !line.startsWith("[机器人]") && !line.endsWith("…"))
+    .slice(-KNOWLEDGE_QUERY_TURNS)
+    .reverse()
+    .map((line) => line.replace(/^\[[^\]]*\]\s*/, ""));
+  const parts = [msg.content.trim(), ...earlier].filter(Boolean);
+  return { query: maskPersonal(parts.join("\n")).slice(0, KNOWLEDGE_QUERY_CHARS), secret: parts.some(containsSecret) };
 }
 
 /** 要核对的数字：两位以上的数字，带点或冒号的（版本号、IP、时间） */

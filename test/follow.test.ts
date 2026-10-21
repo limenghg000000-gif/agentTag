@@ -181,12 +181,12 @@ test("带上群记忆一起判断：群里定的规矩也在里面，是对它�
 });
 
 test("不是对它说的、答案在群记忆里：开了主动接话的群里模型可以说「接：」，交给主动接话再想一遍；没开、在做事、群记忆是空的不给这个选择", async () => {
-  const spoken: Array<{ id: string; said: string; memory: string; content: string }> = [];
+  const spoken: Array<{ id: string; said: string; memory: string; content: string; recent?: readonly string[] }> = [];
   const worked: string[] = [];
   const chimeIn = (active: boolean) => ({
     active: () => active,
-    speak: async (m: NormalizedMessage, ask: { content: string; memory: string }, said: string) => {
-      spoken.push({ id: m.messageId, said, memory: ask.memory, content: ask.content });
+    speak: async (m: NormalizedMessage, ask: { content: string; memory: string; recent?: readonly string[] }, said: string) => {
+      spoken.push({ id: m.messageId, said, memory: ask.memory, content: ask.content, recent: ask.recent });
     },
     work: async (m: NormalizedMessage) => {
       worked.push(m.messageId);
@@ -202,6 +202,11 @@ test("不是对它说的、答案在群记忆里：开了主动接话的群里�
   assert.equal(spoken[0].said, "测试库是 db-test-2.internal（群记忆 #3）");
   assert.equal(spoken[0].memory, memory);
   assert.equal(spoken[0].content, t.requests[0].messages[0].content);
+  // 话题最近几条也交过去：要开口前查经验库时和这条一起当查询词
+  assert.ok(spoken[0].recent && spoken[0].recent.length > 0);
+  for (const line of spoken[0].recent ?? []) {
+    assert.ok(t.requests[0].messages[0].content.includes(line));
+  }
   assert.match(t.requests[0].system, /回答「接：」加上要说的一句话/);
   assert.match(t.logs.join("\n"), /不是对机器人说的，答案在群记忆里，看要不要接一句.*message=om_2/);
 

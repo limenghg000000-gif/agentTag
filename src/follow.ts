@@ -34,6 +34,8 @@ export interface JudgeAsk {
   memory: string;
   /** 给模型看的经验库里查到的经验编号（「K3」「aiops#5」）：说到的「经验 K3」「aiops 经验 #5」要在这里面 */
   knowledge?: readonly string[];
+  /** 这条之前的最近几条（话题里的或群聊，带 [发言人]，机器人说的是 [机器人]）：要开口前查经验库时和这条一起当查询词 */
+  recent?: readonly string[];
 }
 
 /**
@@ -494,7 +496,7 @@ export class ThreadFollower {
     if (!chime) {
       return { answer: false };
     }
-    const ask = { system, content, memory };
+    const ask = { system, content, memory, recent };
     if (/^[\s*「"']*做[」"'\s。.!！]*$/.test(result.text.trim())) {
       return { answer: false, work: true, ask };
     }
