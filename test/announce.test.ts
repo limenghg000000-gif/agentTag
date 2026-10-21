@@ -7,6 +7,7 @@ import type { SendInput } from "@larksuiteoapi/node-sdk";
 import {
   compareVersions,
   MAX_ANNOUNCED_VERSIONS,
+  MAX_CARD_BYTES,
   MAX_NOTES_CHARS,
   MAX_TECH_CHARS,
   MAX_TECH_TOTAL_CHARS,
@@ -182,7 +183,19 @@ test("通知卡片放满了也在飞书 30 KB 以内", () => {
   }));
   const card = renderAnnouncementCard(versions, { botName: "飞书 CLI", link: "https://features.example.com", docsLink: "https://docs.example.com" });
   const bytes = Buffer.byteLength(JSON.stringify(card));
-  assert.ok(bytes < 28_000, `卡片 ${bytes} 字节，飞书上限 30 KB`);
+  assert.ok(bytes <= MAX_CARD_BYTES, `卡片 ${bytes} 字节，飞书上限 30 KB`);
+
+  // 全是尖括号：每个转义成 4 个字节，字数没超但字节超了，从最后一版起去掉技术说明
+  const angle = (n: number) => Array.from({ length: n }, (_, i) => (i % 40 === 39 ? "\n" : "<")).join("");
+  const worst = [
+    { version: "0.31.0", notes: angle(MAX_NOTES_CHARS / 2), tech: angle(MAX_TECH_TOTAL_CHARS / 2) },
+    { version: "0.30.0", notes: angle(MAX_NOTES_CHARS / 2), tech: angle(MAX_TECH_TOTAL_CHARS / 2) },
+  ];
+  const full = renderAnnouncementCard(worst, { docsLink: "https://docs.example.com" });
+  const fullJson = JSON.stringify(full);
+  assert.ok(Buffer.byteLength(fullJson) <= MAX_CARD_BYTES, `卡片 ${Buffer.byteLength(fullJson)} 字节`);
+  assert.equal(fullJson.match(/collapsible_panel/g)?.length, 1, "第二版的技术说明去掉，第一版的留着");
+  assert.match(fullJson, /技术说明（0\.31\.0/);
 });
 
 test("文档链接：「文档中心」「功能说明」换成配置的地址（# 换成写的小节），https 原样用，别的、没配的不放", () => {
@@ -262,7 +275,10 @@ test("通知卡片：有技术说明的版本下面放一个默认收起的「�
   ];
   const json = JSON.stringify(renderAnnouncementCard(versions));
   assert.equal(json.match(/collapsible_panel/g)?.length, 2, "第一版截短，第二版放得下，第三版加起来超了上限不放");
-  assert.match(json, /太长了没列全，见文档中心的更新日志/);
+  // 没配文档中心就不说去文档中心看，配了才说
+  assert.match(json, /太长了没列全）/);
+  assert.ok(!json.includes("文档中心"));
+  assert.match(JSON.stringify(renderAnnouncementCard(versions, { docsLink: "https://docs.example.com" })), /太长了没列全，见文档中心的更新日志）/);
   // 退回的文字不带技术说明
   assert.ok(!renderAnnouncementMarkdown(versions).includes("技术改动"));
 });
@@ -270,7 +286,8 @@ test("通知卡片：有技术说明的版本下面放一个默认收起的「�
 test("通知卡片最多列几个版本，更早的只说还有几个", () => {
   const versions = Array.from({ length: MAX_ANNOUNCED_VERSIONS + 2 }, (_, i) => ({ version: `0.${20 - i}.0`, notes: `- 第 ${20 - i} 版` }));
   const json = JSON.stringify(renderAnnouncementCard(versions));
-  assert.match(json, /还有 2 个更早的版本没列出来/);
+  assert.match(json, /还有 2 个更早的版本没列出来。/);
+  assert.match(JSON.stringify(renderAnnouncementCard(versions, { docsLink: "https://docs.example.com" })), /还有 2 个更早的版本没列出来，见文档中心的更新日志。/);
   assert.ok(!json.includes(`第 ${20 - MAX_ANNOUNCED_VERSIONS} 版`));
 });
 
