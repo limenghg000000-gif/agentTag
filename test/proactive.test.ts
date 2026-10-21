@@ -355,6 +355,20 @@ test("每个群每小时最多回几次，过了一小时恢复", async () => {
   }
 });
 
+test("不填每小时最多回几次就不限：和 Claude Tag 一样只看该不该说", async () => {
+  const t = await setup({ judge: "接：要我帮忙查一下吗？" });
+  try {
+    for (let i = 1; i <= 6; i++) {
+      t.advance(1000);
+      await t.replier.consider(msg(`om_${i}`));
+    }
+    assert.equal(t.replies.length, 6);
+    assert.doesNotMatch(t.logs.join("\n"), /这一小时已经主动回了/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("每个群每小时最多判断 120 条，后面的不问模型", async () => {
   const t = await setup({ judge: "不接" });
   try {
@@ -536,7 +550,9 @@ test("群里 @ 机器人说「别主动插话」就停，「可以主动说话�
     // 停着的时候群里说的话，打开以后补漏轮询再看到也不判断；打开以后说的照常
     assert.equal(restarted.wants(msg("om_4", { content: "测试环境数据库是哪个来着", createTime: START + 30_000 })), false);
     assert.equal(restarted.wants(msg("om_5", { content: "测试环境数据库是哪个来着", createTime: START + 90_000 })), true);
-    assert.match(t.replies[1], /会看情况主动接一句.*每小时最多 3 次/);
+    assert.match(t.replies[1], /会看情况主动接一句/);
+    // 不填每小时最多几次就不限，回的话里也不说次数
+    assert.doesNotMatch(t.replies[1], /每小时最多/);
     const again = t.make();
     await again.init();
     assert.equal(again.active("oc_1"), true);
@@ -936,6 +952,36 @@ test("不像提问、不像报错的不先查；第一眼想开口的，再想�
     assert.deepEqual(work.worked, ["om_1"]);
   } finally {
     await work.cleanup();
+  }
+});
+
+test("口语里的问法、故障说法也先查经验库：咋回事、打满了、卡住了、OOM、down；通知、闲聊不查", async () => {
+  const asks = [
+    "Redis 入方向带宽又被打满了",
+    "Redis 入方向带宽又被打满了，排查一下咋回事",
+    "订单服务又卡住了",
+    "pod 被 OOMKilled 了",
+    "支付回调服务 down 了",
+    "接口延迟飙到 2 秒",
+    "网关又在告警",
+  ];
+  const quiet = [
+    "下午测试库要迁移，大家注意一下",
+    "周五下午 3 点开发版评审会，在 3 楼会议室",
+    "这周的周报我晚点发群里",
+  ];
+  const t = await setup({ judge: "不接", knowledge: LESSONS });
+  try {
+    for (const [i, content] of [...asks, ...quiet].entries()) {
+      t.advance(1000);
+      await t.replier.consider(msg(`om_${i}`, { content }));
+    }
+    assert.deepEqual(
+      t.looked,
+      asks.map((_, i) => `om_${i}`),
+    );
+  } finally {
+    await t.cleanup();
   }
 });
 

@@ -203,11 +203,11 @@ test("FOLLOW_THREADS、CHAT_CONTEXT：默认开，off 关掉，写错时报错",
   assert.equal(loadConfig({ ...base, DATA_DIR: "/srv/bot" }).followStateFile, path.resolve("/srv/bot", "follow.json"));
 });
 
-test("PROACTIVE_CHAT_IDS：默认没有群；只算群白名单里的，别的列出来提醒；PROACTIVE_MAX_PER_HOUR 默认 3", () => {
+test("PROACTIVE_CHAT_IDS：默认没有群；只算群白名单里的，别的列出来提醒；PROACTIVE_MAX_PER_HOUR 不填就不限", () => {
   const off = loadConfig(base).proactive;
   assert.equal(off.chatIds.size, 0);
   assert.deepEqual(off.ignored, []);
-  assert.equal(off.maxPerHour, 3);
+  assert.equal(off.maxPerHour, Number.POSITIVE_INFINITY);
   assert.equal(off.stateFile, path.resolve("data", "proactive.json"));
 
   const on = loadConfig({

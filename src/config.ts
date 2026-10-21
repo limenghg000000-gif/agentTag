@@ -74,7 +74,7 @@ export interface Config {
     chatIds: ReadonlySet<string>;
     /** PROACTIVE_CHAT_IDS 里不在群白名单的，不生效，启动时日志里提醒 */
     ignored: string[];
-    /** 每个群每小时最多主动回几次（PROACTIVE_MAX_PER_HOUR，默认 3） */
+    /** 每个群每小时最多主动回几次（PROACTIVE_MAX_PER_HOUR），不填就不限（Infinity），和 Claude Tag 一样只看该不该说 */
     maxPerHour: number;
     /** 群里说「别主动插话」后记在这个文件里，重启后照样停着 */
     stateFile: string;
@@ -136,8 +136,6 @@ export const DEFAULT_EMBEDDING_MODEL = "text-embedding-v4";
 export const DEFAULT_THINKING_BUDGET = 4000;
 /** 数据目录，相对路径按启动时的工作目录算 */
 export const DEFAULT_DATA_DIR = "data";
-/** 每个群每小时最多主动接几次话（PROACTIVE_MAX_PER_HOUR 不填时） */
-export const DEFAULT_PROACTIVE_MAX_PER_HOUR = 3;
 /** 补漏轮询默认每 10 秒一次 */
 export const DEFAULT_CATCHUP_INTERVAL_SECONDS = 10;
 /** 群记忆备份默认保留 14 天 */
@@ -290,8 +288,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`CHAT_CONTEXT 只能是 on 或 off，当前为 ${env.CHAT_CONTEXT}`);
   }
 
-  const proactiveMax = Number(env.PROACTIVE_MAX_PER_HOUR?.trim() || DEFAULT_PROACTIVE_MAX_PER_HOUR);
-  if (!Number.isInteger(proactiveMax) || proactiveMax < 1 || proactiveMax > 60) {
+  const proactiveMaxEnv = env.PROACTIVE_MAX_PER_HOUR?.trim();
+  const proactiveMax = proactiveMaxEnv ? Number(proactiveMaxEnv) : Number.POSITIVE_INFINITY;
+  if (proactiveMaxEnv && (!Number.isInteger(proactiveMax) || proactiveMax < 1 || proactiveMax > 60)) {
     throw new Error(`PROACTIVE_MAX_PER_HOUR 要填 1～60 的整数，当前为 ${env.PROACTIVE_MAX_PER_HOUR}`);
   }
 

@@ -24,7 +24,7 @@ import { McpHub } from "./mcp.js";
 import { createNameLookup } from "./operator-names.js";
 import type { AboutBot } from "./prompt.js";
 import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
-import { ProactiveReplier } from "./proactive.js";
+import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
@@ -345,7 +345,10 @@ console.log(
 if (config.proactive.chatIds.size > 0) {
   const paused = [...config.proactive.chatIds].filter((chatId) => !proactive.active(chatId));
   console.log(
-    `主动接话：群 ${[...config.proactive.chatIds].join(", ")} 里没 @ 的消息看情况接一句，每个群每小时最多 ${config.proactive.maxPerHour} 次` +
+    `主动接话：群 ${[...config.proactive.chatIds].join(", ")} 里没 @ 的消息看情况接一句，` +
+      (Number.isFinite(config.proactive.maxPerHour)
+        ? `每个群每小时最多 ${config.proactive.maxPerHour} 次`
+        : `不限回几次（每个群每小时最多判断 ${MAX_JUDGED_PER_HOUR} 条）`) +
       (paused.length > 0 ? `；${paused.join(", ")} 有人说过「别主动插话」，现在停着（@ 机器人说「可以主动说话」再打开）` : ""),
   );
 } else {

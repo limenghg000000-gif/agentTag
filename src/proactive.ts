@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
-import { DEFAULT_PROACTIVE_MAX_PER_HOUR } from "./config.js";
 import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
 import { JUDGE_MEMORY_CHARS, type JudgeAsk, JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
@@ -27,10 +26,11 @@ const CONFIRM_TIMEOUT_MS = 60_000;
 const KNOWLEDGE_TIMEOUT_MS = 10_000;
 /**
  * 像提问、像报错的消息：看一眼之前就查经验库，查到的一起给模型判断（只在想开口时才查的话，它本来不打算开口时经验库用不上）。
- * 指名问某人的（@ 了别人）、表态的、机器人发的前面已经筛掉了
+ * 口语里的问法和故障说法也算（「咋回事」「排查一下」「带宽被打满了」「又卡住了」「pod 被 OOMKilled」）；
+ * 多算了只是多查一次经验库。指名问某人的（@ 了别人）、表态的、机器人发的前面已经筛掉了
  */
 const ASKS_OR_REPORTS =
-  /[?？]|吗|怎么|怎样|如何|为啥|为什么|什么原因|哪[个里儿些]|谁|是不是|有没有|能不能|报错|错误|失败|异常|超时|崩了|挂了|不通|打不开|访问不了|连不上|\b[45]\d\d\b|code\s*[=:：]|exception|error|panic|timeout|traceback|fatal/i;
+  /[?？]|吗|怎么|怎样|如何|咋|为啥|为什么|什么原因|什么情况|啥情况|啥原因|哪[个里儿些]|谁|是不是|有没有|能不能|排查|查一下|查下|帮忙看|帮我看|报错|错误|失败|异常|超时|崩了|挂了|宕机|不通|打不开|访问不了|连不上|起不来|不可用|没响应|满了|打满|爆了|告警|报警|卡住|卡死|[很好太变]慢|延迟|抖动|飙|\b[45]\d\d\b|code\s*[=:：]|exception|error|panic|timeout|traceback|fatal|\boom|refused|unavailable|\bdown\b|alert/i;
 /** 查经验库时带上这条之前最近几条群成员说的（「这个又报错了」这类，服务名、报错原文在前面几条里） */
 const KNOWLEDGE_QUERY_TURNS = 3;
 /** 查经验库的查询词最长多少字 */
@@ -94,6 +94,7 @@ export interface ProactiveOptions {
   superseded?: (msg: NormalizedMessage) => boolean;
   /** 这个话题里机器人有没有正在做的任务（见 TaskRegistry.busy）：话题里按群记忆接话时，判断的这会儿有人 @ 它、点了「接着查」，就不插这一句 */
   topicBusy?: (threadKey: string) => boolean;
+  /** 每个群每小时最多主动回几次，不填就不限 */
   maxPerHour?: number;
   logger?: Logger;
   now?: () => number;
@@ -115,7 +116,8 @@ interface PausedState {
  * 主动接话（像 Claude Tag 在频道里那样）：打开了的群里，没 @ 机器人的消息（群主界面的、它没跟着的话题里的）
  * 带着群记忆和刚才的聊天让模型看一眼，大多数不接。要接的有三种：答案就在群记忆或刚才的聊天里、一两句说得清，直接答；
  * 群记忆里有规矩说这类事不用 @ 也要它处理，像被 @ 一样去做；有人提了它能帮的事、还没人接，问一句要不要它来。
- * 要开口的先打开思考再想一遍，说的话核对出处，对不上不接。每个群每小时最多接几次。
+ * 要开口的先打开思考再想一遍，说的话核对出处，对不上不接。和 Claude Tag 一样不限每小时回几次（PROACTIVE_MAX_PER_HOUR 填了才限），
+ * 只限每个群每小时最多判断多少条。
  * 群里 @ 它说「别主动插话」就停，「可以主动说话」再打开。
  */
 export class ProactiveReplier {
@@ -143,7 +145,7 @@ export class ProactiveReplier {
   constructor(private readonly opts: ProactiveOptions) {
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? Date.now;
-    this.maxPerHour = opts.maxPerHour ?? DEFAULT_PROACTIVE_MAX_PER_HOUR;
+    this.maxPerHour = opts.maxPerHour ?? Number.POSITIVE_INFINITY;
   }
 
   /** 读出之前说过「别主动插话」的群。文件不在就是都没停；读坏了打一行警告，按都没停算 */
@@ -303,7 +305,7 @@ export class ProactiveReplier {
       msg,
       pause
         ? `好的，这个群里我不主动接话了，只在被 @ 时回${this.opts.followsThreads ? "（我回答过的话题里，追问照样不用 @）" : ""}。要重新打开，@ 我说「可以主动说话」。`
-        : `好的，这个群里我会看情况主动接一句：有人问的事群记忆或刚才的聊天里有答案，或者提了我能帮的事，每小时最多 ${this.maxPerHour} 次。不想要了就 @ 我说「别主动插话」。`,
+        : `好的，这个群里我会看情况主动接一句：有人问的事群记忆或刚才的聊天里有答案，或者提了我能帮的事${Number.isFinite(this.maxPerHour) ? `，每小时最多 ${this.maxPerHour} 次` : ""}。不想要了就 @ 我说「别主动插话」。`,
     );
   }
 
