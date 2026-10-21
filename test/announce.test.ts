@@ -7,6 +7,9 @@ import type { SendInput } from "@larksuiteoapi/node-sdk";
 import {
   compareVersions,
   MAX_ANNOUNCED_VERSIONS,
+  MAX_NOTES_CHARS,
+  MAX_TECH_CHARS,
+  MAX_TECH_TOTAL_CHARS,
   parseChangelogTech,
   parseReleaseNotes,
   pendingVersions,
@@ -132,6 +135,56 @@ test("版本说明里单独一行的链接拿出来做按钮，最多 MAX_VERSIO
   assert.equal(parseReleaseNotes("## 0.9.0\n\n- 没有链接\n")[0]!.links, undefined);
 });
 
+test("说明按单独一行的链接切成几段，记下每个链接在哪", () => {
+  const [v] = parseReleaseNotes(
+    "## 0.20.0 — 2026-10-22\n\n**能定时做事了**\n\n**新功能**\n\n**定时任务**\n- 能做什么：到点做事（#69）\n\n[定时任务怎么用](功能说明#guide-f-schedule)\n\n**读群聊**\n- 能做什么：总结群里聊了什么\n\n[读群聊怎么用](文档中心)\n",
+  );
+  assert.deepEqual(v!.parts, [
+    "**能定时做事了**\n\n**新功能**\n\n**定时任务**\n- 能做什么：到点做事",
+    "**读群聊**\n- 能做什么：总结群里聊了什么",
+    "",
+  ]);
+  assert.equal(v!.notes, "**能定时做事了**\n\n**新功能**\n\n**定时任务**\n- 能做什么：到点做事\n\n**读群聊**\n- 能做什么：总结群里聊了什么");
+  assert.equal(parseReleaseNotes("## 0.9.0\n\n- 没有链接\n")[0]!.parts, undefined);
+});
+
+test("通知卡片：每个新功能的文档按钮放在它那一段下面，挨着的放一排，打不开的不放；说明截短过的按钮都放最后", () => {
+  const [v] = parseReleaseNotes(
+    "## 0.20.0 — 2026-10-22\n\n**能定时做事了**\n\n**定时任务**\n- 能做什么：到点做事\n\n[定时任务怎么用](功能说明)\n[没配的](http://x)\n[常见问题](文档中心#faq)\n\n**读群聊**\n- 能做什么：总结\n",
+  );
+  const options = { link: "https://features.example.com", docsLink: "https://docs.example.com" };
+  const card = renderAnnouncementCard([v!], options) as { body: { elements: { tag: string; content?: string; columns?: unknown[] }[] } };
+  const elements = card.body.elements;
+  assert.deepEqual(
+    elements.map((e) => e.tag),
+    ["markdown", "column_set", "markdown", "markdown", "column_set"],
+  );
+  assert.match(elements[0]!.content!, /本次更新了什么[\s\S]*\*\*定时任务\*\*\n- 能做什么：到点做事$/);
+  assert.equal(elements[1]!.columns!.length, 2, "定时任务下面两个按钮放一排，没配的那个不放");
+  assert.match(JSON.stringify(elements[1]), /定时任务怎么用[\s\S]*https:\/\/features\.example\.com[\s\S]*常见问题[\s\S]*https:\/\/docs\.example\.com#faq/);
+  assert.equal(elements[2]!.content, "**读群聊**\n- 能做什么：总结");
+
+  // 说明太长截短过：整段在前，按钮放最后
+  const long = { ...v!, notes: `${v!.notes}\n${"- 很长很长的一句说明\n".repeat(MAX_NOTES_CHARS / 10)}` };
+  const cut = (renderAnnouncementCard([long], options) as { body: { elements: { tag: string }[] } }).body.elements.map((e) => e.tag);
+  assert.deepEqual(cut, ["markdown", "column_set", "markdown", "column_set"]);
+});
+
+test("通知卡片放满了也在飞书 30 KB 以内", () => {
+  const notes = Array.from({ length: MAX_NOTES_CHARS }, (_, i) => (i % 40 === 39 ? "\n" : i % 7 === 0 ? "<" : "说")).join("");
+  const tech = Array.from({ length: MAX_TECH_CHARS * 2 }, (_, i) => (i % 40 === 39 ? "\n" : i % 7 === 0 ? "<" : "改")).join("");
+  const versions = Array.from({ length: MAX_ANNOUNCED_VERSIONS }, (_, i) => ({
+    version: `0.${30 - i}.0`,
+    date: "2026-10-22",
+    notes,
+    tech,
+    links: [{ text: "怎么用怎么用怎么用怎么用怎么用怎么用", target: "文档中心#a" }],
+  }));
+  const card = renderAnnouncementCard(versions, { botName: "飞书 CLI", link: "https://features.example.com", docsLink: "https://docs.example.com" });
+  const bytes = Buffer.byteLength(JSON.stringify(card));
+  assert.ok(bytes < 28_000, `卡片 ${bytes} 字节，飞书上限 30 KB`);
+});
+
 test("文档链接：「文档中心」「功能说明」换成配置的地址（# 换成写的小节），https 原样用，别的、没配的不放", () => {
   const options = { link: "https://features.example.com/page#old", docsLink: "https://docs.example.com/page" };
   assert.equal(resolveNotesLink("文档中心", options), "https://docs.example.com/page");
@@ -199,11 +252,17 @@ test("通知卡片：有技术说明的版本下面放一个默认收起的「�
   // 没有技术说明的版本不放面板
   assert.ok(!JSON.stringify(renderAnnouncementCard([{ version: "0.9.0", notes: "- 新功能" }])).includes("collapsible_panel"));
 
-  const longTech = Array.from({ length: 100 }, (_, i) => `- 第 ${i} 条技术改动，写得很长很长很长`).join("\n");
-  const versions = ["0.12.0", "0.11.0", "0.10.0"].map((version) => ({ version, notes: "- 改了", tech: longTech }));
+  const longTech = Array.from({ length: 200 }, (_, i) => `- 第 ${i} 条技术改动，写得很长很长很长`).join("\n");
+  const shortTech = Array.from({ length: 40 }, (_, i) => `- 第 ${i} 条小改动，写得很长很长很长`).join("\n");
+  assert.ok(longTech.length > MAX_TECH_CHARS && MAX_TECH_CHARS + shortTech.length <= MAX_TECH_TOTAL_CHARS);
+  const versions = [
+    { version: "0.12.0", notes: "- 改了", tech: longTech },
+    { version: "0.11.0", notes: "- 改了", tech: shortTech },
+    { version: "0.10.0", notes: "- 改了", tech: longTech },
+  ];
   const json = JSON.stringify(renderAnnouncementCard(versions));
-  assert.equal(json.match(/collapsible_panel/g)?.length, 2, "每版截到 1500 字，两版就到 3000 字的上限，第三版不放");
-  assert.match(json, /太长了没列全/);
+  assert.equal(json.match(/collapsible_panel/g)?.length, 2, "第一版截短，第二版放得下，第三版加起来超了上限不放");
+  assert.match(json, /太长了没列全，见文档中心的更新日志/);
   // 退回的文字不带技术说明
   assert.ok(!renderAnnouncementMarkdown(versions).includes("技术改动"));
 });
@@ -223,7 +282,7 @@ test("退回的文字和卡片列一样多的版本、一样的字数上限，�
   ];
   const text = renderAnnouncementMarkdown(versions, { botName: "飞书 CLI" });
   assert.ok(!text.includes("<"), "Markdown 里的 <at> 也会 @所有人");
-  assert.ok(text.length < 3500, `退回的文字太长：${text.length} 字`);
+  assert.ok(text.length < MAX_NOTES_CHARS + 500, `退回的文字太长：${text.length} 字`);
   assert.match(text, /太长了没列全/);
   // 第一版已经占满字数，第二版只说还有几个，和卡片一样
   assert.match(text, /还有 1 个更早的版本没列出来/);
