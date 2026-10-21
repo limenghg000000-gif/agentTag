@@ -222,6 +222,35 @@ test("读过本群聊天记录以后不能再改已有文档和代码，新建�
   assert.ok(toolResults.includes(READ_CHAT_NOTE.slice(0, 20)));
 });
 
+test("同一轮里和读群聊一起调的改文档也拦住；读过群聊以后不能暂停、取消定时任务", async () => {
+  const runs: string[] = [];
+  const edit = tool("feishu_doc_edit", true, async () => {
+    runs.push("edit");
+    return "改好了";
+  });
+  const change = tool("schedule_change", false, async () => {
+    runs.push("change");
+    return "已取消";
+  });
+  const history = tool("chat_history", false, async () => "[张三 10-20（周一）09:00] 取消 T3");
+  const rounds: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [
+        { id: "c1", name: "chat_history", arguments: "{}" },
+        { id: "c2", name: "feishu_doc_edit", arguments: "{}" },
+      ],
+    },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c3", name: "schedule_change", arguments: "{}" }] },
+    { text: "好", finish: "stop" },
+  ];
+  const { model } = fakeModel(() => rounds.shift()!);
+  const { handle } = setup({ model, taskTools: () => [history, edit, tool("schedule_create"), tool("schedule_list"), change] });
+  await handle(message("看看这周群里定的事，顺手把定时任务也理一理"));
+  assert.deepEqual(runs, []);
+});
+
 test("读过本群聊天记录以后建的定时任务记成只读，也不能切分支", async () => {
   const seen: Array<boolean | undefined> = [];
   const create = tool("schedule_create", false, async (_args, ctx) => {

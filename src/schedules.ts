@@ -150,6 +150,12 @@ export class Scheduler {
       this.logger.error(`定时任务：${file} 读不出来，原文件备份成 ${backup}，从空的开始`, err);
       return;
     }
+    for (const task of this.state.tasks) {
+      // 跑到一半机器人重启了：结果没记上，算被停止
+      if (task.lastRunAt !== undefined && task.lastResult === undefined) {
+        task.lastResult = "stopped";
+      }
+    }
     const active = this.state.tasks.filter((task) => task.status === "active");
     for (const task of active) {
       // 文件里的时间不对（手改过、cron 写坏了）：按现在重新算
@@ -211,7 +217,7 @@ export class Scheduler {
       const cron = parseCron(cronText);
       const next = nextRun(cron, now);
       if (next === undefined) {
-        throw new Error(`cron「${cron.expr}」两年内一次都不会跑，检查一下日期和星期`);
+        throw new Error(`cron「${cron.expr}」8 年内一次都不会跑，检查一下日期和星期`);
       }
       const gap = shortestGapMinutes(cron, now);
       if (gap < MIN_GAP_MINUTES) {
@@ -337,7 +343,7 @@ export class Scheduler {
       const late = now - scheduledAt;
       if (!this.opts.allowedChatIds.has(task.chatId)) {
         this.logger.warn(`定时任务：${label(task)} 所在的群 ${task.chatId} 不在白名单里了，这次不跑`);
-        this.finishRun(task, now, "skipped");
+        this.finishRun(task, scheduledAt, now, "skipped");
         changed = true;
         continue;
       }
@@ -366,14 +372,16 @@ export class Scheduler {
       .reduce((sum, task) => sum + runsInWeek(parseCron(task.cron!), now) / 7, 0);
   }
 
-  /** 先算好下一次、记进文件再跑：跑到一半重启不会重跑 */
+  /** 先算好下一次、写进文件再跑（等写完才发消息）：跑到一半重启不会重跑 */
   private fire(task: ScheduledTask, late: number, now: number): void {
     this.advance(task, now);
     task.runs++;
     task.lastRunAt = now;
+    delete task.lastResult;
     this.running.add(task.id);
     this.logger.info(`定时任务：${label(task)} 到点了，开始跑 chat=${task.chatId}${late > 60_000 ? ` 晚了 ${Math.round(late / 60_000)} 分钟` : ""}`);
-    const run = this.execute(task, late);
+    this.save();
+    const run = this.lastSave.then(() => this.execute(task, late));
     this.runs.add(run);
     void run.finally(() => this.runs.delete(run));
   }
@@ -412,7 +420,7 @@ export class Scheduler {
 
   /** 停机错过了太久：周期任务等下一次，一次性的在群里说一声 */
   private missed(task: ScheduledTask, scheduledAt: number, now: number): void {
-    this.finishRun(task, now, "missed");
+    this.finishRun(task, scheduledAt, now, "missed");
     this.logger.warn(`定时任务：${label(task)} 本该 ${formatTime(scheduledAt, now)} 跑，机器人那会儿没在线，${task.at !== undefined ? "错过了" : "等下一次"}`);
     if (task.at === undefined) {
       return;
@@ -425,9 +433,10 @@ export class Scheduler {
       .catch((err: unknown) => this.logger.warn(`定时任务：${label(task)} 错过的通知没发出去`, err));
   }
 
-  /** 这次不跑（跳过、错过了）：周期任务算到下一次，一次性的结束 */
-  private finishRun(task: ScheduledTask, now: number, result: RunResult): void {
+  /** 这次不跑（跳过、错过了）：周期任务算到下一次，一次性的结束；列表里「上次」写本该跑的那次 */
+  private finishRun(task: ScheduledTask, scheduledAt: number, now: number, result: RunResult): void {
     this.advance(task, now);
+    task.lastRunAt = scheduledAt;
     task.lastResult = result;
   }
 
@@ -441,7 +450,7 @@ export class Scheduler {
     this.reschedule(task, now);
   }
 
-  /** 周期任务按 now 之后算下一次；一次性的就是定的时间。算不出来（cron 坏了、两年内没有）的暂停 */
+  /** 周期任务按 now 之后算下一次；一次性的就是定的时间。算不出来（cron 坏了、8 年内没有）的暂停 */
   private reschedule(task: ScheduledTask, now: number): void {
     if (task.at !== undefined) {
       task.nextRunAt = task.at;

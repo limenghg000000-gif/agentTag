@@ -164,7 +164,7 @@ function describeTask(task: ScheduledTask, now: number): string {
         : task.status === "cancelled"
           ? "已取消"
           : "跑完了";
-  const last = task.lastRunAt !== undefined ? `，上次 ${formatTime(task.lastRunAt, now)} ${RESULT_TEXT[task.lastResult ?? "done"]}` : "";
+  const last = task.lastRunAt !== undefined ? `，上次 ${formatTime(task.lastRunAt, now)} ${task.lastResult ? RESULT_TEXT[task.lastResult] : "开始跑了，还没跑完"}` : "";
   const creator = task.creator.name ? `${task.creator.name}建的` : "";
   return `${label(task)} · ${describeSchedule(task, now)}${task.remind ? " · 纯提醒" : ""} · ${preview(task.prompt)} · ${creator}${creator ? " · " : ""}${state}（已跑 ${task.runs} 次${last}）`;
 }

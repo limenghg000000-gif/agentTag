@@ -5,8 +5,8 @@
 
 const OFFSET_MS = 8 * 60 * 60_000;
 const MINUTE_MS = 60_000;
-/** 往后最多找多久：2 月 29 号这种几年才有一次的，两年内碰不到就算没有 */
-const HORIZON_DAYS = 366 * 2;
+/** 往后最多找多久：2 月 29 号这种几年才有一次的也要找得到（逢百年不闰，最多隔 8 年），8 年内碰不到就算没有 */
+const HORIZON_DAYS = 366 * 8;
 
 export interface Cron {
   /** 原文（空白规整过） */
@@ -66,7 +66,11 @@ function parseField(text: string, min: number, max: number, name: string, names?
     return n;
   };
   for (const part of text.split(",")) {
-    const [range = "", stepText] = part.split("/");
+    const pieces = part.split("/");
+    if (pieces.length > 2) {
+      throw new Error(`cron 的「${name}」那段「${part}」写错了：/ 只能有一个`);
+    }
+    const [range = "", stepText] = pieces;
     const step = stepText === undefined ? 1 : Number(stepText);
     if (!Number.isInteger(step) || step < 1 || (stepText !== undefined && !/^\d+$/.test(stepText))) {
       throw new Error(`cron 的「${name}」那段「${part}」写错了：/ 后面要写正整数`);
@@ -77,7 +81,11 @@ function parseField(text: string, min: number, max: number, name: string, names?
       from = min;
       to = max;
     } else if (range.includes("-")) {
-      const [a = "", b = ""] = range.split("-");
+      const ends = range.split("-");
+      if (ends.length !== 2) {
+        throw new Error(`cron 的「${name}」那段「${part}」写错了：范围写成「1-5」这样，只能有一个 -`);
+      }
+      const [a = "", b = ""] = ends;
       from = value(a);
       to = value(b);
       if (from > to) {
@@ -114,7 +122,7 @@ function dayMatches(cron: Cron, date: Date): boolean {
   return day || weekday;
 }
 
-/** after 之后（不含）下一次的时间，两年内都没有时返回 undefined */
+/** after 之后（不含）下一次的时间，8 年内都没有时返回 undefined */
 export function nextRun(cron: Cron, after: number): number | undefined {
   // 北京时间的墙上时间当成 UTC 来算，从 after 的下一分钟开始找
   let local = Math.floor((after + OFFSET_MS) / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
@@ -138,7 +146,7 @@ export function nextRun(cron: Cron, after: number): number | undefined {
   return undefined;
 }
 
-/** 从 after 起往后最多 count 次的时间（两年内） */
+/** 从 after 起往后最多 count 次的时间（8 年内） */
 export function upcomingRuns(cron: Cron, after: number, count: number): number[] {
   const runs: number[] = [];
   let t: number | undefined = after;
@@ -173,15 +181,16 @@ export function parseAt(text: string): number {
   if (!match) {
     throw new Error(`一次性的时间要写成北京时间「2026-10-22 15:00」这样，现在是「${text}」`);
   }
-  const [, y, mo, d, h = "9", mi = "0"] = match;
-  const local = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi));
+  const [, y, mo, d, h = "9", mi = "0", sec = "0"] = match;
+  const local = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec));
   const date = new Date(local);
   if (
     date.getUTCFullYear() !== Number(y) ||
     date.getUTCMonth() !== Number(mo) - 1 ||
     date.getUTCDate() !== Number(d) ||
     date.getUTCHours() !== Number(h) ||
-    date.getUTCMinutes() !== Number(mi)
+    date.getUTCMinutes() !== Number(mi) ||
+    date.getUTCSeconds() !== Number(sec)
   ) {
     throw new Error(`「${text}」这个时间不存在`);
   }

@@ -28,8 +28,9 @@ test("几种常见写法：工作日、几个时间点、每 2 小时、每月�
   assert.equal(nextRun(parseCron("0 9 1 JAN *"), bj("2026-10-21 10:00")), bj("2027-01-01 09:00"));
   // 几号和星期都写了：满足一样就算（cron 的老规矩）
   assert.equal(nextRun(parseCron("0 9 1 * 5"), bj("2026-10-21 10:00")), bj("2026-10-23 09:00"));
-  // 两年内碰不到的
+  // 8 年内碰不到的；2 月 29 号刚过完也找得到下一个闰年
   assert.equal(nextRun(parseCron("0 9 31 2 *"), bj("2026-10-21 10:00")), undefined);
+  assert.equal(nextRun(parseCron("0 9 29 2 *"), bj("2028-03-01 10:00")), bj("2032-02-29 09:00"));
 });
 
 test("写错的 cron 报出哪一段不对", () => {
@@ -39,6 +40,8 @@ test("写错的 cron 报出哪一段不对", () => {
   assert.throws(() => parseCron("*/0 9 * * *"), /正整数/);
   assert.throws(() => parseCron("0 9-5 * * *"), /写反了/);
   assert.throws(() => parseCron("0 9 * * MONDAY"), /「星期」那段/);
+  assert.throws(() => parseCron("*/2/3 9 * * *"), /\/ 只能有一个/);
+  assert.throws(() => parseCron("0 1-2-3 * * *"), /只能有一个 -/);
 });
 
 test("相邻两次最短隔多久、一周跑几次", () => {
@@ -54,7 +57,8 @@ test("相邻两次最短隔多久、一周跑几次", () => {
 test("一次性的时间按北京时间读，不存在的日期报错", () => {
   assert.equal(parseAt("2026-10-22 15:00"), bj("2026-10-22 15:00"));
   assert.equal(parseAt("2026/10/22 15:00"), bj("2026-10-22 15:00"));
-  assert.equal(parseAt("2026-10-22T15:00:30"), bj("2026-10-22 15:00"));
+  assert.equal(parseAt("2026-10-22T15:00:30"), bj("2026-10-22 15:00") + 30_000);
+  assert.throws(() => parseAt("2026-10-22 15:00:61"), /不存在/);
   assert.equal(parseAt("2026-10-22 9：05"), bj("2026-10-22 09:05"));
   assert.throws(() => parseAt("2026-02-30 09:00"), /不存在/);
   assert.throws(() => parseAt("2026-10-22 25:00"), /不存在/);

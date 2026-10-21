@@ -103,7 +103,7 @@ test("一次性任务跑完就结束；时间已经过了、一年以后、cron 
 test("上限：两次至少隔 1 小时、每群 20 个、每人 10 个、每群每天要干活的最多跑 48 次（纯提醒不算）", () => {
   const { scheduler } = setup();
   assert.throws(() => scheduler.create({ ...base, prompt: "x", cron: "*/30 * * * *" }), /至少隔 60 分钟.*最短只隔 30 分钟/);
-  assert.throws(() => scheduler.create({ ...base, prompt: "x", cron: "0 9 31 2 *" }), /两年内一次都不会跑/);
+  assert.throws(() => scheduler.create({ ...base, prompt: "x", cron: "0 9 31 2 *" }), /8 年内一次都不会跑/);
 
   for (let i = 0; i < MAX_PER_CREATOR; i++) {
     scheduler.create({ ...base, prompt: `任务 ${i}`, cron: "0 9 * * *" });
@@ -196,6 +196,8 @@ test("停机错过了：2 小时内补跑（带上晚了多久），再晚的周
   scheduler.tick();
   await tick();
   assert.equal(weekly.lastResult, "missed");
+  // 「上次」记的是错过的那一次
+  assert.equal(weekly.lastRunAt, bj("2026-10-26 09:00"));
   assert.equal(weekly.nextRunAt, bj("2026-11-02 09:00"));
   assert.equal(weekly.runs, 0);
   // 一次性的 10:00 晚了 1 小时多，补跑
@@ -225,6 +227,7 @@ test("群不在白名单里了不跑；同时最多跑 2 个，多的下一轮�
   await tick();
   assert.equal(ran.length, 0);
   assert.equal(gone.lastResult, "skipped");
+  assert.equal(gone.lastRunAt, bj("2026-10-22 09:00"));
   assert.equal(gone.nextRunAt, bj("2026-10-23 09:00"));
 
   const releases: Array<() => void> = [];
@@ -283,6 +286,40 @@ test("记在文件里：重启后接着跑，编号接着往下排；文件坏�
   assert.equal(errors.length, 1);
   const files = await readdir(path.dirname(file));
   assert.ok(files.some((name) => name.startsWith("schedules.json.bad-")));
+});
+
+test("到点先把下一次写进文件再跑；跑到一半重启的，上次的结果记成被停止", async () => {
+  const file = await tempFile();
+  const saved: Array<[number | undefined, string]> = [];
+  let release!: () => void;
+  const first = setup({
+    file,
+    run: async () => {
+      const state = JSON.parse(await readFile(file, "utf8"));
+      saved.push(...state.tasks.map((t: ScheduledTask) => [t.nextRunAt, t.status] as [number | undefined, string]));
+      return new Promise<RunResult>((resolve) => (release = () => resolve("done")));
+    },
+  });
+  await first.scheduler.init();
+  const weekly = first.scheduler.create({ ...base, prompt: "周报", cron: "0 9 * * 1" });
+  first.clock.now = bj("2026-10-26 09:00");
+  first.scheduler.tick();
+  // 写文件要等磁盘：最多等 5 秒
+  for (let i = 0; i < 500 && saved.length === 0; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // 跑的时候文件里已经是下一次了，重启不会把这次再跑一遍
+  assert.deepEqual(saved, [[bj("2026-11-02 09:00"), "active"]]);
+  assert.equal(first.scheduler.list("oc_1")[0]!.id, weekly.id);
+
+  // 这时候机器人重启了：读回来的「上次」没有结果，算被停止
+  const second = setup({ file });
+  await second.scheduler.init();
+  const [restored] = second.scheduler.list("oc_1");
+  assert.equal(restored!.lastRunAt, bj("2026-10-26 09:00"));
+  assert.equal(restored!.lastResult, "stopped");
+  release();
+  await first.scheduler.stop();
 });
 
 test("停下时不再看新到点的，等正在跑的记完结果", async () => {
