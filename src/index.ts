@@ -202,6 +202,13 @@ const proactive = new ProactiveReplier({
   skipTopic: (threadKey) => follower?.owns(threadKey) ?? false,
   // 群记忆里定过规矩的那类事：像被 @ 一样去做，只给读的工具；之后跟着这个话题
   work: (msg) => answerUnaddressed(msg),
+  // 像提问、像报错的看一眼之前查经验库，别的要开口说话的再想一遍之前查（和回答前自动查的同一个；查询词里手机号这类打码，像密钥的不发到 aiops）
+  ...(knowledge
+    ? {
+        knowledge: (query: string, msg: NormalizedMessage, signal: AbortSignal, options: { secret: boolean }) =>
+          knowledge.lookup(query, { chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }, signal, options),
+      }
+    : {}),
   onReplied: (msg) => follower?.track(msg),
   followsThreads: follower !== undefined,
   // 话题里勾了「同时发送到群」的追问，群里那份不再主动接话：话题里那份归跟聊
