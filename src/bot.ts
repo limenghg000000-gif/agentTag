@@ -115,6 +115,8 @@ const MEMORY_REQUEST =
  * 说了这些的不当成整理之前的内容（「每周一总结一下这个话题」要建任务，不是现在就总结）
  */
 const SCHEDULE_ASK = /定时|计划任务|周期任务|提醒|闹钟|到点|每(?:天|日|晚|早|周|星期|礼拜|个?月|隔|个?小时|年)|工作日|cron/i;
+/** 要暂停、恢复、取消定时任务（和 SCHEDULE_TALK 一起看） */
+const SCHEDULE_CHANGE_ASK = /暂停|恢复|取消|停(?:掉|了|用|一下)|删(?:掉|了|除)|关(?:掉|了)|不(?:要|用)了|重新开/;
 /**
  * 提问说到了定时任务或者以后的某个时间（「明天下午 3 点」「下周一」「T3」「半小时后」）：给定时任务的工具。
  * 认多了只是多给几个工具，模型照工具说明只在明确要以后做事时才建；认少了它就说做不到
@@ -711,7 +713,10 @@ async function runTask(
     // 提问本身说了要改哪个文档或代码：给改的工具、不带群聊（和没有旁听时一样）；没说：带群聊、只给读的工具
     const ambient = hasWrites && !noPermission && !followUp && context.history.some(isChatContext);
     // 「合到 uat」「开个 MR」也算要改：合并、开合并请求的工具只在发起人这句话明确要时才给，不能带群聊
-    const chatDropped = ambient && (CHANGE_REQUEST.test(question) || asksToOpenRequest(question));
+    // 暂停、恢复、取消定时任务也一样：群聊里埋的「取消 T3」不能借任务主人、管理员的 @ 去做。这句话本身说了要停、要取消的不带群聊；
+    // 没说的带着群聊，不给 schedule_change（见下面 taskTools）。不在写权限名单里的人也能停自己建的任务，所以不看 ambient
+    const asksToChangeSchedule = !followUp && SCHEDULE_TALK.test(question) && SCHEDULE_CHANGE_ASK.test(question) && context.history.some(isChatContext);
+    const chatDropped = (ambient && (CHANGE_REQUEST.test(question) || asksToOpenRequest(question))) || asksToChangeSchedule;
     const ambientOnly = ambient && !chatDropped;
     const modelHistory = chatDropped ? history.filter((m) => !isChatContext(m)) : history;
     // 跟聊接过来的、没 @ 机器人的话：话题里谁都能写字，写权限名单里的人随口说一句没 @ 的话，
@@ -743,6 +748,8 @@ async function runTask(
         !(readOnly && tool.writes) &&
         // 定时任务到点跑的不改代码、不开合并请求、不合并
         !(scheduled && tool.writes && isCodeTool(tool.spec.name)) &&
+        // 带着群聊的不给暂停、恢复、取消定时任务
+        !(tool.spec.name === SCHEDULE_CHANGE_TOOL && modelHistory.some(isChatContext)) &&
         !(
           SCHEDULE_TOOLS.has(tool.spec.name) &&
           (!scheduleTalk ||

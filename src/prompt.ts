@@ -19,7 +19,7 @@ export interface PromptContext {
   readOnly?: boolean;
   /** 这次带上了群里刚才的聊天、提问没说要改哪个文档或代码，只给了读的工具 */
   ambientOnly?: boolean;
-  /** 提问说了要改文档或代码，群里刚才的聊天这次没带上 */
+  /** 提问说了要改文档、代码，或者要暂停、取消定时任务，群里刚才的聊天这次没带上 */
   chatDropped?: boolean;
   /** 这句没 @ 机器人（跟聊接过来的），没给改文档、改代码的工具 */
   unaddressed?: boolean;
@@ -171,7 +171,7 @@ export function buildSystemPrompt({
   }
   if (chatDropped) {
     lines.push(
-      "- 这次提问说了要改文档或代码，所以没带上群里刚才的聊天。提问说到「上面」「刚才」的内容你看不到：请他把要写进去的内容或要改的地方直接写在 @ 你的话里，不要猜。",
+      "- 这次提问说了要改文档、代码或者暂停、取消定时任务，所以没带上群里刚才的聊天。提问说到「上面」「刚才」的内容你看不到：请他把要写进去的内容或要改的地方直接写在 @ 你的话里，不要猜。",
     );
   }
   if (unaddressed) {
