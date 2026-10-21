@@ -111,6 +111,27 @@ const MEMORY_REQUEST =
   /记住|记下|记一下|忘掉|把[^，。,.!?！？\n]{0,12}忘了|(?:删|改|更新)[^，。,.!?！？\n]{0,8}记忆|记忆[^，。,.!?！？\n]{0,8}(?:删|改|更新)/;
 
 /**
+ * 提问本身在给机器人定以后的规矩，没说「记住」也算让它记（和 Claude Tag 一样，群里定的规矩记进频道记忆）：
+ * 「线上报错必须要 @ 你再直接帮忙查」「不用 @ 你也直接查」「以后告警别管」「这类消息你不用回」。
+ * 2026-10-21 在群主界面 @ 它说「线上报错必须要 @ 你在直接帮忙查」，带着半小时群聊、这句又没说「记住」，拿不到记群记忆的工具，
+ * 它把群聊里「Redis 入方向带宽打满了，排查一下」当成这次要查的事，查了 17 步。
+ * 「以后」只认一句话开头的（「重启以后都报错」不算）；认多了只是多给记群记忆的工具，模型照提示词只在真在定规矩时记
+ */
+const RULE_REQUEST = new RegExp(
+  [
+    // 要不要 @ 它：「必须要 @ 你」「不用 @ 你」「没 @ 你的时候」「@ 你再查」
+    String.raw`(?:必须|一定|得|需要|要|先|不用|不必|无需|不需要|没有?|不)\s*(?:要\s*|先\s*)?@\s*(?:你|机器人)`,
+    String.raw`@\s*(?:了\s*)?(?:你|机器人)\s*(?:才|再|在[^哪吗么]|的时候|以后|之后)`,
+    // 一句话开头的「以后」「今后」「从现在起」后面跟着怎么做
+    String.raw`(?:^|[，。,.;；!?！？\s])(?:以后|今后|往后|从今往后|从现在起|从今天起|下次)[^，。,.!?！？\n]{0,20}?(?:直接|帮忙|不用|不要|别|只|都|一律|必须|记得|先)`,
+    // 「你以后…」「你只回…」「机器人别管…」
+    String.raw`(?:你|机器人)\s*(?:以后|今后|往后|一律|只(?:在|有|回|管|接)|别(?:管|理|回|接|插|主动)|不(?:用|要)(?:管|理|回|接|插|主动))`,
+    // 「这类告警不用管」「报警群的消息别回」（「要不要管」是在问，不算）
+    String.raw`(?<!要)(?:别|不用|不要|无需|不必)(?:管|理会?|回复?|接话|插话)`,
+  ].join("|"),
+);
+
+/**
  * 提问本身要建定时任务、要它以后或定期做事：「每周一 9 点汇总」「明天提醒我」「工作日每天查一下」「定时任务」。
  * 说了这些的不当成整理之前的内容（「每周一总结一下这个话题」要建任务，不是现在就总结）
  */
@@ -406,6 +427,8 @@ async function runTask(
 ): Promise<void> {
   const { model, tools, tasks, send, updateCard, logger = console, now = Date.now, cardIntervalMs = 1000 } = deps;
   const scheduled = options.scheduled;
+  // 这句话本身让它记住、忘掉、改记忆，或者在给它定以后的规矩（定时任务到点跑的任务内容不算定规矩：那是建任务时模型写的）
+  const asksToRemember = MEMORY_REQUEST.test(question) || (scheduled === undefined && RULE_REQUEST.test(question));
   const task = tasks.create(msg.chatId, threadKeyOf(msg));
   // 提问的时间：排队的时间也算进「等了多久」
   const askedAt = now();
@@ -602,7 +625,7 @@ async function runTask(
             readChat &&
             ((tool.writes && tool.spec.name !== "feishu_doc_create") ||
               tool.spec.name === SCHEDULE_CHANGE_TOOL ||
-              (MEMORY_WRITE_TOOLS.has(tool.spec.name) && !MEMORY_REQUEST.test(question)))
+              (MEMORY_WRITE_TOOLS.has(tool.spec.name) && !asksToRemember))
           ) {
             throw new Error(READ_CHAT_NOTE);
           }
@@ -728,10 +751,10 @@ async function runTask(
     const scheduledReadOnly = scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || !asksToWrite);
     const readOnly = noPermission || followUp || ambientOnly || unaddressed || scheduledReadOnly;
     // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
-    // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
+    // 只有这句话本身让它记住、忘掉、改记忆，或者在给它定以后的规矩，才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
     const memoryLocked =
       options.proactive === true ||
-      (!followUp && (modelHistory.some(isChatContext) || options.unaddressed === true || scheduled !== undefined) && !MEMORY_REQUEST.test(question));
+      (!followUp && (modelHistory.some(isChatContext) || options.unaddressed === true || scheduled !== undefined) && !asksToRemember);
     // 起草经验、归档经验、群记忆和经验库冲突的卡片也一样：点了就改经验库或群记忆，这句话本身没说到经验库、记忆的事就不给
     const draftsLocked =
       options.proactive === true ||

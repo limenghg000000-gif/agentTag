@@ -839,6 +839,53 @@ test("带上了群聊、没 @ 的跟聊：这句话没让记住或忘掉时不�
   assert.match(plain.requests[3].system, /这次群记忆只能看/);
 });
 
+test("给机器人定以后的规矩，没说「记住」也给记群记忆的工具（带着群聊也给）；顺带说到「以后」「@ 你」「不要管」的提问、定时任务的内容照旧不给", async () => {
+  const memory = await memoryStore();
+  const { model, requests } = fakeModel(() => ({ text: "已记住", finish: "stop" }));
+  // 2026-10-21：群聊里正好有 Redis 带宽打满，@ 它定规矩，它拿不到记忆的工具，去查了 Redis
+  const chat = `${CHAT_CONTEXT_HEADER}\n[赵作武 17:58] Redis 入方向带宽又被打满了，排查一下咋回事`;
+  const withChat = fakeContext({ history: [{ role: "user", content: chat }], source: "chat" }).source;
+  const { handle } = setup({ model, memory, context: withChat });
+  const memoryTools = ["memory_save", "memory_update", "memory_delete"];
+
+  const rules = [
+    "线上报错必须要 @ 你在直接帮忙查",
+    "线上报错不用 @ 你也直接帮忙查",
+    "报错要 @ 你再查",
+    "以后告警别管",
+    "从现在起只在 @ 你的时候回",
+    "这个群里你只回运维相关的",
+    "发版通知不用回复",
+  ];
+  for (const [i, question] of rules.entries()) {
+    await handle(message(question, { messageId: `om_r${i}` }));
+    assert.deepEqual(requests[i].tools?.map((t) => t.name), memoryTools, question);
+    assert.doesNotMatch(requests[i].system, /这次群记忆只能看/, question);
+  }
+  assert.match(requests[0].system, /没说「记住」也算让你记住/);
+  assert.match(requests[0].system, /这次只记规矩，不要照着它现在就去查、去做，群里刚才聊的事也不要当成这次要做的事/);
+
+  const questions = ["重启以后都报错了，帮忙看下", "我 @ 你在哪看结果？", "这个告警要不要管？", "你只看了日志吗", "上面那个报错是怎么回事"];
+  for (const [i, question] of questions.entries()) {
+    const n = rules.length + i;
+    await handle(message(question, { messageId: `om_q${i}` }));
+    assert.deepEqual(requests[n].tools?.map((t) => t.name) ?? [], [], question);
+    assert.match(requests[n].system, /他这句话要是在给你定以后的规矩，告诉他这次没记上/, question);
+  }
+
+  // 定时任务到点跑的：任务内容是建任务时模型写的，像在定规矩也不算
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle: run } = setup({ model: plain.model, memory });
+  await run(message("每天查一下线上报错，没有报错的不用回复"), { scheduled: { label: "T3", schedule: "每天 10:00" } });
+  assert.deepEqual(plain.requests[0].tools?.map((t) => t.name) ?? [], []);
+  // 没 @ 的跟聊里定规矩：和说「记住」一样给
+  await run(message("以后这类报错直接帮忙查", { messageId: "om_2", rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), memoryTools);
+  // 主动接话照群里的规矩去做的：照旧不给
+  await run(message("以后这类报错直接帮忙查", { messageId: "om_3", senderId: "ou_2" }), { unaddressed: true, proactive: true });
+  assert.deepEqual(plain.requests[2].tools?.map((t) => t.name) ?? [], []);
+});
+
 test("群里还没有记忆时也告诉模型可以记", async () => {
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const { handle } = setup({ model, memory: await memoryStore() });
