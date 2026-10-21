@@ -13,8 +13,13 @@ export interface ReleaseNotesVersion {
   notes: string;
   /** 技术版 CHANGELOG.md 里同一版本的内容，卡片上折叠放在「技术说明」里；没有时为空 */
   tech?: string;
-  /** 说明里单独一行写的文档链接，卡片上做成这一版下面的按钮；没有时为空 */
+  /** 说明里单独一行写的文档链接，卡片上在原来那一行的位置做成按钮；没有时为空 */
   links?: ReleaseNotesLink[];
+  /**
+   * 有文档链接时，说明按链接切开的几段：parts[i] 在第 i 个链接前面，最后一段在最后一个链接后面（可能是空的）。
+   * 卡片照这个顺序放，每个新功能的按钮跟在它那一段下面
+   */
+  parts?: string[];
 }
 
 /**
@@ -31,10 +36,17 @@ export const PRODUCT_NAME = "AgentTag";
 
 /** 一张通知卡片最多列几个版本，更早的只说还有几个 */
 export const MAX_ANNOUNCED_VERSIONS = 5;
-/** 一张通知卡片里说明的总字数上限，超了后面的版本只说还有几个 */
-const MAX_NOTES_CHARS = 3000;
-/** 一个版本的技术说明最多放多少字；一张卡片里技术说明加起来也不超过 MAX_NOTES_CHARS，超了后面的版本不放 */
-const MAX_TECH_CHARS = 1500;
+/**
+ * 一张通知卡片里说明的总字数上限，超了后面的版本只说还有几个。攒几个改动一起发的一版，每个新功能都写能做什么、谁用得上、怎么说，
+ * 所以放得比较宽；加上技术说明，卡片也在飞书的 30 KB 以内
+ */
+export const MAX_NOTES_CHARS = 4500;
+/** 一个版本的技术说明最多放多少字 */
+export const MAX_TECH_CHARS = 2500;
+/** 一张卡片里技术说明加起来最多多少字，超了后面的版本不放 */
+export const MAX_TECH_TOTAL_CHARS = 3500;
+/** 飞书卡片 JSON 最多 30 KB，留点余量 */
+export const MAX_CARD_BYTES = 28_000;
 /** 发失败的群过一阵再试 */
 export const ANNOUNCE_RETRY_MS = 10 * 60_000;
 /** 一个群一次部署最多试这么多次，还发不出去就等下次重启 */
@@ -54,20 +66,20 @@ export const MAX_VERSION_LINKS = 3;
 
 /**
  * 读产品更新说明（RELEASE_NOTES.md）：每个「## 0.8.0 — 2026-10-14」开头的段是一个版本，按文件里的先后返回（最新的在最上面）。
- * 「## 未发布」这类没有版本号的段跳过。每段只取 ### 小标题之前的部分，结尾的 PR 号去掉；
- * 单独一行的链接（最多 MAX_VERSION_LINKS 个）从说明里拿出来，放进 links
+ * 「## 未发布」这类没有版本号的段跳过（平时合并的改动先写在那里，发版时才定版本号）。每段只取 ### 小标题之前的部分，结尾的 PR 号去掉；
+ * 单独一行的链接（最多 MAX_VERSION_LINKS 个）从说明里拿出来，放进 links，说明按它们切开放进 parts
  */
 export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
   const versions: ReleaseNotesVersion[] = [];
-  let current: { version: string; date?: string; lines: string[]; links: ReleaseNotesLink[]; cut: boolean } | undefined;
+  let current: { version: string; date?: string; lines: string[]; parts: string[][]; links: ReleaseNotesLink[]; cut: boolean } | undefined;
+  const clean = (lines: readonly string[]) => lines.join("\n").replace(PR_REFS, "").replace(/\n{3,}/g, "\n\n").trim();
   const flush = () => {
     if (current) {
-      const notes = current.lines.join("\n").replace(PR_REFS, "").replace(/\n{3,}/g, "\n\n").trim();
       versions.push({
         version: current.version,
         ...(current.date ? { date: current.date } : {}),
-        notes,
-        ...(current.links.length > 0 ? { links: current.links } : {}),
+        notes: clean(current.lines),
+        ...(current.links.length > 0 ? { links: current.links, parts: current.parts.map(clean) } : {}),
       });
     }
   };
@@ -76,7 +88,14 @@ export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
       flush();
       const match = VERSION_HEADING.exec(line);
       current = match
-        ? { version: `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`, date: match[4] || undefined, lines: [], links: [], cut: false }
+        ? {
+            version: `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`,
+            date: match[4] || undefined,
+            lines: [],
+            parts: [[]],
+            links: [],
+            cut: false,
+          }
         : undefined;
       continue;
     }
@@ -90,9 +109,11 @@ export function parseReleaseNotes(text: string): ReleaseNotesVersion[] {
     const link = LINK_LINE.exec(line);
     if (link && current.links.length < MAX_VERSION_LINKS) {
       current.links.push({ text: link[1]!.trim(), target: link[2]! });
+      current.parts.push([]);
       continue;
     }
     current.lines.push(line.trimEnd());
+    current.parts.at(-1)!.push(line.trimEnd());
   }
   flush();
   return versions;
@@ -124,6 +145,47 @@ function versionLinks(v: ReleaseNotesVersion, options: AnnouncementOptions): { t
     const url = resolveNotesLink(link.target, options);
     return url ? [{ text: link.text, url }] : [];
   });
+}
+
+type NotesSegment = { text: string } | { buttons: { text: string; url: string }[] };
+
+/**
+ * 一个版本在卡片上按什么顺序放：说明的一段、这段下面的文档按钮、下一段……挨着的按钮放一排，打不开的链接不放。
+ * 说明被截短过（parts 和 notes 对不上了）时，整段说明在前、按钮都放最后
+ */
+function notesSegments(v: ReleaseNotesVersion, options: AnnouncementOptions): NotesSegment[] {
+  const links = v.links ?? [];
+  const parts = v.parts?.length === links.length + 1 ? v.parts : undefined;
+  if (!parts) {
+    const buttons = versionLinks(v, options);
+    return [...(v.notes ? [{ text: v.notes }] : []), ...(buttons.length > 0 ? [{ buttons }] : [])];
+  }
+  const segments: NotesSegment[] = [];
+  const add = (segment: NotesSegment) => {
+    const last = segments.at(-1);
+    if ("text" in segment) {
+      if (!segment.text) {
+        return;
+      }
+      if (last && "text" in last) {
+        last.text = `${last.text}\n\n${segment.text}`;
+        return;
+      }
+    } else if (last && "buttons" in last) {
+      last.buttons.push(...segment.buttons);
+      return;
+    }
+    segments.push(segment);
+  };
+  parts.forEach((part, i) => {
+    add({ text: part });
+    const link = links[i];
+    const url = link ? resolveNotesLink(link.target, options) : undefined;
+    if (link && url) {
+      add({ buttons: [{ text: link.text, url }] });
+    }
+  });
+  return segments;
 }
 
 /**
@@ -199,24 +261,25 @@ export interface AnnouncementOptions {
  * 一条通知里列哪几个版本（卡片和退回的文字一样）：最多 MAX_ANNOUNCED_VERSIONS 个、说明加起来不超过 MAX_NOTES_CHARS 字，
  * 后面的只说还有几个。第一个版本再长也要列，太长就按行截短
  */
-function shownVersions(versions: readonly ReleaseNotesVersion[]): ReleaseNotesVersion[] {
+function shownVersions(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions): ReleaseNotesVersion[] {
+  const see = seeFull(options);
   const shown: ReleaseNotesVersion[] = [];
   let chars = 0;
   for (const v of versions) {
     if (shown.length >= MAX_ANNOUNCED_VERSIONS || (shown.length > 0 && chars + v.notes.length > MAX_NOTES_CHARS)) {
       break;
     }
-    shown.push(v.notes.length > MAX_NOTES_CHARS ? { ...v, notes: truncateText(v.notes, MAX_NOTES_CHARS, "见更新说明") } : v);
+    shown.push(v.notes.length > MAX_NOTES_CHARS ? { ...v, notes: truncateText(v.notes, MAX_NOTES_CHARS, see), parts: undefined } : v);
     chars += v.notes.length;
   }
-  // 技术说明另算一份字数：每版最多 MAX_TECH_CHARS 字，加起来超了 MAX_NOTES_CHARS 后面的版本就不放
+  // 技术说明另算一份字数：每版最多 MAX_TECH_CHARS 字，加起来超了 MAX_TECH_TOTAL_CHARS 后面的版本就不放
   let techChars = 0;
   return shown.map((v) => {
     if (!v.tech) {
       return v;
     }
-    const tech = v.tech.length > MAX_TECH_CHARS ? truncateText(v.tech, MAX_TECH_CHARS, "见 CHANGELOG.md") : v.tech;
-    if (techChars + tech.length > MAX_NOTES_CHARS) {
+    const tech = v.tech.length > MAX_TECH_CHARS ? truncateText(v.tech, MAX_TECH_CHARS, see) : v.tech;
+    if (techChars + tech.length > MAX_TECH_TOTAL_CHARS) {
       const { tech: _dropped, ...rest } = v;
       return rest;
     }
@@ -225,9 +288,14 @@ function shownVersions(versions: readonly ReleaseNotesVersion[]): ReleaseNotesVe
   });
 }
 
+/** 说明、技术说明、更早的版本放不下时，让大家去哪看全的：配了文档中心才说，没配不指一个打不开的地方 */
+function seeFull(options: AnnouncementOptions): string {
+  return options.docsLink ? "，见文档中心的更新日志" : "";
+}
+
 /** 按行截短，连同末尾「没列全」那句不超过 max 字；第一行就超了按字截 */
 function truncateText(text: string, max: number, seeAlso: string): string {
-  const tail = `\n…（太长了没列全，${seeAlso}）`;
+  const tail = `\n…（太长了没列全${seeAlso}）`;
   const room = max - tail.length;
   const kept: string[] = [];
   let chars = 0;
@@ -249,10 +317,10 @@ function versionHeading(v: ReleaseNotesVersion, single: boolean, date: (text: st
 }
 
 /** 卡片和退回的文字末尾都有的几句：还有几个版本没列、第一次收到通知时介绍一句自己 */
-function footerLines(name: string, rest: number, firstTime: boolean | undefined): string[] {
+function footerLines(name: string, rest: number, options: AnnouncementOptions): string[] {
   return [
-    ...(rest > 0 ? [`还有 ${rest} 个更早的版本没列出来，见更新说明。`] : []),
-    firstTime
+    ...(rest > 0 ? [`还有 ${rest} 个更早的版本没列出来${seeFull(options)}。`] : []),
+    options.firstTime
       ? `我是${name}，在群里 @ 我就能提问、派活。以后每次更新，我都会在这里说一声。`
       : "有问题、想让我做什么，照常在群里 @ 我。",
   ];
@@ -288,18 +356,39 @@ function buttonRow(buttons: readonly { text: string; url: string; primary?: bool
   };
 }
 
-/** 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前 */
+/**
+ * 更新通知卡片（飞书卡片 JSON 2.0）。versions 新的在前。字数上限按字算，尖括号转义、中文三个字节，
+ * 极端情况下整张卡片还会超过 MAX_CARD_BYTES：从最后一版起去掉技术说明，直到放得下（不带技术说明的卡片一定放得下）
+ */
 export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): object {
+  let shown = shownVersions(versions, options);
+  let card = cardJson(versions, shown, options);
+  for (let i = shown.length - 1; i >= 0 && Buffer.byteLength(JSON.stringify(card)) > MAX_CARD_BYTES; i--) {
+    if (shown[i]!.tech) {
+      shown = shown.map((v, j) => (j === i ? { ...v, tech: undefined } : v));
+      card = cardJson(versions, shown, options);
+    }
+  }
+  return card;
+}
+
+function cardJson(versions: readonly ReleaseNotesVersion[], shown: readonly ReleaseNotesVersion[], options: AnnouncementOptions): object {
   const name = options.botName || "机器人";
-  const shown = shownVersions(versions);
   const title = `${PRODUCT_NAME} 更新了 · ${versions[0]?.version ?? ""}`;
   const grey = (text: string) => `<font color='grey'>${escapeCardMarkdown(text)}</font>`;
   const elements: object[] = shown.flatMap((v) => {
-    const docs = versionLinks(v, options);
+    // 说明和每个新功能的文档按钮按写的顺序放，这一版的标题写在第一段说明前面
+    const segments = notesSegments(v, options);
+    const first = segments[0];
+    const lead = first && "text" in first ? first.text : "";
+    const body = [
+      { tag: "markdown", content: [versionHeading(v, versions.length === 1, grey), escapeCardMarkdown(lead)].filter(Boolean).join("\n") },
+      ...segments
+        .slice(lead ? 1 : 0)
+        .map((segment) => ("buttons" in segment ? buttonRow(segment.buttons) : { tag: "markdown", content: escapeCardMarkdown(segment.text) })),
+    ];
     return [
-      { tag: "markdown", content: [versionHeading(v, versions.length === 1, grey), escapeCardMarkdown(v.notes)].join("\n") },
-      // 这一版新功能的文档
-      ...(docs.length > 0 ? [buttonRow(docs)] : []),
+      ...body,
       // 技术说明给开发同事看，默认收起
       ...(v.tech
         ? [
@@ -318,7 +407,7 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
         : []),
     ];
   });
-  const footer = footerLines(escapeCardMarkdown(name), versions.length - shown.length, options.firstTime);
+  const footer = footerLines(escapeCardMarkdown(name), versions.length - shown.length, options);
   elements.push({ tag: "markdown", content: footer.map((line) => `<font color='grey'>${line}</font>`).join("\n") });
   const links = footerLinks(options);
   if (links.length > 0) {
@@ -338,13 +427,13 @@ export function renderAnnouncementCard(versions: readonly ReleaseNotesVersion[],
  */
 export function renderAnnouncementMarkdown(versions: readonly ReleaseNotesVersion[], options: AnnouncementOptions = {}): string {
   const name = options.botName || "机器人";
-  const shown = shownVersions(versions);
+  const shown = shownVersions(versions, options);
   const lines = [`**${PRODUCT_NAME} 更新了 · ${versions[0]?.version ?? ""}**`];
   for (const v of shown) {
     lines.push("", versionHeading(v, versions.length === 1, (text) => text), v.notes);
     lines.push(...versionLinks(v, options).map((link) => `${link.text}：${link.url}`));
   }
-  lines.push("", ...footerLines(name, versions.length - shown.length, options.firstTime));
+  lines.push("", ...footerLines(name, versions.length - shown.length, options));
   const links = footerLinks(options);
   if (links.length > 0) {
     lines.push("", ...links.map((link) => `${link.text}：${link.url}`));
