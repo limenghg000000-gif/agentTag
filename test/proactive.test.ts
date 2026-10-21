@@ -7,7 +7,16 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { ThreadMessage } from "../src/feishu.js";
 import type { ChatModel, ChatRequest } from "../src/llm.js";
 import type { MemoryEntry } from "../src/memory.js";
-import { MAX_JUDGED_PER_HOUR, PAUSE_COMMAND, ProactiveReplier, RESUME_COMMAND, unsupported } from "../src/proactive.js";
+import {
+  IGNORED_AFTER_MS,
+  MAX_JUDGED_PER_HOUR,
+  PAUSE_COMMAND,
+  ProactiveReplier,
+  QUIET_AFTER_MESSAGES,
+  QUIET_AFTER_MS,
+  RESUME_COMMAND,
+  unsupported,
+} from "../src/proactive.js";
 
 const START = Date.UTC(2026, 9, 14, 2, 0, 0);
 const BOT = "ou_bot";
@@ -93,8 +102,10 @@ async function setup(
       return { text: lastSaid, finish: "stop" };
     },
   };
-  const make = () =>
-    new ProactiveReplier({
+  /** make 出来的都记下，收尾时等它们写完文件再删目录 */
+  const made: ProactiveReplier[] = [];
+  const make = () => {
+    const made1 = new ProactiveReplier({
       allowedChatIds: new Set(["oc_1", "oc_2"]),
       enabledChatIds: new Set(opts.enabled ?? ["oc_1"]),
       stateFile,
@@ -105,6 +116,8 @@ async function setup(
       botOpenId: () => BOT,
       reply: async (m, markdown) => {
         replies.push(`${m.messageId} ${markdown}`);
+        // 和发消息的接口一样返回发出去的消息 id
+        return { messageId: `om_bot_${replies.length}` };
       },
       onReplied: (m) => replied.push(m.messageId),
       ...(opts.maxPerHour ? { maxPerHour: opts.maxPerHour } : {}),
@@ -148,6 +161,9 @@ async function setup(
       logger: { info: (line: string) => logs.push(line), warn: (line: string) => logs.push(line), error: (line: string) => logs.push(line) },
       now: () => now,
     });
+    made.push(made1);
+    return made1;
+  };
   const replier = make();
   await replier.init();
   return {
@@ -165,7 +181,10 @@ async function setup(
     advance: (ms: number) => {
       now += ms;
     },
-    cleanup: () => rm(dir, { recursive: true, force: true }),
+    cleanup: async () => {
+      await Promise.all(made.map((one) => one.flush()));
+      await rm(dir, { recursive: true, force: true });
+    },
   };
 }
 
@@ -369,6 +388,120 @@ test("不填每小时最多回几次就不限：和 Claude Tag 一样只看该�
   }
 });
 
+test("机器人上次说话以后群里发了 200 条它都没说话：这个群先不看了，有人 @ 它、它回了以后接着看", async () => {
+  const t = await setup();
+  try {
+    for (let i = 0; i < QUIET_AFTER_MESSAGES - 1; i++) {
+      t.replier.noteActivity(msg(`om_chat_${i}`, { content: "随便聊聊" }));
+    }
+    assert.equal(t.replier.wants(msg("om_1")), true);
+    t.replier.noteActivity(msg("om_chat_last", { content: "随便聊聊" }));
+    assert.equal(t.replier.wants(msg("om_1")), false);
+    assert.equal(t.replier.listening("oc_1"), false);
+    // 开关没变：不是有人说了「别主动插话」
+    assert.equal(t.replier.active("oc_1"), true);
+    assert.equal(t.replier.wants(msg("om_2")), false);
+    const quiet = t.logs.filter((line) => line.includes("这个群先不看了"));
+    assert.equal(quiet.length, 1);
+    assert.match(quiet[0], /我上次在群里说话以后已经有 200 条消息/);
+
+    // 有人 @ 它、它回了：接着看
+    t.replier.spoke("oc_1");
+    assert.equal(t.replier.wants(msg("om_3")), true);
+    assert.match(t.logs.join("\n"), /我在这个群里回话了，接着看 chat=oc_1/);
+    // 别的群各数各的
+    assert.equal(t.replier.listening("oc_2"), false);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("10 天没人 @ 它、它也没在群里说话：先不看了；重启后照样不看，@ 它一次接着看", async () => {
+  const t = await setup();
+  try {
+    t.replier.noteActivity(msg("om_0", { content: "随便聊聊" }));
+    t.advance(QUIET_AFTER_MS - HOUR);
+    assert.equal(t.replier.wants(msg("om_1")), true);
+    t.advance(2 * HOUR);
+    assert.equal(t.replier.wants(msg("om_2")), false);
+    assert.match(t.logs.join("\n"), /10 天没人 @ 我、我也没在群里说话，这个群先不看了/);
+
+    // 记在文件里：重启后照样不看
+    await t.replier.flush();
+    const saved = JSON.parse(await readFile(t.stateFile, "utf8"));
+    assert.equal(saved.reading.oc_1.messages, 1);
+    const restarted = t.make();
+    await restarted.init();
+    assert.equal(restarted.wants(msg("om_3")), false);
+    restarted.spoke("oc_1");
+    assert.equal(restarted.wants(msg("om_4")), true);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("没被 @ 时开口过了一小时没人理：判断时告诉模型没人理的多，这次少说", async () => {
+  const t = await setup({ judge: "接：要我帮忙查一下吗？" });
+  try {
+    await t.replier.consider(msg("om_1"));
+    assert.equal(t.replies.length, 1);
+    // 第一次开口前没有记录，提示词里不提
+    assert.doesNotMatch(t.requests[0].system ?? "", /没被 @ 时开口/);
+    // 不到一小时的先不算
+    t.advance(IGNORED_AFTER_MS - 60_000);
+    await t.replier.consider(msg("om_2", { createTime: START + 60_000 }));
+    assert.doesNotMatch(t.requests[1].system ?? "", /没被 @ 时开口/);
+    t.advance(2 * 60_000);
+    await t.replier.consider(msg("om_3", { createTime: START + 120_000 }));
+    // om_1 过了一小时没人理；om_2 刚回、不算
+    assert.match(t.requests[2].system ?? "", /你最近在这个群里没被 @ 时开口 1 次：0 次有人理.*1 次没人理。没人理的多：这个群不太需要你主动开口/);
+    // 写在提示词里，不放进材料：次数不算核对出处的依据
+    assert.doesNotMatch(String(t.requests[2].messages[0].content), /没被 @ 时开口/);
+    assert.match(t.confirms[2].system ?? "", /没人理的多/);
+    assert.match(t.logs.join("\n"), /主动接话：接一句 chat=oc_1 message=om_3 .*最近没被 @ 时开口有人理=0\/1/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("有人理：在它开的话题里回了、@ 了它、引用回复它、点了表情都算；点「踩」、话题里别人自己聊的不算", async () => {
+  const t = await setup({ judge: "接：要我帮忙查一下吗？" });
+  try {
+    // 群主界面的消息：它回在新开的话题里，话题里之后有人说话就算理了它
+    await t.replier.consider(msg("om_1"));
+    t.replier.noteActivity(msg("om_1_re", { rootId: "om_1", threadId: "omt_1", createTime: START + 1000, content: "好的，查一下" }));
+    // 原来就有的话题里接的：话题里别人接着自己聊不算，引用回复它才算
+    await t.replier.consider(msg("om_2", { rootId: "om_root", threadId: "omt_2", createTime: START + 2000 }));
+    t.replier.noteActivity(msg("om_2_chat", { rootId: "om_root", threadId: "omt_2", createTime: START + 3000, content: "我觉得是缓存的问题" }));
+    await t.replier.consider(msg("om_3", { rootId: "om_root3", threadId: "omt_3", createTime: START + 4000 }));
+    t.replier.noteActivity(msg("om_3_re", { rootId: "om_root3", threadId: "omt_3", createTime: START + 5000, replyToMessageId: "om_bot_3", content: "要" }));
+    // 点表情：点赞算理了，点「踩」算没人理
+    await t.replier.consider(msg("om_4", { createTime: START + 6000 }));
+    t.replier.noteReaction("om_bot_4", "ou_2", "THUMBSUP", "added");
+    await t.replier.consider(msg("om_5", { createTime: START + 7000 }));
+    t.replier.noteReaction("om_bot_5", "ou_2", "ThumbsDown", "added");
+    // 机器人自己点的、取消的不算
+    await t.replier.consider(msg("om_6", { createTime: START + 8000 }));
+    t.replier.noteReaction("om_bot_6", BOT, "THUMBSUP", "added");
+    t.replier.noteReaction("om_bot_6", "ou_2", "THUMBSUP", "removed");
+    assert.equal(t.replies.length, 6);
+
+    t.advance(IGNORED_AFTER_MS + 60_000);
+    await t.replier.consider(msg("om_7", { createTime: START + IGNORED_AFTER_MS }));
+    // 理了的：om_1、om_3、om_4；没人理的：om_2、om_5（踩）、om_6
+    assert.match(t.requests[6].system ?? "", /没被 @ 时开口 6 次：3 次有人理.*3 次没人理。有没人理的：拿不准的更要不接。/);
+
+    // 重启后照样记得（om_7 刚回、还不算）
+    await t.replier.flush();
+    const restarted = t.make();
+    await restarted.init();
+    await restarted.consider(msg("om_8", { createTime: START + IGNORED_AFTER_MS + 1000 }));
+    assert.match(t.requests[7].system ?? "", /没被 @ 时开口 6 次：3 次有人理/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("每个群每小时最多判断 120 条，后面的不问模型", async () => {
   const t = await setup({ judge: "不接" });
   try {
@@ -511,6 +644,7 @@ test("回复发不出去：不占每小时的次数，下次照样带上怎么�
     await replier.consider(msg("om_2"));
     assert.equal(t.replies.length, 1);
     assert.match(t.replies[0], /不需要的话 @ 我说「别主动插话」/);
+    await replier.flush();
   } finally {
     await t.cleanup();
   }
