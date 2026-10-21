@@ -322,6 +322,27 @@ test("到点先把下一次写进文件再跑；跑到一半重启的，上次�
   await first.scheduler.stop();
 });
 
+test("下一次的时间写不进文件（磁盘满、没权限）：这次不跑，记成出错，免得重启后再跑一遍", async () => {
+  // 文件所在的「目录」其实是个文件：怎么写都失败
+  const blocker = await tempFile();
+  await writeFile(blocker, "");
+  const errors: string[] = [];
+  const { scheduler, clock, ran } = setup({
+    file: path.join(blocker, "schedules.json"),
+    logger: { ...quiet, error: (text: string) => errors.push(text) },
+  });
+  scheduler.create({ ...base, prompt: "周报", cron: "0 9 * * 1" });
+  clock.now = bj("2026-10-26 09:00");
+  scheduler.tick();
+  await scheduler.stop();
+  assert.deepEqual(ran, []);
+  const [task] = scheduler.list("oc_1");
+  assert.equal(task!.lastResult, "failed");
+  assert.equal(task!.failures, 1);
+  assert.equal(task!.nextRunAt, bj("2026-11-02 09:00"));
+  assert.match(errors.join("\n"), /T1 下一次的时间没写进文件，这次不跑/);
+});
+
 test("停下时不再看新到点的，等正在跑的记完结果", async () => {
   let release!: () => void;
   const { scheduler, clock } = setup({ run: () => new Promise<RunResult>((resolve) => (release = () => resolve("stopped"))), tickMs: 10 });
@@ -364,12 +385,19 @@ test("工具：建好照实说时间和怎么取消；只能看、改本群的�
   assert.match(created, /取消定时任务 T1/);
   assert.equal(scheduler.list("oc_1")[0]!.readOnly, undefined);
   assert.equal(scheduler.list("oc_1")[0]!.creator.name, "ML");
+  assert.doesNotMatch(created, /只能查、不能改文档/);
 
   // 这次没有改文档的工具（不在写权限名单里、带着群聊）：记成只读
   const reminder = await call(mine.get("schedule_create"), { task: "看发版", at: "2026-10-22 15:00", remind: true }, false);
   assert.match(reminder, /T2（纯提醒）：10-22（周四）15:00 一次/);
   assert.equal(scheduler.list("oc_1").find((t) => t.id === 2)!.readOnly, true);
+  assert.doesNotMatch(reminder, /只能查、不能改文档/);
   await assert.rejects(call(mine.get("schedule_create"), { task: "x", cron: "*/10 * * * *" }, true), /至少隔 60 分钟/);
+
+  // 到点去做、但只能读的：照实告诉模型，别说到点会改文档
+  const other = setup().scheduler;
+  const [create] = createScheduleTools({ scheduler: other, chatId: "oc_1", senderId: "ou_ml", askerName: "ML", messageId: "om_1", canManageAll: false, now: () => bj("2026-10-21 10:00") });
+  assert.match(await call(create, { task: "汇总进展", cron: "0 18 * * 5" }, false), /T1（到点去做）[\s\S]*到点只能查、不能改文档/);
 
   const listed = await call(mine.get("schedule_list"), {});
   assert.match(listed, /这个群有 2 个定时任务/);

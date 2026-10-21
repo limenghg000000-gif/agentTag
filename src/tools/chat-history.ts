@@ -7,6 +7,8 @@ export const CHAT_HISTORY_TOOL = "chat_history";
 const MAX_RANGE_MS = 8 * 24 * 60 * 60_000;
 /** 群主界面最多读多少条（最新的） */
 const MAX_MESSAGES = 200;
+/** 往前翻页最多调几次接口（一般 4 次就够 200 条，同一秒里刷屏的要多翻几次） */
+const MAX_PAGES = 10;
 /** 最多展开多少个话题（最新的），每个话题最多读多少条 */
 const MAX_THREADS = 20;
 const THREAD_MESSAGES = 30;
@@ -112,19 +114,22 @@ async function listChat(api: Pick<FeishuApi, "listChatMessages">, chatId: string
   const pages: ThreadMessage[][] = [];
   let end = until;
   let total = 0;
-  while (total < MAX_MESSAGES) {
-    const page = (await api.listChatMessages(chatId, since, end, 50)).filter((m) => m.createTime >= since && m.createTime <= end);
+  for (let calls = 0; total < MAX_MESSAGES && calls < MAX_PAGES && end >= since; calls++) {
+    // 接口按整秒截：会带回这一秒里比 end 晚、上一页已经看过的，先去掉再看还剩几条新的
+    const raw = await api.listChatMessages(chatId, since, end, 50);
+    const page = raw.filter((m) => m.createTime >= since && m.createTime <= end);
     const fresh = pages.length === 0 ? page : page.filter((m) => !pages.some((p) => p.some((seen) => seen.messageId === m.messageId)));
-    if (fresh.length === 0) {
+    if (fresh.length > 0) {
+      pages.unshift(fresh);
+      total += fresh.length;
+    }
+    // 接口没给满一页：再往前没有了（要看接口给了几条，不是去掉重复以后剩几条）
+    if (raw.length < 50) {
       break;
     }
-    pages.unshift(fresh);
-    total += fresh.length;
-    if (page.length < 50) {
-      break;
-    }
-    // 下一页从这一页最早那条往前（同一秒的可能重复，上面去掉了）
-    end = Math.min(...fresh.map((m) => m.createTime));
+    // 下一页从这一页最早那条往前（同一秒的会重复，上面去掉了）。
+    // 一条新的都没有：这一秒里超过 50 条，按秒翻不过去，跳过这一秒剩下的，免得一直拿同一页
+    end = fresh.length > 0 ? Math.min(...fresh.map((m) => m.createTime)) : Math.floor(end / 1000) * 1000 - 1;
   }
   return pages.flat().slice(-MAX_MESSAGES);
 }

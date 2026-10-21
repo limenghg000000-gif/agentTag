@@ -88,3 +88,35 @@ test("超过 50 条往前翻页；太长时去掉最早的；范围不对报错"
   await assert.rejects(tool.run({ since: "上周" }, ctx), /2026-10-22 15:00/);
   assert.match(await tool.run({ since: "2026-10-20 00:00" }, ctx), /没有聊天记录/);
 });
+
+test("翻页的分界那一秒里有好几条：接口按整秒截会带回上一页看过的，也接着往前翻", async () => {
+  // 每分钟一条；第 70、71 条在同一秒里（相差 0.4 秒），第一页最早的正好是第 70 条
+  const main = Array.from({ length: 120 }, (_, i) => {
+    const m = msg(`om_${i}`, "2026-10-20 08:00", `第 ${i} 条`);
+    return { ...m, createTime: m.createTime + Math.min(i, 70) * 60_000 + (i === 70 ? 100 : 0) + (i > 70 ? 500 + (i - 71) * 60_000 : 0) };
+  });
+  const { api, calls } = fakeApi(main);
+  const tool = createChatHistoryTool({ api, chatId: "oc_1", now: () => bj("2026-10-21 10:00") });
+  const out = await tool.run({ since: "2026-10-20 00:00" }, ctx);
+  assert.equal(calls.length, 3);
+  assert.match(out, /，120 条；/);
+  assert.match(out, /第 0 条/);
+  assert.match(out, /第 69 条/);
+  assert.match(out, /第 71 条/);
+});
+
+test("同一秒里超过 50 条：跳过这一秒接着往前翻，不会一直拿同一页", async () => {
+  const base = bj("2026-10-20 08:00");
+  const main = [
+    ...Array.from({ length: 30 }, (_, i) => ({ ...msg(`om_a${i}`, "2026-10-20 08:00", `早的第 ${i} 条`), createTime: base + i * 60_000 })),
+    // 一秒里 60 条（机器人刷屏）
+    ...Array.from({ length: 60 }, (_, i) => ({ ...msg(`om_b${i}`, "2026-10-20 08:00", `刷屏 ${i}`), createTime: base + 3_600_000 + i * 10 })),
+    ...Array.from({ length: 30 }, (_, i) => ({ ...msg(`om_c${i}`, "2026-10-20 08:00", `晚的第 ${i} 条`), createTime: base + 7_200_000 + i * 60_000 })),
+  ];
+  const { api, calls } = fakeApi(main);
+  const tool = createChatHistoryTool({ api, chatId: "oc_1", now: () => bj("2026-10-21 10:00") });
+  const out = await tool.run({ since: "2026-10-20 00:00" }, ctx);
+  assert.ok(calls.length <= 10);
+  assert.match(out, /早的第 29 条/);
+  assert.match(out, /晚的第 29 条/);
+});

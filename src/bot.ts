@@ -617,9 +617,14 @@ async function runTask(
           let facts: CodeFact[] = [];
           let output: string;
           try {
-            // writable：这次有没有改文档、改代码的工具。建定时任务时记下来，到点跑的时候不会比建的时候权限大；
+            // writable：这次有改文档、改代码的工具，而且发起人这句话本身说了要改。建定时任务时记下来，到点跑的时候不会比建的时候权限大。
+            // 任务内容是模型写的：建的人只说「每天汇总一下」，模型写成「汇总并更新周报文档」，到点也不能改；
             // 读过群聊以后也算没有（不然群里埋的「把某某文档清空」能借定时任务挪到以后、借建任务的人的权限去做）
-            output = await tool.run(args, { ...ctx, onFacts: (found) => (facts = [...facts, ...found]), writable: hasWrites && !readOnly && !readChat });
+            output = await tool.run(args, {
+              ...ctx,
+              onFacts: (found) => (facts = [...facts, ...found]),
+              writable: hasWrites && !readOnly && !readChat && asksToWrite,
+            });
           } catch (err) {
             // 代码工具找到了文件、只是读不了（太大、二进制）：报错里带着这个文件，算查到了路径，不算查到哪一行
             if (err instanceof ToolError) {
@@ -712,9 +717,10 @@ async function runTask(
     // 跟聊接过来的、没 @ 机器人的话：话题里谁都能写字，写权限名单里的人随口说一句没 @ 的话，
     // 不能让模型借他的权限照着话题里别人埋的话去改文档、改代码。要改就 @ 机器人直接说
     const unaddressed = hasWrites && !noPermission && !followUp && options.unaddressed === true;
-    // 定时任务到点跑的：没人看着，建任务时写好的这句话没说要改文档的只给读的工具；建的时候就只能读（不在写权限名单里、带着群聊建的）的照样只能读
-    const scheduledReadOnly =
-      scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || !(CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question)));
+    // 这句话本身说了要改文档、改代码、写进文档（到点跑的定时任务看任务内容，建任务时看建的人说的这句）
+    const asksToWrite = CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question);
+    // 定时任务到点跑的：没人看着，建任务时写好的这句话没说要改文档的只给读的工具；建的时候就只能读（不在写权限名单里、带着群聊建的、建的人没说要改的）的照样只能读
+    const scheduledReadOnly = scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || !asksToWrite);
     const readOnly = noPermission || followUp || ambientOnly || unaddressed || scheduledReadOnly;
     // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
     // 只有这句话本身让它记住、忘掉、改记忆才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）

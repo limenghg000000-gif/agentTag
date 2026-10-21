@@ -114,7 +114,8 @@ export class Scheduler {
   private readonly now: () => number;
   private readonly files = new FileQueue();
   private saveQueued = false;
-  private lastSave: Promise<void> = Promise.resolve();
+  /** 最近一次写文件：写成了是 true，写失败是 false（不会 reject） */
+  private lastSave: Promise<boolean> = Promise.resolve(true);
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly opts: SchedulerOptions) {
@@ -185,8 +186,8 @@ export class Scheduler {
   }
 
   /** 等排着的写文件做完（测试用） */
-  flush(): Promise<void> {
-    return this.lastSave;
+  async flush(): Promise<void> {
+    await this.lastSave;
   }
 
   /** 建一个定时任务。时间不对、超过上限时抛错，错误信息是一句给模型看的中文 */
@@ -381,15 +382,21 @@ export class Scheduler {
     this.running.add(task.id);
     this.logger.info(`定时任务：${label(task)} 到点了，开始跑 chat=${task.chatId}${late > 60_000 ? ` 晚了 ${Math.round(late / 60_000)} 分钟` : ""}`);
     this.save();
-    const run = this.lastSave.then(() => this.execute(task, late));
+    const run = this.lastSave.then((saved) => this.execute(task, late, saved));
     this.runs.add(run);
     void run.finally(() => this.runs.delete(run));
   }
 
-  private async execute(task: ScheduledTask, late: number): Promise<void> {
+  private async execute(task: ScheduledTask, late: number, saved: boolean): Promise<void> {
     let result: RunResult;
     try {
-      result = await this.opts.run(task, late);
+      if (saved) {
+        result = await this.opts.run(task, late);
+      } else {
+        // 下一次的时间没写进文件：跑了的话，2 小时内重启会把这次再跑一遍（再改一次文档、再提醒一次），宁可这次不跑
+        this.logger.error(`定时任务：${label(task)} 下一次的时间没写进文件，这次不跑 chat=${task.chatId}`);
+        result = "failed";
+      }
     } catch (err) {
       this.logger.error(`定时任务：${label(task)} 跑的时候出错 chat=${task.chatId}`, err);
       result = "failed";
@@ -481,7 +488,7 @@ export class Scheduler {
     this.state.tasks = this.state.tasks.filter((task) => !drop.has(task));
   }
 
-  /** 写进文件（配了的话）。写失败只打警告：内存里照样跑，最多是重启后少了这次的改动 */
+  /** 写进文件（配了的话）。写失败打警告、lastSave 变成 false：到点的这次不跑（见 fire），别的改动内存里照样有，重启后会少 */
   private save(): void {
     const file = this.opts.file;
     if (!file || this.saveQueued) {
@@ -493,10 +500,14 @@ export class Scheduler {
         this.saveQueued = false;
         return writeAtomically(file, `${JSON.stringify(this.state, null, 2)}\n`);
       })
-      .catch((err) => {
-        this.saveQueued = false;
-        this.logger.warn(`定时任务：写 ${file} 失败，重启后这次的改动会丢`, err);
-      });
+      .then(
+        () => true,
+        (err: unknown) => {
+          this.saveQueued = false;
+          this.logger.warn(`定时任务：写 ${file} 失败，重启后这次的改动会丢`, err);
+          return false;
+        },
+      );
   }
 }
 

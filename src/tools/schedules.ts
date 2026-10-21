@@ -83,7 +83,7 @@ export function createScheduleTools(opts: ScheduleToolsOptions): Tool[] {
         ...(cron ? { cron } : {}),
         ...(at ? { at } : {}),
         ...(args.remind === true ? { remind: true } : {}),
-        // 这次没有改文档的工具（建的人不在写权限名单里、带着群聊只给读的）：到点也只能读，以后加进名单也不会变
+        // 这次不能改（建的人不在写权限名单里、带着群聊只给读的、建的人这句话没说要改文档）：到点也只能读，以后加进名单也不会变
         ...(ctx.writable !== true ? { readOnly: true } : {}),
       });
       const t = now();
@@ -93,6 +93,9 @@ export function createScheduleTools(opts: ScheduleToolsOptions): Tool[] {
         task.remind
           ? "到点在这个群里发提醒、@ 建任务的人。"
           : "到点在这个群里新发一条消息，结果回在它下面的话题里。",
+        ...(task.readOnly && !task.remind
+          ? ["到点只能查、不能改文档（建的人这句话没说要改哪篇文档，或者这次只给了读的工具）。要到点写进某篇文档，请建的人 @ 你时直接说写进哪篇，再建一个。"]
+          : []),
         `要暂停或取消就说「暂停定时任务 ${label(task)}」「取消定时任务 ${label(task)}」（建任务的人和管理员能操作）。`,
       ].join("\n");
     },

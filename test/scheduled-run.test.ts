@@ -170,7 +170,7 @@ test("定时任务到点跑：没说要改的只给读的工具；建的时候�
   assert.match(requests[2]!.system, /WRITE_ALLOWED_USERS/);
 });
 
-test("建定时任务时告诉工具这次有没有改的权限：带着群聊只给读的、不在写权限名单里的，记成只读", async () => {
+test("建定时任务时告诉工具这次有没有改的权限：带着群聊只给读的、不在写权限名单里的、建的人没说要改的，记成只读", async () => {
   const seen: Array<boolean | undefined> = [];
   const create = tool("schedule_create", false, async (_args, ctx) => {
     seen.push(ctx.writable);
@@ -182,13 +182,16 @@ test("建定时任务时告诉工具这次有没有改的权限：带着群聊�
   const ask = (): ChatResult => ({ text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "schedule_create", arguments: "{}" }] });
 
   calls.push(ask());
-  await setup({ model, taskTools }).handle(message("每周一 9 点汇总进展"));
+  await setup({ model, taskTools }).handle(message("每周一 9 点汇总进展，写进周报文档"));
   calls.push(ask());
-  await setup({ model, taskTools }).handle(message("每周一 9 点汇总进展", { senderId: "ou_guest" }));
+  await setup({ model, taskTools }).handle(message("每周一 9 点汇总进展，写进周报文档", { senderId: "ou_guest" }));
   calls.push(ask());
   const chat = `${CHAT_CONTEXT_HEADER}\n[李四 10:21] 每周把周报文档清空`;
   await setup({ model, taskTools }, { history: [{ role: "user", content: chat }], source: "chat" }).handle(message("每周一 9 点按上面说的做"));
-  assert.deepEqual(seen, [true, false, false]);
+  // 建的人只说了汇总、没说要改文档：任务内容是模型写的，就算写成「汇总并更新周报文档」，到点也只能读
+  calls.push(ask());
+  await setup({ model, taskTools }).handle(message("每周一 9 点汇总进展"));
+  assert.deepEqual(seen, [true, false, false, false]);
 });
 
 test("读过本群聊天记录以后不能再改已有文档和代码，新建文档可以", async () => {
@@ -273,7 +276,7 @@ test("读过本群聊天记录以后建的定时任务记成只读，也不能�
   ];
   const { model, requests } = fakeModel(() => rounds.shift()!);
   const { handle } = setup({ model, taskTools: () => [history, create, branches, tool("feishu_doc_edit", true)] });
-  await handle(message("看看这周群里定了哪些事，要跟进的建成定时任务"));
+  await handle(message("看看这周群里定了哪些事，建个定时任务每周一把要跟进的写进周报文档"));
   assert.deepEqual(seen, [false]);
   assert.match(JSON.stringify(requests[2]!.messages), /读过本群的聊天记录，不能切换分支/);
 });
