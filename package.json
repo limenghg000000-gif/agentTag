@@ -1,6 +1,6 @@
 {
   "name": "agenttag",
-  "version": "0.19.0",
+  "version": "0.19.1",
   "private": true,
   "description": "飞书版 Claude Tag：AI 助手作为成员加入飞书群，@ 它即可派活",
   "type": "module",
@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "typecheck": "tsc",
-    "test": "node --import tsx --test \"test/**/*.test.ts\""
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "eval:knowledge": "node dist/eval-knowledge.js"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.74.0",

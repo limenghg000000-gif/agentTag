@@ -2789,9 +2789,10 @@ test("模型查经验库、看经验时任务停了不等表格", async () => {
   await assert.rejects(getting, (err: Error) => err.name === "AbortError");
 });
 
-test("读表格卡住时这次报错、不留在缓存里：回答前检索超时后模型再查，不会一直等那次读", async () => {
+test("读表格卡住时这次报错、不留在缓存里：回答前检索超时后模型再查，不会一直等那次读；一分钟内不再重读，过了再读", async () => {
   const backend = new MemoryBackend();
-  const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 30 });
+  let now = new Date("2026-10-21T10:00:00Z");
+  const base = new KnowledgeBase(backend, { logger: quiet, readTimeoutMs: 30, now: () => now });
   await base.save(normalizeDraft(dau));
   const list = backend.list.bind(backend);
   backend.list = () => new Promise(() => {});
@@ -2800,14 +2801,145 @@ test("读表格卡住时这次报错、不留在缓存里：回答前检索超�
   const abandoned = raceAbort(base.search("日活"), lookup.signal);
   lookup.abort();
   await assert.rejects(abandoned, (err: Error) => err.name === "AbortError");
-  // 模型接着调 knowledge_search：用的是缓存里那次读，到了读表格的期限就报错
+  // 模型接着调 knowledge_search：用的是缓存里那次读，到了读表格的期限就报错（刚存过经验，改之前读到的不拿来凑合）
   await assert.rejects(base.search("日活"), /读经验库表格超过 0.03 秒没读完/);
-  // 报错的那次不留在缓存里，表格好了马上能查到
+  // 报错的那次不留在缓存里；一分钟内不再重读，马上报错，不让每个问题都等到超时
   backend.list = list;
+  const lists = backend.lists;
+  await assert.rejects(base.search("日活"), /经验库表格刚才没读成，60 秒后再读/);
+  assert.equal(backend.lists, lists);
+  // 保存、核对卡片要读表格现在的样子：照样重新读
+  assert.equal((await base.get("K1", { fresh: true }))?.id, "K1");
+  assert.equal(backend.lists, lists + 1);
   assert.deepEqual(
     (await base.search("日活")).map((hit) => hit.entry.id),
     ["K1"],
   );
+});
+
+test("表格读不出来时检索用上次读到的，一分钟内不再重读；读到了就用新的；改过表格后不拿改之前的凑合", async () => {
+  const backend = new MemoryBackend();
+  let now = new Date("2026-10-21T10:00:00Z");
+  const later = (ms: number) => (now = new Date(now.getTime() + ms));
+  const warnings: string[] = [];
+  const base = new KnowledgeBase(backend, { logger: { ...quiet, warn: (text: string) => warnings.push(text) }, now: () => now });
+  await base.save(normalizeDraft(code8));
+  await base.save(normalizeDraft(dau));
+  assert.deepEqual((await base.search("日活")).map((hit) => hit.entry.id), ["K2"]);
+
+  // 过了一分钟缓存过期，表格读不出来：用上次读到的，日志里说一句
+  const list = backend.list.bind(backend);
+  backend.list = async () => {
+    backend.lists++;
+    throw new KnowledgeError("飞书接口 500");
+  };
+  later(61_000);
+  const lists = backend.lists;
+  assert.deepEqual((await base.search("日活")).map((hit) => hit.entry.id), ["K2"]);
+  assert.equal(backend.lists, lists + 1);
+  assert.match(warnings.join("\n"), /表格这次没读成（飞书接口 500），60 秒内不再重读，检索先用 2026-10-21T10:00:00.000Z 读到的 2 条/);
+  // 一分钟内不再重读，看一条经验也用上次读到的
+  later(30_000);
+  assert.deepEqual((await base.search("code=8")).map((hit) => hit.entry.id), ["K1"]);
+  assert.equal((await base.get("K1"))?.title, code8.title);
+  assert.equal(backend.lists, lists + 1);
+  // 要按表格现在的样子来的（保存、核对卡片）不用旧的
+  await assert.rejects(base.get("K1", { fresh: true }), /飞书接口 500/);
+
+  // 表格好了：过了一分钟重新读，读到的是改过的
+  backend.list = list;
+  backend.entries[1].title = "日活的口径（新）";
+  later(61_000);
+  assert.equal((await base.search("日活"))[0]?.entry.title, "日活的口径（新）");
+
+  // 归档了 K1 以后表格又读不出来：不拿归档前读到的凑合，检索报错
+  await base.archive("K1");
+  backend.list = async () => {
+    throw new KnowledgeError("飞书接口 500");
+  };
+  await assert.rejects(base.search("code=8"), /飞书接口 500/);
+});
+
+test("读表格失败时已经改过表格、重新读过：这次失败过时了，不拦着下次检索读表格", async () => {
+  const backend = new MemoryBackend();
+  let now = new Date("2026-10-21T10:00:00Z");
+  const warnings: string[] = [];
+  const base = new KnowledgeBase(backend, { logger: { ...quiet, warn: (text: string) => warnings.push(text) }, now: () => now });
+  await base.save(normalizeDraft(code8));
+  assert.deepEqual((await base.search("code=8")).map((hit) => hit.entry.id), ["K1"]);
+
+  // 缓存过期，检索开始读表格，一直没回来
+  const list = backend.list.bind(backend);
+  let fail!: (err: Error) => void;
+  backend.list = () => {
+    backend.lists++;
+    return new Promise((_, reject) => (fail = reject));
+  };
+  now = new Date(now.getTime() + 61_000);
+  const slow = base.search("code=8");
+  // 这时候存了一条经验（重新读了表格），然后之前那次读失败了
+  backend.list = list;
+  await base.save(normalizeDraft(dau));
+  fail(new KnowledgeError("飞书接口 500"));
+  await assert.rejects(slow, /飞书接口 500/, "存过经验，不拿存之前读到的凑合");
+  assert.match(warnings.join("\n"), /表格这次没读成（飞书接口 500），之后已经改过或者重新读过表格，下次检索照常读/);
+
+  // 下一次检索照常读表格，查得到新存的
+  const lists = backend.lists;
+  assert.deepEqual((await base.search("日活")).map((hit) => hit.entry.id), ["K2"]);
+  assert.equal(backend.lists, lists + 1);
+});
+
+test("检索打分明细：每条有效经验的语义相似度、关键词命中、总分，不按门槛筛，和检索算法一致", async () => {
+  const backend = new MemoryBackend();
+  const { embedder } = fakeEmbedder(["降载", "日活"]);
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet });
+  await base.save(normalizeDraft(code8));
+  await base.save(normalizeDraft(dau));
+  await base.save(normalizeDraft({ ...dau, title: "旧的日活口径" }));
+  await base.archive("K3");
+
+  const { scores, semantic } = await base.explain("user-rpc 降载了，code=8 ResourceExhausted");
+  assert.equal(semantic, true);
+  assert.deepEqual(
+    scores.map((score) => score.entry.id),
+    ["K1", "K2"],
+    "归档的不算，够不够相近都列出来，按总分排",
+  );
+  const [first, second] = scores;
+  assert.ok(first.semantic! > 0.9);
+  assert.equal(first.markerHits, 3, "code=8、ResourceExhausted、user-rpc");
+  assert.equal(first.score, first.semantic! + 0.3);
+  assert.equal(first.passes, true);
+  assert.equal(second.passes, false);
+  const hits = await base.search("user-rpc 降载了，code=8 ResourceExhausted");
+  assert.deepEqual(
+    hits.map((hit) => [hit.entry.id, hit.score]),
+    scores.filter((score) => score.passes).map((score) => [score.entry.id, score.score]),
+  );
+  assert.deepEqual(await base.explain("  "), { scores: [], semantic: false });
+});
+
+test("语义相似度到 0.6 才算相近：同一类话题、说的不是一回事的常有 0.5 多，不带上", async () => {
+  const backend = new MemoryBackend();
+  // 向量都是单位长度，和提问 [1, 0] 的相似度就是第一个数
+  const like = (similarity: number) => [similarity, Math.sqrt(1 - similarity ** 2)];
+  const embedder: Embedder = {
+    model: "fake-embedding",
+    async embed(texts) {
+      return texts.map((text) => (text.includes("六成二") ? like(0.62) : text.includes("五成八") ? like(0.58) : [1, 0]));
+    },
+  };
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet });
+  await base.save(normalizeDraft({ ...dau, title: "像六成二的经验" }));
+  await base.save(normalizeDraft({ ...dau, title: "像五成八的经验" }));
+
+  const hits = await base.search("转链服务今天有没有报错");
+  assert.deepEqual(
+    hits.map((hit) => hit.entry.id),
+    ["K1"],
+  );
+  assert.ok(Math.abs(hits[0].semantic! - 0.62) < 1e-9);
 });
 
 test("归档：团队经验库的按编号，aiops 经验库的按 aiops_id；两个都填或都不填报错", async () => {

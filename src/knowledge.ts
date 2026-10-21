@@ -37,6 +37,11 @@ const PROMPT_FIRST_FIELDS = ["结论", "怎么处理"];
 const CACHE_MS = 60_000;
 /** 读一次整张表最多等多久：飞书接口不认中止信号，卡住的读不能留在缓存里，让后面的检索和保存都跟着等 */
 const READ_TIMEOUT_MS = 15_000;
+/**
+ * 读表格失败（出错、超时）后多久内不再重读：这段时间检索直接用上次读到的，没读到过就马上报错。
+ * 不然表格读不出来时，每个问题回答前都要等到检索超时
+ */
+const READ_RETRY_MS = 60_000;
 /** 一次给向量模型的条数（百炼 text-embedding-v4 一次最多 10 条） */
 const EMBED_BATCH = 10;
 /** 算向量时每条最多多少字 */
@@ -45,10 +50,16 @@ const EMBED_TEXT_CHARS = 2000;
 const INDEX_FIELD_CHARS = 450;
 /** 提问最多取多少字去检索 */
 const QUERY_CHARS = 1000;
-/** 语义相似度到这个数才算相近 */
-const SEMANTIC_MIN = 0.5;
+/**
+ * 语义相似度到这个数才算相近。text-embedding-v4 下，同是转链、京东、商品服务这类话题的两段话，说的不是一回事也常有 0.5～0.59；
+ * 拿线上 59 个提问试过（npm run eval:knowledge），0.5 时 59 问里 27 问带上了经验、多数不相干，0.6 时剩下的基本对得上
+ */
+export const SEMANTIC_MIN = 0.6;
 /** 没有向量时，关键词得分到这个数才算相近 */
-const KEYWORD_MIN = 0.35;
+export const KEYWORD_MIN = 0.35;
+/** 经验的关键词、错误码、告警名在提问里出现一个加多少分，最多加多少（加满了语义不够也算相近） */
+const MARKER_BONUS = 0.3;
+const MARKER_BONUS_MAX = 0.6;
 /** 起草时和已有经验的语义相似度到这个数，卡片上提示「很像」 */
 const NEAR_DUPLICATE_SEMANTIC = 0.85;
 /** 没有向量时，关键词得分到这个数提示「很像」 */
@@ -170,6 +181,21 @@ export interface KnowledgeHit {
   semantic?: number;
 }
 
+/** 一条经验对一个提问的打分明细（调门槛用，见 KnowledgeBase.explain） */
+export interface KnowledgeScore {
+  entry: KnowledgeEntry;
+  /** 语义相似度；没有向量时为空 */
+  semantic?: number;
+  /** 经验的关键词、错误码、告警名在提问里出现了几个（同一个词只算一次） */
+  markerHits: number;
+  /** 只按关键词算的分：词和两字片段对上的比例 ×0.6，加上关键词加分 */
+  keyword: number;
+  /** 排序用的总分：有向量时是语义相似度加关键词加分的一半，没有时是 keyword */
+  score: number;
+  /** 按现在的门槛算不算相近 */
+  passes: boolean;
+}
+
 export class KnowledgeError extends Error {
   constructor(message: string) {
     super(message);
@@ -199,6 +225,7 @@ export interface KnowledgeBaseOptions {
   now?: () => Date;
   cacheMs?: number;
   readTimeoutMs?: number;
+  readRetryMs?: number;
 }
 
 /**
@@ -211,7 +238,16 @@ export class KnowledgeBase {
   private readonly now: () => Date;
   private readonly cacheMs: number;
   private readonly readTimeoutMs: number;
+  private readonly readRetryMs: number;
   private cached?: { at: number; entries: Promise<KnowledgeEntry[]> };
+  /** 最近一次读成功的表格：读不出来时检索先用它（开始读的时间，用来比哪次更新） */
+  private lastGood?: { at: number; entries: KnowledgeEntry[] };
+  /** 上次读表格失败的时间：READ_RETRY_MS 内不再重读 */
+  private readFailedAt?: number;
+  /** 改过几次表格：改之前开始读的那次读到的是旧的，不拿来当 lastGood */
+  private writes = 0;
+  /** 开始读过几次表格：读失败时已经又开始读了一次，就不记作读失败（免得新的那次读好了还一分钟不重读） */
+  private reads = 0;
   /** 已经警告过的表格行（编号加上缺了什么、哪里像有密钥），同一个问题只警告一次 */
   private readonly warned = new Set<string>();
   private readonly vectors = new Map<string, number[]>();
@@ -229,25 +265,79 @@ export class KnowledgeBase {
     this.now = options.now ?? (() => new Date());
     this.cacheMs = options.cacheMs ?? CACHE_MS;
     this.readTimeoutMs = options.readTimeoutMs ?? READ_TIMEOUT_MS;
+    this.readRetryMs = options.readRetryMs ?? READ_RETRY_MS;
   }
 
   location(): Promise<string | undefined> {
     return this.backend.location();
   }
 
+  /**
+   * 整张表（一分钟内读过就用缓存）。fresh 时一定重新读，读不出来就报错：保存、归档、核对卡片都要按表格现在的样子来。
+   * 不是 fresh 的（检索、看一条经验）在表格读不出来时用上次读到的，这时卡片上的内容到点保存时还会重新读表格核对；
+   * 读失败后 READ_RETRY_MS 内不再重读，没读到过就马上报错，不让每个问题都等到检索超时
+   */
   async entries(fresh = false): Promise<KnowledgeEntry[]> {
     const at = this.now().getTime();
+    if (!fresh && !this.cached && this.readFailedAt !== undefined && at - this.readFailedAt < this.readRetryMs) {
+      const wait = Math.ceil((this.readFailedAt + this.readRetryMs - at) / 1000);
+      return this.lastGoodOr(new KnowledgeError(`经验库表格刚才没读成，${wait} 秒后再读`));
+    }
     if (fresh || !this.cached || at - this.cached.at > this.cacheMs) {
       const entries = this.read();
+      const writes = this.writes;
+      const reads = ++this.reads;
       this.cached = { at, entries };
-      // 读失败、超时都不缓存，下次重新读
-      entries.catch(() => {
-        if (this.cached?.entries === entries) {
-          this.cached = undefined;
-        }
-      });
+      entries.then(
+        (read) => {
+          this.readFailedAt = undefined;
+          if (writes === this.writes && (!this.lastGood || this.lastGood.at <= at)) {
+            this.lastGood = { at, entries: read };
+          }
+        },
+        // 读失败、超时都不缓存，READ_RETRY_MS 以后重新读
+        (err: unknown) => {
+          if (this.cached?.entries === entries) {
+            this.cached = undefined;
+          }
+          const reason = err instanceof Error ? err.message : String(err);
+          // 读着的时候改过表格、或者又开始读了一次：这次读过时了，不拦着下次读
+          if (writes !== this.writes || reads !== this.reads) {
+            this.logger.warn(`经验库：表格这次没读成（${reason}），之后已经改过或者重新读过表格，下次检索照常读`);
+            return;
+          }
+          this.readFailedAt = this.now().getTime();
+          const fallback = this.lastGood
+            ? `检索先用 ${new Date(this.lastGood.at).toISOString()} 读到的 ${this.lastGood.entries.length} 条`
+            : "这段时间检索不到团队经验库";
+          this.logger.warn(`经验库：表格这次没读成（${reason}），${this.readRetryMs / 1000} 秒内不再重读，${fallback}`);
+        },
+      );
     }
-    return structuredClone(await this.cached.entries);
+    const reading = this.cached.entries;
+    try {
+      return structuredClone(await reading);
+    } catch (err) {
+      if (fresh) {
+        throw err;
+      }
+      return this.lastGoodOr(err);
+    }
+  }
+
+  /** 改了表格：缓存和上次读到的都作废，下次重新读（读不出来时不拿改之前的凑合，免得检索到刚归档的） */
+  private changed(): void {
+    this.cached = undefined;
+    this.lastGood = undefined;
+    this.writes++;
+  }
+
+  /** 上次读到的表格；没读到过就抛 err */
+  private lastGoodOr(err: unknown): KnowledgeEntry[] {
+    if (!this.lastGood) {
+      throw err;
+    }
+    return structuredClone(this.lastGood.entries);
   }
 
   /**
@@ -337,6 +427,24 @@ export class KnowledgeBase {
       .slice(0, limit);
   }
 
+  /**
+   * 检索打分的明细：每条能检索的有效经验的语义相似度、关键词加分和总分，不按门槛筛，按总分从高到低。
+   * 只给调门槛的测试命令（eval-knowledge）用，回答时用 search
+   */
+  async explain(query: string, signal?: AbortSignal): Promise<{ scores: KnowledgeScore[]; semantic: boolean }> {
+    const text = query.trim().slice(0, QUERY_CHARS);
+    const entries = await this.entries();
+    const candidates = entries.filter((entry) => usable(entry) && entry.status === "active");
+    if (!text || candidates.length === 0) {
+      return { scores: [], semantic: false };
+    }
+    const semantic = await this.similarities(text, candidates, signal);
+    return {
+      scores: candidates.map((entry, i) => scoreParts(entry, text, semantic?.[i])).sort((a, b) => b.score - a.score),
+      semantic: semantic !== undefined,
+    };
+  }
+
   /** 和草稿很像的已有经验（起草时在卡片上提示，免得存重复的） */
   async similar(draft: KnowledgeDraft, options: Pick<SearchOptions, "signal" | "semanticDeadline"> = {}): Promise<KnowledgeHit | undefined> {
     const [hit] = await this.search(indexText(draft), { ...options, limit: 1 });
@@ -409,7 +517,7 @@ export class KnowledgeBase {
         createdAt: this.now().toISOString(),
       };
       const rowId = await this.backend.add(entry);
-      this.cached = undefined;
+      this.changed();
       this.logger.info(`经验库 新增 ${entry.id}「${entry.title}」 类别=${entry.category} 发起人=${meta.proposedBy ?? "未知"} 确认人=${meta.confirmedBy ?? "未知"}`);
       return rowId ? { ...entry, rowId } : entry;
     });
@@ -442,7 +550,7 @@ export class KnowledgeBase {
         return entry;
       }
       await this.updateRow(entry, { status: "archived" });
-      this.cached = undefined;
+      this.changed();
       this.logger.info(`经验库 归档 ${entry.id} 确认人=${meta.confirmedBy ?? "未知"}`);
       return { ...entry, status: "archived" };
     });
@@ -452,7 +560,7 @@ export class KnowledgeBase {
   linkAiops(entry: Pick<KnowledgeEntry, "id" | "rowId" | "conflict">, aiopsId: number): Promise<void> {
     return this.exclusive(async () => {
       await this.updateRow(entry, { aiopsId });
-      this.cached = undefined;
+      this.changed();
     });
   }
 
@@ -569,6 +677,15 @@ function indexText(entry: KnowledgeDraft): string {
  * 有向量时以语义相似度为主，关键词命中加分；关键词命中两个以上的，语义不够也算
  */
 function scoreEntry(entry: KnowledgeEntry, query: string, semantic: number | undefined): KnowledgeHit | undefined {
+  const parts = scoreParts(entry, query, semantic);
+  if (!parts.passes) {
+    return undefined;
+  }
+  return { entry, score: parts.score, ...(parts.semantic !== undefined ? { semantic: parts.semantic } : {}) };
+}
+
+/** scoreEntry 的打分明细，够不够相近都返回 */
+function scoreParts(entry: KnowledgeEntry, query: string, semantic: number | undefined): KnowledgeScore {
   const lower = query.toLowerCase();
   const text = indexText(entry).toLowerCase();
   // 同一个词在关键词、错误码里各写一遍，或者一个是另一个的一部分（ResourceExhausted 和 Exhausted），提问里出现一次只算一个
@@ -577,15 +694,15 @@ function scoreEntry(entry: KnowledgeEntry, query: string, semantic: number | und
       .map((word) => word.toLowerCase())
       .filter((word) => word.length >= 2 && lower.includes(word)),
   );
-  const keywordHits = [...markers].filter((word) => ![...markers].some((other) => other !== word && other.includes(word))).length;
-  const bonus = Math.min(0.6, keywordHits * 0.3);
-  if (semantic !== undefined) {
-    return semantic >= SEMANTIC_MIN || bonus >= 0.6 ? { entry, score: semantic + bonus / 2, semantic } : undefined;
-  }
+  const markerHits = [...markers].filter((word) => ![...markers].some((other) => other !== word && other.includes(word))).length;
+  const bonus = Math.min(MARKER_BONUS_MAX, markerHits * MARKER_BONUS);
   // 提问里的词有多少出现在经验里，经验标题里的词有多少出现在提问里，取大的：提问里常带「怎么办」「是怎么回事」这类话
   const coverage = Math.max(overlap(queryTerms(lower), text), overlap(queryTerms(entry.title.toLowerCase()), lower));
-  const score = coverage * 0.6 + bonus;
-  return score >= KEYWORD_MIN ? { entry, score } : undefined;
+  const keyword = coverage * 0.6 + bonus;
+  if (semantic !== undefined) {
+    return { entry, semantic, markerHits, keyword, score: semantic + bonus / 2, passes: semantic >= SEMANTIC_MIN || bonus >= MARKER_BONUS_MAX };
+  }
+  return { entry, markerHits, keyword, score: keyword, passes: keyword >= KEYWORD_MIN };
 }
 
 /** terms 里有几成出现在 text 里 */
