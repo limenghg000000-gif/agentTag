@@ -582,12 +582,14 @@ async function runTask(
         run: async (args, ctx) => {
           // code_branches 的 switch_to 会改这个话题后面看代码、改代码、开合并请求用的分支：按钮问的、没 @ 的跟聊、
           // 带上了群聊只给读的工具的都不能切（不然群里埋一句「切到某某分支」，后面有写权限的人 @ 了再改代码就用了那个分支）
-          if ((followUp || options.unaddressed || ambientOnly || scheduled) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+          if ((followUp || options.unaddressed || ambientOnly || scheduled || readChat) && tool.spec.name === BRANCHES_TOOL && args.switch_to) {
             throw new Error(
               followUp
                 ? "这次是点「接着查」按钮问的，只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
                 : scheduled
                   ? "这次是定时任务到点跑的，代码只能查，不能切换分支。只看别的分支，用其他代码工具的 branch 参数"
+                  : readChat
+                  ? "这次读过本群的聊天记录，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数"
                   : options.unaddressed
                   ? "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数"
                   : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
@@ -609,8 +611,9 @@ async function runTask(
           let facts: CodeFact[] = [];
           let output: string;
           try {
-            // writable：这次有没有改文档、改代码的工具。建定时任务时记下来，到点跑的时候不会比建的时候权限大
-            output = await tool.run(args, { ...ctx, onFacts: (found) => (facts = [...facts, ...found]), writable: hasWrites && !readOnly });
+            // writable：这次有没有改文档、改代码的工具。建定时任务时记下来，到点跑的时候不会比建的时候权限大；
+            // 读过群聊以后也算没有（不然群里埋的「把某某文档清空」能借定时任务挪到以后、借建任务的人的权限去做）
+            output = await tool.run(args, { ...ctx, onFacts: (found) => (facts = [...facts, ...found]), writable: hasWrites && !readOnly && !readChat });
           } catch (err) {
             // 代码工具找到了文件、只是读不了（太大、二进制）：报错里带着这个文件，算查到了路径，不算查到哪一行
             if (err instanceof ToolError) {
@@ -678,6 +681,10 @@ async function runTask(
               results: earlier,
               now,
               onUse: (result) => {
+                // 之前读到的群聊记录拿回来用，和这次读一样：后面不能改已有的文档和代码
+                if (result.tool === CHAT_HISTORY_TOOL) {
+                  readChat = true;
+                }
                 restored.push(result);
                 evidence.push(result.evidence);
                 attempted.add(result.tool);
