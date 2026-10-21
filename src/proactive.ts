@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
-import { DEFAULT_PROACTIVE_MAX_PER_HOUR } from "./config.js";
 import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
 import { JUDGE_MEMORY_CHARS, type JudgeAsk, JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
@@ -12,6 +11,17 @@ import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 /** 每个群每小时最多判断多少条：太热闹的群，后面的不判断，省模型费用 */
 export const MAX_JUDGED_PER_HOUR = 120;
 const HOUR_MS = 60 * 60_000;
+/**
+ * 机器人上次在群里说话以后，群里人发了这么多条、它一句都没说：这个群先不看了（像 Claude Tag 一样，聊得这么热闹都用不上它），
+ * 不主动接话，有人 @ 它、它回了以后再接着看。Claude Tag 没公布它的数，我们先定 200 条
+ */
+export const QUIET_AFTER_MESSAGES = 200;
+/** 这么久没人 @ 它、它也没在群里说过话：这个群先不看了（Claude Tag 是 10 天），有人 @ 它一次再接着看 */
+export const QUIET_AFTER_MS = 10 * 24 * HOUR_MS;
+/** 没被 @ 时开口以后，这么久没人在它开的话题里回、没人 @ 它、没人点表情，算没人理 */
+export const IGNORED_AFTER_MS = HOUR_MS;
+/** 每个群记最近几次没被 @ 时开口有没有人理 */
+const SPOKEN_KEPT = 10;
 /** 判断时带上之前几条群聊 */
 const JUDGE_CHAT_MESSAGES = 10;
 /** 判断时每条最多看多少字 */
@@ -27,10 +37,11 @@ const CONFIRM_TIMEOUT_MS = 60_000;
 const KNOWLEDGE_TIMEOUT_MS = 10_000;
 /**
  * 像提问、像报错的消息：看一眼之前就查经验库，查到的一起给模型判断（只在想开口时才查的话，它本来不打算开口时经验库用不上）。
- * 指名问某人的（@ 了别人）、表态的、机器人发的前面已经筛掉了
+ * 口语里的问法和故障说法也算（「咋回事」「排查一下」「带宽被打满了」「又卡住了」「pod 被 OOMKilled」）；
+ * 多算了只是多查一次经验库。指名问某人的（@ 了别人）、表态的、机器人发的前面已经筛掉了
  */
 const ASKS_OR_REPORTS =
-  /[?？]|吗|怎么|怎样|如何|为啥|为什么|什么原因|哪[个里儿些]|谁|是不是|有没有|能不能|报错|错误|失败|异常|超时|崩了|挂了|不通|打不开|访问不了|连不上|\b[45]\d\d\b|code\s*[=:：]|exception|error|panic|timeout|traceback|fatal/i;
+  /[?？]|吗|怎么|怎样|如何|咋|为啥|为什么|什么原因|什么情况|啥情况|啥原因|哪[个里儿些]|谁|是不是|有没有|能不能|排查|查一下|查下|帮忙看|帮我看|报错|错误|失败|异常|超时|崩了|挂了|宕机|不通|打不开|访问不了|连不上|起不来|不可用|没响应|满了|打满|爆了|告警|报警|卡住|卡死|[很好太变]慢|延迟|抖动|飙|\b[45]\d\d\b|code\s*[=:：]|exception|error|panic|timeout|traceback|fatal|\boom|refused|unavailable|\bdown\b|alert/i;
 /** 查经验库时带上这条之前最近几条群成员说的（「这个又报错了」这类，服务名、报错原文在前面几条里） */
 const KNOWLEDGE_QUERY_TURNS = 3;
 /** 查经验库的查询词最长多少字 */
@@ -94,6 +105,7 @@ export interface ProactiveOptions {
   superseded?: (msg: NormalizedMessage) => boolean;
   /** 这个话题里机器人有没有正在做的任务（见 TaskRegistry.busy）：话题里按群记忆接话时，判断的这会儿有人 @ 它、点了「接着查」，就不插这一句 */
   topicBusy?: (threadKey: string) => boolean;
+  /** 每个群每小时最多主动回几次，不填就不限 */
   maxPerHour?: number;
   logger?: Logger;
   now?: () => number;
@@ -109,13 +121,40 @@ type Move = { say: string } | { work: true };
 interface PausedState {
   /** 群 id → 谁、什么时候说的「别主动插话」 */
   paused: Record<string, { by: string; at: number }>;
+  /** 群 id → 机器人上次在群里说话（或者有人 @ 它）的时间、那以后群里人发了几条：太热闹、太久没动静的群先不看 */
+  reading?: Record<string, Reading>;
+  /** 群 id → 最近几次没被 @ 时开口，有没有人理：没人理的多就少说 */
+  spoken?: Record<string, Spoken[]>;
+}
+
+interface Reading {
+  /** 机器人上次在群里说话、或者有人 @ 它的时间 */
+  lastAt: number;
+  /** 机器人上次说话以后，群里人发了几条（群主界面和话题里的都算） */
+  messages: number;
+}
+
+/** 一次没被 @ 时开口 */
+interface Spoken {
+  /** 开口的那个话题（threadKeyOf） */
+  thread: string;
+  at: number;
+  /** 回的那句话的消息 id（有人点表情、引用回复时对得上）；照规矩去做的拿不到 */
+  messageId?: string;
+  /** 回在群主界面消息下面、新开的话题：话题里之后有人说话就算理了它。原来就有的话题里，要 @ 它或者引用回复它才算 */
+  newTopic: boolean;
+  /** 有人理了（在它开的话题里回了、@ 了它、引用回复了它、点了表情） */
+  answered?: boolean;
+  /** 有人点了「踩」这类表情：算没人理 */
+  disliked?: boolean;
 }
 
 /**
  * 主动接话（像 Claude Tag 在频道里那样）：打开了的群里，没 @ 机器人的消息（群主界面的、它没跟着的话题里的）
  * 带着群记忆和刚才的聊天让模型看一眼，大多数不接。要接的有三种：答案就在群记忆或刚才的聊天里、一两句说得清，直接答；
  * 群记忆里有规矩说这类事不用 @ 也要它处理，像被 @ 一样去做；有人提了它能帮的事、还没人接，问一句要不要它来。
- * 要开口的先打开思考再想一遍，说的话核对出处，对不上不接。每个群每小时最多接几次。
+ * 要开口的先打开思考再想一遍，说的话核对出处，对不上不接。和 Claude Tag 一样不限每小时回几次（PROACTIVE_MAX_PER_HOUR 填了才限），
+ * 只限每个群每小时最多判断多少条。
  * 群里 @ 它说「别主动插话」就停，「可以主动说话」再打开。
  */
 export class ProactiveReplier {
@@ -136,6 +175,17 @@ export class ProactiveReplier {
   /** 每个话题里最新一条人发的消息：话题里按群记忆接话时，判断的这会儿话题里有人说话了就不接 */
   private readonly latestInTopic = new Map<string, { messageId: string; at: number }>();
   private readonly files = new FileQueue();
+  /** 已经排上、还没开始写的那次：开始写时取当时的状态，这期间再有变化不用再排一次 */
+  private saveQueued = false;
+  private lastSave: Promise<void> = Promise.resolve();
+  /** 群 id → 机器人上次在群里说话的时间、那以后群里人发了几条 */
+  private readonly readingState = new Map<string, Reading>();
+  /** 已经记过「先不看了」的群：一次不看只记一行 */
+  private readonly quietLogged = new Set<string>();
+  /** 数过的消息：补漏轮询每 10 秒把最近 5 分钟的消息再报一遍，事件和轮询也会各报一次，同一条只数一次 */
+  private readonly counted = new Set<string>();
+  /** 群 id → 最近几次没被 @ 时开口 */
+  private readonly spoken = new Map<string, Spoken[]>();
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly maxPerHour: number;
@@ -143,10 +193,13 @@ export class ProactiveReplier {
   constructor(private readonly opts: ProactiveOptions) {
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? Date.now;
-    this.maxPerHour = opts.maxPerHour ?? DEFAULT_PROACTIVE_MAX_PER_HOUR;
+    this.maxPerHour = opts.maxPerHour ?? Number.POSITIVE_INFINITY;
   }
 
-  /** 读出之前说过「别主动插话」的群。文件不在就是都没停；读坏了打一行警告，按都没停算 */
+  /**
+   * 读出之前说过「别主动插话」的群、每个群机器人上次说话以后的消息数、最近几次开口有没有人理。
+   * 文件不在就是都没停、都从头算；读坏了打一行警告，按都没停算
+   */
   async init(): Promise<void> {
     let raw: string;
     try {
@@ -160,12 +213,28 @@ export class ProactiveReplier {
     try {
       const state = JSON.parse(raw) as PausedState;
       this.paused = new Map(Object.entries(state.paused ?? {}));
+      for (const [chatId, reading] of Object.entries(state.reading ?? {})) {
+        if (typeof reading?.lastAt === "number" && typeof reading.messages === "number") {
+          this.readingState.set(chatId, { lastAt: reading.lastAt, messages: reading.messages });
+        }
+      }
+      for (const [chatId, list] of Object.entries(state.spoken ?? {})) {
+        const kept = (Array.isArray(list) ? list : []).filter(
+          (entry) => typeof entry?.thread === "string" && typeof entry.at === "number" && typeof entry.newTopic === "boolean",
+        );
+        if (kept.length > 0) {
+          this.spoken.set(chatId, kept.slice(-SPOKEN_KEPT));
+        }
+      }
     } catch (err) {
       this.logger.warn(`主动接话：${this.opts.stateFile} 格式不对，先按所有群都没停算`, err);
     }
   }
 
-  /** 群里人发的每条消息（@ 不 @ 都算）都报给它：判断完要回之前，看判断的这会儿有没有人接了话 */
+  /**
+   * 群里人发的每条消息（@ 不 @ 都算）都报给它：判断完要回之前，看判断的这会儿有没有人接了话；
+   * 数机器人上次说话以后群里发了几条；看它没被 @ 时说的话有没有人理
+   */
   noteActivity(msg: NormalizedMessage): void {
     if (!this.opts.enabledChatIds.has(msg.chatId) || !msg.senderId.startsWith("ou_") || msg.senderId === this.opts.botOpenId()) {
       return;
@@ -174,6 +243,25 @@ export class ProactiveReplier {
       remember(this.replied, msg.rootId);
     }
     const at = msg.createTime || this.now();
+    let changed = false;
+    const reading = this.readingState.get(msg.chatId) ?? { lastAt: this.now(), messages: 0 };
+    // 机器人上次说话之前发的不算（补漏轮询回看时会再报一遍）
+    if (!this.counted.has(msg.messageId) && at >= reading.lastAt) {
+      remember(this.counted, msg.messageId);
+      this.readingState.set(msg.chatId, { lastAt: reading.lastAt, messages: reading.messages + 1 });
+      changed = true;
+    }
+    const key = threadKeyOf(msg);
+    for (const entry of this.spoken.get(msg.chatId) ?? []) {
+      const toBot = entry.newTopic || msg.mentionedBot || (entry.messageId !== undefined && msg.replyToMessageId === entry.messageId);
+      if (!entry.answered && entry.thread === key && at >= entry.at && toBot) {
+        entry.answered = true;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.persist();
+    }
     if (inTopic(msg)) {
       const key = threadKeyOf(msg);
       const last = this.latestInTopic.get(key);
@@ -206,11 +294,79 @@ export class ProactiveReplier {
   }
 
   /**
+   * 这个群现在看不看、能不能主动开口：开着（active），而且还在看。和 Claude Tag 一样，这两种情况先不看：
+   * 机器人上次说话以后群里已经发了 QUIET_AFTER_MESSAGES 条；QUIET_AFTER_MS（10 天）没人 @ 它、它也没在群里说过话。
+   * 有人 @ 它、它回了（见 spoke）再接着看。它回答过的话题照样跟（跟聊不受影响）
+   */
+  listening(chatId: string): boolean {
+    if (!this.active(chatId)) {
+      return false;
+    }
+    const reading = this.readingState.get(chatId);
+    if (!reading) {
+      return true;
+    }
+    const why =
+      reading.messages >= QUIET_AFTER_MESSAGES
+        ? `我上次在群里说话以后已经有 ${reading.messages} 条消息`
+        : this.now() - reading.lastAt > QUIET_AFTER_MS
+          ? `${Math.floor(QUIET_AFTER_MS / (24 * HOUR_MS))} 天没人 @ 我、我也没在群里说话`
+          : undefined;
+    if (!why) {
+      return true;
+    }
+    if (!this.quietLogged.has(chatId)) {
+      this.quietLogged.add(chatId);
+      this.logger.info(`主动接话：${why}，这个群先不看了，有人 @ 我、我回了以后再接着看 chat=${chatId}`);
+    }
+    return false;
+  }
+
+  /**
+   * 机器人在这个群里说了话、或者要回答有人 @ 它的话（回答 @、跟聊接着回、照规矩去做、主动接一句都算）：
+   * 从这时起重新数群里的消息、重新算 10 天，先不看了的群接着看
+   */
+  spoke(chatId: string): void {
+    if (!this.opts.enabledChatIds.has(chatId)) {
+      return;
+    }
+    if (this.quietLogged.delete(chatId)) {
+      this.logger.info(`主动接话：我在这个群里回话了，接着看 chat=${chatId}`);
+    }
+    this.readingState.set(chatId, { lastAt: this.now(), messages: 0 });
+    this.persist();
+  }
+
+  /** 有人给机器人的消息点了表情：是它没被 @ 时说的话，就算有人理了（点的是「踩」这类，又没别人理的，算没人理） */
+  noteReaction(messageId: string, operatorId: string, emojiType: string, action: "added" | "removed"): void {
+    if (action !== "added" || operatorId === this.opts.botOpenId()) {
+      return;
+    }
+    for (const list of this.spoken.values()) {
+      for (const entry of list) {
+        if (entry.messageId === messageId) {
+          if (DISLIKE.test(emojiType)) {
+            entry.disliked = true;
+          } else {
+            entry.answered = true;
+          }
+          this.persist();
+        }
+      }
+    }
+  }
+
+  /** 等排着的写文件做完（测试和退出前用） */
+  flush(): Promise<void> {
+    return this.lastSave;
+  }
+
+  /**
    * 这条没 @ 机器人的消息要不要判断：主动接话的群里（群主界面的，或者话题里的：跟聊在跟的话题先归跟聊，调用方先问它）、
    * 不在说过「只在 @ 我时回」的话题里、人发的、没 @ 别人、不是 @所有人、去掉图片还有几个字、不只是表个态
    */
   wants(msg: NormalizedMessage, fromApp = false): boolean {
-    if (msg.mentionedBot || msg.mentionAll || fromApp || !this.active(msg.chatId)) {
+    if (msg.mentionedBot || msg.mentionAll || fromApp || !this.listening(msg.chatId)) {
       return false;
     }
     // 群主界面引用回复话题第一条的只有 rootId 没有 threadId，算群主界面的
@@ -237,7 +393,7 @@ export class ProactiveReplier {
    * 其余和群主界面的一样
    */
   private wantsInTopic(msg: NormalizedMessage): boolean {
-    if (msg.mentionedBot || msg.mentionAll || !inTopic(msg) || !this.active(msg.chatId)) {
+    if (msg.mentionedBot || msg.mentionAll || !inTopic(msg) || !this.listening(msg.chatId)) {
       return false;
     }
     if (msg.createTime && msg.createTime < (this.resumedAt.get(msg.chatId) ?? 0)) {
@@ -303,7 +459,7 @@ export class ProactiveReplier {
       msg,
       pause
         ? `好的，这个群里我不主动接话了，只在被 @ 时回${this.opts.followsThreads ? "（我回答过的话题里，追问照样不用 @）" : ""}。要重新打开，@ 我说「可以主动说话」。`
-        : `好的，这个群里我会看情况主动接一句：有人问的事群记忆或刚才的聊天里有答案，或者提了我能帮的事，每小时最多 ${this.maxPerHour} 次。不想要了就 @ 我说「别主动插话」。`,
+        : `好的，这个群里我会看情况主动接一句：有人问的事群记忆或刚才的聊天里有答案，或者提了我能帮的事${Number.isFinite(this.maxPerHour) ? `，每小时最多 ${this.maxPerHour} 次` : ""}。不想要了就 @ 我说「别主动插话」。`,
     );
   }
 
@@ -336,7 +492,7 @@ export class ProactiveReplier {
     await this.run(msg, {
       where: "话题里",
       wanted: () => this.wantsInTopic(msg),
-      judge: () => this.confirm(msg, "话题里", ask, { say: said }),
+      judge: () => this.confirm(msg, "话题里", this.withEngagement(msg.chatId, ask), { say: said }),
       dropped: () => this.opts.topicBusy?.(threadKeyOf(msg)) ?? false,
       movedOn: () => this.movedOnInTopic(msg),
       hint: "\n\n（没 @ 我，答案在群记忆里我就接一句。这个话题里不需要的话说「只在 @ 我时回」，整个群都不要就在群里 @ 我说「别主动插话」。）",
@@ -354,7 +510,7 @@ export class ProactiveReplier {
     await this.run(msg, {
       where: "话题里",
       wanted: () => this.wantsInTopic(msg),
-      judge: () => this.confirm(msg, "话题里", ask, { work: true }),
+      judge: () => this.confirm(msg, "话题里", this.withEngagement(msg.chatId, ask), { work: true }),
       dropped: () => this.opts.topicBusy?.(threadKeyOf(msg)) ?? false,
       movedOn: () => this.movedOnInTopic(msg),
       hint: "",
@@ -417,7 +573,11 @@ export class ProactiveReplier {
       return;
     }
     const verdict = !move ? "不接" : "work" in move ? "照群里的规矩，像被 @ 一样去做" : "接一句";
-    this.logger.info(`主动接话：${step.where}${verdict} chat=${chatId} message=${msg.messageId} 用时=${this.now() - startedAt}ms`);
+    const counted = this.engagement(chatId);
+    this.logger.info(
+      `主动接话：${step.where}${verdict} chat=${chatId} message=${msg.messageId} 用时=${this.now() - startedAt}ms` +
+        (counted ? ` 最近没被 @ 时开口有人理=${counted.answered}/${counted.settled}` : ""),
+    );
     // 判断的这会儿可能有人说了「别主动插话」，或者别的消息先回了、到了上限，或者话题里的原消息到了
     if (!move || !this.active(chatId) || recent(this.replies, chatId, this.now()) >= this.maxPerHour || step.dropped()) {
       return;
@@ -437,15 +597,18 @@ export class ProactiveReplier {
       } catch (err) {
         unpush(this.replies, chatId, at);
         this.logger.warn(`主动接话：照群里的规矩去做没做成 chat=${chatId} message=${msg.messageId}`, err);
+        return;
       }
+      this.noteSpoken(msg, at);
       return;
     }
     const said = move.say;
     const today = new Date(at).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
     const hinting = this.hinted.get(chatId) !== today;
     const hint = hinting ? step.hint : "";
+    let sent: unknown;
     try {
-      await this.opts.reply(msg, said + hint);
+      sent = await this.opts.reply(msg, said + hint);
     } catch (err) {
       unpush(this.replies, chatId, at);
       this.logger.warn(`主动接话：回复发不出去 chat=${chatId} message=${msg.messageId}`, err);
@@ -454,7 +617,50 @@ export class ProactiveReplier {
     if (hinting) {
       this.hinted.set(chatId, today);
     }
+    this.spoke(chatId);
+    this.noteSpoken(msg, at, messageIdOf(sent));
     this.opts.onReplied?.(msg);
+  }
+
+  /** 记下这次没被 @ 时开口：之后看有没有人理 */
+  private noteSpoken(msg: NormalizedMessage, at: number, messageId?: string): void {
+    const list = [...(this.spoken.get(msg.chatId) ?? []), { thread: threadKeyOf(msg), at, newTopic: !inTopic(msg), ...(messageId ? { messageId } : {}) }];
+    this.spoken.set(msg.chatId, list.slice(-SPOKEN_KEPT));
+    this.persist();
+  }
+
+  /**
+   * 最近几次没被 @ 时开口有几次有人理：开口过了 IGNORED_AFTER_MS（1 小时）还没人理的、被点了「踩」又没别人理的算没人理，
+   * 没到时间的先不算。有人理过就算理了：一个人点踩压不掉别人的回复。一次都算不上时返回 undefined
+   */
+  private engagement(chatId: string): { settled: number; answered: number } | undefined {
+    const settled = (this.spoken.get(chatId) ?? []).filter((entry) => entry.answered || entry.disliked || this.now() - entry.at >= IGNORED_AFTER_MS);
+    if (settled.length === 0) {
+      return undefined;
+    }
+    return { settled: settled.length, answered: settled.filter((entry) => entry.answered).length };
+  }
+
+  /**
+   * 判断的提示词后面加上最近开口有没有人理（Claude Tag 也记这个，没人理的群里少说）：没人理的多，只接答案确定、有人在等的，
+   * 不问要不要帮忙。写在提示词里，不放进材料：材料里的数字算核对出处的依据，这里的次数不算
+   */
+  private withEngagement(chatId: string, ask: JudgeAsk): JudgeAsk {
+    const counted = this.engagement(chatId);
+    if (!counted) {
+      return ask;
+    }
+    const ignored = counted.settled - counted.answered;
+    const advice =
+      ignored > counted.answered
+        ? "没人理的多：这个群不太需要你主动开口。这次只在答案确定、明显有人在等的时候才接，不问要不要帮忙，拿不准就不接。"
+        : ignored > 0
+          ? "有没人理的：拿不准的更要不接。"
+          : "";
+    return {
+      ...ask,
+      system: `${ask.system}\n你最近在这个群里没被 @ 时开口 ${counted.settled} 次：${counted.answered} 次有人理（在话题里回了、@ 了你、点了表情），${ignored} 次没人理。${advice}`,
+    };
   }
 
   /**
@@ -565,7 +771,12 @@ export class ProactiveReplier {
       "",
       `新消息（${topic ? "话题里，" : ""}没有 @ 你）：[${msg.senderName || "群成员"}] ${clip(msg.content.trim())}`,
     ].join("\n");
-    return { system: judgePrompt(this.opts.botName() || "机器人", topic, this.opts.work !== undefined), content, memory, recent: recentLines };
+    return this.withEngagement(msg.chatId, {
+      system: judgePrompt(this.opts.botName() || "机器人", topic, this.opts.work !== undefined),
+      content,
+      memory,
+      recent: recentLines,
+    });
   }
 
   private async chatLines(msg: NormalizedMessage): Promise<string[]> {
@@ -593,11 +804,43 @@ export class ProactiveReplier {
 
   /** 排队写：几个群同时开关时，写文件不互相覆盖（每次写的都是写的那一刻的状态） */
   private async save(): Promise<void> {
-    await this.files.run(this.opts.stateFile, () => {
-      const state: PausedState = { paused: Object.fromEntries(this.paused) };
-      return writeAtomically(this.opts.stateFile, `${JSON.stringify(state, null, 2)}\n`);
-    });
+    await this.files.run(this.opts.stateFile, () => this.write());
   }
+
+  /** 消息数、开口有没有人理变了：排一次写文件，不等它写完。写失败只打警告，最多是重启后从头数 */
+  private persist(): void {
+    if (this.saveQueued) {
+      return;
+    }
+    this.saveQueued = true;
+    this.lastSave = this.files
+      .run(this.opts.stateFile, () => {
+        this.saveQueued = false;
+        return this.write();
+      })
+      .catch((err) => {
+        this.saveQueued = false;
+        this.logger.warn(`主动接话：记不下群里的消息数，重启后从头数 ${this.opts.stateFile}`, err);
+      });
+  }
+
+  private write(): Promise<void> {
+    const state: PausedState = {
+      paused: Object.fromEntries(this.paused),
+      reading: Object.fromEntries(this.readingState),
+      spoken: Object.fromEntries(this.spoken),
+    };
+    return writeAtomically(this.opts.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+  }
+}
+
+/** 「踩」这类表情（飞书的 ThumbsDown 这类）：点了算没人理 */
+const DISLIKE = /down|dislike/i;
+
+/** 回复发出去以后拿到的消息 id（发消息的接口返回 { messageId }），拿不到就是 undefined */
+function messageIdOf(sent: unknown): string | undefined {
+  const id = (sent as { messageId?: unknown } | undefined)?.messageId;
+  return typeof id === "string" && id ? id : undefined;
 }
 
 /** 一小时内的次数（顺手删掉一小时以前的） */

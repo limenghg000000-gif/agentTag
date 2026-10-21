@@ -24,7 +24,7 @@ import { McpHub } from "./mcp.js";
 import { createNameLookup } from "./operator-names.js";
 import type { AboutBot } from "./prompt.js";
 import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
-import { ProactiveReplier } from "./proactive.js";
+import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
 import { describeSchedule, escapePost, label, type RunResult, type ScheduledTask, Scheduler } from "./schedules.js";
 import { createBuildChecker } from "./build.js";
@@ -129,7 +129,7 @@ const replyInThread = (msg: NormalizedMessage, markdown: string) =>
   channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
 // 在群里直接 @ 时带上群里刚才的聊天（CHAT_CONTEXT）
 const context = new ThreadContextLoader(feishuApi, console, undefined, cardAnswers, config.chatContext);
-const handleMessage = createMessageHandler({
+const answerMessage = createMessageHandler({
   model,
   tools,
   // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分
@@ -174,6 +174,14 @@ const handleMessage = createMessageHandler({
   send: (to, input, opts) => channel.send(to, input, opts),
   updateCard: (messageId, card) => channel.updateCard(messageId, card),
 });
+/**
+ * 机器人要回答的消息（@ 它的、跟聊接着回的、照规矩去做的、点按钮接着问的）都从这里走：先告诉主动接话它在这个群里说话了，
+ * 重新数群里的消息、重新算 10 天（太热闹、太久没动静先不看了的群，有人 @ 它以后接着看）
+ */
+const handleMessage: typeof answerMessage = (msg, options) => {
+  proactive.spoke(msg.chatId);
+  return answerMessage(msg, options);
+};
 
 // 话题里跟聊：机器人回答过的话题里，没 @ 它的追问先判断是不是对它说的，是才回
 const follower = config.followThreads
@@ -191,7 +199,8 @@ const follower = config.followThreads
       memory: (chatId) => memory.list(chatId).then((entries) => renderMemoryForPrompt(entries, JUDGE_MEMORY_CHARS).text),
       // 不是对它说的、答案在群记忆里（或者是群里定过规矩的那类事）：开了主动接话的群里，再想一遍、核对出处后接一句（去做）
       chimeIn: {
-        active: (chatId) => proactive.active(chatId),
+        // 开着主动接话、群里没说「别主动插话」、这个群也还在看（太热闹、太久没动静的先不看）
+        active: (chatId) => proactive.listening(chatId),
         speak: (msg, ask, said) => proactive.speakInTopic(msg, ask, said),
         // 群里定过规矩的那类事：同样再想一遍、算每小时的次数，再像被 @ 一样去做
         work: (msg, ask) => proactive.workInTopic(msg, ask),
@@ -381,6 +390,8 @@ const followUp = createFollowUp({
   },
 });
 channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) }));
+// 有人给机器人没被 @ 时说的话点了表情：算有人理（要在飞书开发者后台订阅「消息被 reaction」事件才收得到，没订阅就只看回复和 @）
+channel.on("reaction", (evt) => proactive.noteReaction(evt.messageId, evt.operator.openId, evt.emojiType, evt.action));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
 
 try {
@@ -420,9 +431,14 @@ console.log(
 );
 if (config.proactive.chatIds.size > 0) {
   const paused = [...config.proactive.chatIds].filter((chatId) => !proactive.active(chatId));
+  const quiet = [...config.proactive.chatIds].filter((chatId) => proactive.active(chatId) && !proactive.listening(chatId));
   console.log(
-    `主动接话：群 ${[...config.proactive.chatIds].join(", ")} 里没 @ 的消息看情况接一句，每个群每小时最多 ${config.proactive.maxPerHour} 次` +
-      (paused.length > 0 ? `；${paused.join(", ")} 有人说过「别主动插话」，现在停着（@ 机器人说「可以主动说话」再打开）` : ""),
+    `主动接话：群 ${[...config.proactive.chatIds].join(", ")} 里没 @ 的消息看情况接一句，` +
+      (Number.isFinite(config.proactive.maxPerHour)
+        ? `每个群每小时最多 ${config.proactive.maxPerHour} 次`
+        : `不限回几次（每个群每小时最多判断 ${MAX_JUDGED_PER_HOUR} 条）`) +
+      (paused.length > 0 ? `；${paused.join(", ")} 有人说过「别主动插话」，现在停着（@ 机器人说「可以主动说话」再打开）` : "") +
+      (quiet.length > 0 ? `；${quiet.join(", ")} 太热闹或太久没人 @，先不看了（@ 机器人一次接着看）` : ""),
   );
 } else {
   console.log("主动接话没开：只回 @ 机器人的消息和跟着的话题（PROACTIVE_CHAT_IDS 填群的 chat_id 可以打开）");
@@ -525,8 +541,9 @@ const shutdown = async () => {
   await Promise.race([knowledge?.idle(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   await mcp?.stop();
   await channel.disconnect();
-  // 跟着的话题正在写文件的，写完再退出
+  // 跟着的话题、主动接话数的消息正在写文件的，写完再退出
   await follower?.flush();
+  await proactive.flush();
   process.exit(0);
 };
 process.once("SIGINT", shutdown);
