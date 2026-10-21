@@ -50,8 +50,11 @@ const EMBED_TEXT_CHARS = 2000;
 const INDEX_FIELD_CHARS = 450;
 /** 提问最多取多少字去检索 */
 const QUERY_CHARS = 1000;
-/** 语义相似度到这个数才算相近 */
-export const SEMANTIC_MIN = 0.5;
+/**
+ * 语义相似度到这个数才算相近。text-embedding-v4 下，同是转链、京东、商品服务这类话题的两段话，说的不是一回事也常有 0.5～0.59；
+ * 拿线上 59 个提问试过（npm run eval:knowledge），0.5 时 59 问里 27 问带上了经验、多数不相干，0.6 时剩下的基本对得上
+ */
+export const SEMANTIC_MIN = 0.6;
 /** 没有向量时，关键词得分到这个数才算相近 */
 export const KEYWORD_MIN = 0.35;
 /** 经验的关键词、错误码、告警名在提问里出现一个加多少分，最多加多少（加满了语义不够也算相近） */

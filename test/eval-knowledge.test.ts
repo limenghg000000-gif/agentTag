@@ -74,9 +74,10 @@ test("检索测试的输出：几档门槛的统计、标注的查对了几条�
   const lines = await evaluate(base, parseAsks("user-rpc 降载了吗 => K1\n今天中午吃什么 => 无"), "来自提问文件", "fake-embedding");
   assert.deepEqual(lines.slice(0, 3), ["经验库有效的 2 条：", "  K1 user-rpc 降载", "  K2 日活的口径"]);
   assert.ok(lines.includes("提问 2 个（来自提问文件）。按意思检索用 fake-embedding。"));
-  // 0.5 这档：降载那句查到 K1（对），吃饭那句什么都没查到
+  // 0.6 这档（现在的门槛）：降载那句查到 K1（对），吃饭那句什么都没查到
   assert.ok(lines.includes("门槛    有查到的提问   平均每问查到   查到的里对的   该查到的查到了"));
-  assert.ok(lines.includes("0.50    1/2          0.5            1/1            1/1  ←现在"));
+  assert.ok(lines.includes("0.50    1/2          0.5            1/1            1/1"));
+  assert.ok(lines.includes("0.60    1/2          0.5            1/1            1/1  ←现在"));
   assert.ok(lines.includes("1.  ✓K1 1.00+1   K2 0.00  ｜ user-rpc 降载了吗  应查到：K1"));
   assert.ok(lines.includes("2.   K1 0.05   K2 0.05  ｜ 今天中午吃什么  应查到：无"));
 });

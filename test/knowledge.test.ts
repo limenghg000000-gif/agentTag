@@ -2890,6 +2890,28 @@ test("检索打分明细：每条有效经验的语义相似度、关键词命�
   assert.deepEqual(await base.explain("  "), { scores: [], semantic: false });
 });
 
+test("语义相似度到 0.6 才算相近：同一类话题、说的不是一回事的常有 0.5 多，不带上", async () => {
+  const backend = new MemoryBackend();
+  // 向量都是单位长度，和提问 [1, 0] 的相似度就是第一个数
+  const like = (similarity: number) => [similarity, Math.sqrt(1 - similarity ** 2)];
+  const embedder: Embedder = {
+    model: "fake-embedding",
+    async embed(texts) {
+      return texts.map((text) => (text.includes("六成二") ? like(0.62) : text.includes("五成八") ? like(0.58) : [1, 0]));
+    },
+  };
+  const base = new KnowledgeBase(backend, { embedder, logger: quiet });
+  await base.save(normalizeDraft({ ...dau, title: "像六成二的经验" }));
+  await base.save(normalizeDraft({ ...dau, title: "像五成八的经验" }));
+
+  const hits = await base.search("转链服务今天有没有报错");
+  assert.deepEqual(
+    hits.map((hit) => hit.entry.id),
+    ["K1"],
+  );
+  assert.ok(Math.abs(hits[0].semantic! - 0.62) < 1e-9);
+});
+
 test("归档：团队经验库的按编号，aiops 经验库的按 aiops_id；两个都填或都不填报错", async () => {
   const { backend, base, desk, sent, calls, click, tool } = deskSetup();
   await base.save(normalizeDraft(dau));
