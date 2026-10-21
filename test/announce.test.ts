@@ -267,18 +267,23 @@ test("通知卡片：有技术说明的版本下面放一个默认收起的「�
 
   const longTech = Array.from({ length: 200 }, (_, i) => `- 第 ${i} 条技术改动，写得很长很长很长`).join("\n");
   const shortTech = Array.from({ length: 40 }, (_, i) => `- 第 ${i} 条小改动，写得很长很长很长`).join("\n");
-  assert.ok(longTech.length > MAX_TECH_CHARS && MAX_TECH_CHARS + shortTech.length <= MAX_TECH_TOTAL_CHARS);
+  assert.ok(longTech.length > MAX_TECH_CHARS && shortTech.length * 2 <= MAX_TECH_TOTAL_CHARS);
+  // 一版太长截短；没配文档中心就不说去文档中心看，配了才说
+  const one = [{ version: "0.12.0", notes: "- 改了", tech: longTech }];
+  const oneJson = JSON.stringify(renderAnnouncementCard(one));
+  assert.equal(oneJson.match(/collapsible_panel/g)?.length, 1);
+  assert.match(oneJson, /太长了没列全）/);
+  assert.ok(!oneJson.includes("文档中心"));
+  assert.match(JSON.stringify(renderAnnouncementCard(one, { docsLink: "https://docs.example.com" })), /太长了没列全，见文档中心的更新日志）/);
+  // 几版加起来超了：放不下的那版不放，后面放得下的照放
   const versions = [
-    { version: "0.12.0", notes: "- 改了", tech: longTech },
-    { version: "0.11.0", notes: "- 改了", tech: shortTech },
-    { version: "0.10.0", notes: "- 改了", tech: longTech },
+    { version: "0.12.0", notes: "- 改了", tech: shortTech },
+    { version: "0.11.0", notes: "- 改了", tech: longTech },
+    { version: "0.10.0", notes: "- 改了", tech: shortTech },
   ];
   const json = JSON.stringify(renderAnnouncementCard(versions));
-  assert.equal(json.match(/collapsible_panel/g)?.length, 2, "第一版截短，第二版放得下，第三版加起来超了上限不放");
-  // 没配文档中心就不说去文档中心看，配了才说
-  assert.match(json, /太长了没列全）/);
-  assert.ok(!json.includes("文档中心"));
-  assert.match(JSON.stringify(renderAnnouncementCard(versions, { docsLink: "https://docs.example.com" })), /太长了没列全，见文档中心的更新日志）/);
+  assert.equal(json.match(/collapsible_panel/g)?.length, 2, "第一版、第三版放得下，第二版加起来超了上限不放");
+  assert.ok(!json.includes("技术说明（0.11.0"));
   // 退回的文字不带技术说明
   assert.ok(!renderAnnouncementMarkdown(versions).includes("技术改动"));
 });

@@ -41,10 +41,10 @@ export const MAX_ANNOUNCED_VERSIONS = 5;
  * 所以放得比较宽；加上技术说明，卡片也在飞书的 30 KB 以内
  */
 export const MAX_NOTES_CHARS = 4500;
-/** 一个版本的技术说明最多放多少字 */
-export const MAX_TECH_CHARS = 2500;
-/** 一张卡片里技术说明加起来最多多少字，超了后面的版本不放 */
+/** 一张卡片里技术说明加起来最多多少字，超了放不下的版本不放 */
 export const MAX_TECH_TOTAL_CHARS = 3500;
+/** 一个版本的技术说明最多放多少字：攒一批发的一版，一张卡片常常就它一版，给它整份的量 */
+export const MAX_TECH_CHARS = MAX_TECH_TOTAL_CHARS;
 /** 飞书卡片 JSON 最多 30 KB，留点余量 */
 export const MAX_CARD_BYTES = 28_000;
 /** 发失败的群过一阵再试 */
@@ -272,7 +272,7 @@ function shownVersions(versions: readonly ReleaseNotesVersion[], options: Announ
     shown.push(v.notes.length > MAX_NOTES_CHARS ? { ...v, notes: truncateText(v.notes, MAX_NOTES_CHARS, see), parts: undefined } : v);
     chars += v.notes.length;
   }
-  // 技术说明另算一份字数：每版最多 MAX_TECH_CHARS 字，加起来超了 MAX_TECH_TOTAL_CHARS 后面的版本就不放
+  // 技术说明另算一份字数：每版最多 MAX_TECH_CHARS 字，加起来超了 MAX_TECH_TOTAL_CHARS 的那版不放
   let techChars = 0;
   return shown.map((v) => {
     if (!v.tech) {
