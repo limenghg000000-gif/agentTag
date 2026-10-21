@@ -856,6 +856,8 @@ test("给机器人定以后的规矩，没说「记住」也给记群记忆的�
     "从现在起只在 @ 你的时候回",
     "这个群里你只回运维相关的",
     "发版通知不用回复",
+    "以后，告警直接帮忙查",
+    "从现在起，回答都用表格",
   ];
   for (const [i, question] of rules.entries()) {
     await handle(message(question, { messageId: `om_r${i}` }));
@@ -878,6 +880,9 @@ test("给机器人定以后的规矩，没说「记住」也给记群记忆的�
   const { handle: run } = setup({ model: plain.model, memory });
   await run(message("每天查一下线上报错，没有报错的不用回复"), { scheduled: { label: "T3", schedule: "每天 10:00" } });
   assert.deepEqual(plain.requests[0].tools?.map((t) => t.name) ?? [], []);
+  // 提示词里也不叫它「只记规矩、不去查」：任务内容里的条件是要照着做的
+  assert.match(plain.requests[0].system, /这次群记忆只能看/);
+  assert.doesNotMatch(plain.requests[0].system, /这次只记规矩|告诉他这次没记上|没说「记住」也算让你记住/);
   // 没 @ 的跟聊里定规矩：和说「记住」一样给
   await run(message("以后这类报错直接帮忙查", { messageId: "om_2", rootId: "om_root" }), { unaddressed: true });
   assert.deepEqual(plain.requests[1].tools?.map((t) => t.name), memoryTools);
