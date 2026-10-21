@@ -394,6 +394,10 @@ test("机器人上次说话以后群里发了 200 条它都没说话：这个群
     for (let i = 0; i < QUIET_AFTER_MESSAGES - 1; i++) {
       t.replier.noteActivity(msg(`om_chat_${i}`, { content: "随便聊聊" }));
     }
+    // 同一条报了好几次（事件、补漏轮询每轮回看）只数一次
+    for (let i = 0; i < 5; i++) {
+      t.replier.noteActivity(msg("om_chat_0", { content: "随便聊聊" }));
+    }
     assert.equal(t.replier.wants(msg("om_1")), true);
     t.replier.noteActivity(msg("om_chat_last", { content: "随便聊聊" }));
     assert.equal(t.replier.wants(msg("om_1")), false);
@@ -406,8 +410,14 @@ test("机器人上次说话以后群里发了 200 条它都没说话：这个群
     assert.match(quiet[0], /我上次在群里说话以后已经有 200 条消息/);
 
     // 有人 @ 它、它回了：接着看
+    t.advance(60_000);
     t.replier.spoke("oc_1");
     assert.equal(t.replier.wants(msg("om_3")), true);
+    // 它回话之前发的（补漏轮询回看到的）不算
+    for (let i = 0; i < QUIET_AFTER_MESSAGES; i++) {
+      t.replier.noteActivity(msg(`om_old_${i}`, { content: "随便聊聊" }));
+    }
+    assert.equal(t.replier.wants(msg("om_4", { createTime: START + 60_000 })), true);
     assert.match(t.logs.join("\n"), /我在这个群里回话了，接着看 chat=oc_1/);
     // 别的群各数各的
     assert.equal(t.replier.listening("oc_2"), false);
@@ -480,23 +490,27 @@ test("有人理：在它开的话题里回了、@ 了它、引用回复它、点
     t.replier.noteReaction("om_bot_4", "ou_2", "THUMBSUP", "added");
     await t.replier.consider(msg("om_5", { createTime: START + 7000 }));
     t.replier.noteReaction("om_bot_5", "ou_2", "ThumbsDown", "added");
+    // 一个人点了踩，别人点了赞：有人理过就算理了
+    await t.replier.consider(msg("om_5b", { createTime: START + 7500 }));
+    t.replier.noteReaction("om_bot_6", "ou_2", "ThumbsDown", "added");
+    t.replier.noteReaction("om_bot_6", "ou_3", "THUMBSUP", "added");
     // 机器人自己点的、取消的不算
     await t.replier.consider(msg("om_6", { createTime: START + 8000 }));
-    t.replier.noteReaction("om_bot_6", BOT, "THUMBSUP", "added");
-    t.replier.noteReaction("om_bot_6", "ou_2", "THUMBSUP", "removed");
-    assert.equal(t.replies.length, 6);
+    t.replier.noteReaction("om_bot_7", BOT, "THUMBSUP", "added");
+    t.replier.noteReaction("om_bot_7", "ou_2", "THUMBSUP", "removed");
+    assert.equal(t.replies.length, 7);
 
     t.advance(IGNORED_AFTER_MS + 60_000);
     await t.replier.consider(msg("om_7", { createTime: START + IGNORED_AFTER_MS }));
-    // 理了的：om_1、om_3、om_4；没人理的：om_2、om_5（踩）、om_6
-    assert.match(t.requests[6].system ?? "", /没被 @ 时开口 6 次：3 次有人理.*3 次没人理。有没人理的：拿不准的更要不接。/);
+    // 理了的：om_1、om_3、om_4、om_5b；没人理的：om_2、om_5（踩）、om_6
+    assert.match(t.requests[7].system ?? "", /没被 @ 时开口 7 次：4 次有人理.*3 次没人理。有没人理的：拿不准的更要不接。/);
 
     // 重启后照样记得（om_7 刚回、还不算）
     await t.replier.flush();
     const restarted = t.make();
     await restarted.init();
     await restarted.consider(msg("om_8", { createTime: START + IGNORED_AFTER_MS + 1000 }));
-    assert.match(t.requests[7].system ?? "", /没被 @ 时开口 6 次：3 次有人理/);
+    assert.match(t.requests[8].system ?? "", /没被 @ 时开口 7 次：4 次有人理/);
   } finally {
     await t.cleanup();
   }

@@ -182,6 +182,8 @@ export class ProactiveReplier {
   private readonly readingState = new Map<string, Reading>();
   /** 已经记过「先不看了」的群：一次不看只记一行 */
   private readonly quietLogged = new Set<string>();
+  /** 数过的消息：补漏轮询每 10 秒把最近 5 分钟的消息再报一遍，事件和轮询也会各报一次，同一条只数一次 */
+  private readonly counted = new Set<string>();
   /** 群 id → 最近几次没被 @ 时开口 */
   private readonly spoken = new Map<string, Spoken[]>();
   private readonly logger: Logger;
@@ -241,16 +243,25 @@ export class ProactiveReplier {
       remember(this.replied, msg.rootId);
     }
     const at = msg.createTime || this.now();
+    let changed = false;
     const reading = this.readingState.get(msg.chatId) ?? { lastAt: this.now(), messages: 0 };
-    this.readingState.set(msg.chatId, { lastAt: reading.lastAt, messages: reading.messages + 1 });
+    // 机器人上次说话之前发的不算（补漏轮询回看时会再报一遍）
+    if (!this.counted.has(msg.messageId) && at >= reading.lastAt) {
+      remember(this.counted, msg.messageId);
+      this.readingState.set(msg.chatId, { lastAt: reading.lastAt, messages: reading.messages + 1 });
+      changed = true;
+    }
     const key = threadKeyOf(msg);
     for (const entry of this.spoken.get(msg.chatId) ?? []) {
       const toBot = entry.newTopic || msg.mentionedBot || (entry.messageId !== undefined && msg.replyToMessageId === entry.messageId);
       if (!entry.answered && entry.thread === key && at >= entry.at && toBot) {
         entry.answered = true;
+        changed = true;
       }
     }
-    this.persist();
+    if (changed) {
+      this.persist();
+    }
     if (inTopic(msg)) {
       const key = threadKeyOf(msg);
       const last = this.latestInTopic.get(key);
@@ -326,7 +337,7 @@ export class ProactiveReplier {
     this.persist();
   }
 
-  /** 有人给机器人的消息点了表情：是它没被 @ 时说的话，就算有人理了（点的是「踩」这类就算没人理） */
+  /** 有人给机器人的消息点了表情：是它没被 @ 时说的话，就算有人理了（点的是「踩」这类，又没别人理的，算没人理） */
   noteReaction(messageId: string, operatorId: string, emojiType: string, action: "added" | "removed"): void {
     if (action !== "added" || operatorId === this.opts.botOpenId()) {
       return;
@@ -619,15 +630,15 @@ export class ProactiveReplier {
   }
 
   /**
-   * 最近几次没被 @ 时开口有几次有人理：开口过了 IGNORED_AFTER_MS（1 小时）还没人理的算没人理，没到时间的先不算。
-   * 一次都算不上时返回 undefined
+   * 最近几次没被 @ 时开口有几次有人理：开口过了 IGNORED_AFTER_MS（1 小时）还没人理的、被点了「踩」又没别人理的算没人理，
+   * 没到时间的先不算。有人理过就算理了：一个人点踩压不掉别人的回复。一次都算不上时返回 undefined
    */
   private engagement(chatId: string): { settled: number; answered: number } | undefined {
     const settled = (this.spoken.get(chatId) ?? []).filter((entry) => entry.answered || entry.disliked || this.now() - entry.at >= IGNORED_AFTER_MS);
     if (settled.length === 0) {
       return undefined;
     }
-    return { settled: settled.length, answered: settled.filter((entry) => entry.answered && !entry.disliked).length };
+    return { settled: settled.length, answered: settled.filter((entry) => entry.answered).length };
   }
 
   /**
