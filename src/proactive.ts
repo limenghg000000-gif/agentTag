@@ -5,6 +5,7 @@ import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
 import { JUDGE_MEMORY_CHARS, type JudgeAsk, JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
 import { type Logger, recentChat, type ThreadContext, threadKeyOf } from "./history.js";
+import { normalizeId } from "./knowledge.js";
 import type { ChatModel } from "./llm.js";
 import { type MemoryStore, renderMemoryForPrompt } from "./memory.js";
 
@@ -608,8 +609,11 @@ function saidLine(text: string): string | undefined {
 
 /** 要核对的数字：两位以上的数字，带点或冒号的（版本号、IP、时间） */
 const NUMBER = /\d+(?:[.:]\d+)+|\d+/g;
-/** 说到的经验编号：团队经验库的「经验 K3」，aiops 经验库的「aiops 经验 #5」（查到的编号里记成 aiops#5） */
-const TEAM_LESSON = /经验\s*(K\d+)/gi;
+/**
+ * 说到的经验编号：团队经验库的「经验 K3」（「K3」「#K3」「k 3」这些写法经验库都认，一样核对；k8s 这类不算），
+ * aiops 经验库的「aiops 经验 #5」（查到的编号里记成 aiops#5）
+ */
+const TEAM_LESSON = /(?<![A-Za-z0-9])#?\s*K\s*(\d+)(?![A-Za-z0-9.])/gi;
 const AIOPS_LESSON = /aiops\s*经验\s*#\s*(\d+)/gi;
 /** 要开口前查到了经验时，判断提示词后面加的这几句 */
 const KNOWLEDGE_RULES = [
@@ -629,10 +633,11 @@ export function unsupported(said: string, ask: Pick<JudgeAsk, "content" | "memor
       missing.push(`群记忆 #${id}`);
     }
   }
-  const lessons = new Set(ask.knowledge ?? []);
-  for (const [, id] of said.matchAll(TEAM_LESSON)) {
-    if (!lessons.has(id.toUpperCase())) {
-      missing.push(`经验 ${id.toUpperCase()}`);
+  // 表格里的编号可能被人改成 k3、K 3、#K3 这样（经验库都认成 K3），按同样的写法比
+  const lessons = new Set((ask.knowledge ?? []).map((id) => (id.startsWith("aiops#") ? id : normalizeId(id))));
+  for (const [, number] of said.matchAll(TEAM_LESSON)) {
+    if (!lessons.has(`K${number}`)) {
+      missing.push(`经验 K${number}`);
     }
   }
   for (const [, id] of said.matchAll(AIOPS_LESSON)) {

@@ -969,4 +969,10 @@ test("核对出处：说到的经验编号要在这次查到的里面，编号�
   assert.deepEqual(unsupported("见经验 K4、aiops 经验 #6", ask), ["经验 K4", "aiops 经验 #6"]);
   // 没查经验库就不能说经验编号
   assert.deepEqual(unsupported("之前遇到过（经验 K12）", { memory: ask.memory, content: ask.content }), ["经验 K12"]);
+  // 经验库认的别的写法一样核对：#K9、K 9、不带「经验」的 K9 都算说了经验编号；k8s 不算
+  assert.deepEqual(unsupported("之前遇到过（经验 #K9）", ask), ["经验 K9"]);
+  assert.deepEqual(unsupported("之前遇到过（K 9）", ask), ["经验 K9"]);
+  assert.deepEqual(unsupported("之前遇到过（#K12），k8s 里重启就好", ask), []);
+  // 表格里的编号被人写成 k12、K 12 的，模型照常写「经验 K12」也对得上
+  assert.deepEqual(unsupported("之前遇到过（经验 K12）", { ...ask, knowledge: ["k 12"] }), []);
 });
