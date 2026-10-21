@@ -16,7 +16,7 @@ import { createFollowUp } from "./follow-up.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
 import { type FeatureList, parseFeatures } from "./features.js";
-import { KnowledgeBase } from "./knowledge.js";
+import { containsSecret, KnowledgeBase, maskPersonal } from "./knowledge.js";
 import { AiopsLessons } from "./knowledge-aiops.js";
 import { BitableKnowledgeBackend, createBitableApi } from "./knowledge-bitable.js";
 import { createOpenAICompatibleEmbedder, createOpenAICompatibleModel, createOpenAICompatibleVisionModel } from "./llm.js";
@@ -202,6 +202,15 @@ const proactive = new ProactiveReplier({
   skipTopic: (threadKey) => follower?.owns(threadKey) ?? false,
   // 群记忆里定过规矩的那类事：像被 @ 一样去做，只给读的工具；之后跟着这个话题
   work: (msg) => answerUnaddressed(msg),
+  // 要开口说话的，再想一遍之前查一次经验库（和回答前自动查的同一个；手机号这类打码，像密钥的不发到 aiops）
+  ...(knowledge
+    ? {
+        knowledge: (msg: NormalizedMessage, signal: AbortSignal) =>
+          knowledge.lookup(maskPersonal(msg.content), { chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }, signal, {
+            secret: containsSecret(msg.content),
+          }),
+      }
+    : {}),
   onReplied: (msg) => follower?.track(msg),
   followsThreads: follower !== undefined,
   // 话题里勾了「同时发送到群」的追问，群里那份不再主动接话：话题里那份归跟聊

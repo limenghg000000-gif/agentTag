@@ -32,6 +32,8 @@ export interface JudgeAsk {
   content: string;
   /** 给模型看的群记忆（带编号）：说到的「群记忆 #几」要在这里面 */
   memory: string;
+  /** 给模型看的经验库里查到的经验编号（「K3」「aiops#5」）：说到的「经验 K3」「aiops 经验 #5」要在这里面 */
+  knowledge?: readonly string[];
 }
 
 /**
