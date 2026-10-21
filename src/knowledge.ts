@@ -246,6 +246,8 @@ export class KnowledgeBase {
   private readFailedAt?: number;
   /** 改过几次表格：改之前开始读的那次读到的是旧的，不拿来当 lastGood */
   private writes = 0;
+  /** 开始读过几次表格：读失败时已经又开始读了一次，就不记作读失败（免得新的那次读好了还一分钟不重读） */
+  private reads = 0;
   /** 已经警告过的表格行（编号加上缺了什么、哪里像有密钥），同一个问题只警告一次 */
   private readonly warned = new Set<string>();
   private readonly vectors = new Map<string, number[]>();
@@ -284,6 +286,7 @@ export class KnowledgeBase {
     if (fresh || !this.cached || at - this.cached.at > this.cacheMs) {
       const entries = this.read();
       const writes = this.writes;
+      const reads = ++this.reads;
       this.cached = { at, entries };
       entries.then(
         (read) => {
@@ -297,11 +300,17 @@ export class KnowledgeBase {
           if (this.cached?.entries === entries) {
             this.cached = undefined;
           }
+          const reason = err instanceof Error ? err.message : String(err);
+          // 读着的时候改过表格、或者又开始读了一次：这次读过时了，不拦着下次读
+          if (writes !== this.writes || reads !== this.reads) {
+            this.logger.warn(`经验库：表格这次没读成（${reason}），之后已经改过或者重新读过表格，下次检索照常读`);
+            return;
+          }
           this.readFailedAt = this.now().getTime();
           const fallback = this.lastGood
             ? `检索先用 ${new Date(this.lastGood.at).toISOString()} 读到的 ${this.lastGood.entries.length} 条`
             : "这段时间检索不到团队经验库";
-          this.logger.warn(`经验库：表格这次没读成（${err instanceof Error ? err.message : String(err)}），${this.readRetryMs / 1000} 秒内不再重读，${fallback}`);
+          this.logger.warn(`经验库：表格这次没读成（${reason}），${this.readRetryMs / 1000} 秒内不再重读，${fallback}`);
         },
       );
     }

@@ -102,16 +102,21 @@ export async function evaluate(base: Pick<KnowledgeBase, "explain" | "entries">,
     results.push({ ask, ...(await base.explain(ask.text)) });
   }
   const entries = (await base.entries()).filter((entry) => entry.status === "active" && usable(entry));
-  const semantic = results.length > 0 && results.every((result) => result.semantic);
+  // 向量中途出错的提问只有关键词分：不算进门槛统计，列表里注明
+  const scored = results.filter((result) => result.semantic);
+  const semantic = scored.length > 0;
+  const keywordOnly = results.length - scored.length;
   const out = [`经验库有效的 ${entries.length} 条：`, ...entries.map((entry) => `  ${entry.id} ${clip(entry.title, TITLE_PREVIEW)}`)];
   out.push(
     "",
     `提问 ${asks.length} 个（${source}）。` +
-      (semantic ? `按意思检索用 ${model ?? "向量模型"}。` : `向量模型没用上（没配或者出错了），下面只是关键词分，门槛是 ${KEYWORD_MIN}。`),
+      (semantic
+        ? `按意思检索用 ${model ?? "向量模型"}。` + (keywordOnly > 0 ? `其中 ${keywordOnly} 个提问向量没算成（看上面的报错），只有关键词分，不算进门槛统计。` : "")
+        : `向量模型没用上（没配或者出错了），下面只是关键词分，门槛是 ${KEYWORD_MIN}。`),
   );
 
   if (semantic) {
-    const labeled = results.some((result) => result.ask.expected !== undefined);
+    const labeled = scored.some((result) => result.ask.expected !== undefined);
     out.push("", `门槛    有查到的提问   平均每问查到   ${labeled ? "查到的里对的   该查到的查到了" : ""}`.trimEnd());
     for (const threshold of THRESHOLDS) {
       let answered = 0;
@@ -120,7 +125,7 @@ export async function evaluate(base: Pick<KnowledgeBase, "explain" | "entries">,
       let right = 0;
       let shown = 0;
       let expected = 0;
-      for (const { ask, scores } of results) {
+      for (const { ask, scores } of scored) {
         const hits = pick(scores, threshold);
         answered += hits.length > 0 ? 1 : 0;
         found += hits.length;
@@ -132,12 +137,12 @@ export async function evaluate(base: Pick<KnowledgeBase, "explain" | "entries">,
         }
       }
       out.push(
-        `${threshold.toFixed(2)}    ${pad(`${answered}/${results.length}`, 13)}${pad((found / results.length).toFixed(1), 15)}` +
+        `${threshold.toFixed(2)}    ${pad(`${answered}/${scored.length}`, 13)}${pad((found / scored.length).toFixed(1), 15)}` +
           (labeled ? `${pad(`${right}/${shown}`, 15)}${right}/${expected}` : "").trimEnd() +
           (threshold === SEMANTIC_MIN ? "  ←现在" : ""),
       );
     }
-    const tops = results.flatMap((result) => (result.scores[0]?.semantic !== undefined ? [result.scores[0].semantic] : [])).sort((a, b) => a - b);
+    const tops = scored.flatMap((result) => (result.scores[0]?.semantic !== undefined ? [result.scores[0].semantic] : [])).sort((a, b) => a - b);
     if (tops.length > 0) {
       const at = (q: number) => tops[Math.min(tops.length - 1, Math.floor(q * tops.length))].toFixed(2);
       out.push("", `每个提问最像的那条的语义相似度：最低 ${tops[0].toFixed(2)}，四分之一 ${at(0.25)}，中位 ${at(0.5)}，四分之三 ${at(0.75)}，最高 ${tops.at(-1)!.toFixed(2)}`);
@@ -145,7 +150,7 @@ export async function evaluate(base: Pick<KnowledgeBase, "explain" | "entries">,
   }
 
   out.push("", `每个提问的前 ${TOP} 名（${semantic ? "语义相似度，+n 是关键词命中几个" : "关键词分"}；✓ 是现在的门槛下会写进提示词的）：`);
-  results.forEach(({ ask, scores }, i) => {
+  results.forEach(({ ask, scores, semantic: vectors }, i) => {
     const top = scores
       .slice(0, TOP)
       .map((score) => {
@@ -154,7 +159,8 @@ export async function evaluate(base: Pick<KnowledgeBase, "explain" | "entries">,
       })
       .join("  ");
     const expected = ask.expected === undefined ? "" : `  应查到：${ask.expected.length > 0 ? ask.expected.join(" ") : "无"}`;
-    out.push(`${pad(`${i + 1}.`, 4)}${top || "（经验库是空的）"}  ｜ ${clip(ask.text, QUESTION_PREVIEW)}${expected}`);
+    const note = semantic && !vectors ? "  （向量没算成，是关键词分）" : "";
+    out.push(`${pad(`${i + 1}.`, 4)}${top || "（经验库是空的）"}  ｜ ${clip(ask.text, QUESTION_PREVIEW)}${expected}${note}`);
   });
   return out;
 }

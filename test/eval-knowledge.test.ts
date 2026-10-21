@@ -81,3 +81,24 @@ test("检索测试的输出：几档门槛的统计、标注的查对了几条�
   assert.ok(lines.includes("1.  ✓K1 1.00+1   K2 0.00  ｜ user-rpc 降载了吗  应查到：K1"));
   assert.ok(lines.includes("2.   K1 0.05   K2 0.05  ｜ 今天中午吃什么  应查到：无"));
 });
+
+test("检索测试：中途向量出错的提问只有关键词分，不算进门槛统计，列表里注明", async () => {
+  const backend = memoryBackend();
+  const flaky: Embedder = {
+    model: "fake-embedding",
+    async embed(texts) {
+      if (texts.some((text) => text.includes("向量挂了"))) {
+        throw new Error("向量服务 500");
+      }
+      return embedder.embed(texts);
+    },
+  };
+  const base = new KnowledgeBase(backend, { embedder: flaky, logger: quiet });
+  await base.save(normalizeDraft({ category: "incident", title: "user-rpc 降载", question: "降载了怎么办", conclusion: "扩容", keywords: "降载" }));
+  await base.save(normalizeDraft({ category: "metric", title: "日活的口径", question: "日活怎么统计", conclusion: "去重用户数", keywords: "日活,DAU" }));
+  const lines = await evaluate(base, parseAsks("user-rpc 降载了吗 => K1\n向量挂了，日活怎么算 => K2"), "来自提问文件", "fake-embedding");
+  assert.ok(lines.includes("提问 2 个（来自提问文件）。按意思检索用 fake-embedding。其中 1 个提问向量没算成（看上面的报错），只有关键词分，不算进门槛统计。"));
+  assert.ok(lines.includes("0.60    1/1          1.0            1/1            1/1  ←现在"));
+  assert.match(lines.find((line) => line.startsWith("2."))!, /向量挂了，日活怎么算  应查到：K2  （向量没算成，是关键词分）$/);
+  assert.doesNotMatch(lines.find((line) => line.startsWith("1."))!, /向量没算成/);
+});

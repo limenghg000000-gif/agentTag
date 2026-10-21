@@ -2860,6 +2860,36 @@ test("表格读不出来时检索用上次读到的，一分钟内不再重读�
   await assert.rejects(base.search("code=8"), /飞书接口 500/);
 });
 
+test("读表格失败时已经改过表格、重新读过：这次失败过时了，不拦着下次检索读表格", async () => {
+  const backend = new MemoryBackend();
+  let now = new Date("2026-10-21T10:00:00Z");
+  const warnings: string[] = [];
+  const base = new KnowledgeBase(backend, { logger: { ...quiet, warn: (text: string) => warnings.push(text) }, now: () => now });
+  await base.save(normalizeDraft(code8));
+  assert.deepEqual((await base.search("code=8")).map((hit) => hit.entry.id), ["K1"]);
+
+  // 缓存过期，检索开始读表格，一直没回来
+  const list = backend.list.bind(backend);
+  let fail!: (err: Error) => void;
+  backend.list = () => {
+    backend.lists++;
+    return new Promise((_, reject) => (fail = reject));
+  };
+  now = new Date(now.getTime() + 61_000);
+  const slow = base.search("code=8");
+  // 这时候存了一条经验（重新读了表格），然后之前那次读失败了
+  backend.list = list;
+  await base.save(normalizeDraft(dau));
+  fail(new KnowledgeError("飞书接口 500"));
+  await assert.rejects(slow, /飞书接口 500/, "存过经验，不拿存之前读到的凑合");
+  assert.match(warnings.join("\n"), /表格这次没读成（飞书接口 500），之后已经改过或者重新读过表格，下次检索照常读/);
+
+  // 下一次检索照常读表格，查得到新存的
+  const lists = backend.lists;
+  assert.deepEqual((await base.search("日活")).map((hit) => hit.entry.id), ["K2"]);
+  assert.equal(backend.lists, lists + 1);
+});
+
 test("检索打分明细：每条有效经验的语义相似度、关键词命中、总分，不按门槛筛，和检索算法一致", async () => {
   const backend = new MemoryBackend();
   const { embedder } = fakeEmbedder(["降载", "日活"]);
