@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type { FeishuApi } from "./feishu.js";
 import { FileQueue, writeAtomically } from "./file-store.js";
-import { JUDGE_MEMORY_CHARS, type JudgeAsk, JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
+import { hasWorkRule, JUDGE_MEMORY_CHARS, type JudgeAsk, JudgeQueue, MUTE_COMMAND, remember, withDeadline } from "./follow.js";
 import { type Logger, recentChat, type ThreadContext, threadKeyOf } from "./history.js";
 import { containsSecret, maskPersonal, normalizeId } from "./knowledge.js";
 import type { ChatModel } from "./llm.js";
@@ -675,7 +675,7 @@ export class ProactiveReplier {
     const first = await withDeadline(limit, async (signal) => {
       const prepared = await this.prepare(msg);
       const ask = lookup ? await this.withKnowledge(msg, where, prepared, "像提问或报错，看一眼前", signal) : prepared;
-      return { ask, move: this.moveOf((await this.ask(ask, false, signal)).text) };
+      return { ask, move: this.moveOf((await this.ask(ask, false, signal)).text, ask) };
     });
     return first.move ? this.confirm(msg, where, first.ask, first.move) : undefined;
   }
@@ -687,7 +687,7 @@ export class ProactiveReplier {
   private async confirm(msg: NormalizedMessage, where: string, ask: JudgeAsk, first: Move): Promise<Move | undefined> {
     // 看一眼前查过的不再查；去做的不用查：像被 @ 一样回答时会先查经验库
     const material = "say" in first && ask.knowledge === undefined ? await this.withKnowledge(msg, where, ask, "要开口，再想一遍前") : ask;
-    const move = await withDeadline(CONFIRM_TIMEOUT_MS, async (signal) => this.moveOf((await this.ask(material, true, signal)).text));
+    const move = await withDeadline(CONFIRM_TIMEOUT_MS, async (signal) => this.moveOf((await this.ask(material, true, signal)).text, material));
     if (!move || ("work" in move) !== ("work" in first)) {
       this.logger.info(`主动接话：${where}打开思考再想一遍，不接了 chat=${msg.chatId} message=${msg.messageId}`);
       return undefined;
@@ -741,9 +741,9 @@ export class ProactiveReplier {
     return this.opts.model.chat({ system: ask.system, messages: [{ role: "user", content: ask.content }], thinking, signal });
   }
 
-  /** 模型的回答：「做」（配了 work 才算）、「接：」加一句话，别的都算不接 */
-  private moveOf(text: string): Move | undefined {
-    if (this.opts.work && /^[\s*「"']*做[」"'\s。.!！]*$/.test(text.trim())) {
+  /** 模型的回答：「做」（配了 work、这次给了模型「做」这个选择才算）、「接：」加一句话，别的都算不接 */
+  private moveOf(text: string, ask: JudgeAsk): Move | undefined {
+    if (this.opts.work && ask.work && /^[\s*「"']*做[」"'\s。.!！]*$/.test(text.trim())) {
       return { work: true };
     }
     const said = saidLine(text);
@@ -771,11 +771,14 @@ export class ProactiveReplier {
       "",
       `新消息（${topic ? "话题里，" : ""}没有 @ 你）：[${msg.senderName || "群成员"}] ${clip(msg.content.trim())}`,
     ].join("\n");
+    // 「做」只在群记忆里有不用 @ 也要它去做的规矩时给：规矩说要先 @ 它的（「线上报错必须 @ 你再查」），没 @ 不去做
+    const work = this.opts.work !== undefined && hasWorkRule(memory);
     return this.withEngagement(msg.chatId, {
-      system: judgePrompt(this.opts.botName() || "机器人", topic, this.opts.work !== undefined),
+      system: judgePrompt(this.opts.botName() || "机器人", topic, work),
       content,
       memory,
       recent: recentLines,
+      work,
     });
   }
 
@@ -968,17 +971,17 @@ function clip(text: string): string {
   return text.length <= JUDGE_MESSAGE_CHARS ? text : `${text.slice(0, JUDGE_MESSAGE_CHARS)}…`;
 }
 
-/** topic：消息在话题里（看的是话题最近几条，不是群聊）；work：能像被 @ 一样去做（给模型多一个选择「做」） */
+/** topic：消息在话题里（看的是话题最近几条，不是群聊）；work：能像被 @ 一样去做（配了处理函数、群记忆里有不用 @ 也要它去做的规矩），给模型多一个选择「做」 */
 function judgePrompt(botName: string, topic: boolean, work: boolean): string {
   const recent = topic ? "这个话题里最近的消息" : "刚才的群聊";
   return [
     `你是飞书群里的机器人「${botName}」，能查线上问题、读代码、读写飞书文档、记群里的约定。群成员一般 @ 你派活。`,
     `下面这条${topic ? "话题里的" : "群"}消息没有 @ 你。判断你要不要接、怎么接。大多数时候不接。`,
-    "群记忆里群里定的规矩（哪类消息不用 @ 也要你处理、哪类别管）优先照着做。",
+    "群记忆里群里定的规矩（哪类消息不用 @ 也要你处理、哪类要 @ 你才处理、哪类别管）优先照着做。规矩说这类事要 @ 你才处理的（比如「线上报错必须 @ 你再查」），这条没 @ 你就不接：不查，也不问要不要帮忙。",
     "只在这几种情况接：",
     `1. 有人问了问题，答案就在下面的群记忆或${recent}里，一两句话说得清：直接回答，说明出处（「群记忆 #3」「刚才张三说的」）。`,
     ...(work
-      ? ["2. 群记忆里有规矩说这类事不用 @ 也要你处理（比如「线上报错直接帮忙查」），这条正是这类事：像被 @ 了一样去查、去做。"]
+      ? ["2. 群记忆里有规矩说这类事不用 @ 也要你处理（比如「线上报错不用 @ 你也直接帮忙查」），这条正是这类事：像被 @ 了一样去查、去做。"]
       : []),
     `${work ? 3 : 2}. 有人明确说了一件你能帮上的事（查线上报错、看代码、整理文档、找以前定过的事），还没人接${work ? "，群里也没定过上面那样的规矩" : ""}：用一句话问要不要你来，说清你会怎么帮。不要自己开始查，也不要先给结论。`,
     "不接的：闲聊、表态、通知、转发、群成员之间已经在处理或已经答了的事、意思不清楚的、你帮不上的。拿不准就不接。",

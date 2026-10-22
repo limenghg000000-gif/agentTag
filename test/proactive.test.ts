@@ -57,6 +57,8 @@ async function setup(
     skipTopic?: (threadKey: string) => boolean;
     /** 配了就能「做」：记下交给它的消息；给 Error 时交给它就失败 */
     work?: boolean | Error;
+    /** 群记忆里再加的规矩（约定）：有不用 @ 也要它去做的规矩，才给模型「做」这个选择 */
+    rules?: string[];
     /** 配了就在要开口前查经验库：记下查了哪条消息；给 Error 时查不成，给函数时照函数查（拿得到中止信号） */
     knowledge?: { text: string; ids: string[] } | Error | ((signal: AbortSignal) => Promise<{ text: string; ids: string[] } | undefined>);
   } = {},
@@ -81,6 +83,13 @@ async function setup(
   ];
   const memoryEntries: MemoryEntry[] = [
     { id: 3, kind: "background", content: "测试环境数据库是 db-test-2.internal", author: "李四", createdAt: new Date(START - HOUR).toISOString() },
+    ...(opts.rules ?? []).map((content, i) => ({
+      id: 5 + i,
+      kind: "convention" as const,
+      content,
+      author: "张三",
+      createdAt: new Date(START - HOUR).toISOString(),
+    })),
   ];
   const judge = opts.judge ?? "不接";
   const model: ChatModel = {
@@ -803,6 +812,10 @@ const TOPIC_ASK = {
   memory: "- #3 测试环境数据库是 db-test-2.internal（李四）",
 };
 const TOPIC_SAID = "测试环境数据库是 db-test-2.internal（群记忆 #3）";
+/** 群记忆里不用 @ 也要它去做的规矩 */
+const WORK_RULE = "线上报错不用 @ 你也直接帮忙查";
+/** 跟聊判断时给了模型「做」这个选择（群记忆里有不用 @ 也要它去做的规矩） */
+const TOPIC_WORK_ASK = { ...TOPIC_ASK, memory: `${TOPIC_ASK.memory}\n- #5 ${WORK_RULE}（张三）`, work: true };
 
 test("跟聊判断出来不是对它说的、想按群记忆接一句：打开思考、同样的材料再问一遍，核对出处后在话题里接", async () => {
   const t = await setup({ confirm: `接：${TOPIC_SAID}` });
@@ -932,20 +945,29 @@ test("话题里：再想一遍的这会儿话题里开始了别的任务（有�
 test("跟聊判断出来是群里定过规矩的那类事：再想一遍还是「做」才交给处理函数，算每小时的次数", async () => {
   const t = await setup({ confirm: "做", work: true, maxPerHour: 1 });
   try {
-    await t.replier.workInTopic(topicMsg("om_1"), TOPIC_ASK);
+    await t.replier.workInTopic(topicMsg("om_1"), TOPIC_WORK_ASK);
     assert.deepEqual(t.worked, ["om_1"]);
     assert.equal(t.confirms.length, 1);
     assert.equal(t.confirms[0].system, TOPIC_ASK.system);
     // 次数用完了
-    await t.replier.workInTopic(topicMsg("om_2", { createTime: START + 1000 }), TOPIC_ASK);
+    await t.replier.workInTopic(topicMsg("om_2", { createTime: START + 1000 }), TOPIC_WORK_ASK);
     assert.deepEqual(t.worked, ["om_1"]);
   } finally {
     await t.cleanup();
   }
+  // 跟聊判断时没给模型「做」这个选择（群记忆里没有不用 @ 也要它去做的规矩）：再想一遍说了「做」也不做
+  const unoffered = await setup({ confirm: "做", work: true });
+  try {
+    await unoffered.replier.workInTopic(topicMsg("om_1"), TOPIC_ASK);
+    assert.deepEqual(unoffered.worked, []);
+    assert.deepEqual(unoffered.replies, []);
+  } finally {
+    await unoffered.cleanup();
+  }
   for (const confirm of ["否", "接：测试环境数据库是 db-test-2.internal（群记忆 #3）"]) {
     const t2 = await setup({ confirm, work: true });
     try {
-      await t2.replier.workInTopic(topicMsg("om_1"), TOPIC_ASK);
+      await t2.replier.workInTopic(topicMsg("om_1"), TOPIC_WORK_ASK);
       assert.deepEqual(t2.worked, [], confirm);
       assert.deepEqual(t2.replies, [], confirm);
     } finally {
@@ -985,7 +1007,7 @@ test("机器人没跟着的话题里的消息也判断：看群记忆和话题�
 });
 
 test("群记忆里定过规矩的那类事：模型说「做」、再想一遍还是「做」，像被 @ 一样交给处理函数，算每小时的次数", async () => {
-  const t = await setup({ judge: "做", work: true, maxPerHour: 1 });
+  const t = await setup({ judge: "做", work: true, maxPerHour: 1, rules: [WORK_RULE] });
   try {
     await t.replier.consider(msg("om_1"));
     assert.deepEqual(t.worked, ["om_1"]);
@@ -1003,7 +1025,7 @@ test("群记忆里定过规矩的那类事：模型说「做」、再想一遍�
 
   // 再想一遍改成了说一句、不接：都不做
   for (const confirm of ["接：要我帮忙查一下吗？", "不接"]) {
-    const t2 = await setup({ judge: "做", work: true, confirm });
+    const t2 = await setup({ judge: "做", work: true, confirm, rules: [WORK_RULE] });
     try {
       await t2.replier.consider(msg("om_1"));
       assert.deepEqual(t2.worked, [], confirm);
@@ -1014,7 +1036,7 @@ test("群记忆里定过规矩的那类事：模型说「做」、再想一遍�
   }
 
   // 交给处理函数没做成：不占每小时的次数
-  const failing = await setup({ judge: "做", work: new Error("发不出去"), maxPerHour: 1 });
+  const failing = await setup({ judge: "做", work: new Error("发不出去"), maxPerHour: 1, rules: [WORK_RULE] });
   try {
     await failing.replier.consider(msg("om_1"));
     await failing.replier.consider(msg("om_2"));
@@ -1025,12 +1047,47 @@ test("群记忆里定过规矩的那类事：模型说「做」、再想一遍�
   }
 
   // 没配处理函数：提示词里没有「做」，模型说了也不算
-  const plain = await setup({ judge: "做" });
+  const plain = await setup({ judge: "做", rules: [WORK_RULE] });
   try {
     await plain.replier.consider(msg("om_1"));
     assert.doesNotMatch(plain.requests[0].system, /输出「做」/);
     assert.deepEqual(plain.replies, []);
     assert.equal(plain.confirms.length, 0);
+  } finally {
+    await plain.cleanup();
+  }
+});
+
+test("群记忆里的规矩说要 @ 它才查：不给模型「做」这个选择，模型说了「做」也不去做；同时有不用 @ 也查的规矩才给", async () => {
+  // 10-22 测试群：@ 它说「线上报错必须要 @ 你在直接帮忙查」记下了，没 @ 的 Redis 带宽报错它还是照规矩去查了
+  const mustAt = "线上报错必须先 @ 飞书 CLI，再由我直接帮忙查。后续群里遇到线上报错、告警、接口异常，需要 @ 我才会排查";
+  const t = await setup({ judge: "做", work: true, rules: [mustAt] });
+  try {
+    await t.replier.consider(msg("om_1", { content: "Redis 入方向带宽又被打满了，排查一下咋回事" }));
+    assert.deepEqual(t.worked, []);
+    assert.deepEqual(t.replies, []);
+    assert.equal(t.confirms.length, 0);
+    const system = t.requests[0].system;
+    assert.doesNotMatch(system, /输出「做」/);
+    assert.match(system, /规矩说这类事要 @ 你才处理的（比如「线上报错必须 @ 你再查」），这条没 @ 你就不接：不查，也不问要不要帮忙/);
+  } finally {
+    await t.cleanup();
+  }
+  // 群里另外定过不用 @ 也查的那类事：给「做」，哪类事归哪条规矩交给模型判断
+  const both = await setup({ judge: "做", work: true, rules: [mustAt, "告警不用 @ 你也直接帮忙查"] });
+  try {
+    await both.replier.consider(msg("om_1", { content: "告警又响了" }));
+    assert.match(both.requests[0].system, /第 2 种输出「做」/);
+    assert.deepEqual(both.worked, ["om_1"]);
+  } finally {
+    await both.cleanup();
+  }
+  // 群记忆里只有背景、没有规矩：也不给「做」
+  const plain = await setup({ judge: "做", work: true });
+  try {
+    await plain.replier.consider(msg("om_1"));
+    assert.doesNotMatch(plain.requests[0].system, /输出「做」/);
+    assert.deepEqual(plain.worked, []);
   } finally {
     await plain.cleanup();
   }
@@ -1093,7 +1150,7 @@ test("不像提问、不像报错的不先查；第一眼想开口的，再想�
     await t.cleanup();
   }
   // 照规矩去做的不在再想一遍前查：像被 @ 一样回答时会先查
-  const work = await setup({ judge: "做", work: true, knowledge: LESSONS });
+  const work = await setup({ judge: "做", work: true, knowledge: LESSONS, rules: [WORK_RULE] });
   try {
     await work.replier.consider(msg("om_1", { content: "下午测试库要迁移，大家注意一下" }));
     assert.deepEqual(work.looked, []);
