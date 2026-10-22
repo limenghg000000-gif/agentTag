@@ -5247,6 +5247,9 @@ test("按群限定了能改群记忆的人：名单外的人这次没有记、�
   assert.ok(!names.some((name) => ["memory_save", "memory_update", "memory_delete"].includes(name)), names.join(","));
   assert.match(asked.requests[0].system, /这个群只有指定的几个人能让你记、改、删群记忆（管理员按群配的），这次提问的人不在里面/);
   assert.doesNotMatch(asked.requests[0].system, /请他直接说「记住……」/);
+  // 「关于记忆」里也不再叫它记：没有记的工具时只留怎么看
+  assert.doesNotMatch(asked.requests[0].system, /memory_save|memory_update|memory_delete|主动记下|已记住/);
+  assert.match(asked.requests[0].system, /有人问你记得什么时，按类别列出记忆并带上编号/);
   assert.match(logs.join("\n"), /发起人不在能改群记忆的名单里，这次群记忆只能看 message=om_1 sender=ou_guest/);
 
   await handle(message("记住：发版固定在每周三", { messageId: "om_2", senderId: "ou_keeper" }));
@@ -5258,5 +5261,7 @@ test("按群限定了能改群记忆的人：名单外的人这次没有记、�
   const rule = asked.requests[2].tools?.map((t) => t.name) ?? [];
   assert.ok(!rule.some((name) => ["memory_save", "memory_update", "memory_delete"].includes(name)), rule.join(","));
   assert.match(asked.requests[2].system, /这次提问的人不在里面/);
-  assert.doesNotMatch(asked.requests[2].system, /这次只给了记群记忆的工具/);
+  assert.doesNotMatch(asked.requests[2].system, /这次只给了记群记忆的工具|memory_save|没说「记住」也算让你记住|已记住/);
+  // 名单里的人：「关于记忆」照旧教它怎么记
+  assert.match(asked.requests[1].system, /用 memory_save 记下/);
 });
