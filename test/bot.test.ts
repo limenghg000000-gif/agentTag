@@ -6,6 +6,7 @@ import { after, test } from "node:test";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
 import {
   askedInChinese,
+  asksNow,
   asksToMerge,
   asksToOpenRequest,
   BLOCKED_OPS_ANSWER,
@@ -1008,6 +1009,14 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     assert.ok(drafts.requests[i].tools?.some((t) => t.name === "knowledge_propose"), question);
     assert.ok(drafts.requests[i].tools?.some((t) => t.name === "knowledge_propose_archive"), question);
     assert.doesNotMatch(drafts.requests[i].system, /这次只给了记群记忆的工具/, question);
+  }
+});
+
+test("判断定规矩时是不是要现在查，很长的消息不会让正则卡住", () => {
+  for (const question of [`以后报错直接${"这次".repeat(50_000)}`, `以后报错直接帮忙${"顺便啊".repeat(30_000)}`, `以后报错别管${"，直接".repeat(30_000)}`]) {
+    const started = performance.now();
+    assert.equal(asksNow(question), false);
+    assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
   }
 });
 

@@ -158,18 +158,28 @@ const NOW_REQUEST =
 /** 指着眼前这件：「这个」「上面」「刚才那个」（「这个群」「这条规矩」说的是群、规矩，不算） */
 const THIS_ONE = String.raw`(?:这个|这条|这些|上面|刚才|那个|那条)(?!群|规矩|规定|约定|记忆)`;
 const LOOK_INTO = String.raw`(?:查|看|排查|分析|处理|跟进|定位|找|解释)`;
+/** 「现在」「这次」「顺便」（「从现在起」不算） */
+const NOW_WORD = /(?<!从)现在(?!起)|这次|眼下|顺便|顺手/;
+const LOOKS_INTO = new RegExp(LOOK_INTO);
+const RULE_SENTENCE_END = /[。.!?！？\n]/;
+/** 指着眼前这件要查（「这个」「上面那个」「刚才」） */
+const POINTS_AND_LOOKS = new RegExp(`${THIS_ONE}[^，。,.!?！？\n]{0,12}?${LOOK_INTO}|${LOOK_INTO}[^，。,.!?！？\n]{0,6}?${THIS_ONE}`);
+
 /**
- * 定规矩的那一小句里也算现在就要查的：说了「现在」「这次」「顺便」，后面又要查、看（隔多远、隔着逗号都算：「这次不用 @ 你，直接帮我查 Redis」），
+ * 定规矩的那一小句里也算现在就要查的：说了「现在」「这次」「顺便」，同一句里后面又要查、看（隔多远、隔着逗号都算：「这次不用 @ 你，直接帮我查 Redis」），
  * 或者指着眼前这件要查（「这个」「上面那个」「刚才」）。
- * 规矩本身说的「直接帮我查」「帮忙查一下」「马上帮我查」不算：「以后报错马上帮我查」是在定以后怎么做
+ * 规矩本身说的「直接帮我查」「帮忙查一下」「马上帮我查」不算：「以后报错马上帮我查」是在定以后怎么做。
+ * 「这次……查」不写成一个中间不限字数的正则：很长又没有查、看的消息，每个「这次」都要往后试到句末，几万字能卡住好几秒
  */
-const NOW_IN_RULE = new RegExp(
-  [
-    String.raw`(?:(?<!从)现在(?!起)|这次|眼下|顺便|顺手)[^。.!?！？\n]*?${LOOK_INTO}`,
-    String.raw`${THIS_ONE}[^，。,.!?！？\n]{0,12}?${LOOK_INTO}`,
-    String.raw`${LOOK_INTO}[^，。,.!?！？\n]{0,6}?${THIS_ONE}`,
-  ].join("|"),
-);
+function nowInRule(clause: string): boolean {
+  return (
+    POINTS_AND_LOOKS.test(clause) ||
+    clause.split(RULE_SENTENCE_END).some((sentence) => {
+      const now = NOW_WORD.exec(sentence);
+      return now !== null && LOOKS_INTO.test(sentence.slice(now.index + now[0].length));
+    })
+  );
+}
 const POINTS_AT_THIS = new RegExp(THIS_ONE);
 const RULE_CLAUSES = new RegExp(FUTURE_RULE.source, "g");
 const RULE_CLAUSE_END = /[，。,.;；!?！？\n]/;
@@ -177,10 +187,10 @@ const RULE_CLAUSE_END = /[，。,.;；!?！？\n]/;
 const RULE_GOES_ON = /^[，,]\s*(?:直接|也|就|都|一律|主动|自己)/;
 
 /**
- * 定规矩的这句话里还要它现在就查。定规矩的那一小句（从认出规矩的地方到下一个逗号、句号，逗号后面接着说「直接……」的也算）只看 NOW_IN_RULE，别的部分看 NOW_REQUEST：
+ * 定规矩的这句话里还要它现在就查。定规矩的那一小句（从认出规矩的地方到下一个逗号、句号，逗号后面接着说「直接……」的也算）只看 nowInRule，别的部分看 NOW_REQUEST：
  * 「以后报错直接帮我查」「以后告警直接帮忙查一下」是规矩本身；「以后告警别管，帮我分析 Redis 带宽」「以后告警别管先帮我看下这个 Redis」要现在查
  */
-function asksNow(question: string): boolean {
+export function asksNow(question: string): boolean {
   const rules: string[] = [];
   let rest = "";
   let from = 0;
@@ -207,7 +217,7 @@ function asksNow(question: string): boolean {
   }
   rest += question.slice(from);
   // 规矩以外的部分指着眼前这件（「……，上面这个也是」），也算要现在查
-  return NOW_REQUEST.test(rest) || POINTS_AT_THIS.test(rest) || rules.some((clause) => NOW_IN_RULE.test(clause));
+  return NOW_REQUEST.test(rest) || POINTS_AT_THIS.test(rest) || rules.some(nowInRule);
 }
 /** 这句话是在问（「这个告警不用管吗」「为什么不用 @ 你也查了」），不是在定规矩 */
 const ASKING = /[?？]\s*$|[吗么呢][。.!！~～\s]*$|为什么|为啥|怎么(?:回事|办|了)|咋(?:回事|办|了)|是不是|能不能|可不可以|会不会/;
