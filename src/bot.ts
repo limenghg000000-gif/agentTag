@@ -2383,52 +2383,88 @@ function ownPrefix(before: string): string {
 }
 
 /**
- * 说法后面还归它的字（编号常写在后面：「已建好定时任务 T2」）：同一个分句里往后看，「而」「并」这类字后面又说了做一件事的，到那儿为止。
- * 「已暂停 T1 并取消 T2」里 T2 不归暂停；「已取消定时任务 T1 和 T2」里「和」后面没说做什么，T2 也归取消
+ * 说法后面的字，按「而」「并」这类字后面又说了做一件事切开：第一段还归这个说法（编号常写在后面：「已建好定时任务 T2」），
+ * 后面每段是接着说的另一件事，连着它后面没再说做什么的几段（「并取消 T2 和 T3」）。
+ * 「已暂停 T1 并取消 T2」里 T2 不归暂停、归取消；「已取消定时任务 T1 和 T2」里「和」后面没说做什么，T2 也归取消
  */
-function ownTail(after: string): string {
-  const parts = (after.match(CLAUSE_AFTER)?.[0] ?? "").split(CONNECTOR);
-  const end = parts.findIndex((part) => STARTS_WITH_CONNECTOR.test(part) && SCHEDULE_ACTION.test(part));
-  return parts.slice(0, end === -1 ? parts.length : end).join("");
+function tailGroups(after: string): string[] {
+  const groups = [""];
+  for (const part of (after.match(CLAUSE_AFTER)?.[0] ?? "").split(CONNECTOR)) {
+    if (STARTS_WITH_CONNECTOR.test(part) && SCHEDULE_ACTION.test(part)) {
+      groups.push(part);
+    } else {
+      groups[groups.length - 1] += part;
+    }
+  }
+  return groups;
+}
+
+/** 「已暂停 T1 并取消 T2」里「并」后面接着说的：前面的「已」管到这儿，也是说做成了 */
+function followingClaim(verb: string): RegExp {
+  return new RegExp(String.raw`^[而并且和及同另还]+\s*(?:也|又|还|再)?\s*(?:(?:帮你|给你|为你)\s*)?${verb}${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`);
+}
+const FOLLOWING_CLAIMS = [
+  ["create", followingClaim(SCHEDULE_CREATE_VERB)],
+  ["change", followingClaim(SCHEDULE_CHANGE_VERB)],
+] as const;
+
+type ScheduleClaim = { kind: "create" | "change"; said: string; ids: string };
+
+/** 回答里说做成了的定时任务改动：说的是什么（看是哪种改动）、连着后面归它的字（找编号）。说以前的不算 */
+function scheduleClaims(answer: string): ScheduleClaim[] {
+  const claims: ScheduleClaim[] = [];
+  for (const [kind, pattern] of [
+    ["create", SCHEDULE_CREATED_CLAIM],
+    ["change", SCHEDULE_CHANGED_CLAIM],
+  ] as const) {
+    for (const match of answer.matchAll(pattern)) {
+      // 前面还归它的字里说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
+      if (EARLIER.test(ownPrefix(answer.slice(0, match.index))) || (OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0]))) {
+        continue;
+      }
+      // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
+      const [own = "", ...following] = tailGroups(answer.slice(match.index + match[0].length));
+      claims.push({ kind, said: match[0], ids: match[0] + own });
+      for (const group of following) {
+        const [next, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, group.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
+        if (next !== undefined && said !== undefined) {
+          claims.push({ kind: next, said, ids: group });
+        }
+      }
+    }
+  }
+  return claims;
 }
 
 /**
  * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change。
  * 调成了的，说到的编号（T2）还要在这次的工具结果里：建了 T3 说成 T4 不算。
  * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算；
- * 说暂停、取消、恢复了的，那个任务现在也得是这个状态（照这次的回执，没改过的照列表）。
+ * 说暂停、取消、恢复了的，那个任务现在也得是这个状态（照这次的回执，没改过的照列表）；没写编号的，这次的回执里得有这么一个改动。
  * known 是这次定时任务工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
-  const kinds: Array<"create" | "change"> = [];
   const listed = (id: string) => new RegExp(`(?<![A-Za-z0-9])${id}(?!\\d)`).test(known);
-  for (const [kind, pattern, tool] of [
-    ["create", SCHEDULE_CREATED_CLAIM, SCHEDULE_CREATE_TOOL],
-    ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
-  ] as const) {
-    // 说以前的不算：前面还归它的字里说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
-    const claims = [...answer.matchAll(pattern)]
-      .filter((match) => !EARLIER.test(ownPrefix(answer.slice(0, match.index))) && !(OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0])))
-      // 编号看说法本身和后面还归它的字；是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
-      .map((match) => ({ said: match[0], ids: match[0] + ownTail(answer.slice(match.index + match[0].length)) }));
-    const backed = ({ said, ids: text }: { said: string; ids: string }) => {
-      const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
-      if (!succeeded.has(tool) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
-        return false;
-      }
-      if (kind === "create") {
-        return ids.every(listed);
-      }
-      // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
-      // 暂停了说成取消、列表写着还在跑说成已取消，都不算
-      const state = CHANGE_STATES.find(([verb]) => verb.test(said))?.[1];
-      return state !== undefined && ids.every((id) => state.test(taskState(known, id) ?? ""));
-    };
-    if (claims.some((claim) => !backed(claim))) {
-      kinds.push(kind);
+  const backed = ({ kind, said, ids: text }: ScheduleClaim) => {
+    const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
+    if (!succeeded.has(kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
+      return false;
     }
-  }
-  return kinds;
+    if (kind === "create") {
+      return ids.every(listed);
+    }
+    // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
+    // 暂停了说成取消、列表写着还在跑说成已取消，都不算；没写编号的（「已取消定时任务」），这次的回执里得有一条是取消
+    const state = CHANGE_STATES.find(([verb]) => verb.test(said))?.[1];
+    if (state === undefined) {
+      return false;
+    }
+    return ids.length === 0
+      ? known.split("\n").some((line) => CHANGE_RECEIPT.test(line) && state.test(line.slice(0, 3)))
+      : ids.every((id) => state.test(taskState(known, id) ?? ""));
+  };
+  const wrong = new Set(scheduleClaims(answer).filter((claim) => !backed(claim)).map((claim) => claim.kind));
+  return (["create", "change"] as const).filter((kind) => wrong.has(kind));
 }
 
 /**
@@ -2440,6 +2476,9 @@ const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
   [/取消|删除|删掉/, /^已取消/],
   [/暂停|停掉|停用|关掉/, /暂停/],
 ];
+
+/** schedule_change 的回执：「已暂停定时任务 T1：…」 */
+const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 T\d+[：:]/;
 
 /** 这个编号现在的状态：这次改过的看最后一条回执，没改过的看列表那一行的最后一段 */
 function taskState(known: string, id: string): string | undefined {
