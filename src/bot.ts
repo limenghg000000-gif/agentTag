@@ -764,7 +764,8 @@ async function runTask(
             }
           }
           if (SCHEDULE_TOOLS.has(tool.spec.name)) {
-            scheduleTexts.push(output);
+            // 建好的回执只留第一行：后面「到点做的事」是建任务的人写的原话，可能有好几行，不能当回执、列表用
+            scheduleTexts.push(tool.spec.name === SCHEDULE_CREATE_TOOL ? (output.split("\n")[0] ?? "") : output);
           }
           if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
             mergedNow = true;
@@ -2487,7 +2488,9 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
  * known 是这次定时任务工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
-  const listed = (id: string) => new RegExp(`(?<![A-Za-z0-9])${id}(?!\\d)`).test(known);
+  // 编号只认工具自己写的位置（回执开头、列表每行开头），任务内容里写着的 T4 不算
+  const lines = known.split("\n");
+  const listed = (id: string) => lines.some((line) => line.match(SCHEDULE_ENTRY)?.[1] === id);
   const backed = ({ kind, said, ids: text }: ScheduleClaim) => {
     const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
     if (!succeeded.has(kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
@@ -2495,7 +2498,7 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     }
     if (kind === "create") {
       // 这次建成了的，说到的编号里得有这次建的那个：建了 T3、列表里原来就有 T4，说「已建好定时任务 T4」不算
-      const created = (id: string) => new RegExp(`^已建好定时任务 ${id}(?!\\d)`, "m").test(known);
+      const created = (id: string) => lines.some((line) => line.startsWith(`已建好定时任务 ${id}（`));
       return ids.every(listed) && (!succeeded.has(SCHEDULE_CREATE_TOOL) || ids.length === 0 || ids.some(created));
     }
     // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
@@ -2509,7 +2512,7 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
       return ids.every(now);
     }
     // 没写编号的（「已暂停定时任务」），这次改过的任务里得有一个现在真是这样：暂停了、后来又被人恢复了的不算
-    return known.split("\n").some((line) => {
+    return lines.some((line) => {
       const id = line.match(CHANGE_RECEIPT)?.[1];
       return id !== undefined && now(id);
     });
@@ -2528,6 +2531,8 @@ const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
   [/暂停|停掉|停用|关掉/, /暂停/],
 ];
 
+/** 工具自己写的编号位置：schedule_create 回执「已建好定时任务 T3（…」、schedule_change 回执「已暂停定时任务 T1：…」、schedule_list 每行「- T1 · …」 */
+const SCHEDULE_ENTRY = /^(?:已建好定时任务 |已(?:暂停|恢复|取消)定时任务 |- )(T\d+)(?:（| · |[：:])/;
 /** schedule_change 的回执：「已暂停定时任务 T1：…」 */
 const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 (T\d+)[：:]/;
 
