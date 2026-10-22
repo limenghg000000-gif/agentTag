@@ -140,6 +140,16 @@ const RULE_REQUEST = new RegExp(
 );
 
 /**
+ * 定规矩的这句话里同时让它现在就查、就看的：「以后告警别管，先帮我看下这个 Redis」「上面那个不用管了，查一下 Redis」「这次也直接查」。
+ * 规矩本身的「直接帮忙查」不算，「从现在起」不算
+ */
+const NOW_REQUEST = /(?:(?<!从)现在(?!起)|这次|眼下|马上|立刻|立即|顺便|顺手)[^，。,.!?！？\n]{0,6}?(?:查|看|排查|分析|处理|跟进)|(?:查|看|排查|分析|处理)(?:一?下|看)/;
+/** 这句话是在问（「这个告警不用管吗」），不是在定规矩 */
+const ASKING = /[?？]\s*$|[吗么呢][。.!！~～\s]*$/;
+/** 只是在定规矩时给的工具：记、改、删、查群记忆 */
+const RULE_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search"]);
+
+/**
  * 提问本身要建定时任务、要它以后或定期做事：「每周一 9 点汇总」「明天提醒我」「工作日每天查一下」「定时任务」。
  * 说了这些的不当成整理之前的内容（「每周一总结一下这个话题」要建任务，不是现在就总结）
  */
@@ -556,6 +566,19 @@ async function runTask(
     if (restate) {
       logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
     }
+    // 只是在给它定以后的规矩（没同时说现在就查哪件事、不是在问）：只给记群记忆的工具，不查经验库。
+    // 2026-10-22 在群主界面 @ 它说「改一下线上报错不需要 @ 你直接帮忙查」，提示词说了只记不查，它记完还是把群聊里的 Redis 报错查了一遍
+    const ruleOnly =
+      !followUp &&
+      !restate &&
+      scheduled === undefined &&
+      options.proactive !== true &&
+      RULE_REQUEST.test(question) &&
+      !NOW_REQUEST.test(question) &&
+      !ASKING.test(question.trim());
+    if (ruleOnly) {
+      logger.info(`给它定规矩，这次只给记群记忆的工具，不查经验库 message=${msg.messageId}`);
+    }
     // 经验库一个话题只自动查成一次：这个话题已经查成过（不管查没查到），后面的追问不再查（查到的经验那次回答已经用上了），
     // 追问里有新线索时模型自己用 knowledge_search 查。没查成过的（超时、出错、只查成一边、那次是整理不查、重启后记不得）照样查。
     // 追问里明说要查经验库、知识库的也照样先查
@@ -563,14 +586,14 @@ async function runTask(
     const before = earlierResults(deps).list(topicKey);
     const earlier = followUp || LIVE_REQUEST.test(question) || FRESH_REQUEST.test(question) ? [] : before;
     // 这个话题之前查过（记着查到的结果）、这次没说要从头查：接着之前的结论只补查缺的那块，不从定位服务开始把之前的步骤重走一遍
-    const continuing = before.length > 0 && !restate && !REDO_REQUEST.test(question);
+    const continuing = before.length > 0 && !restate && !ruleOnly && !REDO_REQUEST.test(question);
     const topics = lookedUpTopics(deps);
-    const lookupSkipped = !restate && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
+    const lookupSkipped = !restate && !ruleOnly && topics.has(taskContext.threadKey) && !ASKS_KNOWLEDGE.test(question);
     if (lookupSkipped) {
       logger.info(`这个话题查过经验库了，这次追问不再自动查 message=${msg.messageId}`);
     }
     const knowledge =
-      restate || lookupSkipped
+      restate || lookupSkipped || ruleOnly
         ? undefined
         : await lookupKnowledge(deps, taskContext, askedFull, history, task.signal, state, () => card?.update(render()));
     if (knowledge && !knowledge.missed?.length) {
@@ -809,6 +832,7 @@ async function runTask(
         !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
         !(draftsLocked && KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) &&
         !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
+        !(ruleOnly && !RULE_TOOLS.has(tool.spec.name)) &&
         // 合并只在发起人这句话明确要合并时给：群记忆、话题里别人的话、合并请求描述里写着「直接合掉」也不会让它去合
         (tool.spec.name !== MERGE_TOOL || asksToMerge(question)) &&
         (createDoc || tool.spec.name !== "feishu_doc_create"),
@@ -913,6 +937,7 @@ async function runTask(
         ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         restate,
+        ...(ruleOnly ? { ruleOnly: true } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),

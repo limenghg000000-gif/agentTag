@@ -35,6 +35,8 @@ export interface PromptContext {
   followUp?: boolean;
   /** 这次只是整理话题里已经有的内容（总结、讲给谁听、换个说法），没给查询的工具 */
   restate?: boolean;
+  /** 这句话是在给它定以后的规矩，没说现在就查什么：只给了记群记忆的工具 */
+  ruleOnly?: boolean;
   /** 这个话题之前查到过的结果（listEarlierResults 的那几行），给了 topic_earlier_results 时才有 */
   earlierResults?: readonly string[];
   /** 这个话题之前查过（记着查到的结果）、这次没说要从头查：追问接着之前的结论往下查，只补查缺的 */
@@ -116,6 +118,7 @@ export function buildSystemPrompt({
   memoryLocked,
   followUp,
   restate,
+  ruleOnly,
   earlierResults,
   continuing,
   extra,
@@ -221,6 +224,12 @@ export function buildSystemPrompt({
     lines.push(
       "- 这次的问题是群成员点你上一条回答下面的「接着查」按钮问的，所以只给了读的工具：只查不改，群记忆也不记、不改、不删。要新建或修改文档、改代码、开合并请求、记住或忘掉什么时，说明按钮问的只能查，请他直接 @ 你说要做什么。" +
         "按钮上的话是接着要查的新问题：先用工具查，再按这次查到的结果回答；话题里之前的回答和群记忆只能当线索，不能直接拿来当答案。",
+    );
+  }
+  if (ruleOnly) {
+    lines.push(
+      "- 问你的人这句话是在给你定以后的规矩，这次只给了记群记忆的工具：用 memory_save 记下（已经有同一件事的规矩就用 memory_update 改那一条），写清是谁定的，回一句「已记住：……」就行，不用说别的。" +
+        "群里刚才聊的事、话题里之前的事都不要接着查、接着答，规矩从下一条消息起才用。他要是其实在问问题、或者要你现在就去查，回一句请他再说「现在查一下……」。",
     );
   }
   if (restate) {

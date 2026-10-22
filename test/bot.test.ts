@@ -891,6 +891,54 @@ test("给机器人定以后的规矩，没说「记住」也给记群记忆的�
   assert.deepEqual(plain.requests[2].tools?.map((t) => t.name) ?? [], []);
 });
 
+test("只是在定规矩（没说现在就查、不是在问）：只给记群记忆的工具，不查经验库；同时说了现在查一下、在问的照常给", async () => {
+  const memory = await memoryStore();
+  const { model, requests } = fakeModel(() => ({ text: "已记住", finish: "stop" }));
+  // 2026-10-22：@ 它说「改一下线上报错不需要 @ 你直直接帮忙查」，它记完又把群聊里的 Redis 报错查了一遍
+  const chat = `${CHAT_CONTEXT_HEADER}\n[赵作武 22:40] Redis 入方向带宽又被打满了，排查一下咋回事`;
+  const withChat = fakeContext({ history: [{ role: "user", content: chat }], source: "chat" }).source;
+  const queries: string[] = [];
+  const logs: string[] = [];
+  const aiops: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => "[]",
+  };
+  const { handle } = setup({
+    model,
+    memory,
+    context: withChat,
+    tools: [aiops],
+    knowledge: {
+      lookup: async (query: string) => {
+        queries.push(query);
+        return undefined;
+      },
+      tools: () => [],
+    },
+    logger: { info: (line: string) => logs.push(line), warn: () => {}, error: () => {} },
+  });
+  const memoryTools = ["memory_save", "memory_update", "memory_delete"];
+
+  for (const [i, question] of ["改一下线上报错不需要 @ 你直直接帮忙查", "记住：以后告警别管", "从现在起，报错直接帮忙查"].entries()) {
+    await handle(message(question, { messageId: `om_r${i}` }));
+    assert.deepEqual(requests[i].tools?.map((t) => t.name), memoryTools, question);
+    assert.match(requests[i].system, /这次只给了记群记忆的工具/, question);
+  }
+  assert.deepEqual(queries, []);
+  assert.match(logs.join("\n"), /给它定规矩，这次只给记群记忆的工具，不查经验库 message=om_r0/);
+
+  // 同时说了现在就查、或者是在问：照常给查的工具、查经验库
+  const asks = ["以后告警别管，先帮我看下这个 Redis", "上面那个报错不用管了，查一下 Redis", "这次也不用 @ 你，现在就查 Redis", "这个告警不用管吗？"];
+  for (const [i, question] of asks.entries()) {
+    const n = 3 + i;
+    await handle(message(question, { messageId: `om_a${i}` }));
+    assert.deepEqual(requests[n].tools?.map((t) => t.name), ["aiops_query_logs", ...memoryTools], question);
+    assert.doesNotMatch(requests[n].system, /这次只给了记群记忆的工具/, question);
+  }
+  assert.equal(queries.length, asks.length);
+});
+
 test("群里还没有记忆时也告诉模型可以记", async () => {
   const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
   const { handle } = setup({ model, memory: await memoryStore() });
