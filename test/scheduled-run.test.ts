@@ -446,6 +446,10 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
     "已建好文档《提醒事项》。",
     "已新建一篇《提醒事项》：https://x.feishu.cn/docx/abc",
     "已建好飞书文档「提醒清单」",
+    "定时任务没有创建成功，时间格式不正确。",
+    "定时任务未创建成功：缺少文档链接",
+    "T3 没有取消成功，请稍后再试",
+    "还没给你建好定时任务，要先 @ 我把时间说全",
   ];
   for (const answer of fine) {
     assert.deepEqual(unbackedScheduleClaims(answer, new Set(), ""), [], answer);
@@ -486,6 +490,7 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 和 T3。", new Set(["schedule_change"]), threeReceipts), []);
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 和 T3。", new Set(["schedule_change"]), twoReceipts), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并建好文档《周报》。", new Set(["schedule_change"]), pausedReceipt), []);
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 但没取消 T2。", new Set(["schedule_change"]), pausedReceipt), []);
   // 没写编号的，这次的回执里得有这么一个改动：暂停了说成「已取消定时任务」不算
   assert.deepEqual(unbackedScheduleClaims("已取消定时任务。", new Set(["schedule_change"]), pausedReceipt), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("已暂停定时任务。", new Set(["schedule_change"]), pausedReceipt), []);

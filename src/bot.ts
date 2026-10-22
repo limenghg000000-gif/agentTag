@@ -2332,8 +2332,8 @@ const TASK_ID = String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`;
 /** 说的是定时任务：定时任务、周期任务、提醒（「告警提醒」不算）、T3 */
 const SCHEDULE_OBJECT = String.raw`(?:定时任务|周期任务|(?<!告警)提醒|${TASK_ID})`;
 /** 一个分句里接着往下说的字：「而」「并」「和」这类。按它切开，切出来的每一段（除了开头那段）都以它开头 */
-const CONNECTOR = /(?=[而并且和及同另还])/;
-const STARTS_WITH_CONNECTOR = /^[而并且和及同另还]/;
+const CONNECTOR = /(?=[而并且和及同另还但])/;
+const STARTS_WITH_CONNECTOR = /^[而并且和及同另还但]/;
 /**
  * 说法和定时任务之间的字：同一个分句里，不跨书名号，中间也没说到别的东西。
  * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
@@ -2348,16 +2348,19 @@ const CLAUSE_AFTER = /^[^，,。；;！!？?\n]*/;
 /** 先说定时任务、再说做了什么的写法（「T1 已取消」） */
 const OBJECT_FIRST = new RegExp(String.raw`^${SCHEDULE_OBJECT}`);
 
+/** 说没做成的：「定时任务没有创建成功」「还没给你建好」「T3 未取消」 */
+const NEGATION = String.raw`(?:没|未|不|无法)`;
+
 function scheduleClaim(verb: string): RegExp {
   return new RegExp(
     [
       // 「已建好定时任务 T2」「已经帮你设置每天 15:34 的提醒」「已暂停 T3」。「已建好的定时任务有…」说的是有哪些，不算
       String.raw`已经?\s*(?:(?:帮你|给你|为你)\s*)?${verb}(?![好了]*的)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
-      // 「帮你建好了定时任务」「给你暂停了 T3」。「我帮你建一个定时任务吧」是在问，不算
-      String.raw`(?:帮你|给你|为你)\s*${verb}(?:好|了|掉)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
+      // 「帮你建好了定时任务」「给你暂停了 T3」。「我帮你建一个定时任务吧」是在问，「还没给你建好定时任务」是没做成，都不算
+      String.raw`(?<!${NEGATION}\s*)(?:帮你|给你|为你)\s*${verb}(?:好|了|掉)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
       // 「定时任务 T2 已建好」「提醒已设置」「T3 已被你暂停」「定时任务建好了」「T3 暂停了」。「T3 暂停了吗」是在问
-      // 「定时任务创建成功后会通知你」说的是以后
-      String.raw`${SCHEDULE_OBJECT}${CLAIM_GAP}{0,6}?(?:已经?\s*(?:被${CLAIM_GAP}{0,8}?)?${verb}|${verb}(?:好了|了|成功)(?![吗么呢后]|以后|之后))`,
+      // 「定时任务创建成功后会通知你」说的是以后；「定时任务没有创建成功」是没做成
+      String.raw`${SCHEDULE_OBJECT}(?:(?!${NEGATION})${CLAIM_GAP}){0,6}?(?:已经?\s*(?:被${CLAIM_GAP}{0,8}?)?${verb}|${verb}(?:好了|了|成功)(?![吗么呢后]|以后|之后))`,
     ].join("|"),
     "g",
   );
@@ -2401,7 +2404,7 @@ function tailGroups(after: string): string[] {
 
 /** 「已暂停 T1 并取消 T2」里「并」后面接着说的：前面的「已」管到这儿，也是说做成了 */
 function followingClaim(verb: string): RegExp {
-  return new RegExp(String.raw`^[而并且和及同另还]+\s*(?:也|又|还|再)?\s*(?:(?:帮你|给你|为你)\s*)?${verb}${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`);
+  return new RegExp(String.raw`^[而并且和及同另还但]+\s*(?:也|又|还|再)?\s*(?:(?:帮你|给你|为你)\s*)?${verb}${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`);
 }
 const FOLLOWING_CLAIMS = [
   ["create", followingClaim(SCHEDULE_CREATE_VERB)],
