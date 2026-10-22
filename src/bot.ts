@@ -2498,11 +2498,10 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
     .flatMap(([kind, pattern]) => [...answer.matchAll(pattern)].map((match) => ({ kind, match })))
     .sort((a, b) => a.match.index - b.match.index);
   const earlier = saidEarlier(answer, matches.map(({ match }) => match.index));
-  // 下一个说法从哪儿开始（同一处开始的另一种说法不算）
-  const nextStarts = matches.map(() => answer.length);
+  // 下一个说法是第几个（同一处开始的另一种说法不算）
+  const nextOf = matches.map(() => -1);
   for (let index = matches.length - 2; index >= 0; index--) {
-    const after = matches[index + 1]!.match.index;
-    nextStarts[index] = after > matches[index]!.match.index ? after : nextStarts[index + 1]!;
+    nextOf[index] = matches[index + 1]!.match.index > matches[index]!.match.index ? index + 1 : nextOf[index + 1]!;
   }
   const claims: ScheduleClaim[] = [];
   matches.forEach(({ kind, match }, index) => {
@@ -2511,15 +2510,21 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
       return;
     }
     const end = match.index + match[0].length;
+    const nextMatch = matches[nextOf[index]!]?.match;
+    const tail = answer.slice(end, Math.max(end, nextMatch?.index ?? answer.length));
     // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
-    const [own = "", ...following] = tailGroups(answer.slice(end, Math.max(end, nextStarts[index]!)));
+    const [own = "", ...following] = tailGroups(tail);
     claims.push({ kind, said: match[0], ids: match[0] + own.replace(ASIDE, "") });
-    for (const group of following) {
-      const [followingKind, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, group.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
+    // 接着说的最后一段一直连到下一个说法、下一个说法又是先说任务的（「已暂停 T1 并取消 T2（之前已暂停）」里的「T2（之前已暂停」），
+    // 那个任务也是这段说的：「并取消」归 T2
+    const reached = nextMatch !== undefined && OBJECT_FIRST.test(nextMatch[0]) && CLAUSE_AFTER.exec(tail)?.[0].length === tail.length;
+    following.forEach((group, at) => {
+      const text = reached && at === following.length - 1 ? group + nextMatch[0] : group;
+      const [followingKind, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, text.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
       if (followingKind !== undefined && said !== undefined) {
-        claims.push({ kind: followingKind, said, ids: group.replace(ASIDE, "") });
+        claims.push({ kind: followingKind, said, ids: text.replace(ASIDE, "") });
       }
-    }
+    });
   });
   return claims;
 }
