@@ -534,6 +534,18 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   const pausedT3 = `${twoReceipts}\n已暂停定时任务 T3：每月 1 号，月报`;
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 而 T3 现在已暂停。", new Set(["schedule_change"]), pausedT3), []);
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 而 T3 现在已暂停。", new Set(["schedule_change"]), threeReceipts), ["change"]);
+  // 「和」「、」接着列的任务，正好是下一个说法的开头，也归「并取消」
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 和 T3（之前已暂停）。", new Set(["schedule_change"]), pausedT3), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 和 T3（之前已暂停）。", new Set(["schedule_change"]), threeReceipts), []);
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2、T3（之前已暂停）。", new Set(["schedule_change"]), pausedT3), ["change"]);
+  // 说法自己接着列的、还没写是哪个任务的，也一样
+  const cancelledT2PausedT3 = "已取消定时任务 T2：每周一 09:00，周报\n已暂停定时任务 T3：每月 1 号，月报";
+  const cancelledT2T3 = "已取消定时任务 T2：每周一 09:00，周报\n已取消定时任务 T3：每月 1 号，月报";
+  assert.deepEqual(unbackedScheduleClaims("已取消 T2 和 T3（之前已暂停）。", new Set(["schedule_change"]), cancelledT2PausedT3), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已取消 T2 和 T3（之前已暂停）。", new Set(["schedule_change"]), cancelledT2T3), []);
+  const cancelledT5 = "已取消定时任务 T5：每月 1 号，月报";
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T2（之前已暂停）。", new Set(["schedule_change"]), cancelledT5), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T2（之前已暂停）。", new Set(["schedule_change"]), cancelledT2T3), []);
 });
 
 test("回答再长、说法再多，定时任务说法检查也很快算完，不会把机器人卡住", () => {
