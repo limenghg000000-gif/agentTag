@@ -960,6 +960,9 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     "以后这类报错直接帮我查，上面这个也是",
     "以后告警别管现在先帮我定位 Redis 故障",
     "这次不用 @ 你直接帮我查 Redis",
+    "这次不用 @ 你，直接帮我查 Redis",
+    "这次线上 Redis 报错不用 @ 你，直接帮忙排查",
+    "刚才那个不用 @ 你，直接帮我查",
   ];
   for (const [i, question] of asks.entries()) {
     const n = rules.length + i;
