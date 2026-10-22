@@ -952,6 +952,29 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     assert.doesNotMatch(plain.requests[i].system, /这次只给了记群记忆的工具/, question);
   }
   assert.ok(plain.requests[0].tools?.some((t) => t.name === "schedule_create"));
+
+  // 要沉淀、归档经验的：照常给起草经验卡片的工具，不当成只是在定规矩
+  const draft = (name: string): Tool => ({
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "",
+  });
+  const drafts = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle: settle } = setup({
+    model: drafts.model,
+    memory,
+    context: withChat,
+    knowledge: {
+      lookup: async () => undefined,
+      tools: () => [draft("knowledge_search"), draft("knowledge_get"), draft("knowledge_propose"), draft("knowledge_propose_archive")],
+    },
+  });
+  for (const [i, question] of ["以后告警别管，把这个结论沉淀成经验", "以后告警别管，把过时的经验 K3 归档"].entries()) {
+    await settle(message(question, { messageId: `om_k${i}` }));
+    assert.ok(drafts.requests[i].tools?.some((t) => t.name === "knowledge_propose"), question);
+    assert.ok(drafts.requests[i].tools?.some((t) => t.name === "knowledge_propose_archive"), question);
+    assert.doesNotMatch(drafts.requests[i].system, /这次只给了记群记忆的工具/, question);
+  }
 });
 
 test("群里还没有记忆时也告诉模型可以记", async () => {
