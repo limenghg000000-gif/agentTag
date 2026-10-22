@@ -10,7 +10,7 @@ import {
   type Prompt as RemotePrompt,
   type Tool as RemoteTool,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { McpServerConfig } from "./config.js";
+import type { McpScope, McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
 import { findSensitive } from "./knowledge.js";
 import { RESULT_NOTES } from "./mcp-notes.js";
@@ -74,6 +74,14 @@ const SUBJECT_KEYS = [
   "promql",
   "query",
 ];
+
+/** 按群收窄以后的 MCP（见 McpHub.scoped），和 BotDeps 里的 mcp 一样 */
+export interface ScopedMcp {
+  readonly names: readonly string[];
+  tools(task: McpTaskContext): Tool[];
+  prompt(toolNames: readonly string[]): string | undefined;
+  thinksAfter(name: string): boolean;
+}
 
 /** MCP 工具调用要记进审计日志的信息 */
 export interface McpTaskContext {
@@ -183,13 +191,39 @@ export class McpHub {
     await Promise.all(this.servers.map((server) => server.conn.close()));
   }
 
-  /** 给一个任务用的 MCP 工具，名字带服务名前缀（aiops_diagnose_service）；服务端下发了剧本的，再加一个读剧本的工具（aiops_playbook） */
-  tools(task: McpTaskContext): Tool[] {
+  /**
+   * 给一个任务用的 MCP 工具，名字带服务名前缀（aiops_diagnose_service）；服务端下发了剧本的，再加一个读剧本的工具（aiops_playbook）。
+   * scope 是这个群能用的服务和工具（按群配置）：没列的服务一个工具都不给，列了工具的只给其中全局也开了的；不传时全局开了的都给
+   */
+  tools(task: McpTaskContext, scope?: McpScope): Tool[] {
     return this.servers.flatMap((server) => {
+      const allowed = scope ? scope.get(server.config.name) : "*";
+      if (allowed === undefined) {
+        return [];
+      }
       const budget: TaskBudget = { playbooks: new Map(), calls: 0, chars: 0, results: new Map() };
-      const tools = server.enabled.map((remote) => this.wrap(server, remote, task, budget));
-      return server.playbooks.length > 0 ? [...tools, this.playbookTool(server, task, budget)] : tools;
+      const enabled = allowed === "*" ? server.enabled : server.enabled.filter((remote) => allowed.includes(remote.name));
+      const tools = enabled.map((remote) => this.wrap(server, remote, task, budget));
+      // 剧本是排查的说明：群里只开了这个服务的几个工具、其中一个都没连上时不给
+      return server.playbooks.length > 0 && (allowed === "*" || tools.length > 0) ? [...tools, this.playbookTool(server, task, budget)] : tools;
     });
+  }
+
+  /**
+   * 按群配置收窄以后交给回答用的一套（名字、工具、使用说明只有这个群能用的服务）。这个群一个服务都不能用时返回 undefined，
+   * 回答时就当没接 MCP
+   */
+  scoped(scope: McpScope): ScopedMcp | undefined {
+    const names = this.names.filter((name) => scope.has(name));
+    if (names.length === 0) {
+      return undefined;
+    }
+    return {
+      names,
+      tools: (task) => this.tools(task, scope),
+      prompt: (toolNames) => this.prompt(toolNames, scope),
+      thinksAfter: (name) => this.thinksAfter(name),
+    };
   }
 
   /** 这个工具来自哪个 MCP 服务（名字以「服务名_」开头）；不是 MCP 的工具返回 undefined */
@@ -252,11 +286,22 @@ export class McpHub {
    * 写进系统提示词的说明：这次任务带了哪个服务的工具，就写那个服务的使用说明（服务端下发的 + 飞书这边的补充）；
    * 配了但还没连上的服务说明一句，免得模型凭空回答
    */
-  prompt(toolNames: readonly string[]): string | undefined {
+  prompt(toolNames: readonly string[], scope?: McpScope): string | undefined {
     const sections = this.servers.flatMap((server) => {
       const { name } = server.config;
+      // 这个群不能用的服务不提：提了模型会说「连不上」「没开」，让人去找管理员
+      if (scope && !scope.has(name)) {
+        return [];
+      }
       if (toolNames.some((tool) => tool.startsWith(`${name}_`))) {
-        return [this.serverPrompt(server)];
+        const allowed = scope?.get(name);
+        // 服务端的说明里会提到全部工具：这个群只开了其中几个时说清楚，免得模型去调没给它的
+        return [
+          this.serverPrompt(server) +
+            (Array.isArray(allowed)
+              ? `\n\n这个群只开了 ${name} 的这几个工具：${allowed.map((tool) => toolName(name, tool)).join("、")}。上面说明里提到的其他 ${name} 工具这里没有，要用的话如实说这个群没开、请他找管理员。`
+              : ""),
+        ];
       }
       if (!server.synced) {
         return [
