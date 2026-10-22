@@ -256,9 +256,10 @@ export class AdminDesk {
   }
 
   private async groupSession(chatId: string, opener: Person): Promise<GroupSession> {
+    // 版本号和表单要同一时刻取：下面读群成员、群名要等，这期间别人存了的话，旧表单配上新版本号确认时就会盖掉别人的改动
+    const version = this.opts.settings.version(chatId);
     const draft = structuredClone(this.opts.settings.override(chatId) ?? {});
-    const listed = [...(draft.writeAllowed ?? []), ...(draft.memoryEditors ?? [])];
-    const { people, note } = await this.members(chatId, listed, "这个群");
+    const { people, note } = await this.members(chatId, this.listed(chatId, draft), "这个群");
     return {
       kind: "group",
       id: randomUUID(),
@@ -267,7 +268,7 @@ export class AdminDesk {
       rev: 0,
       chatId,
       name: await this.chatName(chatId),
-      version: this.opts.settings.version(chatId),
+      version,
       draft,
       people,
       ...(note ? { peopleNote: note } : {}),
@@ -277,6 +278,8 @@ export class AdminDesk {
   }
 
   private async adminsSession(opener: Person): Promise<AdminsSession> {
+    // 同 groupSession：版本号和名单在等群成员之前一起取
+    const version = this.opts.settings.version(ADMINS_TARGET);
     const draft = [...this.opts.settings.admins()];
     const { people, note } = await this.members(this.opts.chatId, draft, "管理群");
     return {
@@ -285,13 +288,22 @@ export class AdminDesk {
       createdAt: this.now(),
       opener,
       rev: 0,
-      version: this.opts.settings.version(ADMINS_TARGET),
+      version,
       draft,
       people: people.filter((openId) => !this.opts.owners.has(openId)),
       ...(note ? { peopleNote: note } : {}),
       view: "form",
       changes: [],
     };
+  }
+
+  /**
+   * 名单里已经有的人：卡片上定的，加上照服务器上的配置现在用的（.env 里这个群的或全局的）。
+   * 读不到群成员、群里人多没列全时，这些人也要能选，才能从现在的名单里减人
+   */
+  private listed(chatId: string, draft: GroupOverride): string[] {
+    const base = this.opts.groups.of(chatId, { card: false });
+    return unique([...(draft.writeAllowed ?? []), ...(draft.memoryEditors ?? []), ...(base.writeAllowed ?? []), ...(base.memoryEditors ?? [])]);
   }
 
   /** 能选的人：群成员加上名单里已经有的。读不到群成员时只有名单里的人，附一句说明 */
@@ -534,7 +546,7 @@ export class AdminDesk {
   private reloadGroup(session: GroupSession): void {
     session.version = this.opts.settings.version(session.chatId);
     session.draft = structuredClone(this.opts.settings.override(session.chatId) ?? {});
-    session.people = unique([...session.people, ...(session.draft.writeAllowed ?? []), ...(session.draft.memoryEditors ?? [])]);
+    session.people = unique([...session.people, ...this.listed(session.chatId, session.draft)]);
     session.view = "form";
     session.changes = [];
   }
@@ -848,7 +860,8 @@ export class AdminDesk {
           ...(canPick || (list?.length ?? 0) > 0 ? [["list", "只有下面选的人"] as [string, string]] : []),
           ["none", "谁都不能"],
         ]),
-        ...(canPick ? [personSelect(key, session.people, (list ?? []).filter((openId) => session.people.includes(openId)))] : []),
+        // 照服务器上的配置时先勾上现在的名单：改成「只有下面选的人」时在它上面减人就行
+        ...(canPick ? [personSelect(key, session.people, (list ?? [...(now ?? [])]).filter((openId) => session.people.includes(openId)))] : []),
       );
     }
     if (session.peopleNote) {

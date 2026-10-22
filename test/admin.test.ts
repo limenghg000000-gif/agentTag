@@ -34,11 +34,11 @@ interface Sent {
   messageId: string;
 }
 
-async function setup(opts: { allowAdminChat?: boolean; directory?: boolean } = {}) {
+async function setup(opts: { allowAdminChat?: boolean; directory?: boolean; env?: Record<string, string>; onMembers?: () => Promise<void> } = {}) {
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), "agenttag-admin-")), "settings");
   const settings = new GroupSettings({ dir, logger: quiet });
   await settings.init();
-  const config = loadConfig({ ...env, ...(opts.allowAdminChat ? { FEISHU_ALLOWED_CHAT_IDS: `${env.FEISHU_ALLOWED_CHAT_IDS},${ADMIN_CHAT}` } : {}) });
+  const config = loadConfig({ ...env, ...opts.env, ...(opts.allowAdminChat ? { FEISHU_ALLOWED_CHAT_IDS: `${env.FEISHU_ALLOWED_CHAT_IDS},${ADMIN_CHAT}` } : {}) });
   const groups = new GroupPolicies(config, (chatId) => settings.override(chatId));
   const sent: Sent[] = [];
   const cards = new Map<string, Record<string, unknown>>();
@@ -61,7 +61,10 @@ async function setup(opts: { allowAdminChat?: boolean; directory?: boolean } = {
       : {
           directory: {
             chatName: async (chatId: string) => names[chatId],
-            members: async (chatId: string) => (members[chatId] ?? []).map((openId) => ({ openId })),
+            members: async (chatId: string) => {
+              await opts.onMembers?.();
+              return (members[chatId] ?? []).map((openId) => ({ openId }));
+            },
           },
         }),
     send: async (to, input, sendOpts) => {
@@ -419,4 +422,35 @@ test("管理群不在白名单里：别的话回一句这里能做什么；在�
   const allowed = await setup({ allowAdminChat: true });
   assert.equal(await allowed.say("帮我查下日志"), false);
   assert.equal(allowed.sent.length, 0);
+});
+
+test("打开卡片时读群成员那会儿别人存了设置：卡片拿的是存之前的版本号，确认时不会盖掉别人的改动", async () => {
+  let settingsRef: GroupSettings | undefined;
+  let raced = false;
+  const t = await setup({
+    onMembers: async () => {
+      if (!raced && settingsRef) {
+        raced = true;
+        await settingsRef.saveGroup("oc_ops", { knowledge: false }, 0, { by: "ou_admin", changes: [] });
+        await settingsRef.saveAdmins(["ou_admin"], 0, { by: "ou_owner", changes: [] });
+      }
+    },
+  });
+  settingsRef = t.settings;
+  await t.say("配置 运营群");
+  const card = t.sent[0]!.messageId;
+  await t.click(card, "next", "ou_owner", { ...keepAll, proactive: "on" });
+  assert.match(text(t.cards.get(card)), /有人改过「运营群」的设置/);
+  assert.deepEqual(t.settings.override("oc_ops"), { knowledge: false });
+});
+
+test("读不到群成员时，.env 里现在的名单也能选：照服务器上的配置先勾上，改成只留其中几个人", async () => {
+  const t = await setup({ directory: false, env: { WRITE_ALLOWED_USERS: "ou_ml,ou_lee" } });
+  await t.say("配置 oc_plain");
+  const card = t.sent[0]!.messageId;
+  assert.deepEqual(initial(t.cards.get(card), "writers"), ["ou_ml", "ou_lee"], "照服务器上的配置时先勾上现在的名单");
+  await t.click(card, "next", "ou_owner", { ...keepAll, writers_mode: "list", writers: ["ou_ml"] });
+  assert.match(text(t.cards.get(card)), /写权限\*\*：照服务器上的配置（现在：2 人：.*） → 只有这 1 人/);
+  await t.click(card, "confirm", "ou_owner");
+  assert.deepEqual(t.settings.override("oc_plain"), { writeAllowed: ["ou_ml"] });
 });
