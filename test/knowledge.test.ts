@@ -20,7 +20,7 @@ import { readFile } from "node:fs/promises";
 import { buildSystemPrompt } from "../src/prompt.js";
 import type { NameLookup } from "../src/operator-names.js";
 import { MAX_CARD_BYTES } from "../src/progress.js";
-import { KNOWLEDGE_ACTION, KnowledgeDesk, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
+import { KNOWLEDGE_ACTION, KnowledgeDesk, type KnowledgeScope, PROPOSAL_TTL_MS } from "../src/tools/knowledge.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const signal = new AbortController().signal;
@@ -855,10 +855,13 @@ function deskSetup({
   saveLesson = () => JSON.stringify({ saved: true, id: 31 }),
   searchLessons = () => JSON.stringify({ hits: [{ id: 31, title: "已同步的", score: 9 }, { id: 40, title: "Open WebUI 存的", score: 8 }] }),
   nameOf,
+  scope,
 }: {
   aiops?: boolean;
   /** null：没配写权限名单 */
   approvers?: ReadonlySet<string> | null;
+  /** 按群的设置：给了就不看 approvers */
+  scope?: (chatId: string) => KnowledgeScope;
   saveLesson?: (args: Record<string, unknown>) => string;
   searchLessons?: (args: Record<string, unknown>) => string;
   nameOf?: NameLookup;
@@ -916,6 +919,7 @@ function deskSetup({
       updates.push({ messageId, card });
     },
     ...(approvers ? { approvers } : {}),
+    ...(scope ? { scope } : {}),
     allowedChatIds: new Set(["oc_1"]),
     ...(nameOf ? { nameOf } : {}),
     logger: quiet,
@@ -4232,7 +4236,59 @@ test("没配写权限名单：经验库只能查，不给起草和归档的工�
   assert.deepEqual(names, ["knowledge_search", "knowledge_get"]);
   assert.match(await tool("knowledge_search").run({ query: "日活" }, { signal }), /K1/);
   const prompt = buildSystemPrompt({ botName: "飞书 CLI", now: new Date(0), toolNames: names, knowledge: { hits: "" } });
-  assert.match(prompt, /现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）/);
+  assert.match(prompt, /现在不能往经验库里存或归档经验（管理员还没给这个群配写权限名单，没人能点确认）/);
   assert.doesNotMatch(prompt, /knowledge_propose/);
   assert.equal(sent.length, 0);
+});
+
+test("按群：谁能点「保存」看卡片所在群的写权限名单；这个群没有名单就不给起草的工具", async () => {
+  let current: KnowledgeScope = { approvers: new Set(["ou_ops"]), aiops: true };
+  const { backend, desk, sent, tool, click, lastCard } = deskSetup({ scope: () => current });
+  const ctx = { chatId: "oc_1", threadKey: "t", senderId: "ou_1", messageId: "om_1" };
+  assert.ok(desk.tools(ctx).some((t) => t.spec.name === "knowledge_propose"));
+  await tool("knowledge_propose").run(code8, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  // 全局名单里的人（ou_admin）在这个群里不算
+  await desk.handleCardAction(click(card, "save", "ou_admin", "ML"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 0);
+  assert.match(cardText(lastCard()), /ML点了确认：只有写权限名单里的人能确认，这次没有执行/);
+  await desk.handleCardAction(click(card, "save", "ou_ops", "运维"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 1);
+  assert.equal(backend.entries[0].confirmedBy, "运维");
+
+  // 这个群没配名单、或者写了 none（空的）：只能查
+  for (const approvers of [undefined, new Set<string>()]) {
+    current = { ...(approvers ? { approvers } : {}), aiops: true };
+    assert.deepEqual(desk.tools(ctx).map((t) => t.spec.name), ["knowledge_search", "knowledge_get"]);
+  }
+});
+
+test("按群：不能用 aiops 的群回答前不查 aiops 经验库，起草不同步、不提案例，硬填 aiops_id 也不归档 aiops 里的", async () => {
+  const { desk, calls, tool, sent } = deskSetup({ scope: () => ({ approvers: new Set(["ou_admin"]), aiops: false }) });
+  const found = await desk.lookup("gateway code=8", task);
+  assert.ok(found);
+  assert.equal(found.aiops, undefined);
+  assert.equal(calls.filter((call) => call.tool === "search_knowledge").length, 0);
+
+  const specs = JSON.stringify(desk.tools({ chatId: "oc_1", threadKey: "t", senderId: "ou_1", messageId: "om_1" }).map((t) => t.spec));
+  assert.doesNotMatch(specs, /case_id|aiops_id|aiops/);
+  await tool("knowledge_propose").run({ ...code8, case_id: 7 }, { signal });
+  const card = cardText((sent[0].input as { card: any }).card);
+  assert.doesNotMatch(card, /aiops/);
+  await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 31 }, { signal }), /这个群没开 aiops，不能归档 aiops 经验库里的经验/);
+  assert.equal(calls.filter((call) => call.tool === "get_knowledge").length, 0);
+});
+
+test("按群：不能用 aiops 的群归档同步过 aiops 的经验，只归档表格里的，aiops 里那条不动，说一声去开了 aiops 的群归档", async () => {
+  const { backend, base, desk, sent, calls, click, tool } = deskSetup({ scope: () => ({ approvers: new Set(["ou_admin"]), aiops: false }) });
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops({ id: "K1" }, 31);
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson" || call.tool === "get_knowledge").length, 0);
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档经验 K1.*\naiops 经验库里同步的经验 #31 没有一起归档：这个群没开 aiops/);
 });

@@ -720,3 +720,32 @@ test("刷新时剧本清单拉失败：沿用上次的剧本，按重试间隔�
 async function fakeHub(server: FakeMcp, overrides: Partial<McpServerConfig> = {}) {
   return hubFor([config(server.url, overrides)], { logger: recorder().logger });
 }
+
+test("按群收窄：没列的服务一个工具都不给、提示词里也不提；列了工具的只给其中开了的，提示词里说清只开了这几个", async () => {
+  const server = await fake({ prompts: PLAYBOOKS });
+  const other = await fake();
+  const hub = await hubFor([config(server.url), config(other.url, { name: "other", tools: "*" })], { logger: recorder().logger });
+  const names = (scope?: Parameters<McpHub["tools"]>[1]) => hub.tools(task, scope).map((tool) => tool.spec.name);
+
+  assert.deepEqual(names(new Map()), []);
+  assert.deepEqual(names(new Map([["other", "*"]])).filter((name) => name.startsWith("aiops_")), []);
+  // 只开 query_logs：全局没开的 get_targets_health 写了也不给；剧本照给（读剧本只是说明）
+  assert.deepEqual(names(new Map([["aiops", ["query_logs", "get_targets_health"]]])), ["aiops_query_logs", "aiops_playbook"]);
+  // 一个都没对上时连剧本也不给
+  assert.deepEqual(names(new Map([["aiops", ["get_targets_health"]]])), []);
+  assert.deepEqual(names(new Map([["aiops", "*"]])), names().filter((name) => name.startsWith("aiops_")));
+
+  const narrowed = hub.scoped(new Map([["aiops", ["query_logs"]]]));
+  assert.ok(narrowed);
+  assert.deepEqual(narrowed.names, ["aiops"]);
+  const tools = narrowed.tools(task).map((tool) => tool.spec.name);
+  assert.deepEqual(tools, ["aiops_query_logs", "aiops_playbook"]);
+  const prompt = narrowed.prompt(tools)!;
+  assert.match(prompt, /## aiops（MCP 服务）/);
+  assert.match(prompt, /这个群只开了 aiops 的这几个工具：aiops_query_logs。上面说明里提到的其他 aiops 工具这里没有/);
+  assert.doesNotMatch(prompt, /## other/);
+  assert.equal(narrowed.thinksAfter("aiops_query_logs"), true);
+  assert.equal(hub.scoped(new Map()), undefined);
+  // 不能用的服务连不上也不提：提了模型会让人去找管理员
+  assert.equal(hub.prompt([], new Map()), undefined);
+});

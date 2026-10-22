@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { BuildChecker, BuildResult } from "./build.js";
+import { isRepoPattern } from "./groups.js";
 import type { Logger } from "./history.js";
 import { type CodeFact, type CodeLocation, type Piece, ToolError, type ToolOutput, ToolOutputBuilder } from "./tools/tool.js";
 
@@ -49,6 +50,11 @@ export interface CodeHost {
   openPullRequest(repo: string, pr: { head: string; base: string; title: string; body: string; keepSource?: boolean }): Promise<{ url: string; number: number }>;
   /** 检查令牌能不能访问这个仓库：能访问时返回一句说明，不能时抛 RepoError 说明原因。启动时用来在日志里报告每个仓库的状态 */
   checkAccess?(repo: string): Promise<string>;
+  /**
+   * 列出一个群组（含子群组）下令牌能看代码的项目路径（group/project），不含已归档的。CODE_REPOS 里写 group/* 时用；
+   * 群组不存在、令牌看不到时抛 RepoError。没有实现时不能写通配
+   */
+  listProjects?(namespace: string, signal?: AbortSignal): Promise<string[]>;
   /** 用平台接口列出分支和各自最近一次提交，不用拉代码。没有实现时用 git 把所有分支拉下来再列 */
   listBranches?(repo: string, signal?: AbortSignal): Promise<BranchInfo[]>;
   /** 用平台接口查一个分支的提交历史（工作目录是浅克隆，没有历史），按提交时间从新到旧。没有实现时 code_log 不能用 */
@@ -261,6 +267,43 @@ export function createGitLabHost(baseUrl: string, token: string, fetchImpl: type
         throw new RepoError(`能看到项目，但角色是 ${role ?? level}，推不了分支，要 Developer 以上`);
       }
       return `能访问${role ? `，角色 ${role}` : ""}${branch}`;
+    },
+    async listProjects(namespace, signal) {
+      const projects: string[] = [];
+      for (let page = 1; page <= PROJECT_PAGES; page++) {
+        // min_access_level=20：报告者以上才看得到代码；with_shared=false：别的群组共享进来的项目不算这个群组的
+        const params = new URLSearchParams({
+          include_subgroups: "true",
+          archived: "false",
+          with_shared: "false",
+          min_access_level: "20",
+          simple: "true",
+          per_page: "100",
+          page: String(page),
+        });
+        const res = await fetchImpl(`${base}/api/v4/groups/${encodeURIComponent(namespace)}/projects?${params}`, {
+          headers: { "private-token": token },
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) {
+          throw new RepoError(
+            res.status === 404
+              ? `找不到群组 ${namespace}，或者令牌看不到它（HTTP 404）`
+              : res.status === 401
+                ? "令牌无效或过期了（HTTP 401）"
+                : `GitLab 列群组 ${namespace} 的项目失败（HTTP ${res.status}）`,
+          );
+        }
+        const items = (await res.json()) as { path_with_namespace?: unknown }[];
+        projects.push(...items.flatMap((item) => (typeof item.path_with_namespace === "string" ? [item.path_with_namespace] : [])));
+        const next = res.headers.get("x-next-page");
+        if (items.length < 100 || (next !== null && !/^\d+$/.test(next))) {
+          break;
+        }
+      }
+      // 只认路径真在这个群组下面的（接口按群组 id 查，返回的路径照理都在下面，再核对一次）
+      const prefix = `${namespace.toLowerCase()}/`;
+      return projects.filter((project) => project.toLowerCase().startsWith(prefix));
     },
     async listBranches(repo, signal) {
       // 分支多的仓库一页列不完：翻页列全（认线上分支要看到所有受保护的分支），最多 BRANCH_PAGES 页
@@ -854,7 +897,10 @@ export interface CodeWorkspacesOptions {
   /** 工作目录的根，每个话题一个子目录 */
   root: string;
   host: CodeHost;
-  /** 允许操作的仓库（GitLab 的项目路径 group/project，或 GitHub 的 owner/repo） */
+  /**
+   * 配置里写到的所有仓库（GitLab 的项目路径 group/project，或 GitHub 的 owner/repo），按群配的也在里面；
+   * 也可以是 group/*（通配，靠 refreshPatterns 从平台上列出来）。每个话题能用哪几个由调用方按群给（open 的 allowed）
+   */
   repos: readonly string[];
   /** 给仓库指定的默认分支（仓库 → 分支）。没指定的用仓库自己的默认分支 */
   branches?: Readonly<Record<string, string>>;
@@ -869,13 +915,18 @@ export interface CodeWorkspacesOptions {
  * 同一话题的任务本来就排队执行，不会同时改一份目录。几天没用的目录由 sweep 删掉。
  */
 export class CodeWorkspaces {
+  /** 配置里一个个写出来的仓库（不含通配） */
   readonly repos: readonly string[];
+  /** 配置里的通配（group/*） */
+  readonly patterns: readonly string[];
   readonly host: CodeHost;
   readonly branches: Readonly<Record<string, string>>;
   private readonly root: string;
   private readonly logger: Logger;
   private readonly now: () => Date;
   private readonly build?: BuildChecker;
+  /** 通配上次从平台列出来的项目：通配 → 项目路径。列失败的沿用上次的 */
+  private readonly matched = new Map<string, readonly string[]>();
   /** 推之前会不会编译检查（BUILD_CHECK） */
   readonly buildCheck: boolean;
 
@@ -884,21 +935,67 @@ export class CodeWorkspaces {
     this.buildCheck = opts.build !== undefined;
     this.root = opts.root;
     this.host = opts.host;
-    this.repos = opts.repos;
+    this.repos = opts.repos.filter((repo) => !isRepoPattern(repo));
+    this.patterns = opts.repos.filter(isRepoPattern);
     this.branches = opts.branches ?? {};
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? (() => new Date());
   }
 
-  /** 打开（没有就克隆）这个话题的工作目录。没有未提交改动、也没开过 PR 时先更新到最新 */
-  async open(threadKey: string, repo: string, signal?: AbortSignal): Promise<Workspace> {
-    const name = this.repos.find((r) => r.toLowerCase() === repo.trim().toLowerCase());
+  /**
+   * 一个群的仓库清单展开成具体的仓库：写出来的照写（大小写按配置里第一次的写法），通配换成平台上列出来的项目（还没列过、列失败时没有）。
+   * 不在配置里的不认：调用方只能从配置过的仓库里挑
+   */
+  resolve(entries: readonly string[]): string[] {
+    const all = [...this.repos, ...[...this.matched.values()].flat()];
+    const found = entries.flatMap((entry) =>
+      isRepoPattern(entry)
+        ? this.patterns.some((pattern) => pattern.toLowerCase() === entry.toLowerCase())
+          ? (this.matched.get(this.patterns.find((pattern) => pattern.toLowerCase() === entry.toLowerCase())!) ?? [])
+          : []
+        : all.filter((repo) => repo.toLowerCase() === entry.toLowerCase()).slice(0, 1),
+    );
+    return found.filter((repo, i) => found.findIndex((other) => other.toLowerCase() === repo.toLowerCase()) === i);
+  }
+
+  /** 从平台上重新列出每个通配下的项目（启动时、之后定时）；列出来有变化的写进日志，列失败的写进日志、沿用上次的 */
+  async refreshPatterns(signal?: AbortSignal): Promise<void> {
+    const list = this.host.listProjects?.bind(this.host);
+    await Promise.all(
+      this.patterns.map(async (pattern) => {
+        if (!list) {
+          this.logger.warn(`代码仓库 ${pattern}：${this.host.name} 不支持通配，要一个个写仓库`);
+          return;
+        }
+        try {
+          const projects = await list(pattern.slice(0, -2), signal);
+          const before = this.matched.get(pattern);
+          this.matched.set(pattern, projects);
+          if (!before || before.join(",") !== projects.join(",")) {
+            this.logger.info(`代码仓库 ${pattern}：列出 ${projects.length} 个项目${projects.length > 0 ? `（${projects.join(", ")}）` : "，机器人账号在这个群组下看不到项目"}`);
+          }
+        } catch (err) {
+          this.logger.warn(`代码仓库 ${pattern} 列不出项目${this.matched.has(pattern) ? "，沿用上次列出的" : ""}：${err instanceof Error ? err.message : String(err)}`);
+        }
+      }),
+    );
+  }
+
+  /**
+   * 打开（没有就克隆）这个话题的工作目录。没有未提交改动、也没开过 PR 时先更新到最新。
+   * allowed 是这次能用的仓库（按群展开过的），不在里面的直接拒绝；不传时是配置里写出来的全部
+   */
+  async open(threadKey: string, repo: string, signal?: AbortSignal, allowed: readonly string[] = this.repos): Promise<Workspace> {
+    const name = allowed.find((r) => r.toLowerCase() === repo.trim().toLowerCase());
     if (!name) {
-      throw new RepoError(`没有接入仓库 ${repo}，能操作的只有：${this.repos.join("、")}`);
+      throw new RepoError(
+        allowed.length > 0 ? `这个群没有接入仓库 ${repo}，能操作的只有：${allowed.join("、")}` : `这个群没有接入仓库 ${repo}，没有能操作的仓库`,
+      );
     }
     const dir = path.join(this.root, safeName(threadKey), safeName(name.replace("/", "__")));
     const env = this.host.gitEnv();
-    const configured = this.branches[name];
+    // 指定分支的写法可能和清单里的大小写不一样（CODE_REPOS 写 ai/x，群里写 AI/x@master）
+    const configured = Object.entries(this.branches).find(([repo]) => repo.toLowerCase() === name.toLowerCase())?.[1];
     const exists = await stat(path.join(dir, ".git")).then(
       () => true,
       () => false,
@@ -2589,6 +2686,8 @@ export function ciBranches(text: string): string[] {
 
 /** 列分支最多翻几页（每页 100 个） */
 const BRANCH_PAGES = 20;
+/** 通配的群组下最多列几页项目（每页 100 个） */
+const PROJECT_PAGES = 10;
 
 /** 好几个受保护的部署分支都像线上分支时，按名字挑 */
 const LIVE_NAMES = ["prod", "production", "master", "main", "release", "online", "live"];

@@ -213,6 +213,11 @@ export interface KnowledgeDeskOptions {
    * 谁都能存的话，一个群里有人存一条带指令的「经验」就能影响别的群的回答
    */
   approvers?: ReadonlySet<string>;
+  /**
+   * 按群的设置（GROUPS）：这个群里谁能点「保存」「归档」、谁能改群记忆、能不能用 aiops。传了就按群算，不看 approvers；
+   * 不传时所有群都用 approvers，接了 aiops 的都查、都同步
+   */
+  scope?: (chatId: string) => KnowledgeScope;
   allowedChatIds: ReadonlySet<string>;
   /** 群记忆：给了（而且配了写权限名单）时，群记忆和经验库说法对不上可以发冲突卡片，让群里成员选以哪边为准 */
   memory?: MemoryStore;
@@ -224,6 +229,16 @@ export interface KnowledgeDeskOptions {
   lookupMs?: number;
   semanticMs?: number;
   retryDelayMs?: number;
+}
+
+/** 一个群用经验库时的权限（见 KnowledgeDeskOptions.scope） */
+export interface KnowledgeScope {
+  /** 这个群的写权限名单：能点「保存」「归档」。没有（或者是空的）时这个群只能查，不能起草 */
+  approvers?: ReadonlySet<string>;
+  /** 这个群能改群记忆的人：冲突卡片上要改群记忆时只有他们能点。没有时谁都能 */
+  memoryEditors?: ReadonlySet<string>;
+  /** 这个群能用 aiops：回答前查 aiops 经验库、排查经验同步过去、能归档 aiops 里的经验 */
+  aiops: boolean;
 }
 
 /**
@@ -253,7 +268,7 @@ export class KnowledgeDesk {
     this.lookupMs = options.lookupMs ?? LOOKUP_MS;
     this.semanticMs = options.semanticMs ?? SEMANTIC_MS;
     this.retryDelayMs = options.retryDelayMs ?? LINK_RETRY_MS;
-    if (options.memory && options.approvers) {
+    if (options.memory && (options.approvers || options.scope)) {
       this.conflicts = new ConflictDesk({
         memory: options.memory,
         knowledge: {
@@ -267,7 +282,8 @@ export class KnowledgeDesk {
         },
         send: options.send,
         updateCard: options.updateCard,
-        approvers: options.approvers,
+        approvers: (chatId) => this.approversOf(chatId),
+        ...(options.scope ? { memoryEditors: (chatId: string) => options.scope!(chatId).memoryEditors } : {}),
         allowedChatIds: options.allowedChatIds,
         ...(options.nameOf ? { nameOf: options.nameOf } : {}),
         logger: this.logger,
@@ -285,7 +301,9 @@ export class KnowledgeDesk {
    * 手机号、身份证号格式确定，换成 *** 再查 aiops（用户反馈的问题常带着号码，整条不查就漏了 aiops 里的经验）
    */
   async lookup(query: string, task: McpTaskContext, signal?: AbortSignal, options: { secret?: boolean } = {}): Promise<KnowledgeLookup | undefined> {
-    const { base, aiops } = this.options;
+    const { base } = this.options;
+    // 这个群不能用 aiops 的不查 aiops 经验库：查到的内容会写进回答的提示词
+    const aiops = this.aiopsOf(task.chatId);
     const timeout = timeoutSignal(this.lookupMs);
     const semantic = timeoutSignal(this.semanticMs);
     const deadline = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
@@ -342,8 +360,9 @@ export class KnowledgeDesk {
    */
   tools(ctx: KnowledgeTaskContext, otherTools: readonly string[] = []): Tool[] {
     const { base } = this.options;
-    // 接了 aiops，而且没发现它缺保存、归档经验的工具（还没连上时照样答应，连上了再同步）
-    const withAiops = this.options.aiops !== undefined && !this.options.aiops.lacksWriteTools;
+    // 接了 aiops（这个群也能用），而且没发现它缺保存、归档经验的工具（还没连上时照样答应，连上了再同步）
+    const aiops = this.aiopsOf(ctx.chatId);
+    const withAiops = aiops !== undefined && !aiops.lacksWriteTools;
     const categories = Object.entries(KNOWLEDGE_CATEGORIES)
       .map(([key, label]) => `${key} ${label}`)
       .join("、");
@@ -441,7 +460,7 @@ export class KnowledgeDesk {
       describe: (args) => `起草经验：${preview(args.title)}`,
       run: async (args, { signal }) => {
         const draft = normalizeDraft(args);
-        const caseId = optionalInteger(args.case_id, "case_id");
+        const caseId = withAiops ? optionalInteger(args.case_id, "case_id") : undefined;
         const replacesId = typeof args.replaces === "string" && args.replaces.trim() ? args.replaces : undefined;
         return this.open(ctx, signal, async () => {
           const replaces = replacesId === undefined ? undefined : await raceAbort(this.activeEntry(replacesId), signal);
@@ -495,8 +514,19 @@ export class KnowledgeDesk {
         });
       },
     };
-    // 没配写权限名单：没人能确认，起草和归档的工具不给（提示词里会说存不了）
-    return this.options.approvers ? [search, get, propose, archive, ...(this.conflicts ? [this.conflicts.tool(ctx)] : [])] : [search, get];
+    // 这个群没配写权限名单：没人能确认，起草和归档的工具不给（提示词里会说存不了）
+    return this.approversOf(ctx.chatId) ? [search, get, propose, archive, ...(this.conflicts ? [this.conflicts.tool(ctx)] : [])] : [search, get];
+  }
+
+  /** 这个群能点「保存」「归档」的人；没有时这个群只能查 */
+  private approversOf(chatId: string): ReadonlySet<string> | undefined {
+    const approvers = this.options.scope ? this.options.scope(chatId).approvers : this.options.approvers;
+    return approvers && approvers.size > 0 ? approvers : undefined;
+  }
+
+  /** 这个群能用的 aiops 经验库：没接 aiops、或者按群配置这个群不能用 aiops 时没有 */
+  private aiopsOf(chatId: string): AiopsLessons | undefined {
+    return this.options.scope && !this.options.scope(chatId).aiops ? undefined : this.options.aiops;
   }
 
   /** 处理确认卡片上的按钮。不是经验库的卡片返回 false */
@@ -548,7 +578,7 @@ export class KnowledgeDesk {
       }
       return true;
     }
-    const approver = this.options.approvers?.has(operator.openId) === true;
+    const approver = this.approversOf(proposal.chatId)?.has(operator.openId) === true;
     const who = operator.name ?? "有人";
     if (value.op === "cancel") {
       // 做了一半的是写权限名单里的人确认过的：剩下的不再做，也要名单里的人说了算，发起人只能取消还没确认的
@@ -611,7 +641,8 @@ export class KnowledgeDesk {
    * （还没存新经验的，点保存前再核对一次群记忆）；这两种和旧的改过了（存了新的、旧的没取代）都算没做完（ok 为 false）
    */
   private async replaceFromConflict(request: ReplaceRequest): Promise<{ lines: string[]; ok: boolean }> {
-    const withAiops = this.options.aiops !== undefined && !this.options.aiops.lacksWriteTools;
+    const aiops = this.aiopsOf(request.chatId);
+    const withAiops = aiops !== undefined && !aiops.lacksWriteTools;
     const proposal: SaveProposal = {
       kind: "save",
       draft: request.draft,
@@ -1047,7 +1078,11 @@ export class KnowledgeDesk {
   private async archive(proposal: ArchiveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
     const { target } = proposal;
     if (target.type === "aiops") {
-      await this.options.aiops!.archiveSeen(target.lesson, confirmedBy, task);
+      const aiops = this.aiopsOf(task.chatId);
+      if (!aiops) {
+        throw new KnowledgeError("这个群没开 aiops，不能归档 aiops 经验库里的经验");
+      }
+      await aiops.archiveSeen(target.lesson, confirmedBy, task);
       return {
         // 标题是 aiops 那边的，可能很长：只列开头，卡片太大飞书不收
         done: [`已归档 aiops 经验 #${target.lesson.id}「${clip(target.lesson.title, MAX_TITLE_CHARS)}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`],
@@ -1249,6 +1284,11 @@ export class KnowledgeDesk {
    */
   private async archiveLinked(teamIds: readonly string[], aiopsId: number, confirmedBy: string, task: McpTaskContext, out: Outcome): Promise<void> {
     const { aiops } = this.options;
+    // 卡片所在的群没开 aiops 经验库：不替它动 aiops，说一声那条还在（再试一次也一样，不算没做完）
+    if (aiops && !this.aiopsOf(task.chatId)) {
+      out.done.push(`aiops 经验库里同步的经验 #${aiopsId} 没有一起归档：这个群没开 aiops。要归档它，在开了 aiops 的群里让机器人归档 aiops 经验 #${aiopsId}。`);
+      return;
+    }
     try {
       if (!aiops?.writable) {
         throw new KnowledgeError(aiops?.lacksWriteTools ? lacksToolsNote(aiops) : "aiops 现在连不上");
@@ -1277,6 +1317,10 @@ export class KnowledgeDesk {
   }
 
   private async activeLesson(id: number, ctx: KnowledgeTaskContext, signal: AbortSignal): Promise<AiopsLesson> {
+    // 这个群不能用 aiops：工具里没有 aiops_id 这一项，模型硬填了也不读
+    if (this.options.aiops && !this.aiopsOf(ctx.chatId)) {
+      throw new KnowledgeError("这个群没开 aiops，不能归档 aiops 经验库里的经验");
+    }
     const { aiops } = this.options;
     if (!aiops?.writable) {
       throw new KnowledgeError(`${aiops?.lacksWriteTools ? lacksToolsNote(aiops) : "aiops 现在连不上"}，现在不能归档 aiops 经验库里的经验`);

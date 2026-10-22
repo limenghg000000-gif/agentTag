@@ -195,7 +195,7 @@ test("定时任务到点跑：没说要改的只给读的工具；建的时候�
   assert.deepEqual(names(requests[1]), ["feishu_doc_read"]);
   await handle(message("把上周的进展写进周报文档", { messageId: "om_3", senderId: "ou_left" }), { scheduled });
   assert.deepEqual(names(requests[2]), ["feishu_doc_read"]);
-  assert.match(requests[2]!.system, /WRITE_ALLOWED_USERS/);
+  assert.match(requests[2]!.system, /不在管理员给这个群配的写权限名单里/);
 });
 
 test("建定时任务时告诉工具这次有没有改的权限：带着群聊只给读的、不在写权限名单里的、建的人没说要改的，记成只读", async () => {

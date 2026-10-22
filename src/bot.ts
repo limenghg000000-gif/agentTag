@@ -278,6 +278,13 @@ export interface BotDeps {
   codeRepos?: readonly string[];
   /** 能让机器人改文档、改代码的人（open_id）。不传时群里所有人都能 */
   writeAllowed?: ReadonlySet<string>;
+  /** 能让机器人记、改、删群记忆的人（open_id）。不传时群里所有人都能 */
+  memoryEditors?: ReadonlySet<string>;
+  /**
+   * 按群的配置（GROUPS）：每条消息按它所在的群取一份仓库、写权限名单、能改群记忆的人、MCP 和经验库，整个换掉上面这几项
+   * （群里没有的就是没有，不会退回上面的）。不传时所有群都用上面那几项
+   */
+  scope?: (chatId: string) => ChatScope;
   /** 话题里跟聊、@ 时带上群聊、主动接话至少开着一样。功能清单里「需要：接话」的那一项只在这时列出来 */
   chatAlong?: boolean;
   /** 把提问和话题里的图片识别成文字。不传时图片换成「没能看到」的说明 */
@@ -298,6 +305,28 @@ export interface BotDeps {
   };
 }
 
+/** 一个群用的仓库、写权限名单、能改群记忆的人、MCP 和经验库（见 BotDeps.scope） */
+export type ChatScope = Pick<BotDeps, "codeRepos" | "writeAllowed" | "memoryEditors" | "mcp" | "knowledge">;
+
+/** 这条消息所在的群用的那一份 deps：按群配置换掉仓库、写权限名单、能改群记忆的人、MCP 和经验库；没传 scope 时就是 deps */
+function scopeDeps(deps: BotDeps, chatId: string): BotDeps {
+  if (!deps.scope) {
+    return deps;
+  }
+  const { codeRepos: _codeRepos, writeAllowed: _writeAllowed, memoryEditors: _memoryEditors, mcp: _mcp, knowledge: _knowledge, ...rest } = deps;
+  const scoped: BotDeps = { ...rest, ...deps.scope(chatId) };
+  // 每条消息都是新的一份：之前查到的结果、查过经验库的话题记在原来那份下面，下次问还认得
+  SESSIONS.set(scoped, deps);
+  return scoped;
+}
+
+/** 按群换过的那份 deps → 原来那份：跨提问记在内存里的东西（EARLIER_RESULTS、LOOKED_UP_TOPICS）按原来那份记 */
+const SESSIONS = new WeakMap<BotDeps, BotDeps>();
+
+function sessionOf(deps: BotDeps): BotDeps {
+  return SESSIONS.get(deps) ?? deps;
+}
+
 /**
  * 处理一条已经过 SDK 安全管线的群消息（已去重、已确认 @ 了机器人、@ 占位符已替换成名字）：
  * 在话题里发一张进度卡片，带着话题上下文跑工具循环，结束后更新卡片并把回答发到话题里。
@@ -313,13 +342,15 @@ export function createMessageHandler(deps: BotDeps) {
       logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
       return;
     }
+    // 下面都用这个群的那一份：仓库、写权限名单、MCP、经验库按群配置
+    const local = scopeDeps(deps, msg.chatId);
     const question = msg.content.trim();
     const reply = (markdown: string) =>
       send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
     if (options.scheduled) {
       // 定时任务到点跑的：内容是建任务时写好的，不当成「停止」「别主动插话」这类指令，也不和别的提问去重（两个任务同一分钟跑同一句话照样各跑各的）
       logger.info(`定时任务 ${options.scheduled.label} 到点跑 chat=${msg.chatId} message=${msg.messageId} creator=${msg.senderId}`);
-      await runTask(deps, msg, question, reply, cardKit, options);
+      await runTask(local, msg, question, reply, cardKit, options);
       return;
     }
     logger.info(`收到提问 chat=${msg.chatId} message=${msg.messageId} thread=${threadKeyOf(msg)} sender=${msg.senderId}`);
@@ -360,7 +391,7 @@ export function createMessageHandler(deps: BotDeps) {
       const task = tasks.create(msg.chatId, threadKeyOf(msg));
       try {
         if (await task.waitTurn()) {
-          await sendFeatures(deps, msg, question, deps.about.features);
+          await sendFeatures(local, msg, question, deps.about.features);
         }
       } finally {
         tasks.finish(task);
@@ -368,7 +399,7 @@ export function createMessageHandler(deps: BotDeps) {
       return;
     }
 
-    await runTask(deps, msg, question, reply, cardKit, options);
+    await runTask(local, msg, question, reply, cardKit, options);
   };
 }
 
@@ -829,7 +860,9 @@ async function runTask(
     const scheduledReadOnly =
       scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || (!asksToWrite && scheduled.appendDoc === undefined));
     const readOnly = noPermission || followUp || ambientOnly || unaddressed || scheduledReadOnly;
-    // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
+    // 这个群限定了能改群记忆的人（MEMORY_EDITORS），提问的人不在里面：记、改、删群记忆的工具一律不给，这句话说了「记住」也不给
+    const notMemoryEditor = deps.memoryEditors !== undefined && !deps.memoryEditors.has(msg.senderId);
+    // 群记忆谁都能让机器人记、删（限定了能改群记忆的人的群除外），不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
     // 只有这句话本身让它记住、忘掉、改记忆，或者在给它定以后的规矩，才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
     const memoryLocked =
       options.proactive === true ||
@@ -862,7 +895,7 @@ async function runTask(
             ((followUp || options.unaddressed === true) && tool.spec.name !== SCHEDULE_LIST_TOOL))
         ) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
-        !(memoryLocked && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
+        !((memoryLocked || notMemoryEditor) && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
         !(draftsLocked && KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name)) &&
         !(restate && !RESTATE_TOOLS.has(tool.spec.name)) &&
         !(ruleOnly && !RULE_TOOLS.has(tool.spec.name)) &&
@@ -897,6 +930,9 @@ async function runTask(
     }
     if (unaddressed) {
       logger.info(`没 @ 机器人的跟聊，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    }
+    if (notMemoryEditor && memory) {
+      logger.info(`发起人不在能改群记忆的名单里，这次群记忆只能看 message=${msg.messageId} sender=${msg.senderId}`);
     }
     const prompt = labelUserMessage(context.askerName, asked || "（@ 了你，没有写别的内容）");
     const deep = DEEP_THINKING.test(question);
@@ -986,10 +1022,12 @@ async function runTask(
               },
             }
           : {}),
-        ...(memoryLocked && memory ? { memoryLocked: true } : {}),
+        // 不在能改群记忆的名单里的说这一条就够：「请他说记住…」那条对他没用
+        ...(notMemoryEditor && memory ? { notMemoryEditor: true } : memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         restate,
-        ...(ruleOnly ? { ruleOnly: true } : {}),
+        // 不在能改群记忆名单里的人定规矩：上面那条已经叫它说没记上，不再叫它「用 memory_save 记下」
+        ...(ruleOnly && !(notMemoryEditor && memory) ? { ruleOnly: true } : {}),
         ...(scheduleLocked ? { scheduleLocked } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
@@ -1722,10 +1760,11 @@ const MERGE_TOOL = "code_merge";
 const EARLIER_RESULTS = new WeakMap<BotDeps, EarlierResults>();
 
 function earlierResults(deps: BotDeps): EarlierResults {
-  let store = EARLIER_RESULTS.get(deps);
+  const session = sessionOf(deps);
+  let store = EARLIER_RESULTS.get(session);
   if (!store) {
-    store = new EarlierResults(deps.now ?? Date.now);
-    EARLIER_RESULTS.set(deps, store);
+    store = new EarlierResults(session.now ?? Date.now);
+    EARLIER_RESULTS.set(session, store);
   }
   return store;
 }
@@ -1737,10 +1776,11 @@ const LOOKED_UP_TOPICS_MAX = 2000;
 const LOOKED_UP_TOPICS_MS = 7 * 24 * 60 * 60 * 1000;
 
 function lookedUpTopics(deps: BotDeps): { has(key: string): boolean; map: Map<string, number> } {
-  let map = LOOKED_UP_TOPICS.get(deps);
+  const session = sessionOf(deps);
+  let map = LOOKED_UP_TOPICS.get(session);
   if (!map) {
     map = new Map();
-    LOOKED_UP_TOPICS.set(deps, map);
+    LOOKED_UP_TOPICS.set(session, map);
   }
   const topics = map;
   return {

@@ -14,6 +14,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import { loadConfig } from "./config.js";
+import { GroupPolicies } from "./groups.js";
 import { containsSecret, KEYWORD_MIN, KnowledgeBase, type KnowledgeScore, maskPersonal, normalizeId, SEMANTIC_MIN, usable } from "./knowledge.js";
 import { BitableKnowledgeBackend, createBitableApi } from "./knowledge-bitable.js";
 import { createOpenAICompatibleEmbedder } from "./llm.js";
@@ -200,7 +201,7 @@ async function main(): Promise<void> {
     stateFile: config.knowledge.stateFile,
     ...(config.knowledge.bitable ? { target: config.knowledge.bitable } : {}),
     // 这里只读表格（list），不调整共享；名单照机器人的填
-    share: { chatIds: [...config.feishu.allowedChatIds], editors: [...(config.feishu.writeAllowedUsers ?? [])] },
+    share: new GroupPolicies(config).knowledgeShare(),
   });
   const model = config.knowledge.embeddingModel;
   const base = new KnowledgeBase(backend, {
