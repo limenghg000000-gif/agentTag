@@ -48,6 +48,10 @@ export interface ScheduledTask {
   remind?: boolean;
   /** 建的时候就没有改文档的工具（建的人不在写权限名单里、带着群聊建的）：到点也只给读的工具 */
   readOnly?: boolean;
+  /** 建的人在建任务那句话里自己贴的飞书文档链接：到点只能追加到这篇的文末（周报），别的文档、改和删已有内容都不行 */
+  appendDoc?: string;
+  /** 建的人说了「有异常 @ 我」：到点查到异常时才在结果话题里 @ 他（只 @ 建的人） */
+  alertCreator?: boolean;
   /** 周期任务的 cron（北京时间） */
   cron?: string;
   /** 一次性任务的时间 */
@@ -77,6 +81,8 @@ export interface CreateInput {
   at?: string;
   remind?: boolean;
   readOnly?: boolean;
+  appendDoc?: string;
+  alertCreator?: boolean;
 }
 
 export type ChangeAction = "pause" | "resume" | "cancel";
@@ -88,8 +94,8 @@ export interface SchedulerOptions {
   allowedChatIds: ReadonlySet<string>;
   /** 到点跑一次：发到群里、交给机器人做。late 是比该跑的时间晚了多久 */
   run: (task: ScheduledTask, late: number) => Promise<RunResult>;
-  /** 在群里说一句（错过了、连着失败暂停了） */
-  notify: (chatId: string, markdown: string) => Promise<unknown>;
+  /** 在群里说一句（没跑成、错过了、被别人暂停了）。mention 是要 @ 的人：只会是建任务的人 */
+  notify: (chatId: string, markdown: string, mention?: ScheduleActor) => Promise<unknown>;
   logger?: Logger;
   now?: () => number;
   tickMs?: number;
@@ -243,6 +249,9 @@ export class Scheduler {
       }
       nextRunAt = at;
     }
+    if (input.remind && input.appendDoc) {
+      throw new Error("纯提醒到点只发一句提醒，不写文档：要到点汇总后追加到文档的，remind 不填");
+    }
     const task: ScheduledTask = {
       id: this.state.nextId++,
       chatId: input.chatId,
@@ -252,6 +261,9 @@ export class Scheduler {
       prompt,
       ...(input.remind ? { remind: true } : {}),
       ...(input.readOnly ? { readOnly: true } : {}),
+      ...(input.appendDoc ? { appendDoc: input.appendDoc } : {}),
+      // 纯提醒本来就 @ 建的人
+      ...(input.alertCreator && !input.remind ? { alertCreator: true } : {}),
       ...(cronText ? { cron: parseCron(cronText).expr } : {}),
       ...(at !== undefined ? { at } : {}),
       status: "active",
@@ -262,7 +274,8 @@ export class Scheduler {
     this.state.tasks.push(task);
     this.save();
     this.logger.info(
-      `定时任务：建了 ${label(task)} chat=${task.chatId} creator=${task.creator.openId} ${describeSchedule(task)}${task.remind ? " 纯提醒" : ""} 下次=${formatTime(nextRunAt, now)}`,
+      `定时任务：建了 ${label(task)} chat=${task.chatId} creator=${task.creator.openId} ${describeSchedule(task)}${task.remind ? " 纯提醒" : ""}` +
+        `${task.appendDoc ? ` 追加到=${task.appendDoc}` : ""}${task.alertCreator ? " 有异常@建的人" : ""} 下次=${formatTime(nextRunAt, now)}`,
     );
     return task;
   }
@@ -288,7 +301,8 @@ export class Scheduler {
   }
 
   /**
-   * 暂停、恢复、取消。只有建的人和 canManageAll（写权限名单里的人，没配名单时是所有人）能做；
+   * 暂停、恢复、取消。暂停只会让机器人少做事，群里谁都能；恢复（重新按建的人的权限干活）、取消（恢复不了）只有建的人和
+   * canManageAll（写权限名单里的人，没配名单时是所有人）能做。别人暂停、取消了的，在群里 @ 建的人说一声。
    * 别的群的、不存在的报找不到。做不了时抛错，错误信息是一句给模型看的中文
    */
   change(chatId: string, id: number, action: ChangeAction, actor: ScheduleActor, canManageAll: boolean): ScheduledTask {
@@ -296,8 +310,12 @@ export class Scheduler {
     if (!task) {
       throw new Error(`这个群里没有定时任务 T${id}，用 schedule_list 看看有哪些`);
     }
-    if (task.creator.openId !== actor.openId && !canManageAll) {
-      throw new Error(`定时任务 T${id} 是${task.creator.name ?? "别人"}建的，只有建的人和管理员（写权限名单里的人）能暂停、恢复、取消`);
+    const byOther = task.creator.openId !== actor.openId;
+    if (byOther && !canManageAll && action !== "pause") {
+      throw new Error(
+        `定时任务 T${id} 是${task.creator.name ?? "别人"}建的，只有建的人和管理员（写权限名单里的人）能${action === "resume" ? "恢复" : "取消"}。` +
+          `要先停下来可以暂停（谁都能暂停，会 @ 建的人说一声）`,
+      );
     }
     if (task.status === "cancelled" || task.status === "finished") {
       throw new Error(`定时任务 T${id} 已经${task.status === "cancelled" ? "取消" : "跑完"}了，要的话重新建一个`);
@@ -329,6 +347,16 @@ export class Scheduler {
     this.prune();
     this.save();
     this.logger.info(`定时任务：${label(task)} ${ACTION_LOG[action]} by=${actor.openId} chat=${chatId}`);
+    if (byOther && action !== "resume") {
+      const who = actor.name ? escapePost(actor.name) : "群里有人";
+      const next =
+        action === "pause"
+          ? `要接着跑的话 @ 我说「恢复定时任务 T${id}」（建的人和管理员能恢复）。`
+          : "要的话 @ 我再建一个。";
+      void this.opts
+        .notify(chatId, `${action === "pause" ? "⏸️" : "🗑️"} 你建的定时任务 T${id}（${escapePost(describeSchedule(task, now))}：${escapePost(preview(task.prompt))}）被${who}${ACTION_LOG[action]}。${next}`, task.creator)
+        .catch((err: unknown) => this.logger.warn(`定时任务：${label(task)} 被别人${ACTION_LOG[action]}的通知没发出去`, err));
+    }
     return task;
   }
 
@@ -389,6 +417,8 @@ export class Scheduler {
 
   private async execute(task: ScheduledTask, late: number, saved: boolean): Promise<void> {
     let result: RunResult;
+    // 怎么没跑成的：没写进文件没跑、跑的时候抛错（多半是到点那条消息没发出去）、跑完说失败（话题里有出错的卡片）
+    let failedHow: "unsaved" | "threw" | "answer" = "answer";
     try {
       if (saved) {
         result = await this.opts.run(task, late);
@@ -396,10 +426,12 @@ export class Scheduler {
         // 下一次的时间没写进文件：跑了的话，2 小时内重启会把这次再跑一遍（再改一次文档、再提醒一次），宁可这次不跑
         this.logger.error(`定时任务：${label(task)} 下一次的时间没写进文件，这次不跑 chat=${task.chatId}`);
         result = "failed";
+        failedHow = "unsaved";
       }
     } catch (err) {
       this.logger.error(`定时任务：${label(task)} 跑的时候出错 chat=${task.chatId}`, err);
       result = "failed";
+      failedHow = "threw";
     } finally {
       this.running.delete(task.id);
     }
@@ -410,17 +442,18 @@ export class Scheduler {
       task.failures = 0;
     }
     this.logger.info(`定时任务：${label(task)} 跑完了，结果=${result}${task.failures > 0 ? ` 连着失败 ${task.failures} 次` : ""}`);
-    if (result === "failed" && task.failures >= MAX_FAILURES && task.status === "active") {
-      task.status = "paused";
-      task.nextRunAt = undefined;
-      task.pausedFor = "failures";
-      this.logger.warn(`定时任务：${label(task)} 连着失败 ${task.failures} 次，自动暂停了`);
+    if (result === "failed") {
+      const paused = task.failures >= MAX_FAILURES && task.status === "active";
+      if (paused) {
+        task.status = "paused";
+        task.nextRunAt = undefined;
+        task.pausedFor = "failures";
+        this.logger.warn(`定时任务：${label(task)} 连着失败 ${task.failures} 次，自动暂停了`);
+      }
+      // 没跑成要建的人管一下：@ 建的人（只 @ 他）。被停止的（有人点了停止、机器人重启）不 @
       await this.opts
-        .notify(
-          task.chatId,
-          `⏸️ 定时任务 T${task.id}（${escapePost(describeSchedule(task))}）连着 ${task.failures} 次没跑成，先暂停了。查清原因后 @ 我说「恢复定时任务 T${task.id}」。`,
-        )
-        .catch((err: unknown) => this.logger.warn(`定时任务：${label(task)} 自动暂停的通知没发出去`, err));
+        .notify(task.chatId, failureNote(task, failedHow, paused, this.now()), task.creator)
+        .catch((err: unknown) => this.logger.warn(`定时任务：${label(task)} 没跑成的通知没发出去`, err));
     }
     this.save();
   }
@@ -432,10 +465,12 @@ export class Scheduler {
     if (task.at === undefined) {
       return;
     }
+    // 一次性的本来到点就要 @ 建的人
     void this.opts
       .notify(
         task.chatId,
-        `⏰ 定时任务 T${task.id} 本该在 ${formatTime(scheduledAt, now)} 跑（${escapePost(preview(task.prompt))}），那会儿机器人没在线，错过了。要的话 @ 我再建一次。`,
+        `⏰ 你建的定时任务 T${task.id} 本该在 ${formatTime(scheduledAt, now)} 跑（${escapePost(preview(task.prompt))}），那会儿机器人没在线，错过了。要的话 @ 我再建一次。`,
+        task.creator,
       )
       .catch((err: unknown) => this.logger.warn(`定时任务：${label(task)} 错过的通知没发出去`, err));
   }
@@ -512,6 +547,27 @@ export class Scheduler {
 }
 
 const ACTION_LOG: Record<ChangeAction, string> = { pause: "暂停了", resume: "恢复了", cancel: "取消了" };
+
+/** 没跑成时 @ 建的人的那句话：一次性的说要的话再建；周期的说下次照常跑、连着几次会暂停，或者已经暂停了怎么恢复 */
+function failureNote(task: ScheduledTask, how: "unsaved" | "threw" | "answer", paused: boolean, now: number): string {
+  const head = `你建的定时任务 T${task.id}（${escapePost(describeSchedule(task, now))}：${escapePost(preview(task.prompt))}）`;
+  const why =
+    how === "unsaved"
+      ? "：机器人这边记不下任务进度，这次没跑，请管理员看一下机器人的日志"
+      : how === "answer"
+        ? `，原因看那条「⏰ 定时任务 T${task.id}」下面的话题`
+        : "";
+  if (paused) {
+    return `⏸️ ${head}连着 ${task.failures} 次没跑成${why}，先暂停了。查清原因后 @ 我说「恢复定时任务 T${task.id}」。`;
+  }
+  if (task.at !== undefined) {
+    return `⚠️ ${head}没跑成${why}。要的话 @ 我再建一个。`;
+  }
+  if (task.status === "active" && task.nextRunAt !== undefined) {
+    return `⚠️ ${head}这次没跑成${why}。下次 ${formatTime(task.nextRunAt, now)} 照常跑；连着 ${MAX_FAILURES} 次没跑成会先暂停。`;
+  }
+  return `⚠️ ${head}这次没跑成${why}。`;
+}
 
 /** 定时任务的编号：T3 */
 export function label(task: Pick<ScheduledTask, "id">): string {
