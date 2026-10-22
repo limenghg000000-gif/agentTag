@@ -1943,3 +1943,76 @@ test("开到 uat 前把改动放到 uat 上编一下：编不过不推；编过�
   assert.equal(live.base, "main");
   assert.equal((await runGit(["ls-remote", "--heads", "origin", `refs/heads/${pr.branch}`], { cwd: ws.dir })).stdout.split("\t")[0], sha);
 });
+
+test("GitLab 列群组下的项目：含子群组、不含归档和共享进来的，翻页列全，只留路径在这个群组下面的", async () => {
+  const urls: string[] = [];
+  const host = createGitLabHost("https://lab.corp", "glpat-x", (async (url: string, init?: RequestInit) => {
+    urls.push(url);
+    assert.equal((init?.headers as Record<string, string>)["private-token"], "glpat-x");
+    const page = Number(/[?&]page=(\d+)/.exec(url)![1]);
+    const items =
+      page === 1
+        ? [...Array.from({ length: 99 }, (_, i) => ({ path_with_namespace: `golang/svc${i}` })), { path_with_namespace: "other/leak" }]
+        : [{ path_with_namespace: "golang/lib/x" }];
+    return new Response(JSON.stringify(items), { status: 200, headers: { "x-next-page": page === 1 ? "2" : "" } });
+  }) as unknown as typeof fetch);
+  const projects = await host.listProjects!("golang");
+  assert.equal(projects.length, 100);
+  assert.ok(projects.includes("golang/lib/x"));
+  assert.ok(!projects.includes("other/leak"));
+  assert.equal(urls.length, 2);
+  assert.match(urls[0], /^https:\/\/lab\.corp\/api\/v4\/groups\/golang\/projects\?/);
+  assert.match(urls[0], /include_subgroups=true&archived=false&with_shared=false&min_access_level=20/);
+  const missing = createGitLabHost("https://lab.corp", "t", (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch);
+  await assert.rejects(missing.listProjects!("nope"), /找不到群组 nope，或者令牌看不到它/);
+});
+
+test("按群展开仓库：写出来的照配置里的写法，通配换成列出来的项目；列失败沿用上次的；不在配置里的不认", async () => {
+  let listed: Record<string, string[] | Error> = { golang: ["golang/user", "golang/lib/x"] };
+  const warnings: string[] = [];
+  const host: CodeHost = {
+    ...fakeHost().host,
+    async listProjects(namespace) {
+      const result = listed[namespace];
+      if (result instanceof Error || result === undefined) {
+        throw result ?? new RepoError("没有");
+      }
+      return result;
+    },
+  };
+  const all = new CodeWorkspaces({
+    root: path.join(tmp, `ws${rootCount++}`),
+    host,
+    repos: ["ai/agent-tag", "golang/*", "php/*"],
+    logger: { ...quiet, warn: (message: string) => warnings.push(message) },
+  });
+  assert.deepEqual(all.repos, ["ai/agent-tag"]);
+  assert.deepEqual(all.patterns, ["golang/*", "php/*"]);
+  // 还没列过：通配下暂时没有
+  assert.deepEqual(all.resolve(["golang/*", "AI/agent-tag"]), ["ai/agent-tag"]);
+  await all.refreshPatterns();
+  assert.deepEqual(all.resolve(["golang/*", "AI/agent-tag"]), ["golang/user", "golang/lib/x", "ai/agent-tag"]);
+  // 配置里没有的仓库、通配不认；具体写出来的列过的项目也认（写在别的群的通配下）
+  assert.deepEqual(all.resolve(["other/x", "ops/*", "golang/user"]), ["golang/user"]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /代码仓库 php\/\* 列不出项目/);
+  // 列失败：沿用上次的
+  listed = { golang: new RepoError("GitLab 挂了") };
+  await all.refreshPatterns();
+  assert.deepEqual(all.resolve(["golang/*"]), ["golang/user", "golang/lib/x"]);
+  assert.ok(warnings.some((warning) => /golang\/\* 列不出项目，沿用上次列出的：GitLab 挂了/.test(warning)));
+});
+
+test("代码工具只能打开这个群的仓库：别的群的仓库直接拒绝，提示里只列这个群的", async () => {
+  const all = new CodeWorkspaces({ root: path.join(tmp, `ws${rootCount++}`), host: fakeHost().host, repos: ["acme/demo", "acme/secret"], logger: quiet });
+  await assert.rejects(all.open("om_g1", "acme/secret", undefined, ["acme/demo"]), /这个群没有接入仓库 acme\/secret，能操作的只有：acme\/demo/);
+  await assert.rejects(all.open("om_g1", "acme/demo", undefined, []), /这个群没有接入仓库 acme\/demo，没有能操作的仓库/);
+  const tools = Object.fromEntries(
+    createCodeTools({ workspaces: all, repos: ["acme/demo"], threadKey: "om_g2", botName: () => "飞书 CLI" }).map((tool) => [tool.spec.name, tool]),
+  );
+  // 只有一个仓库：参数里不列别的，不填 repo 就是它
+  assert.match(tools.code_list_files.spec.description + JSON.stringify(tools.code_list_files.spec.parameters), /acme\/demo/);
+  assert.doesNotMatch(JSON.stringify(tools.code_list_files.spec.parameters), /acme\/secret/);
+  assert.match(await tools.code_list_files.run({}, { signal }), /README\.md/);
+  await assert.rejects(tools.code_read_file.run({ repo: "acme/secret", path: "README.md" }, { signal }), /这个群没有接入仓库 acme\/secret/);
+});

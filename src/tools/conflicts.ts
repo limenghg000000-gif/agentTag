@@ -118,8 +118,10 @@ export interface ConflictDeskOptions {
   knowledge: ConflictKnowledge;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   updateCard: (messageId: string, card: object) => Promise<void>;
-  /** 写权限名单：要改经验库（选了以群记忆为准）时只有名单里的人能点同步 */
-  approvers: ReadonlySet<string>;
+  /** 这个群的写权限名单：要改经验库（选了以群记忆为准）时只有名单里的人能点同步。没有名单的群谁都不能改经验库 */
+  approvers: (chatId: string) => ReadonlySet<string> | undefined;
+  /** 这个群能改群记忆的人：要改群记忆（选了以经验库为准）时只有他们能点同步。不传、或者这个群没限定时谁都能 */
+  memoryEditors?: (chatId: string) => ReadonlySet<string> | undefined;
   allowedChatIds: ReadonlySet<string>;
   /** 卡片回调里没有点的人的名字：用它找（见 createNameLookup）。不传时找不到名字的写「有人」 */
   nameOf?: NameLookup;
@@ -130,7 +132,7 @@ export interface ConflictDeskOptions {
 /**
  * 群记忆和团队经验库说法对不上时的冲突卡片：模型把对不上的几处列出来，每处写好两个方向各改成什么；
  * 程序发卡片，群里成员每处选以哪边为准（默认选更新的那边），点「按选择同步」后把输的那边改成和赢的一样。
- * 群记忆是这个群自己的，群里谁都能让机器人改，只改群记忆时谁都能点；经验库所有群共用，要改它时只有写权限名单里的人能点，
+ * 群记忆是这个群自己的，群里谁都能让机器人改（这个群限定了能改群记忆的人时只有他们），只改群记忆时这些人都能点；经验库所有群共用，要改它时只有这个群写权限名单里的人能点，
  * 而且走和「保存」一样的流程（存新的、归档旧的、排查经验同步 aiops）。
  * 卡片内容存在内存里（按钮只回传卡片编号和选项，回调里的内容不可信），机器人重启后旧卡片点了提示失效
  */
@@ -236,7 +238,7 @@ export class ConflictDesk {
       await this.render(card, expiredCard("这张卡片超过 24 小时，已经失效。需要的话在话题里再说一次「查一下群记忆和经验库有没有冲突」"));
       return true;
     }
-    const approver = this.options.approvers.has(operator.openId);
+    const approver = this.options.approvers(card.chatId)?.has(operator.openId) === true;
     if (value.op === "pick") {
       const index = typeof value.row === "string" ? Number(value.row) : Number.NaN;
       const row = Number.isInteger(index) ? card.rows[index] : undefined;
@@ -285,6 +287,17 @@ export class ConflictDesk {
         `${who}点了同步：有 ${changesKnowledge} 处选了「以群记忆为准」，要改经验库（所有群共用），只有写权限名单里的人能点。` +
         "只想改群记忆的话，把那几处改成「以经验库为准」或「先不动」再点";
       this.logger.info(`冲突卡片 要改经验库、不在写权限名单里，没有同步 card=${card.id} operator=${operator.openId}`);
+      await this.render(card);
+      return true;
+    }
+    // 这个群限定了谁能改群记忆（MEMORY_EDITORS）：选了以经验库为准的那几处要改群记忆，只有他们能点
+    const changesMemory = card.rows.filter((row) => row.pick === "knowledge").length;
+    const editors = this.options.memoryEditors?.(card.chatId);
+    if (changesMemory > 0 && editors && !editors.has(operator.openId)) {
+      card.note =
+        `${who}点了同步：有 ${changesMemory} 处选了「以经验库为准」，要改群记忆，这个群只有指定的人能改群记忆。` +
+        "只想改经验库的话，把那几处改成「以群记忆为准」或「先不动」再点";
+      this.logger.info(`冲突卡片 要改群记忆、不在能改群记忆的名单里，没有同步 card=${card.id} operator=${operator.openId}`);
       await this.render(card);
       return true;
     }

@@ -364,3 +364,126 @@ test("SCHEDULED_TASKS：默认开，记在 DATA_DIR/schedules.json；off 关掉�
   assert.equal(loadConfig({ ...base, SCHEDULED_TASKS: " OFF " }).schedules, undefined);
   assert.throws(() => loadConfig({ ...base, SCHEDULED_TASKS: "yes" }), /SCHEDULED_TASKS 只能是 on 或 off/);
 });
+
+const groupBase = {
+  ...base,
+  FEISHU_ALLOWED_CHAT_IDS: "oc_test,oc_ops,oc_other",
+  GITLAB_URL: "https://lab.corp",
+  GITLAB_TOKEN: "t",
+  MCP_SERVERS: "aiops=https://aiops.example.com/mcp",
+};
+
+test("GROUPS：不配时没有按群的配置；配了的群逐项读 GROUP_<名字>_…，没写的项不读（照全局）", () => {
+  assert.deepEqual(loadConfig(base).groups, []);
+  const config = loadConfig({
+    ...groupBase,
+    CODE_REPOS: "ai/aiops-mcp@aiops,ai/agent-tag",
+    WRITE_ALLOWED_USERS: "ou_ml",
+    GROUPS: " test=oc_test , Ops=oc_ops ",
+    GROUP_TEST_CODE_REPOS: "golang/*, php/gateway@master",
+    GROUP_TEST_WRITE_ALLOWED_USERS: "ou_a, ou_b",
+    GROUP_TEST_MEMORY_EDITORS: "none",
+    GROUP_TEST_MCP: "aiops",
+    GROUP_TEST_MCP_AIOPS_TOOLS: "diagnose_service, find_service",
+    GROUP_TEST_KNOWLEDGE: "off",
+    // 和群配置无关的变量不管
+    GROUP_ID: "1000",
+  });
+  const [test, ops] = config.groups;
+  assert.equal(test.name, "test");
+  assert.equal(test.chatId, "oc_test");
+  assert.deepEqual(test.codeRepos, ["golang/*", "php/gateway"]);
+  assert.deepEqual(test.writeAllowedUsers, new Set(["ou_a", "ou_b"]));
+  assert.deepEqual(test.memoryEditors, new Set());
+  assert.deepEqual(test.mcp, new Map([["aiops", ["diagnose_service", "find_service"]]]));
+  assert.equal(test.knowledge, false);
+  assert.deepEqual(ops, { name: "ops", chatId: "oc_ops" });
+  // 群里指定的分支和全局的合在一起，全局的仓库清单不变
+  assert.deepEqual(config.code?.repos, ["ai/aiops-mcp", "ai/agent-tag"]);
+  assert.deepEqual(config.code?.branches, { "ai/aiops-mcp": "aiops", "php/gateway": "master" });
+});
+
+test("GROUPS 写错时报错：格式不对、名字或群重复、群不在白名单里", () => {
+  assert.throws(() => loadConfig({ ...groupBase, GROUPS: "oc_test" }), /名字=群的 chat_id/);
+  assert.throws(() => loadConfig({ ...groupBase, GROUPS: "team-a=oc_test" }), /名字只用字母和数字/);
+  assert.throws(() => loadConfig({ ...groupBase, GROUPS: "test=" }), /名字=群的 chat_id/);
+  assert.throws(() => loadConfig({ ...groupBase, GROUPS: "test=oc_test,TEST=oc_ops" }), /test 写了两次/);
+  assert.throws(() => loadConfig({ ...groupBase, GROUPS: "test=oc_test,ops=oc_test" }), /群 oc_test 写了两次（test 和 ops）/);
+  assert.throws(() => loadConfig({ ...groupBase, GROUPS: "x=oc_x" }), /x 的群 oc_x 不在 FEISHU_ALLOWED_CHAT_IDS 里/);
+});
+
+test("GROUP_ 变量名写错时报错，不悄悄照全局：群名拼错、项拼错", () => {
+  const groups = { ...groupBase, GROUPS: "test=oc_test" };
+  assert.throws(() => loadConfig({ ...groups, GROUP_TSET_WRITE_ALLOWED_USERS: "ou_a" }), /GROUP_TSET_WRITE_ALLOWED_USERS 里的群名 tset 不在 GROUPS 里/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_CODE_REPO: "ai/x" }), /GROUP_TEST_CODE_REPO 不认识/);
+  assert.throws(() => loadConfig({ ...base, GROUP_OPS_MCP: "off" }), /群名 ops 不在 GROUPS 里/);
+  // 空的当没写
+  assert.deepEqual(loadConfig({ ...groups, GROUP_TSET_CODE_REPOS: " " }).groups, [{ name: "test", chatId: "oc_test" }]);
+});
+
+test("GROUP_<名字>_CODE_REPOS：off 是不开代码；GitLab 能写 group/*；只有群里配了仓库时也接代码仓库", () => {
+  const off = loadConfig({ ...groupBase, CODE_REPOS: "ai/agent-tag", GROUPS: "test=oc_test", GROUP_TEST_CODE_REPOS: "OFF" });
+  assert.deepEqual(off.groups[0].codeRepos, []);
+  const only = loadConfig({ ...groupBase, GROUPS: "test=oc_test", GROUP_TEST_CODE_REPOS: "ai/*" });
+  assert.deepEqual(only.code?.repos, []);
+  assert.deepEqual(only.groups[0].codeRepos, ["ai/*"]);
+  assert.deepEqual(only.code?.host, { kind: "gitlab", url: "https://lab.corp", token: "t" });
+  assert.deepEqual(loadConfig({ ...groupBase, CODE_REPOS: "ai/tools/*" }).code?.repos, ["ai/tools/*"]);
+});
+
+test("仓库清单写错时报错：通配带分支、GitHub 写通配、* 不在最后、同一个仓库两处分支不一样、群里配了仓库却没配 GitLab", () => {
+  const groups = { ...groupBase, GROUPS: "test=oc_test" };
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_CODE_REPOS: "ai/*@master" }), /通配的不能指定分支/);
+  assert.throws(() => loadConfig({ ...base, CODE_REPOS: "acme/*", GITHUB_TOKEN: "g" }), /通配只支持 GitLab/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_CODE_REPOS: "ai/*/x" }), /项目路径/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_CODE_REPOS: "a*/x/*" }), /通配要写成 group\/\*/);
+  assert.throws(
+    () => loadConfig({ ...groups, CODE_REPOS: "ai/x@master", GROUP_TEST_CODE_REPOS: "AI/x@uat" }),
+    /GROUP_TEST_CODE_REPOS 里 AI\/x 指定的分支 uat 和别处写的 master 不一样/,
+  );
+  // 两处写的一样没关系
+  assert.deepEqual(loadConfig({ ...groups, CODE_REPOS: "ai/x@master", GROUP_TEST_CODE_REPOS: "ai/x@master" }).code?.branches, { "ai/x": "master" });
+  assert.throws(
+    () => loadConfig({ ...base, FEISHU_ALLOWED_CHAT_IDS: "oc_test", GROUPS: "test=oc_test", GROUP_TEST_CODE_REPOS: "ai/x" }),
+    /配了 GROUP_TEST_CODE_REPOS 就要配 GITLAB_URL 和 GITLAB_TOKEN/,
+  );
+});
+
+test("GROUP_<名字>_WRITE_ALLOWED_USERS、MEMORY_EDITORS：none 是谁都不能，写的要是 open_id；全局 MEMORY_EDITORS 不配时谁都能改群记忆", () => {
+  const groups = { ...groupBase, GROUPS: "test=oc_test" };
+  assert.deepEqual(loadConfig({ ...groups, GROUP_TEST_WRITE_ALLOWED_USERS: "None" }).groups[0].writeAllowedUsers, new Set());
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_WRITE_ALLOWED_USERS: "赵作武" }), /GROUP_TEST_WRITE_ALLOWED_USERS 要填飞书用户的 open_id.*赵作武/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_MEMORY_EDITORS: "ou_a,someone" }), /GROUP_TEST_MEMORY_EDITORS.*someone/);
+  assert.equal(loadConfig(base).feishu.memoryEditors, undefined);
+  assert.deepEqual(loadConfig({ ...base, MEMORY_EDITORS: "ou_a, ou_b" }).feishu.memoryEditors, new Set(["ou_a", "ou_b"]));
+  assert.throws(() => loadConfig({ ...base, MEMORY_EDITORS: "x" }), /MEMORY_EDITORS 要填飞书用户的 open_id/);
+});
+
+test("GROUP_<名字>_MCP：off 是不能用；只写工具时其他服务照全局；工具只能在全局开了的里挑", () => {
+  const groups = { ...groupBase, MCP_SERVERS: "aiops=https://a.example.com/mcp,other=https://b.example.com/mcp", MCP_OTHER_TOOLS: "*", GROUPS: "test=oc_test" };
+  assert.equal(loadConfig(groups).groups[0].mcp, undefined);
+  assert.deepEqual(loadConfig({ ...groups, GROUP_TEST_MCP: "off" }).groups[0].mcp, new Map());
+  assert.deepEqual(loadConfig({ ...groups, GROUP_TEST_MCP: "Other" }).groups[0].mcp, new Map([["other", "*"]]));
+  assert.deepEqual(
+    loadConfig({ ...groups, GROUP_TEST_MCP_AIOPS_TOOLS: "query_logs" }).groups[0].mcp,
+    new Map<string, readonly string[] | "*">([
+      ["aiops", ["query_logs"]],
+      ["other", "*"],
+    ]),
+  );
+  // 全局是 * 的服务，按群写什么工具名都行（服务端有没有到连上时才知道）
+  assert.deepEqual(loadConfig({ ...groups, GROUP_TEST_MCP_OTHER_TOOLS: "anything" }).groups[0].mcp?.get("other"), ["anything"]);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_MCP: "grafana" }), /GROUP_TEST_MCP 里的 grafana 不在 MCP_SERVERS 里/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_MCP_AIOPS_TOOLS: "save_lesson" }), /save_lesson 全局没开（MCP_AIOPS_TOOLS）/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_MCP: "other", GROUP_TEST_MCP_AIOPS_TOOLS: "query_logs" }), /不在这个群能用的服务里/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_MCP: "off", GROUP_TEST_MCP_AIOPS_TOOLS: "query_logs" }), /GROUP_TEST_MCP=off/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_MCP_GRAFANA_TOOLS: "x" }), /不在这个群能用的服务里/);
+});
+
+test("GROUP_<名字>_KNOWLEDGE：off 是这个群不用经验库；全局关着时群里开不了", () => {
+  const groups = { ...groupBase, GROUPS: "test=oc_test" };
+  assert.equal(loadConfig({ ...groups, GROUP_TEST_KNOWLEDGE: "OFF" }).groups[0].knowledge, false);
+  assert.equal(loadConfig({ ...groups, GROUP_TEST_KNOWLEDGE: "on" }).groups[0].knowledge, true);
+  assert.throws(() => loadConfig({ ...groups, KNOWLEDGE: "off", GROUP_TEST_KNOWLEDGE: "on" }), /全局 KNOWLEDGE=off/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_KNOWLEDGE: "yes" }), /GROUP_TEST_KNOWLEDGE 只能是 on 或 off/);
+});

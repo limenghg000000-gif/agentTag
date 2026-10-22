@@ -9,7 +9,7 @@ import { MemoryStore } from "../src/memory.js";
 import type { NameLookup } from "../src/operator-names.js";
 import { buildSystemPrompt } from "../src/prompt.js";
 import { CONFLICT_ACTION, CONFLICT_TOOL, CONFLICT_TTL_MS, MAX_CONFLICTS } from "../src/tools/conflicts.js";
-import { KnowledgeDesk } from "../src/tools/knowledge.js";
+import { KnowledgeDesk, type KnowledgeScope } from "../src/tools/knowledge.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const signal = new AbortController().signal;
@@ -72,7 +72,8 @@ async function setup({
   approvers = new Set(["ou_admin"]),
   memory = true,
   nameOf,
-}: { approvers?: ReadonlySet<string> | null; memory?: boolean; nameOf?: NameLookup } = {}) {
+  scope,
+}: { approvers?: ReadonlySet<string> | null; memory?: boolean; nameOf?: NameLookup; scope?: (chatId: string) => KnowledgeScope } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "conflicts-"));
   const backend = new TableBackend();
   backend.entries.push(structuredClone(release), structuredClone(alarm));
@@ -95,6 +96,7 @@ async function setup({
       updates.push({ messageId, card });
     },
     ...(approvers ? { approvers } : {}),
+    ...(scope ? { scope } : {}),
     allowedChatIds: new Set(["oc_1"]),
     ...(memory ? { memory: store } : {}),
     ...(nameOf ? { nameOf } : {}),
@@ -650,5 +652,34 @@ test("冲突卡片：分不出哪边更新时默认先不动", async () => {
     assert.match(text(s.card()), /分不出哪边更新，默认先不动/);
   } finally {
     await s.cleanup();
+  }
+});
+
+test("冲突卡片：这个群限定了能改群记忆的人时，选了以经验库为准（要改群记忆）的只有他们能点同步；改经验库看这个群的写权限名单", async () => {
+  const s = await setup({ approvers: null, scope: () => ({ approvers: new Set(["ou_ops"]), memoryEditors: new Set(["ou_keeper", "ou_ops"]), aiops: false }) });
+  try {
+    s.setClock("2026-10-14T08:00:00.000Z");
+    await s.tool().run({ conflicts: s.both }, { signal });
+    await s.pick(1, "skip");
+    await s.apply("ou_2", "李四");
+    assert.match(text(s.card()), /李四点了同步：有 1 处选了「以经验库为准」，要改群记忆，这个群只有指定的人能改群记忆/);
+    assert.equal((await s.store.list("oc_1"))[0].content, "发版固定在每周三", "没改");
+    await s.apply("ou_keeper", "王五");
+    assert.equal((await s.store.list("oc_1"))[0].content, "发版固定在每周四下午");
+  } finally {
+    await s.cleanup();
+  }
+  // 要改经验库：全局名单里的 ou_admin 在这个群不算，这个群名单里的 ou_ops 能点
+  const t = await setup({ scope: () => ({ approvers: new Set(["ou_ops"]), aiops: false }) });
+  try {
+    await t.tool().run({ conflicts: t.both }, { signal });
+    await t.pick(0, "skip");
+    await t.apply("ou_admin", "ML");
+    assert.match(text(t.card()), /ML点了同步：有 1 处选了「以群记忆为准」，要改经验库/);
+    await t.apply("ou_ops", "运维");
+    assert.equal(t.backend.entries.filter((entry) => entry.status === "active").length, 2);
+    assert.ok(t.backend.entries.some((entry) => entry.conclusion === "先让用户重启手机，还收不到再查短信通道"));
+  } finally {
+    await t.cleanup();
   }
 });

@@ -31,6 +31,8 @@ export interface PromptContext {
   scheduled?: { label: string; schedule: string; creatorName?: string; readOnly?: boolean; appendDoc?: string; alert?: boolean };
   /** 带上了群聊、或者是没 @ 的跟聊，这句话本身没让它记住或忘掉什么：没给记、改、删群记忆的工具 */
   memoryLocked?: boolean;
+  /** 这个群限定了能改群记忆的人（MEMORY_EDITORS），提问的人不在里面：没给记、改、删群记忆的工具 */
+  notMemoryEditor?: boolean;
   /** 这次是点「接着查」按钮问的，只给了读的工具 */
   followUp?: boolean;
   /** 这次只是整理话题里已经有的内容（总结、讲给谁听、换个说法），没给查询的工具 */
@@ -114,6 +116,7 @@ export function buildSystemPrompt({
   unaddressed,
   scheduled,
   memoryLocked,
+  notMemoryEditor,
   followUp,
   restate,
   earlierResults,
@@ -162,7 +165,7 @@ export function buildSystemPrompt({
   }
   if (readOnly) {
     lines.push(
-      "- 这次提问的人没有让你改东西的权限（管理员在 WRITE_ALLOWED_USERS 里配置），所以这次没有新建或修改文档、改代码、开合并请求的工具。可以帮他读、查、回答；他要改文档、改代码或开合并请求时，直接说明他没有这个权限，请他找有权限的同事，不要假装已经改了。",
+      "- 这次提问的人没有让你改东西的权限（不在管理员给这个群配的写权限名单里），所以这次没有新建或修改文档、改代码、开合并请求的工具。可以帮他读、查、回答；他要改文档、改代码或开合并请求时，直接说明他没有这个权限，请他找有权限的同事，不要假装已经改了。",
     );
   }
   if (ambientOnly) {
@@ -208,6 +211,14 @@ export function buildSystemPrompt({
         "到点按建任务的人的权限跑：他不能改文档的，任务里也改不了；定时任务只查代码，不改代码、不开合并请求；不改已有文档，只能追加到他这句话里自己贴了链接的那篇（填 append_doc）。" +
         "他说「有异常 @ 我」的填 alert_creator。到点正常跑完不 @ 人，没跑成、被别人暂停时机器人会 @ 建的人；只能 @ 建任务的人，要 @ 别人、@ 所有人的告诉他做不到。" +
         "暂停群里谁都能；恢复、取消只有建任务的人和管理员能做。",
+    );
+  }
+  if (notMemoryEditor) {
+    lines.push(
+      "- 这个群只有指定的几个人能让你记、改、删群记忆（管理员按群配的），这次提问的人不在里面：群记忆只能看，这次没有记、改、删群记忆的工具，不要说已经记住、已经改了或删了。" +
+        "他让你记住、忘掉什么时，告诉他这个群只有指定的人能改群记忆，请他找这些人说" +
+        // 定时任务到点跑的不加：任务内容里的条件是要照着做的，不是定规矩
+        (scheduled ? "。" : "；他这句话要是在给你定以后的规矩，也一样告诉他没记上，不要照着规矩现在就去查、去做。"),
     );
   }
   if (memoryLocked) {
@@ -410,7 +421,7 @@ function knowledgeSection(
         ? "- 这次是点「接着查」按钮问的，不能起草存进或归档经验的卡片。有人要沉淀经验时，请他直接 @ 你说，不要假装已经存了。"
         : draftsLocked
         ? "- 这次不能起草存进或归档经验的卡片，也不能发群记忆和经验库冲突的卡片：这句话本身没说到经验库，群聊里、话题里别人说的「沉淀」「归档」不算，也不要主动起草。要存的话请他直接说「沉淀成经验」。"
-        : "- 现在不能往经验库里存或归档经验（管理员还没配写权限名单 WRITE_ALLOWED_USERS）。有人要沉淀经验时如实说明，不要假装已经存了。",
+        : "- 现在不能往经验库里存或归档经验（管理员还没给这个群配写权限名单，没人能点确认）。有人要沉淀经验时如实说明，不要假装已经存了。",
     );
     return lines;
   }

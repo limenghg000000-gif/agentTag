@@ -4,7 +4,7 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { MissedEventAlarm } from "./alarm.js";
 import { parseReleaseNotes, UpdateAnnouncer } from "./announce.js";
 import { MemoryBackup } from "./backup.js";
-import { createCardActionHandler, createMessageHandler } from "./bot.js";
+import { type ChatScope, createCardActionHandler, createMessageHandler } from "./bot.js";
 import { CardAnswerStore } from "./card-answers.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { FEATURES_FILE, loadConfig, RELEASE_NOTES_FILE } from "./config.js";
@@ -13,6 +13,7 @@ import { DuplicateAsks } from "./duplicates.js";
 import { createFeishuApi } from "./feishu.js";
 import { JUDGE_MEMORY_CHARS, ThreadFollower } from "./follow.js";
 import { createFollowUp } from "./follow-up.js";
+import { GroupPolicies } from "./groups.js";
 import { ThreadContextLoader } from "./history.js";
 import { ImageReader } from "./images.js";
 import { type FeatureList, parseFeatures } from "./features.js";
@@ -44,6 +45,8 @@ if (existsSync(".env")) {
   process.loadEnvFile(".env");
 }
 const config = loadConfig();
+// 按群的配置（GROUPS）：每个群用哪些仓库、谁能改、能用哪些 MCP 工具、用不用经验库，群里没写的项照全局
+const groups = new GroupPolicies(config);
 
 // Channel 是飞书 SDK 在长连接之上的封装：拉取机器人身份、识别 @、按消息 id 去重、丢弃过期重推、Markdown 转富文本发送
 const channel = createLarkChannel({
@@ -81,7 +84,7 @@ const cardAnswers = new CardAnswerStore(config.cardAnswersDir);
 // 群成员在新话题里说「上面那个」时，模型用 chat_recent_threads 看本群最近几个话题的问答
 const recentThreads = new RecentThreadStore(config.recentThreadsDir);
 const docs = new FeishuDocs(createDocsApi(channel.rawClient), () => channel.botIdentity?.name ?? "机器人");
-const workspaces = config.code ? await openCodeWorkspaces(config.code) : undefined;
+const workspaces = config.code ? await openCodeWorkspaces(config.code, groups.repoEntries()) : undefined;
 // MCP 服务在后台连接，连上之前（或连不上时）的提问没有它的工具，不耽误机器人启动
 const mcp = config.mcp.length > 0 ? new McpHub(config.mcp) : undefined;
 void mcp?.start();
@@ -91,10 +94,8 @@ const knowledgeTable = config.knowledge
       api: createBitableApi(channel.rawClient),
       stateFile: config.knowledge.stateFile,
       ...(config.knowledge.bitable ? { target: config.knowledge.bitable } : {}),
-      share: {
-        chatIds: [...config.feishu.allowedChatIds],
-        editors: [...(config.feishu.writeAllowedUsers ?? [])],
-      },
+      // 共享给用经验库的群（只读）和这些群里能点「保存」的人
+      share: groups.knowledgeShare(),
     })
   : undefined;
 const knowledge = config.knowledge
@@ -108,7 +109,15 @@ const knowledge = config.knowledge
       ...(mcp?.names.includes("aiops") ? { aiops: new AiopsLessons(mcp, "aiops") } : {}),
       send: (to, input, opts) => channel.send(to, input, opts),
       updateCard: (messageId, card) => channel.updateCard(messageId, card),
-      ...(config.feishu.writeAllowedUsers ? { approvers: config.feishu.writeAllowedUsers } : {}),
+      // 谁能点「保存」「归档」、谁能改群记忆、能不能用 aiops 经验库，都按卡片所在的群
+      scope: (chatId) => {
+        const policy = groups.of(chatId);
+        return {
+          ...(policy.writeAllowed ? { approvers: policy.writeAllowed } : {}),
+          ...(policy.memoryEditors ? { memoryEditors: policy.memoryEditors } : {}),
+          aiops: usesAiopsLessons(chatId),
+        };
+      },
       allowedChatIds: config.feishu.allowedChatIds,
       // 群记忆和经验库说法对不上时发冲突卡片，选好以哪边为准后两边一起改
       memory,
@@ -132,33 +141,35 @@ const context = new ThreadContextLoader(feishuApi, console, undefined, cardAnswe
 const answerMessage = createMessageHandler({
   model,
   tools,
-  // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分
-  taskTools: ({ chatId, senderId, threadKey, askerName, messageId }) => [
-    ...createDocTools({ docs, chatId, requesterOpenId: senderId }),
-    // 读本群一段时间的聊天记录（周报、「今天大家讨论了什么」）：只能读本群，读过以后这次不能再改已有的文档和代码
-    createChatHistoryTool({ api: feishuApi, chatId, cardAnswers }),
-    ...(workspaces
-      ? createCodeTools({ workspaces, threadKey, askerName, botName: () => channel.botIdentity?.name ?? "机器人" })
-      : []),
-    // 定时任务记在提问的人名下，到点按他的权限跑；暂停、取消别人建的要在写权限名单里（没配名单时谁都能）
-    ...(scheduler
-      ? createScheduleTools({
-          scheduler,
-          chatId,
-          senderId,
-          ...(askerName ? { askerName } : {}),
-          messageId,
-          canManageAll: !config.feishu.writeAllowedUsers || config.feishu.writeAllowedUsers.has(senderId),
-        })
-      : []),
-  ],
+  // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分，只给这个群的仓库
+  taskTools: ({ chatId, senderId, threadKey, askerName, messageId }) => {
+    const policy = groups.of(chatId);
+    const repos = codeReposOf(chatId);
+    return [
+      ...createDocTools({ docs, chatId, requesterOpenId: senderId }),
+      // 读本群一段时间的聊天记录（周报、「今天大家讨论了什么」）：只能读本群，读过以后这次不能再改已有的文档和代码
+      createChatHistoryTool({ api: feishuApi, chatId, cardAnswers }),
+      ...(workspaces && repos.length > 0
+        ? createCodeTools({ workspaces, repos, threadKey, askerName, botName: () => channel.botIdentity?.name ?? "机器人" })
+        : []),
+      // 定时任务记在提问的人名下，到点按他的权限跑；暂停、取消别人建的要在这个群的写权限名单里（没配名单时谁都能）
+      ...(scheduler
+        ? createScheduleTools({
+            scheduler,
+            chatId,
+            senderId,
+            ...(askerName ? { askerName } : {}),
+            messageId,
+            canManageAll: !policy.writeAllowed || policy.writeAllowed.has(senderId),
+          })
+        : []),
+    ];
+  },
   allowedChatIds: config.feishu.allowedChatIds,
   // 群主界面说「别主动插话」开关主动接话，话题里说「只在 @ 我时回」停掉跟聊（下面创建，收到消息时已经有了）
   command: (msg) => proactive.toggle(msg) ?? follower?.mute(msg),
-  ...(workspaces ? { codeRepos: workspaces.repos } : {}),
-  ...(config.feishu.writeAllowedUsers ? { writeAllowed: config.feishu.writeAllowedUsers } : {}),
-  ...(mcp ? { mcp } : {}),
-  ...(knowledge ? { knowledge } : {}),
+  // 仓库、写权限名单、能改群记忆的人、MCP 工具、经验库按消息所在的群取
+  scope: chatScope,
   ...(images ? { images } : {}),
   chatAlong: config.followThreads || config.chatContext || config.proactive.chatIds.size > 0,
   showThinking: config.showThinking,
@@ -227,11 +238,14 @@ const proactive = new ProactiveReplier({
   skipTopic: (threadKey) => follower?.owns(threadKey) ?? false,
   // 群记忆里定过规矩的那类事：像被 @ 一样去做，只给读的工具；之后跟着这个话题
   work: (msg) => answerUnaddressed(msg),
-  // 像提问、像报错的看一眼之前查经验库，别的要开口说话的再想一遍之前查（和回答前自动查的同一个；查询词里手机号这类打码，像密钥的不发到 aiops）
+  // 像提问、像报错的看一眼之前查经验库，别的要开口说话的再想一遍之前查（和回答前自动查的同一个；查询词里手机号这类打码，像密钥的不发到 aiops）。
+  // 关掉经验库的群不查
   ...(knowledge
     ? {
-        knowledge: (query: string, msg: NormalizedMessage, signal: AbortSignal, options: { secret: boolean }) =>
-          knowledge.lookup(query, { chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }, signal, options),
+        knowledge: async (query: string, msg: NormalizedMessage, signal: AbortSignal, options: { secret: boolean }) =>
+          groups.of(msg.chatId).knowledge
+            ? knowledge.lookup(query, { chatId: msg.chatId, senderId: msg.senderId, messageId: msg.messageId }, signal, options)
+            : undefined,
       }
     : {}),
   onReplied: (msg) => follower?.track(msg),
@@ -494,8 +508,21 @@ if (config.webSearch) {
   console.log("联网搜索没开：WEB_SEARCH=off，或者 MODEL_BASE_URL 不是百炼的 OpenAI 兼容接口（web_search 只支持百炼）");
 }
 if (workspaces) {
-  console.log(`代码仓库已配置（${workspaces.host.name}）：${workspaces.repos.join(", ")}，工作目录在 ${config.code!.workspaceDir}`);
+  console.log(
+    `代码仓库已配置（${workspaces.host.name}）：${[...workspaces.repos, ...workspaces.patterns].join(", ")}，工作目录在 ${config.code!.workspaceDir}` +
+      (config.groups.length > 0
+        ? `；没单独配仓库的群${config.code!.repos.length > 0 ? `用 ${config.code!.repos.join(", ")}` : "没有代码工具"}`
+        : ""),
+  );
   void checkRepos(workspaces);
+  if (workspaces.patterns.length > 0) {
+    // 通配（group/*）下的项目从 GitLab 上列：启动时列一次，之后每 30 分钟再列一次，群组里新建的项目不用重启
+    void workspaces.refreshPatterns();
+    setInterval(() => void workspaces.refreshPatterns(), 30 * 60_000).unref();
+  }
+}
+for (const line of groups.describe()) {
+  console.log(line);
 }
 if (mcp) {
   console.log(`MCP 服务：${mcp.names.join(", ")}，在后台连接，连上后日志里有一行「MCP <名字>：已连上」`);
@@ -621,8 +648,37 @@ async function checkRepos(workspaces: CodeWorkspaces): Promise<void> {
   );
 }
 
-/** 代码仓库工具要用 git。没装 git 时不开这些工具，别的照常 */
-async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promise<CodeWorkspaces | undefined> {
+/** 这个群能操作的具体仓库：按群配置的清单展开通配（还没从 GitLab 列出来的通配暂时没有） */
+function codeReposOf(chatId: string): string[] {
+  const entries = groups.of(chatId).codeRepos;
+  return workspaces && entries.length > 0 ? workspaces.resolve(entries) : [];
+}
+
+/** 这个群回答时用的仓库、写权限名单、能改群记忆的人、MCP 工具和经验库（按群配置，群里没写的项照全局） */
+function chatScope(chatId: string): ChatScope {
+  const policy = groups.of(chatId);
+  const repos = codeReposOf(chatId);
+  const scopedMcp = mcp?.scoped(policy.mcp);
+  return {
+    ...(repos.length > 0 ? { codeRepos: repos } : {}),
+    ...(policy.writeAllowed ? { writeAllowed: policy.writeAllowed } : {}),
+    ...(policy.memoryEditors ? { memoryEditors: policy.memoryEditors } : {}),
+    ...(scopedMcp ? { mcp: scopedMcp } : {}),
+    ...(knowledge && policy.knowledge ? { knowledge } : {}),
+  };
+}
+
+/**
+ * 这个群能用 aiops 经验库：能用 aiops 的查经验工具（search_knowledge）。回答前查 aiops 经验库、排查经验同步过去、
+ * 归档 aiops 里的经验都看它
+ */
+function usesAiopsLessons(chatId: string): boolean {
+  const tools = groups.of(chatId).mcp.get("aiops");
+  return tools === "*" || (tools !== undefined && tools.includes("search_knowledge"));
+}
+
+/** 代码仓库工具要用 git。没装 git 时不开这些工具，别的照常。repos 是全局和各群写到的所有仓库 */
+async function openCodeWorkspaces(code: NonNullable<typeof config.code>, repos: readonly string[]): Promise<CodeWorkspaces | undefined> {
   try {
     await runGit(["--version"]);
   } catch (err) {
@@ -633,7 +689,7 @@ async function openCodeWorkspaces(code: NonNullable<typeof config.code>): Promis
   const workspaces = new CodeWorkspaces({
     root: code.workspaceDir,
     host,
-    repos: code.repos,
+    repos,
     branches: code.branches,
     ...(code.build ? { build: createBuildChecker(code.goproxy ? { goproxy: code.goproxy } : {}) } : {}),
   });

@@ -27,6 +27,8 @@ export const CODE_TOOL_NAMES = [
 
 export interface CodeToolsOptions {
   workspaces: CodeWorkspaces;
+  /** 这个群能操作的仓库（按群展开过的，见 CodeWorkspaces.resolve）。不传时是配置里写出来的全部 */
+  repos?: readonly string[];
   /** 话题标识：同一话题的几次任务共用一份工作目录 */
   threadKey: string;
   /** 发起人的名字，写进 PR 描述 */
@@ -35,8 +37,7 @@ export interface CodeToolsOptions {
 }
 
 /** 代码仓库工具。每个任务单独创建一套，工作目录按话题复用。 */
-export function createCodeTools({ workspaces, threadKey, askerName, botName }: CodeToolsOptions): Tool[] {
-  const repos = workspaces.repos;
+export function createCodeTools({ workspaces, repos = workspaces.repos, threadKey, askerName, botName }: CodeToolsOptions): Tool[] {
   const { requestName, refOf } = workspaces.host;
   // 平台支持时机器人能合并：只合自己开的、开到允许开发者合并的分支的
   const canMerge = workspaces.host.mergeCheck !== undefined && workspaces.host.mergeRequest !== undefined;
@@ -50,7 +51,8 @@ export function createCodeTools({ workspaces, threadKey, askerName, botName }: C
     const key = repo.toLowerCase();
     let ws = opened.get(key);
     if (!ws) {
-      ws = workspaces.open(threadKey, repo, signal);
+      // 只能打开这个群的仓库：模型填了别的群的仓库（或者通配下没列出来的），在这里就拒绝
+      ws = workspaces.open(threadKey, repo, signal, repos);
       ws.catch(() => opened.delete(key));
       opened.set(key, ws);
     }
