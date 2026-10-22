@@ -622,7 +622,8 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
-    // 这次真的建成、改成的定时任务（工具回执的第一行）：回答说得不对被拦下时，照这个告诉大家实际做成了什么，免得重复建
+    // 这次真的建成、改成的定时任务，只记做了什么、哪个编号（「已暂停定时任务 T1」）：回答说得不对时，照这个打回、告诉大家实际做成了什么，免得重复建。
+    // 不记回执里的任务内容：那是建任务的人写的，打回的说明是以系统检查的口吻发给模型的，不能夹带别人写的话
     const scheduleDone: string[] = [];
     // 这次定时任务工具（建、改、列表）的结果原文：回答里说的编号只认这里的，文档、代码里碰巧写着的 T4 不算
     const scheduleTexts: string[] = [];
@@ -726,7 +727,10 @@ async function runTask(
           }
           succeeded.add(tool.spec.name);
           if (tool.spec.name === SCHEDULE_CREATE_TOOL || tool.spec.name === SCHEDULE_CHANGE_TOOL) {
-            scheduleDone.push(output.split("\n")[0]!);
+            const done = output.match(SCHEDULE_RECEIPT)?.[0];
+            if (done) {
+              scheduleDone.push(done);
+            }
           }
           if (SCHEDULE_TOOLS.has(tool.spec.name)) {
             scheduleTexts.push(output);
@@ -2446,7 +2450,7 @@ export function reviewScheduleClaims(
   const notes: string[] = [];
   if (ran.length > 0) {
     notes.push(
-      `${ran.map(toolOf).join("、")} 这次已经做成了，回执是：${done().join("；")}。回答里说的定时任务（编号、是建还是改）和回执对不上：照回执改，不要再调 ${ran.map(toolOf).join("、")} 重做一遍，再调就多建、多改一个。`,
+      `${ran.map(toolOf).join("、")} 这次已经做成了：${done().join("、")}。回答里说的定时任务（编号、是建还是改）和这个对不上：照这个改，不要再调 ${ran.map(toolOf).join("、")} 重做一遍，再调就多建、多改一个。`,
     );
   }
   if (notRun.length > 0) {
@@ -2465,6 +2469,9 @@ export function reviewScheduleClaims(
 
 export const BLOCKED_SCHEDULE_ANSWER =
   "这次没有建成，也没有改动定时任务。要建、要改请 @ 我，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全，比如「@我 每天 15:30 汇总今天群里的讨论，追加到 https://…」。";
+
+/** 定时任务回执开头做了什么、哪个编号：「已建好定时任务 T3」「已暂停定时任务 T1」 */
+const SCHEDULE_RECEIPT = /^已(?:建好|暂停|恢复|取消)定时任务 T\d+/;
 
 /** 回答说的定时任务和这次做成的对不上时发出去的：什么都没做成就是 BLOCKED_SCHEDULE_ANSWER，做成了的照工具回执列出来 */
 export function blockedScheduleAnswer(done: readonly string[]): string {

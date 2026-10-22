@@ -571,10 +571,12 @@ test("建成了却说错了编号：拦下时照实列出这次建成的，不�
   assert.equal(requests.length, 3);
   // 打回时给回执、叫它照着改，不叫它再建一个
   const note = JSON.stringify(requests[2]!.messages.at(-1));
-  assert.match(note, /schedule_create 这次已经做成了，回执是：已建好定时任务 T3/);
+  assert.match(note, /schedule_create 这次已经做成了：已建好定时任务 T3。/);
+  // 打回的说明里只有做了什么、哪个编号，不夹带回执里的任务内容（那是建任务的人写的）
+  assert.doesNotMatch(note, /汇总群聊|每天 15:30（北京时间）/);
   assert.match(note, /不要再调 schedule_create 重做一遍/);
   assert.doesNotMatch(note, /要做就现在调/);
-  const answer = blockedScheduleAnswer(["已建好定时任务 T3（到点去做）：每天 15:30（北京时间），下次是 10-22 15:30。"]);
+  const answer = blockedScheduleAnswer(["已建好定时任务 T3"]);
   assert.deepEqual(markdowns(sent), [answer]);
   assert.match(answer, /实际做成的：\n- 已建好定时任务 T3/);
   assert.match(answer, /不用再建一次/);
