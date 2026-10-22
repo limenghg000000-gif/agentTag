@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
-import { MUTE_COMMAND, MUTED_REPLY, ThreadFollower, type ThreadFollowerOptions } from "../src/follow.js";
+import { hasWorkRule, MUTE_COMMAND, MUTED_REPLY, ThreadFollower, type ThreadFollowerOptions } from "../src/follow.js";
 
 const DAY = 24 * 60 * 60_000;
 import type { ThreadContext } from "../src/history.js";
@@ -242,6 +242,46 @@ test("不是对它说的、答案在群记忆里：开了主动接话的群里�
   assert.doesNotMatch(off.requests[0].system, /回答「做」/);
   assert.deepEqual(worked, ["om_5"]);
   assert.deepEqual(off.handled, []);
+  // 群里的规矩说要 @ 它才查：没有「做」这个选择，模型说了也不去做（「否」那句里说清这类事没 @ 回答否）
+  const mustAt = setup("做", false, { chimeIn: chimeIn(true), memory: "【约定】\n- #6 线上报错必须先 @ 飞书 CLI，再由我直接帮忙查（张三）" });
+  mustAt.follower.track(asked);
+  await mustAt.follower.consider(msg("om_7", { content: "gateway 又报 502 了" }));
+  assert.doesNotMatch(mustAt.requests[0].system, /回答「做」/);
+  assert.match(mustAt.requests[0].system, /群记忆里规矩说要 @ 它才处理的那类事，没 @ 它又不是在跟它说话的，也回答「否」/);
+  assert.match(mustAt.requests[0].system, /只输出一行：是、否，或者「接：」加一句话/);
+  assert.deepEqual(worked, ["om_5"]);
+  assert.deepEqual(mustAt.handled, []);
+});
+
+test("群记忆里有没有不用 @ 也要它去做的规矩：要先 @ 它才做的不算", () => {
+  const line = (content: string) => `【约定】\n- #5 ${content}（张三，10月22日）`;
+  for (const content of [
+    "线上报错不用 @ 你也直接帮忙查",
+    "线上报错不需要 @ 机器人，直接帮忙排查",
+    "告警没 @ 你的时候也直接帮忙查",
+    "告警直接帮忙查",
+    "部署相关的问题不用等 @ 直接处理",
+    "以后发版失败主动帮忙看一下",
+  ]) {
+    assert.equal(hasWorkRule(line(content)), true, content);
+  }
+  for (const content of [
+    "线上报错必须先 @ 飞书 CLI，再由我直接帮忙查",
+    "线上报错必须要 @ 你在直接帮忙查",
+    "报错要 @ 你再直接查",
+    "@ 了你才直接帮忙查",
+    "只在 @ 你的时候直接帮忙查",
+    "测试环境数据库是 db-test-2.internal",
+    "别主动插话",
+  ]) {
+    assert.equal(hasWorkRule(line(content)), false, content);
+  }
+  // 好几条里有一条是不用 @ 也查的就算；不是群记忆条目的行（类别标题、群聊）不看
+  assert.equal(hasWorkRule(`${line("线上报错必须先 @ 你再查")}\n- #6 告警不用 @ 你也直接帮忙查（李四）`), true);
+  assert.equal(hasWorkRule("[张三] 线上报错不用 @ 你也直接帮忙查"), false);
+  // 一条记忆里有换行：后面那行说了要先 @ 它，这条也不算
+  assert.equal(hasWorkRule(`【约定】\n- #5 线上报错直接帮忙查\n不过必须先 @ 你（张三）\n【背景】\n- #3 测试库是 db-test-2`), false);
+  assert.equal(hasWorkRule(""), false);
 });
 
 test("判断出错时不回：宁可漏回一句，也不在别人说话时插嘴", async () => {

@@ -36,6 +36,35 @@ export interface JudgeAsk {
   knowledge?: readonly string[];
   /** 这条之前的最近几条（话题里的或群聊，带 [发言人]，机器人说的是 [机器人]）：要开口前查经验库时和这条一起当查询词 */
   recent?: readonly string[];
+  /** 这次给没给模型「做」这个选择（群记忆里有不用 @ 也要它去做的规矩，见 hasWorkRule）：没给的，模型说了「做」也不算 */
+  work?: boolean;
+}
+
+/** 规矩里说「不用 @ 也…」「直接帮忙查」：像是没 @ 也要它去做的那类规矩 */
+const WORK_RULE = new RegExp(
+  [
+    String.raw`(?:不|没|无|别|免)(?:用|必|需要?|有)?\s*(?:等\s*)?@`,
+    String.raw`(?:直接|主动)(?:帮忙|帮|去|来)?(?:查|排查|处理|看|跟进|定位|解决)`,
+  ].join("|"),
+);
+/** 规矩里说「必须 @ 你再查」「@ 了才查」「只在 @ 你的时候回」：要先 @ 它才做（「不用 @」「没 @ 也」前面带了不、没的不算） */
+const MUST_AT_RULE = new RegExp(
+  [
+    String.raw`(?<!(?:不|没|无|别|免)[用必需有]?)(?:必须|一定|得|需要?|要|先)\s*(?:先\s*)?@`,
+    String.raw`(?<!(?:不|没|无|别|免)[用必需有]?\s*)@[^，。；,;!！?？\n]{0,15}?(?:才|再|之后|以后|的时候|时)`,
+    String.raw`只(?:在|有|回|接)[^，。；,;\n]{0,8}@`,
+  ].join("|"),
+);
+
+/**
+ * 群记忆（带编号、一条一行）里有没有不用 @ 也要它去做的规矩（「线上报错不用 @ 你也直接帮忙查」）。有才给模型「做」这个选择。
+ * 同一条里又说了要先 @ 它的（「线上报错必须先 @ 你，再直接帮忙查」）不算：模型容易把它看成「直接帮忙查」，没 @ 就去查了
+ */
+export function hasWorkRule(memory: string): boolean {
+  // 一条记忆里有换行的，后面几行也算这一条
+  return memory
+    .split(/\n(?=- #\d+ |【)/)
+    .some((entry) => /^- #\d+ /.test(entry) && WORK_RULE.test(entry) && !MUST_AT_RULE.test(entry));
 }
 
 /**
@@ -488,7 +517,9 @@ export class ThreadFollower {
     ].join("\n");
     // 话题里正在做事时不接群记忆的话：别在它回答的前后插一句
     const chime = Boolean(memory) && !busy && (this.opts.chimeIn?.active(msg.chatId) ?? false);
-    const system = judgePrompt(this.opts.botName() || "机器人", chime);
+    // 「做」只在群记忆里有不用 @ 也要它去做的规矩时给：规矩说要先 @ 它的，没 @ 不去做
+    const work = chime && hasWorkRule(memory);
+    const system = judgePrompt(this.opts.botName() || "机器人", chime, work);
     const result = await this.opts.model.chat({ system, messages: [{ role: "user", content }], thinking: false, signal });
     if (/^[「"'*\s]*是/.test(result.text)) {
       return { answer: true };
@@ -496,8 +527,8 @@ export class ThreadFollower {
     if (!chime) {
       return { answer: false };
     }
-    const ask = { system, content, memory, recent };
-    if (/^[\s*「"']*做[」"'\s。.!！]*$/.test(result.text.trim())) {
+    const ask = { system, content, memory, recent, work };
+    if (work && /^[\s*「"']*做[」"'\s。.!！]*$/.test(result.text.trim())) {
       return { answer: false, work: true, ask };
     }
     const said = /^[\s*「"']*接\s*[:：]\s*([\s\S]+)$/.exec(result.text.trim())?.[1].trim();
@@ -576,20 +607,27 @@ function clip(text: string): string {
   return text.length <= JUDGE_MESSAGE_CHARS ? text : `${text.slice(0, JUDGE_MESSAGE_CHARS)}…`;
 }
 
-/** chime：这个群能不能按群记忆接一句（开了主动接话），能的话多给一个选择「接：」 */
-function judgePrompt(botName: string, chime: boolean): string {
+/**
+ * chime：这个群能不能按群记忆接一句（开了主动接话），能的话多给一个选择「接：」；
+ * work：群记忆里有不用 @ 也要它去做的规矩（见 hasWorkRule），再多给一个选择「做」
+ */
+function judgePrompt(botName: string, chime: boolean, work: boolean): string {
   return [
     `你在判断飞书群一个话题里的新消息要不要群里的机器人「${botName}」回应。`,
     "机器人之前在这个话题里回答过问题，所以群成员接着跟它说话时可能不再 @ 它。",
     "话题里 [机器人] 开头的是机器人说的，其他是群成员说的，方括号里是发言人。给了群记忆的话，里面群里定的规矩（哪类消息别管）优先照着做。",
     "回答「是」：在跟机器人说话、要它回应的，比如接着机器人的回答追问，让它继续做、换个做法、再查一下，纠正它说的，补充它要的信息。",
+    ...(work
+      ? [
+          "回答「做」：不是在跟机器人说话，但群记忆里有规矩说这类事不用 @ 也要它处理（比如「线上报错不用 @ 你也直接帮忙查」），这条正是这类事。规矩说的是要 @ 它才处理的（比如「线上报错必须 @ 你再查」），没 @ 它就不算。",
+        ]
+      : []),
     ...(chime
       ? [
-          "回答「做」：不是在跟机器人说话，但群记忆里有规矩说这类事不用 @ 也要它处理（比如「线上报错直接帮忙查」），这条正是这类事。",
           "回答「接：」加上要说的一句话：不是在跟机器人说话，但有人问了问题、在找一件事，或者说的和群记忆对不上，而答案就在群记忆里、一两句话说得清。直接说，写明出处（「群记忆 #3」），只能照抄群记忆里的原文，不超过 100 字。",
         ]
       : []),
-    `回答「否」：群成员之间互相说话、商量、分工，只是表个态（好的、收到、谢谢、👍、哈哈），和机器人在做的事无关的闲聊${chime ? "，群记忆里也没有答案、也不归规矩管的" : ""}。`,
-    `拿不准时回答「否」。只输出一行：${chime ? "是、否、做，或者「接：」加一句话" : "一个字，是或者否"}。`,
+    `回答「否」：群成员之间互相说话、商量、分工，只是表个态（好的、收到、谢谢、👍、哈哈），和机器人在做的事无关的闲聊${chime ? "，群记忆里也没有答案、也不归规矩管的；群记忆里规矩说要 @ 它才处理的那类事，没 @ 它又不是在跟它说话的，也回答「否」" : ""}。`,
+    `拿不准时回答「否」。只输出一行：${chime ? `是、否${work ? "、做" : ""}，或者「接：」加一句话` : "一个字，是或者否"}。`,
   ].join("\n");
 }
