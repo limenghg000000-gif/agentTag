@@ -920,7 +920,8 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
   });
   const memoryTools = ["memory_save", "memory_update", "memory_delete"];
 
-  for (const [i, question] of ["改一下线上报错不需要 @ 你直直接帮忙查", "记住：以后告警别管", "从现在起，报错直接帮忙查"].entries()) {
+  const rules = ["改一下线上报错不需要 @ 你直直接帮忙查", "记住：以后告警别管", "从现在起，报错直接帮忙查", "下次线上报错直接帮忙查", "你以后只回 @ 你的消息"];
+  for (const [i, question] of rules.entries()) {
     await handle(message(question, { messageId: `om_r${i}` }));
     assert.deepEqual(requests[i].tools?.map((t) => t.name), memoryTools, question);
     assert.match(requests[i].system, /这次只给了记群记忆的工具/, question);
@@ -928,10 +929,22 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
   assert.deepEqual(queries, []);
   assert.match(logs.join("\n"), /给它定规矩，这次只给记群记忆的工具，不查经验库 message=om_r0/);
 
-  // 同时说了现在就查、或者是在问：照常给查的工具、查经验库
-  const asks = ["以后告警别管，先帮我看下这个 Redis", "上面那个报错不用管了，查一下 Redis", "这次也不用 @ 你，现在就查 Redis", "这个告警不用管吗？"];
+  // 同时说了现在就查、或者是在问、只是说眼下这件不用管：照常给查的工具、查经验库
+  const asks = [
+    "以后告警别管，先帮我看下这个 Redis",
+    "上面那个报错不用管了，查一下 Redis",
+    "这次也不用 @ 你，现在就查 Redis",
+    "这个告警不用管吗？",
+    "这个报错不用管，帮我分析 Redis 带宽打满的原因",
+    "以后告警别管，帮我分析 Redis 带宽打满的原因",
+    "为什么这个告警不用管",
+    "为什么不用 @ 你也查了",
+    "这个报错不用管，Redis 带宽打满的原因是什么",
+    "这个报错不用管，接着排查 Redis 带宽",
+    "你别管这个，接着排查 Redis",
+  ];
   for (const [i, question] of asks.entries()) {
-    const n = 3 + i;
+    const n = rules.length + i;
     await handle(message(question, { messageId: `om_a${i}` }));
     assert.deepEqual(requests[n].tools?.map((t) => t.name), ["aiops_query_logs", ...memoryTools], question);
     assert.doesNotMatch(requests[n].system, /这次只给了记群记忆的工具/, question);
