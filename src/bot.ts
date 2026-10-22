@@ -2474,6 +2474,9 @@ function tailGroups(after: string): string[] {
 function followingClaim(verb: string): RegExp {
   return new RegExp(String.raw`^[而并且和及同另还但]+\s*(?:也|又|还|再)?\s*(?:(?:帮你|给你|为你)\s*)?${verb}${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`);
 }
+/** 接着说的一段里只说了一件事：开头的「并」「而」后面没再接着说别的 */
+const DANGLING = /^[而并且和及同另还但]+[^而并且和及同另还但]*$/;
+const HAS_TASK_ID = new RegExp(TASK_ID);
 const FOLLOWING_CLAIMS = [
   ["create", followingClaim(SCHEDULE_CREATE_VERB)],
   ["change", followingClaim(SCHEDULE_CHANGE_VERB)],
@@ -2516,10 +2519,11 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
     const [own = "", ...following] = tailGroups(tail);
     claims.push({ kind, said: match[0], ids: match[0] + own.replace(ASIDE, "") });
     // 接着说的最后一段一直连到下一个说法、下一个说法又是先说任务的（「已暂停 T1 并取消 T2（之前已暂停）」里的「T2（之前已暂停」），
-    // 那个任务也是这段说的：「并取消」归 T2
+    // 这段自己又没写编号、也没再接着说别的的，那个任务是这段说的：「并取消」归 T2。「并取消 T2 而 T3 现在已暂停」里 T3 不归取消
     const reached = nextMatch !== undefined && OBJECT_FIRST.test(nextMatch[0]) && CLAUSE_AFTER.exec(tail)?.[0].length === tail.length;
     following.forEach((group, at) => {
-      const text = reached && at === following.length - 1 ? group + nextMatch[0] : group;
+      const borrow = reached && at === following.length - 1 && DANGLING.test(group) && !HAS_TASK_ID.test(group);
+      const text = borrow ? group + nextMatch[0] : group;
       const [followingKind, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, text.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
       if (followingKind !== undefined && said !== undefined) {
         claims.push({ kind: followingKind, said, ids: text.replace(ASIDE, "") });

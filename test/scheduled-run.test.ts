@@ -530,6 +530,10 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2（之前已暂停）。", new Set(["schedule_change"]), twoReceipts), []);
   const pausedT1CancelledT5 = `${pausedReceipt}\n已取消定时任务 T5：每月 1 号，月报`;
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消定时任务 T2（之前已暂停）。", new Set(["schedule_change"]), pausedT1CancelledT5), ["change"]);
+  // 「并取消」自己写了编号、后面又接着说了另一个任务的，下一个说法的任务不归它
+  const pausedT3 = `${twoReceipts}\n已暂停定时任务 T3：每月 1 号，月报`;
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 而 T3 现在已暂停。", new Set(["schedule_change"]), pausedT3), []);
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2 而 T3 现在已暂停。", new Set(["schedule_change"]), threeReceipts), ["change"]);
 });
 
 test("回答再长、说法再多，定时任务说法检查也很快算完，不会把机器人卡住", () => {
