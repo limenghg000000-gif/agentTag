@@ -1078,7 +1078,11 @@ export class KnowledgeDesk {
   private async archive(proposal: ArchiveProposal, confirmedBy: string, task: McpTaskContext): Promise<Outcome> {
     const { target } = proposal;
     if (target.type === "aiops") {
-      await this.options.aiops!.archiveSeen(target.lesson, confirmedBy, task);
+      const aiops = this.aiopsOf(task.chatId);
+      if (!aiops) {
+        throw new KnowledgeError("这个群没开 aiops，不能归档 aiops 经验库里的经验");
+      }
+      await aiops.archiveSeen(target.lesson, confirmedBy, task);
       return {
         // 标题是 aiops 那边的，可能很长：只列开头，卡片太大飞书不收
         done: [`已归档 aiops 经验 #${target.lesson.id}「${clip(target.lesson.title, MAX_TITLE_CHARS)}」，确认人 ${confirmedBy}。以后检索不到它，告警自动排查也不再引用。`],
@@ -1280,6 +1284,11 @@ export class KnowledgeDesk {
    */
   private async archiveLinked(teamIds: readonly string[], aiopsId: number, confirmedBy: string, task: McpTaskContext, out: Outcome): Promise<void> {
     const { aiops } = this.options;
+    // 卡片所在的群没开 aiops 经验库：不替它动 aiops，说一声那条还在（再试一次也一样，不算没做完）
+    if (aiops && !this.aiopsOf(task.chatId)) {
+      out.done.push(`aiops 经验库里同步的经验 #${aiopsId} 没有一起归档：这个群没开 aiops。要归档它，在开了 aiops 的群里让机器人归档 aiops 经验 #${aiopsId}。`);
+      return;
+    }
     try {
       if (!aiops?.writable) {
         throw new KnowledgeError(aiops?.lacksWriteTools ? lacksToolsNote(aiops) : "aiops 现在连不上");

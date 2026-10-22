@@ -4280,3 +4280,15 @@ test("按群：不能用 aiops 的群回答前不查 aiops 经验库，起草不
   await assert.rejects(tool("knowledge_propose_archive").run({ aiops_id: 31 }, { signal }), /这个群没开 aiops，不能归档 aiops 经验库里的经验/);
   assert.equal(calls.filter((call) => call.tool === "get_knowledge").length, 0);
 });
+
+test("按群：不能用 aiops 的群归档同步过 aiops 的经验，只归档表格里的，aiops 里那条不动，说一声去开了 aiops 的群归档", async () => {
+  const { backend, base, desk, sent, calls, click, tool } = deskSetup({ scope: () => ({ approvers: new Set(["ou_admin"]), aiops: false }) });
+  await base.save(normalizeDraft(code8));
+  await base.linkAiops({ id: "K1" }, 31);
+  await tool("knowledge_propose_archive").run({ id: "K1", reason: "已修复" }, { signal });
+  await desk.handleCardAction(click((sent[0].input as { card: any }).card, "archive"));
+  await desk.idle();
+  assert.equal(backend.entries[0].status, "archived");
+  assert.equal(calls.filter((call) => call.tool === "archive_lesson" || call.tool === "get_knowledge").length, 0);
+  assert.match((sent.at(-1)!.input as { markdown: string }).markdown, /已归档经验 K1.*\naiops 经验库里同步的经验 #31 没有一起归档：这个群没开 aiops/);
+});

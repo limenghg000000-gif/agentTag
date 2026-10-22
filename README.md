@@ -213,7 +213,7 @@ npm start
 | `GROUP_<名字>_WRITE_ALLOWED_USERS` | 否 | 这个群的写权限名单，`none` 是这个群谁都不能让机器人改文档、改代码。经验库的「保存」「归档」、暂停和取消别人建的定时任务也按这个名单 |
 | `GROUP_<名字>_MEMORY_EDITORS` | 否 | 这个群能让机器人记、改、删群记忆的人，`none` 是群记忆只能看 |
 | `GROUP_<名字>_MCP` | 否 | 这个群能用的 MCP 服务（`MCP_SERVERS` 里的名字，逗号分隔），`off` 是都不能用。不能用的服务提示词里也不提 |
-| `GROUP_<名字>_MCP_<服务>_TOOLS` | 否 | 这个服务在这个群只开其中几个工具，只能在全局开了的（`MCP_<服务>_TOOLS`）里挑。aiops 不开 `search_knowledge`（全局开给模型的 `get_knowledge` 也要开）时，这个群回答前不查 aiops 经验库、排查经验不同步过去、不能归档 aiops 里的经验 |
+| `GROUP_<名字>_MCP_<服务>_TOOLS` | 否 | 这个服务在这个群只开其中几个工具，只能在全局开了的（`MCP_<服务>_TOOLS`）里挑。aiops 不开 `search_knowledge`（全局开给模型的 `get_knowledge` 也要开）时，这个群回答前不查 aiops 经验库、排查经验不同步过去、不能归档 aiops 里的经验（归档同步过去的经验时 aiops 里那条也不动） |
 | `GROUP_<名字>_KNOWLEDGE` | 否 | `off`：这个群回答前不查团队经验库，也没有经验库的工具；机器人建的表格不共享给这个群（之前共享过的启动时撤掉）。经验库是各群共用的一张表，`on` 和不写一样 |
 | `GITLAB_URL` | 接 GitLab 时必填 | 公司 GitLab 的地址，如 `https://gitlab.example.com` |
 | `GITLAB_TOKEN` | 接 GitLab 时必填 | GitLab 访问令牌，权限选 `api`，角色至少 Developer。只接一个项目时用它的项目访问令牌；接多个项目时用群组访问令牌或个人访问令牌（项目访问令牌只能访问建它的那个项目） |
