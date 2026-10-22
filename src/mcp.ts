@@ -243,6 +243,12 @@ export class McpHub {
     return server !== undefined && server.catalog.has(tool) && directAllowed(server.config, tool);
   }
 
+  /** 这个服务开给模型的工具（服务端的工具名）；还没连上过时返回 undefined。管理群的卡片上列出来让人勾 */
+  enabledTools(serverName: string): string[] | undefined {
+    const server = this.find(serverName);
+    return server?.synced ? server.enabled.map((tool) => tool.name) : undefined;
+  }
+
   /** 连上过、拿到了工具清单（之后刷新失败也算，沿用上次的清单） */
   connected(serverName: string): boolean {
     return this.find(serverName)?.synced ?? false;

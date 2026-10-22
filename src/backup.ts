@@ -17,6 +17,10 @@ export interface MemoryBackupOptions {
   /** 每天一个子目录，名字是日期（服务器本地时间） */
   backupDir: string;
   keepDays: number;
+  /** 日志里怎么叫备份的东西，默认「群记忆」（管理群改的群配置也用它备份） */
+  label?: string;
+  /** 日志里数文件的单位，默认「个群」 */
+  unit?: string;
   logger?: Logger;
   now?: () => Date;
 }
@@ -29,6 +33,8 @@ export class MemoryBackup {
   private readonly memoryDir: string;
   private readonly backupDir: string;
   private readonly keepDays: number;
+  private readonly label: string;
+  private readonly unit: string;
   private readonly logger: Logger;
   private readonly now: () => Date;
   private timer?: NodeJS.Timeout;
@@ -38,6 +44,8 @@ export class MemoryBackup {
     this.memoryDir = opts.memoryDir;
     this.backupDir = opts.backupDir;
     this.keepDays = opts.keepDays;
+    this.label = opts.label ?? "群记忆";
+    this.unit = opts.unit ?? "个群";
     this.logger = opts.logger ?? console;
     this.now = opts.now ?? (() => new Date());
   }
@@ -79,7 +87,7 @@ export class MemoryBackup {
 
     const removed = await this.prune(existing);
     this.logger.info(
-      `群记忆已备份到 ${target}（${files.length} 个群）` + (removed > 0 ? `，删掉了 ${removed} 份超过 ${this.keepDays} 天的旧备份` : ""),
+      `${this.label}已备份到 ${target}（${files.length} ${this.unit}）` + (removed > 0 ? `，删掉了 ${removed} 份超过 ${this.keepDays} 天的旧备份` : ""),
     );
     return target;
   }
@@ -90,7 +98,7 @@ export class MemoryBackup {
     }
     this.running = this.runOnce()
       .then(() => undefined)
-      .catch((err) => this.logger.error(`群记忆备份失败，下个小时再试：${err instanceof Error ? err.message : err}`))
+      .catch((err) => this.logger.error(`${this.label}备份失败，下个小时再试：${err instanceof Error ? err.message : err}`))
       .finally(() => {
         this.running = undefined;
       });

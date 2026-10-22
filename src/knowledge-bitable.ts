@@ -278,10 +278,16 @@ export interface BitableBackendOptions {
    * 机器人自己建表时共享给谁：白名单群只读，写权限名单里的人可编辑。
    * 群一直只读：经验库所有群共用，群里谁都能改表格的话，任何人都能绕过确认卡片往里写内容。可管理只留给机器人：能管协作者的人才能把表格共享出名单
    */
-  share: { chatIds: readonly string[]; editors: readonly string[] };
-  /** 撤权限（或降成只读）没成功时隔多久再试，默认 10 分钟。名单改了要重启，没配写权限名单时又不会再保存，不能只等下次启动或保存 */
+  share: ShareList | (() => ShareList);
+  /** 撤权限（或降成只读）没成功时隔多久再试，默认 10 分钟。没配写权限名单时不会再保存，不能只等下次启动、保存或管理群里改名单 */
   revokeRetryMs?: number;
   logger?: Logger;
+}
+
+/** 共享给哪些群（只读）和哪些人（可编辑）。传函数的每次调整时取最新的（管理群的卡片上改了名单不用重启） */
+export interface ShareList {
+  chatIds: readonly string[];
+  editors: readonly string[];
 }
 
 /** 机器人自己建的表记在数据目录里：表在哪，已经共享给了谁 */
@@ -514,7 +520,8 @@ export class BitableKnowledgeBackend implements KnowledgeBackend {
    * 失败不影响保存，记一条警告，下次启动或保存时再试；该撤的没撤掉、该降成只读的没降成时，隔 revokeRetryMs 自己再试
    */
   private async reconcile(target: BitableState): Promise<void> {
-    const { api, share } = this.options;
+    const { api } = this.options;
+    const share = typeof this.options.share === "function" ? this.options.share() : this.options.share;
     const wanted = new Map<string, [BitableMember, BitablePerm]>([
       ...share.chatIds.map((id): [string, [BitableMember, BitablePerm]] => [`openchat:${id}`, [{ type: "openchat", id }, "view"]]),
       ...share.editors.map((id): [string, [BitableMember, BitablePerm]] => [`openid:${id}`, [{ type: "openid", id }, "edit"]]),

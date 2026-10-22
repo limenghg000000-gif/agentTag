@@ -767,7 +767,7 @@ test("没打开的群里说开关的话：告诉他这个群没开；「只在 @
   const t = await setup();
   try {
     assert.equal(await t.replier.toggleIfAsked(msg("om_1", { chatId: "oc_2", mentionedBot: true, content: "可以主动说话" })), true);
-    assert.match(t.replies[0], /这个群没开主动接话.*PROACTIVE_CHAT_IDS/);
+    assert.match(t.replies[0], /这个群没开主动接话.*找管理员打开这个群的主动接话/);
     assert.equal(t.replier.active("oc_2"), false);
     assert.equal(await t.replier.toggleIfAsked(msg("om_2", { chatId: "oc_2", mentionedBot: true, content: "只在 @ 我时回" })), false);
     assert.equal(await t.replier.toggleIfAsked(msg("om_3", { chatId: "oc_9", mentionedBot: true, content: "别主动插话" })), false);
