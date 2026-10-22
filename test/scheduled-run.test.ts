@@ -546,6 +546,12 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   const cancelledT5 = "已取消定时任务 T5：每月 1 号，月报";
   assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T2（之前已暂停）。", new Set(["schedule_change"]), cancelledT5), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T2（之前已暂停）。", new Set(["schedule_change"]), cancelledT2T3), []);
+  // 下一个说法要查的也一样：「并取消」「已取消定时任务」后面的 T2 照样归取消
+  const pausedT1ResumedT2 = `${pausedReceipt}\n已恢复定时任务 T2：每周一 09:00，周报`;
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2（现在已恢复）。", new Set(["schedule_change"]), pausedT1ResumedT2), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T2（现在已恢复）。", new Set(["schedule_change"]), `${cancelledT5}\n已恢复定时任务 T2：周报`), ["change"]);
+  // 先说任务的说法，后面的任务不归它
+  assert.deepEqual(unbackedScheduleClaims("提醒已取消 T3 已暂停。", new Set(["schedule_change"]), `${cancelledT1}\n已暂停定时任务 T3：月报`), []);
 });
 
 test("回答再长、说法再多，定时任务说法检查也很快算完，不会把机器人卡住", () => {

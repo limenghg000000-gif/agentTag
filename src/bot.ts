@@ -2520,15 +2520,14 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
     const tail = answer.slice(end, Math.max(end, nextMatch?.index ?? answer.length));
     // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
     const [own = "", ...following] = tailGroups(tail);
-    // 下一个说法说的是以前的、不查，又是先说任务的（「已暂停 T1 并取消 T2 和 T3（之前已暂停）」里的「T3（之前已暂停」），这段话一直连到它：
-    // 这段最后是「和」「、」接着列任务的，或者自己还没写是哪个任务的，它开头的任务也是这段说的，照这段的改动查
-    const carried =
-      nextMatch !== undefined && historical[nextOf[index]!] && OBJECT_FIRST.test(nextMatch[0]) && CLAUSE_AFTER.exec(tail)?.[0].length === tail.length ? nextMatch[0] : "";
-    // 「已取消 T2 和 T3（之前…」「已取消定时任务 T2（之前…」；「T1 已暂停 T2（之前…」里 T1 已经写了，T2 不归它
-    const ownCarries = following.length === 0 && (LISTING.test(own) || (own.trim() === "" && !HAS_TASK_ID.test(match[0])));
+    // 下一个说法是先说任务的（「已暂停 T1 并取消 T2 和 T3（之前已暂停）」里的「T3（之前已暂停」），这段话一直连到它：
+    // 这段最后是「和」「、」接着列任务的，或者自己还没写是哪个任务的，它开头的任务也是这段说的，照这段的改动查（下一个说法要查的照样查）
+    const carried = nextMatch !== undefined && OBJECT_FIRST.test(nextMatch[0]) && CLAUSE_AFTER.exec(tail)?.[0].length === tail.length ? nextMatch[0] : "";
+    // 「已取消 T2 和 T3（之前…」「已取消定时任务 T2（现在…」。「T1 已暂停 T2 已取消」里 T1 已经写了、「提醒已取消 T3 已暂停」先说的任务，后面的任务都不归它
+    const ownCarries = following.length === 0 && (LISTING.test(own) || (own.trim() === "" && !OBJECT_FIRST.test(match[0]) && !HAS_TASK_ID.test(match[0])));
     claims.push({ kind, said: match[0], ids: match[0] + (ownCarries ? own + carried : own).replace(ASIDE, "") });
     following.forEach((group, at) => {
-      // 「并取消 」「并取消定时任务 」后面就是任务；「并取消 T2 和 」接着列任务。「并取消 T2 而 T3（之前…」里「而」说起的是别的，T3 不归取消
+      // 「并取消 」「并取消定时任务 」后面就是任务；「并取消 T2 和 」接着列任务。「并取消 T2 而 T3 现在已暂停」里「而」说起的是别的，T3 不归取消
       const carries = at === following.length - 1 && ((DANGLING.test(group) && !HAS_TASK_ID.test(group)) || LISTING.test(group));
       const text = carries ? group + carried : group;
       const [followingKind, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, text.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
