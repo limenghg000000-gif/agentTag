@@ -451,6 +451,9 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_list"]), "这个群还没有定时任务"), ["create"]);
   assert.deepEqual(unbackedScheduleClaims("T1 已被张三暂停", new Set(["schedule_list"]), "T1 · 每天 9:00 · 汇总 · 李四 · 已暂停（张三暂停的）"), []);
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2，已暂停 T1", new Set(["schedule_create"]), "已建好定时任务 T2"), ["change"]);
+  // 只查了列表的：要写着列表里有的编号，列表说没有定时任务时没写编号的说法也不算
+  assert.deepEqual(unbackedScheduleClaims("已为你设置每天 15:34 的提醒。", new Set(["schedule_list"]), "这个群还没有定时任务。"), ["create"]);
+  assert.deepEqual(unbackedScheduleClaims("T1 已暂停，提醒已取消", new Set(["schedule_list"]), "T1 · 每天 · 已暂停"), ["change"]);
 });
 
 test("没 @ 的跟聊说「已建好定时任务」：打回一次照实说，提示词里说这次建不了、请他 @ 着一句说全", async () => {
@@ -522,6 +525,11 @@ test("建成了却说错了编号：拦下时照实列出这次建成的，不�
   const { handle, sent } = setup({ model, taskTools: () => [create, tool("schedule_list"), tool("schedule_change")] });
   await handle(message("每天 15:30 汇总今天群里的讨论"));
   assert.equal(requests.length, 3);
+  // 打回时给回执、叫它照着改，不叫它再建一个
+  const note = JSON.stringify(requests[2]!.messages.at(-1));
+  assert.match(note, /schedule_create 这次已经做成了，回执是：已建好定时任务 T3/);
+  assert.match(note, /不要再调 schedule_create 重做一遍/);
+  assert.doesNotMatch(note, /要做就现在调/);
   const answer = blockedScheduleAnswer(["已建好定时任务 T3（到点去做）：每天 15:30（北京时间），下次是 10-22 15:30。"]);
   assert.deepEqual(markdowns(sent), [answer]);
   assert.match(answer, /实际做成的：\n- 已建好定时任务 T3/);

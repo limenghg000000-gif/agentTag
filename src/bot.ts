@@ -918,7 +918,9 @@ async function runTask(
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
           ]),
       // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
-      ...(restate || scheduled ? [] : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, succeeded, () => toolTexts.join("\n"), toolNames))]),
+      ...(restate || scheduled
+        ? []
+        : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, succeeded, () => toolTexts.join("\n"), toolNames, () => scheduleDone))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -2350,24 +2352,28 @@ const SCHEDULE_CREATED_CLAIM = scheduleClaim(String.raw`(?:建|创建|新建|设
 const SCHEDULE_CHANGED_CLAIM = scheduleClaim(String.raw`(?:暂停|恢复|取消|停掉|停用|删除|删掉|关掉)`);
 
 /**
- * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change，
- * 用 schedule_list 查到的现状也算（「T3 已被张三暂停」）。说到的编号（T2）还要在这次的工具结果里出现过：列表里没有 T2，说「已建好 T2」照样不算。
+ * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change。
+ * 调成了的，说到的编号（T2）还要在这次的工具结果里：建了 T3 说成 T4 不算。
+ * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算。
  * known 是这次工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
   const kinds: Array<"create" | "change"> = [];
+  const listed = (id: string) => new RegExp(`(?<![A-Za-z0-9])${id}(?!\\d)`).test(known);
   for (const [kind, pattern, tool] of [
     ["create", SCHEDULE_CREATED_CLAIM, SCHEDULE_CREATE_TOOL],
     ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
   ] as const) {
     // 编号常写在说法后面（「已建好定时任务 T2」）：看到这个分句结束
     const claims = [...answer.matchAll(pattern)].map((match) => answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0]);
-    if (claims.length === 0) {
-      continue;
-    }
-    const ran = succeeded.has(tool) || succeeded.has(SCHEDULE_LIST_TOOL);
-    const ids = claims.flatMap((claim) => [...claim.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]));
-    if (!ran || ids.some((id) => !new RegExp(`(?<![A-Za-z0-9])${id}(?!\\d)`).test(known))) {
+    const backed = (claim: string) => {
+      const ids = [...claim.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
+      if (succeeded.has(tool)) {
+        return ids.every(listed);
+      }
+      return succeeded.has(SCHEDULE_LIST_TOOL) && ids.length > 0 && ids.every(listed);
+    };
+    if (claims.some((claim) => !backed(claim))) {
       kinds.push(kind);
     }
   }
@@ -2376,29 +2382,42 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
 
 /**
  * 说建好、暂停、取消了定时任务，这次却没调成对应的工具：打回一次，叫它照实说；这次没有这个工具的，请他 @ 着一句说全。
- * known 在检查时再取，这次调到的才算
+ * 工具调成了、只是回答说错了（建了 T3 说成 T4）：把回执给它照着改，不叫它再调一次（再调就多建一个）。
+ * known、done（这次建成、改成的回执）在检查时再取，这次调到的才算
  */
 export function reviewScheduleClaims(
   answer: string,
   succeeded: ReadonlySet<string>,
   known: () => string,
   toolNames: readonly string[],
+  done: () => readonly string[] = () => [],
 ): string | undefined {
   const kinds = unbackedScheduleClaims(answer, succeeded, known());
   if (kinds.length === 0) {
     return undefined;
   }
-  const tools = kinds.map((kind) => (kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL));
-  const claimed = kinds.map((kind) => (kind === "create" ? "建好了" : "暂停、恢复或取消了")).join("、");
-  const missing = tools.filter((name) => !toolNames.includes(name));
-  return (
-    `（系统检查）你这次没有用 ${tools.join("、")} 做成（没调、调了出错、这次没有这个工具，或者写的编号这次查到的定时任务里没有），回答里却说定时任务已经${claimed}。` +
-    (missing.length < tools.length ? "这次有这个工具的，要做就现在调，照它返回的写；" : "") +
-    (missing.length > 0
-      ? `这次没有 ${missing.join("、")}（没 @ 你的话、点按钮问的、这句话本身没说要以后做什么，都只能查）：照实说这次没建成、没改成，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全。`
-      : "做不成就照实说没建成、没改成。") +
-    "其余内容不用改，重新给出完整的回答，不要提这段检查。"
-  );
+  const toolOf = (kind: "create" | "change") => (kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL);
+  const claimedOf = (kind: "create" | "change") => (kind === "create" ? "建好了" : "暂停、恢复或取消了");
+  const ran = kinds.filter((kind) => succeeded.has(toolOf(kind)));
+  const notRun = kinds.filter((kind) => !succeeded.has(toolOf(kind)));
+  const notes: string[] = [];
+  if (ran.length > 0) {
+    notes.push(
+      `${ran.map(toolOf).join("、")} 这次已经做成了，回执是：${done().join("；")}。回答里说的定时任务（编号、是建还是改）和回执对不上：照回执改，不要再调 ${ran.map(toolOf).join("、")} 重做一遍，再调就多建、多改一个。`,
+    );
+  }
+  if (notRun.length > 0) {
+    const tools = notRun.map(toolOf);
+    const missing = tools.filter((name) => !toolNames.includes(name));
+    notes.push(
+      `你这次没有用 ${tools.join("、")} 做成（没调、调了出错、这次没有这个工具，或者写的编号这次查到的定时任务里没有），回答里却说定时任务已经${notRun.map(claimedOf).join("、")}。` +
+        (missing.length < tools.length ? "这次有这个工具的，要做就现在调，照它返回的写；" : "") +
+        (missing.length > 0
+          ? `这次没有 ${missing.join("、")}（没 @ 你的话、点按钮问的、这句话本身没说要以后做什么，都只能查）：照实说这次没建成、没改成，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全。`
+          : "做不成就照实说没建成、没改成。"),
+    );
+  }
+  return `（系统检查）${notes.join("")}其余内容不用改，重新给出完整的回答，不要提这段检查。`;
 }
 
 export const BLOCKED_SCHEDULE_ANSWER =
