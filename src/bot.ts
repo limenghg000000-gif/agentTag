@@ -2354,7 +2354,8 @@ const SCHEDULE_CHANGED_CLAIM = scheduleClaim(String.raw`(?:暂停|恢复|取消|
 /**
  * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change。
  * 调成了的，说到的编号（T2）还要在这次的工具结果里：建了 T3 说成 T4 不算。
- * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算。
+ * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算；
+ * 说暂停、取消、恢复了的，列表里那个任务现在也得是这个状态。
  * known 是这次工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
@@ -2371,13 +2372,34 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
       if (succeeded.has(tool)) {
         return ids.every(listed);
       }
-      return succeeded.has(SCHEDULE_LIST_TOOL) && ids.length > 0 && ids.every(listed);
+      if (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0) {
+        return false;
+      }
+      if (kind === "create") {
+        return ids.every(listed);
+      }
+      // 照着列表说暂停、取消、恢复了的，列表里这个任务现在得真是这样：列表写着「下次 …」（还在跑），说「已取消 T1」不算
+      const state = LISTED_STATES.find(([verb]) => verb.test(claim))?.[1];
+      return state !== undefined && ids.every((id) => state.test(listedState(known, id) ?? ""));
     };
     if (claims.some((claim) => !backed(claim))) {
       kinds.push(kind);
     }
   }
   return kinds;
+}
+
+/** 说的是哪种改动，列表里那一行的状态该是什么样（schedule_list 的写法：「下次 10-23 09:00」「已暂停」「连着失败，自动暂停了」「已取消」） */
+const LISTED_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
+  [/恢复/, /^下次 /],
+  [/取消|删除|删掉/, /^已取消/],
+  [/暂停|停掉|停用|关掉/, /暂停/],
+];
+
+/** schedule_list 结果里这个编号那一行的状态（最后一段） */
+function listedState(known: string, id: string): string | undefined {
+  const line = known.split("\n").find((text) => text.startsWith(`- ${id} · `));
+  return line?.split(" · ").at(-1);
 }
 
 /**

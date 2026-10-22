@@ -449,7 +449,14 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   // 调成了对应的工具才算；查了列表的，说到的编号要在列表里
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_create"]), "已建好定时任务 T2（到点去做）"), []);
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_list"]), "这个群还没有定时任务"), ["create"]);
-  assert.deepEqual(unbackedScheduleClaims("T1 已被张三暂停", new Set(["schedule_list"]), "T1 · 每天 9:00 · 汇总 · 李四 · 已暂停（张三暂停的）"), []);
+  const pausedList = "这个群有 1 个定时任务：\n- T1 · 每天 9:00 · 汇总 · 李四建的 · 已暂停（张三暂停的）（已跑 2 次）";
+  assert.deepEqual(unbackedScheduleClaims("T1 已被张三暂停", new Set(["schedule_list"]), pausedList), []);
+  // 照着列表说暂停、取消、恢复了的，列表里那个任务得真是这样
+  const activeList = "这个群有 1 个定时任务：\n- T1 · 每天 9:00 · 暂停前先汇总 · 李四建的 · 下次 10-23 09:00（已跑 0 次）";
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1。", new Set(["schedule_list"]), activeList), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("T1 已暂停", new Set(["schedule_list"]), activeList), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("T1 已恢复，下次 10-23 09:00", new Set(["schedule_list"]), activeList), []);
+  assert.deepEqual(unbackedScheduleClaims("T1 已恢复", new Set(["schedule_list"]), pausedList), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2，已暂停 T1", new Set(["schedule_create"]), "已建好定时任务 T2"), ["change"]);
   // 只查了列表的：要写着列表里有的编号，列表说没有定时任务时没写编号的说法也不算
   assert.deepEqual(unbackedScheduleClaims("已为你设置每天 15:34 的提醒。", new Set(["schedule_list"]), "这个群还没有定时任务。"), ["create"]);
