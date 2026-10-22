@@ -50,6 +50,7 @@ import {
   createScheduleAlertTool,
   SCHEDULE_ALERT_TOOL,
   SCHEDULE_CHANGE_TOOL,
+  SCHEDULE_CREATE_TOOL,
   SCHEDULE_LIST_TOOL,
   SCHEDULE_TOOL_NAMES,
 } from "./tools/schedules.js";
@@ -245,6 +246,8 @@ const SCHEDULE_TALK = new RegExp(
   "i",
 );
 const SCHEDULE_TOOLS: ReadonlySet<string> = new Set(SCHEDULE_TOOL_NAMES);
+/** 看话题里最近几条消息有没有在说定时任务（提示词里说这次建不了用）：只补了一个时间、一个链接的，前面几条多半说过。群里刚才的聊天不算 */
+const SCHEDULE_TALK_LOOKBACK = 6;
 
 /** 提问本身说到了经验库的事：「沉淀成经验」「记到经验库」「把 #5 归档」「群记忆和经验库有没有冲突」。「数据对不上」「代码冲突」不算 */
 const KNOWLEDGE_REQUEST = /沉淀|经验|知识库|归档/;
@@ -714,6 +717,13 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
+    // 这次真的建成、改成的定时任务，只记做了什么、哪个编号（「已暂停定时任务 T1」）：回答说得不对时，照这个打回、告诉大家实际做成了什么，免得重复建。
+    // 不记回执里的任务内容：那是建任务的人写的，打回的说明是以系统检查的口吻发给模型的，不能夹带别人写的话
+    const scheduleDone: string[] = [];
+    // 这次定时任务工具（建、改、列表）的结果原文：回答里说的编号只认这里的，文档、代码里碰巧写着的 T4 不算
+    const scheduleTexts: string[] = [];
+    // 这次真调成了的定时任务工具：从 topic_earlier_results 拿回来的以前的结果不算（那次建的不是这次建的）
+    const scheduleRan = new Set<string>();
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
     // 这次取出来的之前查到的结果：取到代码工具的结果算读过代码，原文算整理的依据（代码工具的证据里只有代码位置，没有列出来的路径原文）
@@ -813,6 +823,17 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === SCHEDULE_CREATE_TOOL || tool.spec.name === SCHEDULE_CHANGE_TOOL) {
+            const done = output.match(SCHEDULE_RECEIPT)?.[0];
+            if (done) {
+              scheduleDone.push(done);
+            }
+          }
+          if (SCHEDULE_TOOLS.has(tool.spec.name)) {
+            scheduleRan.add(tool.spec.name);
+            // 建好的回执只留第一行：后面「到点做的事」是建任务的人写的原话，可能有好几行，不能当回执、列表用
+            scheduleTexts.push(tool.spec.name === SCHEDULE_CREATE_TOOL ? (output.split("\n")[0] ?? "") : output);
+          }
           if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
             mergedNow = true;
           }
@@ -951,6 +972,21 @@ async function runTask(
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
     toolCount = taskTools.length;
+    // 话题里在说建定时任务，这次却建不了：没 @ 的跟聊、按钮问的只给看的，这句话本身没说到定时（只补了一个时间、一个链接）的不给。
+    // 提示词里说清楚建不了、请他 @ 着一句说全。2026-10-22 测试群：话题里没 @ 补了一句「每天 15:34，从现在开始」、
+    // 只贴了文档链接，模型一个工具没调都回了「已建好定时任务」，其实没建
+    const scheduleLocked =
+      scheduled === undefined &&
+      !restate &&
+      allTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
+      !taskTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
+      [question, ...history.filter((m) => !isChatContext(m)).slice(-SCHEDULE_TALK_LOOKBACK).map((m) => m.content)].some((text) => SCHEDULE_ASK.test(text))
+        ? followUp
+          ? "这次是点按钮问的"
+          : options.unaddressed === true
+            ? "这句没 @ 你"
+            : "这句话本身没说要以后做什么"
+        : undefined;
     if (followUp) {
       logger.info(`点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
@@ -994,6 +1030,10 @@ async function runTask(
             ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded, toolNames.includes(EARLIER_RESULTS_TOOL))] : []),
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
           ]),
+      // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
+      ...(restate || scheduled
+        ? []
+        : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, scheduleRan, () => scheduleTexts.join("\n"), toolNames, () => scheduleDone))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -1056,6 +1096,7 @@ async function runTask(
         restate,
         // 不在能改群记忆名单里的人定规矩：上面那条已经叫它说没记上，不再叫它「用 memory_save 记下」
         ...(ruleOnly && !(notMemoryEditor && memory) ? { ruleOnly: true } : {}),
+        ...(scheduleLocked ? { scheduleLocked } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
@@ -1207,8 +1248,22 @@ async function runTask(
         }
       }
     }
+    // 打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成：不发出去，不然大家以为到点会做。
+    // 这次有建成、改成的（建了 T3 却说成 T4）照实列出来，不说成什么都没做，免得大家再建一个重复的
+    const blockedSchedule =
+      !restate &&
+      !scheduled &&
+      !readChat &&
+      result.finish !== "filtered" &&
+      answer !== BLOCKED_OPS_ANSWER &&
+      !blockedCode &&
+      unbackedScheduleClaims(shown, scheduleRan, scheduleTexts.join("\n")).length > 0;
+    if (blockedSchedule) {
+      logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
+      answer = blockedScheduleAnswer(scheduleDone);
+    }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
-    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || result.finish === "filtered") {
+    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || blockedSchedule || result.finish === "filtered") {
       state.thoughts = undefined;
     }
     state.phase = "done";
@@ -1217,7 +1272,7 @@ async function runTask(
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified, labelUserMessage(context.askerName, askedFull || "（@ 了你，没有写别的内容）"));
     // 被拦下、被审核拦下的回答里没有结论，不记
-    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && result.finish !== "filtered") {
+    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && !blockedSchedule && result.finish !== "filtered") {
       await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
@@ -2378,6 +2433,311 @@ export function madeUpRequestAnswer(madeUp: readonly string[]): string {
 /** 打回重做以后还是写了查不到的合并请求编号时，换成这句发出去 */
 export function blockedRequestAnswer(madeUp: readonly string[]): string {
   return `这次没能给出结论：回答里写的合并请求 ${madeUp.join("、")} 查不到，为免误导没有发出来。请再说一次，要开合并请求可以说清楚开到哪个分支。`;
+}
+
+/** 定时任务的编号：T3（T3a、AT3 不算） */
+const TASK_ID = String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`;
+/** 说的是定时任务：定时任务、周期任务、提醒（「告警提醒」不算）、T3 */
+const SCHEDULE_OBJECT = String.raw`(?:定时任务|周期任务|(?<!告警)提醒|${TASK_ID})`;
+/** 一个分句里接着往下说的字：「而」「并」「和」这类。按它切开，切出来的每一段（除了开头那段）都以它开头 */
+const CONNECTOR = /(?=[而并且和及同另还但])/;
+const STARTS_WITH_CONNECTOR = /^[而并且和及同另还但]/;
+/**
+ * 说法和定时任务之间的字：同一个分句里，不跨书名号，中间也没说到别的东西。
+ * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
+ */
+const CLAIM_GAP = String.raw`(?:(?!文档|表格|页面|知识库|多维表|合并请求|分支|经验|记忆|规矩)[^，,。；;！!？?\n《》])`;
+/**
+ * 「之前已经建好」「上次已暂停」说的是以前的。「原来的 T1 已取消」「之前的提醒已取消」里的「原来的」说的是哪个任务，取消是这次的，照样要查
+ */
+const EARLIER = /(?:之前|此前|以前|上次|原来|早先)(?!的)/;
+const EARLIERS = new RegExp(EARLIER.source, "g");
+/** 分句之间的标点 */
+const CLAIM_CLAUSE_BREAK = /[，,。；;！!？?\n]/;
+const CLAUSE_AFTER = /^[^，,。；;！!？?\n]*/;
+/** 先说定时任务、再说做了什么的写法（「T1 已取消」） */
+const OBJECT_FIRST = new RegExp(String.raw`^${SCHEDULE_OBJECT}`);
+
+/** 说没做成的：「定时任务没有创建成功」「还没给你建好」「T3 未取消」 */
+const NEGATION = String.raw`(?:没|未|不|无法)`;
+
+function scheduleClaim(verb: string): RegExp {
+  return new RegExp(
+    [
+      // 「已建好定时任务 T2」「已经帮你设置每天 15:34 的提醒」「已暂停 T3」。「已建好的定时任务有…」说的是有哪些，不算
+      String.raw`已经?\s*(?:(?:帮你|给你|为你)\s*)?${verb}(?![好了]*的)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
+      // 「帮你建好了定时任务」「给你暂停了 T3」。「我帮你建一个定时任务吧」是在问，「还没给你建好定时任务」是没做成，都不算
+      String.raw`(?<!${NEGATION}\s*)(?:帮你|给你|为你)\s*${verb}(?:好|了|掉)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
+      // 「定时任务 T2 已建好」「提醒已设置」「T3 已被你暂停」「定时任务建好了」「T3 暂停了」。「T3 暂停了吗」是在问
+      // 「定时任务创建成功后会通知你」说的是以后；「定时任务没有创建成功」是没做成
+      String.raw`${SCHEDULE_OBJECT}(?:(?!${NEGATION})${CLAIM_GAP}){0,6}?(?:已经?\s*(?:被${CLAIM_GAP}{0,8}?)?${verb}|${verb}(?:好了|了|成功)(?![吗么呢后]|以后|之后))`,
+    ].join("|"),
+    "g",
+  );
+}
+
+const SCHEDULE_CREATE_VERB = String.raw`(?:建|创建|新建|设置|设定|设好|定好|安排)`;
+const SCHEDULE_CHANGE_VERB = String.raw`(?:暂停|恢复|取消|停掉|停用|删除|删掉|关掉)`;
+/** 回答里说定时任务建好了 */
+const SCHEDULE_CREATED_CLAIM = scheduleClaim(SCHEDULE_CREATE_VERB);
+/** 回答里说定时任务暂停、恢复、取消了 */
+const SCHEDULE_CHANGED_CLAIM = scheduleClaim(SCHEDULE_CHANGE_VERB);
+/** 说了做一件事（「建议」不算） */
+const SCHEDULE_ACTION = new RegExp(String.raw`${SCHEDULE_CREATE_VERB}(?!议)|${SCHEDULE_CHANGE_VERB}`);
+const SCHEDULE_ACTIONS = new RegExp(SCHEDULE_ACTION.source, "g");
+
+/**
+ * 每个说法前面还归它的字里有没有「之前」「上次」。前面还归它的字：同一个分句里往前看，「而」「并」这类字前面说完了另一件事的，到那儿为止。
+ * 「之前 T1 已暂停而 T2 现在已取消」里「之前」归 T1，T2 的取消是这次的；「之前和你说的定时任务 T3 已建好」里「和」前面没说做什么，「之前」照样算。
+ * 整段回答从前往后只扫一遍（starts 从小到大）：每个说法各往前找一遍的话，很长的分句、很多说法会把机器人卡住
+ */
+function saidEarlier(answer: string, starts: readonly number[]): boolean[] {
+  // 做一件事的字、「之前」这类字都不含标点和「而」「并」，在哪儿结束就在哪儿记
+  const actionEnds = new Set([...answer.matchAll(SCHEDULE_ACTIONS)].map((match) => match.index + match[0].length));
+  const earlierStarts = new Map([...answer.matchAll(EARLIERS)].map((match) => [match.index + match[0].length, match.index]));
+  const result: boolean[] = [];
+  let own = 0; // 前面还归说法的字从哪儿开始
+  let acted = false; // 这个分句到这儿为止说过做一件事
+  let earlier = -1; // 最近一处「之前」「上次」从哪儿开始
+  for (let index = 0, next = 0; next < starts.length; index++) {
+    acted ||= actionEnds.has(index);
+    earlier = earlierStarts.get(index) ?? earlier;
+    while (starts[next] === index) {
+      result.push(earlier >= own);
+      next++;
+    }
+    const char = answer[index] ?? "";
+    if (CLAIM_CLAUSE_BREAK.test(char)) {
+      own = index + 1;
+      acted = false;
+    } else if (acted && STARTS_WITH_CONNECTOR.test(char)) {
+      own = index;
+    }
+  }
+  return result;
+}
+
+/**
+ * 说法后面的字，按「而」「并」这类字后面又说了做一件事切开：第一段还归这个说法（编号常写在后面：「已建好定时任务 T2」），
+ * 后面每段是接着说的另一件事，连着它后面没再说做什么的几段（「并取消 T2 和 T3」）。
+ * 「已暂停 T1 并取消 T2」里 T2 不归暂停、归取消；「已取消定时任务 T1 和 T2」里「和」后面没说做什么，T2 也归取消
+ */
+function tailGroups(after: string): string[] {
+  const groups = [""];
+  for (const part of (after.match(CLAUSE_AFTER)?.[0] ?? "").split(CONNECTOR)) {
+    if (STARTS_WITH_CONNECTOR.test(part) && SCHEDULE_ACTION.test(part)) {
+      groups.push(part);
+    } else {
+      groups[groups.length - 1] += part;
+    }
+  }
+  return groups;
+}
+
+/** 「已暂停 T1 并取消 T2」里「并」后面接着说的：前面的「已」管到这儿，也是说做成了 */
+function followingClaim(verb: string): RegExp {
+  return new RegExp(String.raw`^[而并且和及同另还但]+\s*(?:也|又|还|再)?\s*(?:(?:帮你|给你|为你)\s*)?${verb}${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`);
+}
+/** 接着说的一段里只说了一件事：开头的「并」「而」后面没再接着说别的 */
+const DANGLING = /^[而并且和及同另还但]+[^而并且和及同另还但]*$/;
+const HAS_TASK_ID = new RegExp(TASK_ID);
+/** 最后是接着列任务的「和」「及」「与」「、」 */
+const LISTING = /(?:和|及|与|、)\s*$/;
+const FOLLOWING_CLAIMS = [
+  ["create", followingClaim(SCHEDULE_CREATE_VERB)],
+  ["change", followingClaim(SCHEDULE_CHANGE_VERB)],
+] as const;
+
+type ScheduleClaim = { kind: "create" | "change"; said: string; ids: string };
+
+/** 括号里顺带提的（「已建好定时任务 T3（跟 T4 一样每周跑）」里的 T4）不归这个说法 */
+const ASIDE = /（[^（）]*）|\([^()]*\)/g;
+
+/**
+ * 回答里说做成了的定时任务改动：说的是什么（看是哪种改动）、连着后面归它的字（找编号）。说以前的不算。
+ * 后面归它的字到下一个说法为止：「T1 已暂停 T2 已取消」里 T2 归取消。这样每个字只归一个说法，回答再长、说法再多也只扫一遍
+ */
+function scheduleClaims(answer: string): ScheduleClaim[] {
+  const matches = (
+    [
+      ["create", SCHEDULE_CREATED_CLAIM],
+      ["change", SCHEDULE_CHANGED_CLAIM],
+    ] as const
+  )
+    .flatMap(([kind, pattern]) => [...answer.matchAll(pattern)].map((match) => ({ kind, match })))
+    .sort((a, b) => a.match.index - b.match.index);
+  const earlier = saidEarlier(answer, matches.map(({ match }) => match.index));
+  // 下一个说法是第几个（同一处开始的另一种说法不算）
+  const nextOf = matches.map(() => -1);
+  for (let index = matches.length - 2; index >= 0; index--) {
+    nextOf[index] = matches[index + 1]!.match.index > matches[index]!.match.index ? index + 1 : nextOf[index + 1]!;
+  }
+  // 前面还归它的字里说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）：说的是以前的，不查
+  const historical = matches.map(({ match }, index) => earlier[index]! || (OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0])));
+  const claims: ScheduleClaim[] = [];
+  matches.forEach(({ kind, match }, index) => {
+    if (historical[index]) {
+      return;
+    }
+    const end = match.index + match[0].length;
+    const nextMatch = matches[nextOf[index]!]?.match;
+    const tail = answer.slice(end, Math.max(end, nextMatch?.index ?? answer.length));
+    // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
+    const [own = "", ...following] = tailGroups(tail);
+    // 下一个说法是先说任务的（「已暂停 T1 并取消 T2 和 T3（之前已暂停）」里的「T3（之前已暂停」），这段话一直连到它：
+    // 这段最后是「和」「、」接着列任务的，或者自己还没写是哪个任务的，它开头的任务也是这段说的，照这段的改动查（下一个说法要查的照样查）
+    const carried = nextMatch !== undefined && OBJECT_FIRST.test(nextMatch[0]) && CLAUSE_AFTER.exec(tail)?.[0].length === tail.length ? nextMatch[0] : "";
+    // 「已取消 T2 和 T3（之前…」「已取消定时任务 T2（现在…」。「T1 已暂停 T2 已取消」里 T1 已经写了、「提醒已取消 T3 已暂停」先说的任务，后面的任务都不归它
+    const ownCarries = following.length === 0 && (LISTING.test(own) || (own.trim() === "" && !OBJECT_FIRST.test(match[0]) && !HAS_TASK_ID.test(match[0])));
+    claims.push({ kind, said: match[0], ids: match[0] + (ownCarries ? own + carried : own).replace(ASIDE, "") });
+    following.forEach((group, at) => {
+      // 「并取消 」「并取消定时任务 」后面就是任务；「并取消 T2 和 」接着列任务。「并取消 T2 而 T3 现在已暂停」里「而」说起的是别的，T3 不归取消
+      const carries = at === following.length - 1 && ((DANGLING.test(group) && !HAS_TASK_ID.test(group)) || LISTING.test(group));
+      const text = carries ? group + carried : group;
+      const [followingKind, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, text.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
+      if (followingKind !== undefined && said !== undefined) {
+        claims.push({ kind: followingKind, said, ids: text.replace(ASIDE, "") });
+      }
+    });
+  });
+  return claims;
+}
+
+/**
+ * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change。
+ * 调成了的，说到的编号（T2）还要在这次的工具结果里：建了 T3 说成 T4 不算。
+ * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算；
+ * 说暂停、取消、恢复了的，那个任务现在也得是这个状态（照这次的回执，没改过的照列表）；没写编号的，这次的回执里得有这么一个改动。
+ * known 是这次定时任务工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
+ */
+export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
+  // 编号只认工具自己写的位置（回执开头、列表每行开头），任务内容里写着的 T4 不算。先整理好，说法再多也不用每个编号各翻一遍
+  const lines = known.split("\n");
+  const idsOf = (pattern: RegExp) => new Set(lines.map((line) => line.match(pattern)?.[1]).filter((id) => id !== undefined));
+  const listed = idsOf(SCHEDULE_ENTRY);
+  const created = idsOf(CREATE_RECEIPT);
+  const changed = idsOf(CHANGE_RECEIPT);
+  const states = taskStates(lines);
+  const backed = ({ kind, said, ids: text }: ScheduleClaim) => {
+    const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
+    if (!succeeded.has(kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
+      return false;
+    }
+    if (kind === "create") {
+      // 这次建成了的，说建好的编号都得是这次建的：建了 T3、列表里原来就有 T4，说「已建好定时任务 T4」「已建好 T3 和 T4」都不算
+      return ids.every((id) => (succeeded.has(SCHEDULE_CREATE_TOOL) ? created : listed).has(id));
+    }
+    // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
+    // 暂停了说成取消、列表写着还在跑说成已取消，都不算
+    const state = CHANGE_STATES.find(([verb]) => verb.test(said))?.[1];
+    if (state === undefined) {
+      return false;
+    }
+    const now = (id: string) => state.test(states.get(id) ?? "");
+    if (ids.length > 0) {
+      return ids.every(now);
+    }
+    // 没写编号的（「已暂停定时任务」），这次改过的任务里得有一个现在真是这样：暂停了、后来又被人恢复了的不算
+    return [...changed].some(now);
+  };
+  const wrong = new Set(scheduleClaims(answer).filter((claim) => !backed(claim)).map((claim) => claim.kind));
+  return (["create", "change"] as const).filter((kind) => wrong.has(kind));
+}
+
+/**
+ * 说的是哪种改动，这个任务现在该是什么样。schedule_change 的回执开头是「已暂停」「已恢复」「已取消」；
+ * schedule_list 那一行最后一段是「下次 10-23 09:00」「已暂停」「连着失败，自动暂停了」「已取消」
+ */
+const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
+  [/恢复/, /^(?:下次 |已恢复)/],
+  [/取消|删除|删掉/, /^已取消/],
+  [/暂停|停掉|停用|关掉/, /暂停/],
+];
+
+/** 工具自己写的编号位置：schedule_create 回执「已建好定时任务 T3（…」、schedule_change 回执「已暂停定时任务 T1：…」、schedule_list 每行「- T1 · …」 */
+const SCHEDULE_ENTRY = /^(?:已建好定时任务 |已(?:暂停|恢复|取消)定时任务 |- )(T\d+)(?:（| · |[：:])/;
+/** schedule_create 的回执：「已建好定时任务 T3（到点去做）：…」 */
+const CREATE_RECEIPT = /^已建好定时任务 (T\d+)（/;
+/** schedule_change 的回执：「已暂停定时任务 T1：…」 */
+const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 (T\d+)[：:]/;
+/** schedule_list 的一行：「- T1 · 每天 09:00 · … · 下次 10-23 09:00」 */
+const LIST_ENTRY = /^- (T\d+) · /;
+
+/**
+ * 每个编号现在的状态：看这次最后一处说到它的，是回执就看回执开头，是列表就看那一行的最后一段。
+ * 工具结果按调用先后排，一次里查了两回列表、中间别人改过的，以后面那回为准
+ */
+function taskStates(lines: readonly string[]): Map<string, string> {
+  const states = new Map<string, string>();
+  for (const line of lines) {
+    const receipt = line.match(CHANGE_RECEIPT)?.[1];
+    const entry = line.match(LIST_ENTRY)?.[1];
+    if (receipt !== undefined) {
+      states.set(receipt, line.slice(0, 3));
+    } else if (entry !== undefined) {
+      states.set(entry, line.split(" · ").at(-1) ?? "");
+    }
+  }
+  return states;
+}
+
+/**
+ * 说建好、暂停、取消了定时任务，这次却没调成对应的工具：打回一次，叫它照实说、请他 @ 着一句说全，这一轮不叫它去调。
+ * 工具调成了、只是回答说错了（建了 T3 说成 T4）：把回执给它照着改，不叫它再调一次（再调就多建一个）。
+ * known、done（这次建成、改成的回执）在检查时再取，这次调到的才算
+ */
+export function reviewScheduleClaims(
+  answer: string,
+  succeeded: ReadonlySet<string>,
+  known: () => string,
+  toolNames: readonly string[],
+  done: () => readonly string[] = () => [],
+): string | undefined {
+  const kinds = unbackedScheduleClaims(answer, succeeded, known());
+  if (kinds.length === 0) {
+    return undefined;
+  }
+  const toolOf = (kind: "create" | "change") => (kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL);
+  const claimedOf = (kind: "create" | "change") => (kind === "create" ? "建好了" : "暂停、恢复或取消了");
+  const ran = kinds.filter((kind) => succeeded.has(toolOf(kind)));
+  const notRun = kinds.filter((kind) => !succeeded.has(toolOf(kind)));
+  const notes: string[] = [];
+  if (ran.length > 0) {
+    notes.push(
+      `${ran.map(toolOf).join("、")} 这次已经做成了：${done().join("、")}。回答里说的定时任务（编号、是建还是改）和这个对不上：照这个改，不要再调 ${ran.map(toolOf).join("、")} 重做一遍，再调就多建、多改一个。`,
+    );
+  }
+  if (notRun.length > 0) {
+    const tools = notRun.map(toolOf);
+    const missing = tools.filter((name) => !toolNames.includes(name));
+    // 只叫它改回答，不叫它现在去调：说错的可能是任务内容、文档里别人写的话带出来的，照着去调就成了替别人改任务
+    notes.push(
+      `你这次没有用 ${tools.join("、")} 做成（没调、调了出错、这次没有这个工具，或者写的编号这次查到的定时任务里没有），回答里却说定时任务已经${notRun.map(claimedOf).join("、")}。` +
+        `这次只改回答，不要调 ${tools.join("、")}：照实说这次没建成、没改成，` +
+        (missing.length > 0
+          ? `请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全（没 @ 你的话、点按钮问的、这句话本身没说要以后做什么，都建不了、改不了）。`
+          : "要建、要改的，请他 @ 你再说一次。"),
+    );
+  }
+  return `（系统检查）${notes.join("")}其余内容不用改，重新给出完整的回答，不要提这段检查。`;
+}
+
+export const BLOCKED_SCHEDULE_ANSWER =
+  "这次没有建成，也没有改动定时任务。要建、要改请 @ 我，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全，比如「@我 每天 15:30 汇总今天群里的讨论，追加到 https://…」。";
+
+/** 定时任务回执开头做了什么、哪个编号：「已建好定时任务 T3」「已暂停定时任务 T1」 */
+const SCHEDULE_RECEIPT = /^已(?:建好|暂停|恢复|取消)定时任务 T\d+/;
+
+/** 回答说的定时任务和这次做成的对不上时发出去的：什么都没做成就是 BLOCKED_SCHEDULE_ANSWER，做成了的照工具回执列出来 */
+export function blockedScheduleAnswer(done: readonly string[]): string {
+  if (done.length === 0) {
+    return BLOCKED_SCHEDULE_ANSWER;
+  }
+  return (
+    "这次回答里说的定时任务和实际做成的对不上，为免误导没有发出来。这次实际做成的：\n" +
+    done.map((line) => `- ${line}`).join("\n") +
+    "\n不用再建一次；要核对可以 @ 我问「这个群有哪些定时任务」。"
+  );
 }
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；

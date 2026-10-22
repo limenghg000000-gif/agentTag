@@ -184,7 +184,7 @@ export function createScheduleTools(opts: ScheduleToolsOptions): Tool[] {
       const t = now();
       return `${ACTION_DONE[action]}定时任务 ${label(task)}：${describeSchedule(task, t)}，${preview(task.prompt)}` +
         (task.status === "active" && task.nextRunAt !== undefined ? `。下次是 ${formatTime(task.nextRunAt, t)}` : "") +
-        (task.creator.openId !== senderId && action !== "resume" ? `。这是${task.creator.name ?? "别人"}建的，已在群里 @ 他说一声` : "");
+        (task.creator.openId !== senderId && action !== "resume" ? `。这是${task.creator.name ? shownName(task.creator.name) : "别人"}建的，已在群里 @ 他说一声` : "");
     },
   };
 
@@ -287,10 +287,18 @@ function describeTask(task: ScheduledTask, now: number): string {
           ? "已取消"
           : "跑完了";
   const last = task.lastRunAt !== undefined ? `，上次 ${formatTime(task.lastRunAt, now)} ${task.lastResult ? RESULT_TEXT[task.lastResult] : "开始跑了，还没跑完"}` : "";
-  const creator = task.creator.name ? `${task.creator.name}建的` : "";
-  const paused = task.status === "paused" && task.pausedFor === undefined && task.changedBy?.name ? `（${task.changedBy.name}暂停的）` : "";
+  const creator = task.creator.name ? `${shownName(task.creator.name)}建的` : "";
+  const paused = task.status === "paused" && task.pausedFor === undefined && task.changedBy?.name ? `（${shownName(task.changedBy.name)}暂停的）` : "";
   const extras = `${task.remind ? " · 纯提醒" : ""}${task.appendDoc ? ` · 追加到 ${task.appendDoc}` : ""}${task.alertCreator ? " · 有异常 @ 建的人" : ""}`;
   return `${label(task)} · ${describeSchedule(task, now)}${extras} · ${preview(task.prompt)} · ${creator}${creator ? " · " : ""}${state}${paused}（已跑 ${task.runs} 次${last}）`;
+}
+
+/**
+ * 人名写进列表、回执时：换行和空白并成一个空格，「·」换成「・」。
+ * 列表每行用「 · 」分段、最后一段是状态，回答检查照这个认任务现在什么样；名字里写的「 · 已取消」、换行写的假列表行不能变成另一段、另一行
+ */
+function shownName(name: string): string {
+  return name.replace(/\s+/g, " ").replace(/·/g, "・");
 }
 
 const RESULT_TEXT: Record<string, string> = {
