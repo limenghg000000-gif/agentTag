@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadConfig } from "../src/config.js";
-import { GroupPolicies, isRepoPattern } from "../src/groups.js";
+import { type CardSettings, GroupPolicies, isRepoPattern } from "../src/groups.js";
 import type { GroupOverride } from "../src/settings.js";
 
 const env = {
@@ -96,7 +96,7 @@ test("管理群卡片上改过的项盖过 .env 里的，没改的照旧；白�
     oc_test: { codeRepos: [], memoryEditors: [], knowledge: true, mcp: { aiops: "all" } },
     oc_other: { writeAllowed: [] },
   };
-  const groups = new GroupPolicies(loadConfig({ ...env, FEISHU_ALLOWED_CHAT_IDS: "oc_test,oc_ops,oc_plain" }), (chatId) => cards[chatId]);
+  const groups = new GroupPolicies(loadConfig({ ...env, FEISHU_ALLOWED_CHAT_IDS: "oc_test,oc_ops,oc_plain" }), cardsOf(cards));
   const ops = groups.of("oc_ops");
   assert.deepEqual(ops.writeAllowed, new Set(["ou_b", "ou_c"]));
   // 工具只能在全局开了的里挑：全局没开的去掉
@@ -120,7 +120,7 @@ test("管理群卡片上改过的项盖过 .env 里的，没改的照旧；白�
 
 test("全局关着经验库时卡片上打开也不算；卡片上改过的群每次取都是最新的", () => {
   let card: GroupOverride | undefined = { knowledge: true };
-  const groups = new GroupPolicies(loadConfig({ ...env, KNOWLEDGE: "off" }), () => card);
+  const groups = new GroupPolicies(loadConfig({ ...env, KNOWLEDGE: "off" }), { override: () => card, chatIds: () => (card ? ["oc_plain"] : []) });
   assert.equal(groups.of("oc_plain").knowledge, false);
   card = { proactive: true };
   assert.equal(groups.of("oc_plain").proactive, true);
@@ -129,21 +129,55 @@ test("全局关着经验库时卡片上打开也不算；卡片上改过的群�
 });
 
 test("preview：换成卡片上的选择以后用的配置；空的就是全照服务器上的配置", () => {
-  const groups = new GroupPolicies(loadConfig(env), () => ({ writeAllowed: ["ou_z"] }));
+  const groups = new GroupPolicies(loadConfig(env), cardsOf({ oc_ops: { writeAllowed: ["ou_z"] } }));
   assert.deepEqual(groups.preview("oc_ops", { writeAllowed: ["ou_b"] }).writeAllowed, new Set(["ou_b"]));
   assert.deepEqual(groups.preview("oc_ops", {}).writeAllowed, new Set(), "空的照 .env：GROUP_OPS_WRITE_ALLOWED_USERS=none");
 });
 
 test("经验库表格共享按卡片上改过的名单算", () => {
-  const groups = new GroupPolicies(loadConfig(env), (chatId) => (chatId === "oc_ops" ? { writeAllowed: ["ou_b"], knowledge: false } : undefined));
+  const groups = new GroupPolicies(loadConfig(env), cardsOf({ oc_ops: { writeAllowed: ["ou_b"], knowledge: false } }));
   assert.deepEqual(groups.knowledgeShare(), { chatIds: ["oc_plain"], editors: ["ou_ml"] });
 });
 
 test("启动日志加一行卡片上改过的群（写几个人，不写是谁）", () => {
-  const groups = new GroupPolicies(loadConfig(env), (chatId) =>
-    chatId === "oc_plain" ? { writeAllowed: ["ou_b", "ou_c"], mcp: { aiops: "off" }, proactive: true } : undefined,
-  );
+  const groups = new GroupPolicies(loadConfig(env), cardsOf({ oc_plain: { writeAllowed: ["ou_b", "ou_c"], mcp: { aiops: "off" }, proactive: true } }));
   const lines = groups.describe();
   assert.equal(lines.length, 3);
   assert.equal(lines[2], "群 oc_plain（oc_plain）在管理群的卡片上改过：写权限 2 人；MCP aiops 不开；主动接话 开");
 });
+
+test("开通的群：服务器白名单加上卡片上开通的、去掉停用的；存了以后 refresh 原地改，拿着它的地方马上看得到", () => {
+  const cards: Record<string, GroupOverride> = {
+    oc_new: { enabled: true, codeRepos: [], writeAllowed: [] },
+    oc_test: { enabled: false, knowledge: true },
+    oc_left: { writeAllowed: ["ou_b"] },
+  };
+  const groups = new GroupPolicies(loadConfig({ ...env, FEISHU_ALLOWED_CHAT_IDS: "oc_test,oc_ops,oc_plain" }), cardsOf(cards));
+  const allowed = groups.allowed;
+  assert.deepEqual([...allowed].sort(), ["oc_new", "oc_ops", "oc_plain"]);
+  assert.equal(groups.onServer("oc_test"), true);
+  assert.equal(groups.onServer("oc_new"), false);
+  // 卡片上开通的群按卡片上定的；停用的、没开通的不看卡片
+  assert.deepEqual(groups.of("oc_new").codeRepos, []);
+  assert.deepEqual(groups.of("oc_new").writeAllowed, new Set());
+  assert.equal(groups.carded("oc_test"), undefined);
+  assert.equal(groups.carded("oc_left"), undefined);
+  assert.deepEqual(groups.knowledgeShare().chatIds.sort(), ["oc_new", "oc_ops", "oc_plain"]);
+
+  const lines = groups.describe().filter((line) => line.includes("卡片上改过"));
+  assert.deepEqual(lines, [
+    "群 oc_new（oc_new）在管理群的卡片上改过：开通；仓库 不开；写权限 没人",
+    "群 test（oc_test）在管理群的卡片上改过：停用；经验库 用",
+    "群 oc_left（oc_left）在管理群的卡片上改过：没开通；写权限 1 人",
+  ]);
+
+  cards.oc_test = { knowledge: true };
+  delete cards.oc_new;
+  groups.refresh();
+  assert.equal(groups.allowed, allowed, "还是同一个 Set");
+  assert.deepEqual([...allowed].sort(), ["oc_ops", "oc_plain", "oc_test"]);
+});
+
+function cardsOf(cards: Record<string, GroupOverride>): CardSettings {
+  return { override: (chatId) => cards[chatId], chatIds: () => Object.keys(cards) };
+}

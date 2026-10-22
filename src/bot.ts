@@ -336,7 +336,7 @@ export function createMessageHandler(deps: BotDeps) {
   return async (msg: NormalizedMessage, options: TaskOptions = {}): Promise<void> => {
     if (!allowedChatIds.has(msg.chatId)) {
       // 机器人可能也在告警群等业务群里，没加进白名单的群一律不回应，只在日志里打出 chat_id 方便加白
-      logger.info(`忽略白名单外的群 chat=${msg.chatId}，要启用请把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
+      logger.info(`忽略没开通的群 chat=${msg.chatId}，要启用请在管理群里 @ 机器人说「配置」开通，或者把它加进 FEISHU_ALLOWED_CHAT_IDS 后重启`);
       return;
     }
     // 下面都用这个群的那一份：仓库、写权限名单、MCP、经验库按群配置

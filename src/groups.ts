@@ -1,5 +1,5 @@
 import type { Config, GroupConfig, McpScope } from "./config.js";
-import type { GroupOverride } from "./settings.js";
+import type { GroupOverride, GroupSettings } from "./settings.js";
 
 /**
  * 一个群现在用的配置：管理群的卡片上定了的项用卡片的，没定的看 .env 里这个群单独写了没有（GROUPS 加 GROUP_<名字>_…），再没有用全局的。
@@ -28,14 +28,18 @@ type PolicyConfig = Pick<Config, "code" | "mcp" | "knowledge" | "groups"> & {
   proactive: Pick<Config["proactive"], "chatIds">;
 };
 
+/** 管理群卡片上定的项从哪儿取（GroupSettings） */
+export type CardSettings = Pick<GroupSettings, "override" | "chatIds">;
+
 export class GroupPolicies {
   private readonly byChat: ReadonlyMap<string, GroupConfig>;
   private readonly global: Omit<GroupPolicy, "proactive">;
+  private readonly live = new Set<string>();
 
-  /** cards：管理群的卡片上给这个群单独定的项（GroupSettings.override），没开管理群时不传 */
+  /** cards：管理群的卡片上给各群单独定的项（GroupSettings），没开管理群、也没存过时不传 */
   constructor(
     private readonly config: PolicyConfig,
-    private readonly cards?: (chatId: string) => GroupOverride | undefined,
+    private readonly cards?: CardSettings,
   ) {
     this.byChat = new Map(config.groups.map((group) => [group.chatId, group]));
     this.global = {
@@ -45,15 +49,47 @@ export class GroupPolicies {
       mcp: new Map(config.mcp.map((server) => [server.name, "*" as const])),
       knowledge: config.knowledge !== undefined,
     };
+    this.refresh();
+  }
+
+  /**
+   * 现在开通的群：服务器白名单（FEISHU_ALLOWED_CHAT_IDS）里的，去掉卡片上停用的，加上卡片上开通的。
+   * 一直是同一个 Set：各处拿着它判断收不收这个群的消息，卡片上存了以后 refresh 一下马上生效
+   */
+  get allowed(): ReadonlySet<string> {
+    return this.live;
+  }
+
+  /** 卡片上存了新设置以后调：按服务器白名单和卡片上的开通、停用重新算 allowed（原地改，拿着它的地方不用换） */
+  refresh(): void {
+    const next = new Set([...this.config.feishu.allowedChatIds].filter((chatId) => this.cards?.override(chatId)?.enabled !== false));
+    for (const chatId of this.cards?.chatIds() ?? []) {
+      if (this.cards?.override(chatId)?.enabled === true) {
+        next.add(chatId);
+      }
+    }
+    for (const chatId of this.live) {
+      if (!next.has(chatId)) {
+        this.live.delete(chatId);
+      }
+    }
+    for (const chatId of next) {
+      this.live.add(chatId);
+    }
+  }
+
+  /** 这个群写在服务器白名单里（不看卡片上的开通、停用） */
+  onServer(chatId: string): boolean {
+    return this.config.feishu.allowedChatIds.has(chatId);
   }
 
   /**
    * 这个群的配置：卡片上定了的项盖过 .env 里的，.env 里单独配过的群逐项覆盖全局，没配过的就是全局那份。
-   * card: false 只看服务器上的配置（卡片上显示「照服务器上的配置（现在：…）」用）。白名单外的群不看卡片
+   * card: false 只看服务器上的配置（卡片上显示「照服务器上的配置（现在：…）」用）。没开通的群不看卡片
    */
   of(chatId: string, { card = true }: { card?: boolean } = {}): GroupPolicy {
     const base = this.fromEnv(chatId);
-    const override = card && this.config.feishu.allowedChatIds.has(chatId) ? this.cards?.(chatId) : undefined;
+    const override = card ? this.carded(chatId) : undefined;
     return override ? this.withCard(base, override) : base;
   }
 
@@ -63,9 +99,9 @@ export class GroupPolicies {
     return Object.keys(override).length > 0 ? this.withCard(base, override) : base;
   }
 
-  /** 卡片上给这个群单独定的项（白名单外的群不算），没定过返回 undefined */
+  /** 卡片上给这个群单独定的项（没开通的群不算），没定过返回 undefined */
   carded(chatId: string): GroupOverride | undefined {
-    return this.config.feishu.allowedChatIds.has(chatId) ? this.cards?.(chatId) : undefined;
+    return this.live.has(chatId) ? this.cards?.override(chatId) : undefined;
   }
 
   private fromEnv(chatId: string): GroupPolicy {
@@ -148,16 +184,20 @@ export class GroupPolicies {
    * 关掉经验库的群不共享：表格里是别的群的排查经验
    */
   knowledgeShare(): { chatIds: string[]; editors: string[] } {
-    const chatIds = [...this.config.feishu.allowedChatIds].filter((chatId) => this.of(chatId).knowledge);
+    const chatIds = [...this.live].filter((chatId) => this.of(chatId).knowledge);
     const editors = new Set(chatIds.flatMap((chatId) => [...(this.of(chatId).writeAllowed ?? [])]));
     return { chatIds, editors: [...editors] };
   }
 
-  /** 启动日志：.env 里单独配过的群用的是什么（没写的项写「同全局」），再加卡片上改过的群各一行 */
+  /** 启动日志：.env 里单独配过的群用的是什么（没写的项写「同全局」），再加卡片上改过（包括开通、停用）的群各一行 */
   describe(): string[] {
-    const carded = [...this.config.feishu.allowedChatIds].flatMap((chatId) => {
-      const card = this.carded(chatId);
-      return card ? [`群 ${this.of(chatId).name ?? chatId}（${chatId}）在管理群的卡片上改过：${describeOverride(card)}`] : [];
+    const carded = (this.cards?.chatIds() ?? []).flatMap((chatId) => {
+      const card = this.cards?.override(chatId);
+      if (!card) {
+        return [];
+      }
+      const state = this.live.has(chatId) ? (card.enabled ? ["开通"] : []) : [card.enabled === false ? "停用" : "没开通"];
+      return [`群 ${this.of(chatId).name ?? chatId}（${chatId}）在管理群的卡片上改过：${[...state, describeOverride(card)].filter(Boolean).join("；")}`];
     });
     return [...this.describeEnv(), ...carded];
   }

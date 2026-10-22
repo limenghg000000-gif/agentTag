@@ -34,24 +34,27 @@ interface Sent {
   messageId: string;
 }
 
-async function setup(opts: { allowAdminChat?: boolean; directory?: boolean; env?: Record<string, string>; onMembers?: () => Promise<void> } = {}) {
+async function setup(
+  opts: { allowAdminChat?: boolean; directory?: boolean; env?: Record<string, string>; onMembers?: () => Promise<void>; chats?: () => Promise<string[]> } = {},
+) {
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), "agenttag-admin-")), "settings");
   const settings = new GroupSettings({ dir, logger: quiet });
   await settings.init();
   const config = loadConfig({ ...env, ...opts.env, ...(opts.allowAdminChat ? { FEISHU_ALLOWED_CHAT_IDS: `${env.FEISHU_ALLOWED_CHAT_IDS},${ADMIN_CHAT}` } : {}) });
-  const groups = new GroupPolicies(config, (chatId) => settings.override(chatId));
+  const groups = new GroupPolicies(config, settings);
   const sent: Sent[] = [];
   const cards = new Map<string, Record<string, unknown>>();
   const saved: string[] = [];
   let now = 1_000_000;
-  const names: Record<string, string> = { oc_ops: "运营群", oc_test: "测试群", oc_plain: "产品群" };
-  const members: Record<string, string[]> = { oc_ops: ["ou_a", "ou_b", "ou_c"], [ADMIN_CHAT]: ["ou_owner", "ou_admin", "ou_x"] };
+  const names: Record<string, string> = { oc_ops: "运营群", oc_test: "测试群", oc_plain: "产品群", oc_new: "新群", [ADMIN_CHAT]: "管理群" };
+  const members: Record<string, string[]> = { oc_ops: ["ou_a", "ou_b", "ou_c"], oc_new: ["ou_n1", "ou_n2"], [ADMIN_CHAT]: ["ou_owner", "ou_admin", "ou_x"] };
+  // 机器人在的群：白名单里的三个、管理群，还有一个没开通的新群
+  const chats = opts.chats ?? (async () => ["oc_test", "oc_ops", "oc_plain", ADMIN_CHAT, "oc_new"]);
   const desk = new AdminDesk({
     chatId: ADMIN_CHAT,
     owners: new Set(["ou_owner"]),
     settings,
     groups,
-    allowedChatIds: config.feishu.allowedChatIds,
     repos: () => ["ai/aiops-mcp", "ai/agent-tag", "golang/*"],
     mcpServers: ["aiops"],
     mcpTools: () => ["query_logs", "search_knowledge", "get_knowledge"],
@@ -65,6 +68,7 @@ async function setup(opts: { allowAdminChat?: boolean; directory?: boolean; env?
               await opts.onMembers?.();
               return (members[chatId] ?? []).map((openId) => ({ openId }));
             },
+            chats: async () => (await chats()).map((chatId) => ({ chatId, ...(names[chatId] ? { name: names[chatId] } : {}) })),
           },
         }),
     send: async (to, input, sendOpts) => {
@@ -207,7 +211,8 @@ test("「配置 群名」直接打开那个群；GROUPS 里的名字也认；对
   await t.say("配置 财务群");
   assert.match(text(t.sent[2]!.card), /没找到叫「财务群」的群/);
   await t.say("配置 群");
-  assert.match(text(t.sent[3]!.card), /有 3 个群对得上「群」/);
+  assert.match(text(t.sent[3]!.card), /有 4 个群对得上「群」/, "还没开通的新群也算");
+  assert.match(text(t.sent[3]!.card), /还没开通的群.*新群.*"开通"/);
 });
 
 test("管理员改一个群：表单里选好、核对改前改后、点确认才存，下一条消息起生效，管理群里另发一条", async () => {
@@ -453,4 +458,106 @@ test("读不到群成员时，.env 里现在的名单也能选：照服务器上
   assert.match(text(t.cards.get(card)), /写权限\*\*：照服务器上的配置（现在：2 人：.*） → 只有这 1 人/);
   await t.click(card, "confirm", "ou_owner");
   assert.deepEqual(t.settings.override("oc_plain"), { writeAllowed: ["ou_ml"] });
+});
+
+test("总览列出机器人在、还没开通的群（管理群自己不算）；点「开通」先收紧，管理员改好、核对、确认后马上开通", async () => {
+  const t = await setup();
+  await t.say("配置");
+  const overview = t.sent[0]!.messageId;
+  assert.match(text(t.cards.get(overview)), /机器人在、还没开通的群.*新群/);
+  assert.equal(findButton(t.cards.get(overview), "open", { chat: ADMIN_CHAT }), undefined);
+
+  await t.click(overview, "open", "ou_x", undefined, { chat: "oc_new" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const card = t.sent[1]!.messageId;
+  const form = t.cards.get(card);
+  assert.match(text(form), /开通「新群」/);
+  assert.match(text(form), /新开通的群先收紧/);
+  assert.equal(initial(form, "repos_mode"), "set");
+  assert.equal(initial(form, "writers_mode"), "none");
+  assert.equal(initial(form, "mcp_0_mode"), "off");
+  assert.equal(initial(form, "proactive"), "env");
+
+  const choice = { ...keepAll, repos_mode: "set", repos: [], writers_mode: "list", writers: ["ou_n1"], mcp_0_mode: "list", mcp_0_tools: ["query_logs"] };
+  await t.click(card, "next", "ou_x", choice);
+  assert.match(text(t.cards.get(card)), /只有管理员能改设置/);
+  await t.click(card, "next", "ou_owner", choice);
+  const review = text(t.cards.get(card));
+  assert.match(review, /核对：开通「新群」/);
+  assert.match(review, /开通\*\*：没开通（在群里不回话） → 已开通（在群里回话）/);
+  assert.match(review, /代码仓库\*\*：照服务器上的配置（现在：ai\/aiops-mcp、ai\/agent-tag） → 不开代码工具/);
+  assert.equal(t.groups.allowed.has("oc_new"), false, "核对时还没开通");
+
+  await t.click(card, "confirm", "ou_owner");
+  assert.deepEqual(t.settings.override("oc_new"), { enabled: true, codeRepos: [], writeAllowed: ["ou_n1"], mcp: { aiops: ["query_logs"] } });
+  assert.equal(t.groups.allowed.has("oc_new"), true);
+  assert.deepEqual(t.groups.of("oc_new").codeRepos, []);
+  assert.deepEqual(t.groups.of("oc_new").writeAllowed, new Set(["ou_n1"]));
+  assert.match(text(t.cards.get(card)), /已开通「新群」.*从下一条消息起在这个群里回话/);
+  assert.match(text(t.sent.at(-1)!.card), /开通了「新群」/);
+  assert.deepEqual(t.saved, ["oc_new"]);
+
+  await t.say("配置");
+  const after = t.sent.at(-1)!.card;
+  assert.ok(findButton(after, "open", { chat: "oc_new" }));
+  assert.doesNotMatch(text(after), /还没开通的群/);
+});
+
+test("停用一个群：只改开通这一项，确认后马上不回话，其余的设置留着；再开通照原来的设置", async () => {
+  const t = await setup();
+  await t.settings.saveGroup("oc_ops", { proactive: true }, 0, { by: "ou_owner", changes: [] });
+  await t.say("配置 运营群");
+  const card = t.sent[0]!.messageId;
+  await t.click(card, "disable", "ou_owner");
+  const review = text(t.cards.get(card));
+  assert.match(review, /核对：停用「运营群」/);
+  assert.match(review, /开通\*\*：已开通（在群里回话） → 没开通（在群里不回话）/);
+  assert.doesNotMatch(review, /主动接话\*\*/);
+  // 返回修改：表单上还是开通的
+  await t.click(card, "edit", "ou_owner");
+  assert.match(text(t.cards.get(card)), /「运营群」的设置/);
+  await t.click(card, "disable", "ou_owner");
+  await t.click(card, "confirm", "ou_owner");
+  assert.deepEqual(t.settings.override("oc_ops"), { enabled: false, proactive: true });
+  assert.equal(t.groups.allowed.has("oc_ops"), false);
+  assert.equal(t.groups.of("oc_ops").proactive, false, "停用的群不看卡片");
+  assert.match(text(t.cards.get(card)), /已停用「运营群」/);
+  assert.match(text(t.sent.at(-1)!.card), /停用了「运营群」/);
+
+  await t.say("配置");
+  assert.match(text(t.sent.at(-1)!.card), /还没开通的群.*运营群/);
+
+  await t.say("配置 运营群");
+  const reopen = t.sent.at(-1)!.messageId;
+  assert.match(text(t.cards.get(reopen)), /开通「运营群」.*下面是这个群原来的设置/);
+  assert.equal(initial(t.cards.get(reopen), "proactive"), "on");
+  await t.click(reopen, "next", "ou_owner", { ...keepAll, proactive: "on" });
+  await t.click(reopen, "confirm", "ou_owner");
+  assert.deepEqual(t.settings.override("oc_ops"), { proactive: true }, "开通这一项回到照服务器白名单");
+  assert.equal(t.groups.allowed.has("oc_ops"), true);
+  assert.equal(t.groups.of("oc_ops").proactive, true);
+});
+
+test("列不出机器人在哪些群（没开权限）：总览上说明；说「配置 群的编号」也能开通；不是管理员的人不能停用", async () => {
+  const t = await setup({ chats: async () => Promise.reject(new Error("没有权限")) });
+  await t.say("配置");
+  assert.match(text(t.sent[0]!.card), /列不出机器人还在哪些群里（要给应用开「获取群组信息」权限），也可以说「配置 群的编号」开通/);
+
+  await t.say("配置 oc_far");
+  const card = t.sent[1]!.messageId;
+  assert.match(text(t.cards.get(card)), /开通「oc_far」/);
+  // 全部照服务器上的配置：不收紧，但还是开通
+  await t.click(card, "reset", "ou_owner");
+  const review = text(t.cards.get(card));
+  assert.match(review, /开通\*\*：没开通（在群里不回话） → 已开通（在群里回话）/);
+  assert.doesNotMatch(review, /代码仓库\*\*/);
+  await t.click(card, "confirm", "ou_owner");
+  assert.deepEqual(t.settings.override("oc_far"), { enabled: true });
+  assert.equal(t.groups.allowed.has("oc_far"), true);
+
+  await t.say("配置 oc_far", "ou_x");
+  const other = t.sent.at(-1)!.messageId;
+  await t.click(other, "disable", "ou_x");
+  assert.match(text(t.cards.get(other)), /只有管理员能改设置/);
+  assert.equal(t.groups.allowed.has("oc_far"), true);
 });

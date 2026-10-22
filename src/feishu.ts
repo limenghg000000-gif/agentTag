@@ -274,14 +274,22 @@ export interface ChatMember {
   name?: string;
 }
 
+/** 机器人在的一个群 */
+export interface ChatInfo {
+  chatId: string;
+  name?: string;
+}
+
 /**
- * 群名和群成员，管理群的设置卡片用。群名要 im:chat:readonly（获取群信息），群成员要 im:chat.members:read（获取群成员列表）；
- * 没开权限、机器人不在群里时抛 FeishuApiError，卡片上退回用群的编号、只列已经在名单里的人
+ * 群名、群成员、机器人在哪些群，管理群的设置卡片用。群名和机器人在的群要 im:chat:readonly（获取群信息），群成员要 im:chat.members:read（获取群成员列表）；
+ * 没开权限、机器人不在群里时抛 FeishuApiError，卡片上退回用群的编号、只列已经在名单里的人、列不出还没开通的群
  */
 export interface ChatDirectory {
   chatName(chatId: string): Promise<string | undefined>;
   /** 群成员（不含机器人），最多 limit 个 */
   members(chatId: string, limit: number): Promise<ChatMember[]>;
+  /** 机器人在的群，最多 limit 个 */
+  chats(limit: number): Promise<ChatInfo[]>;
 }
 
 export function createChatDirectory(client: Client): ChatDirectory {
@@ -308,6 +316,20 @@ export function createChatDirectory(client: Client): ChatDirectory {
         pageToken = data?.has_more ? data.page_token : undefined;
       } while (pageToken && members.length < limit);
       return members.slice(0, limit);
+    },
+    async chats(limit) {
+      const chats: ChatInfo[] = [];
+      let pageToken: string | undefined;
+      do {
+        const data = await callFeishu(() => client.im.v1.chat.list({ params: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) } }));
+        for (const item of data?.items ?? []) {
+          if (item.chat_id) {
+            chats.push({ chatId: item.chat_id, ...(item.name ? { name: item.name } : {}) });
+          }
+        }
+        pageToken = data?.has_more ? data.page_token : undefined;
+      } while (pageToken && chats.length < limit);
+      return chats.slice(0, limit);
     },
   };
 }

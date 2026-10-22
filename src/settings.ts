@@ -8,6 +8,11 @@ import type { Logger } from "./history.js";
  * 卡片上定的盖过 .env 里的同一项
  */
 export interface GroupOverride {
+  /**
+   * 开通：true 是在卡片上开通的（服务器白名单 FEISHU_ALLOWED_CHAT_IDS 里没有），false 是在卡片上停用的（白名单里有）。
+   * 没写照服务器白名单。停用的群其余的项留着，再开通时照用
+   */
+  enabled?: boolean;
   /** 能操作的仓库（只能是服务器上接入了的仓库，或者 group/* 一整组）；空数组是不开代码工具 */
   codeRepos?: string[];
   /** 写权限名单（open_id）；空数组是谁都不能让机器人改文档、改代码 */
@@ -57,7 +62,7 @@ interface SettingsData {
 }
 
 const OPEN_ID = /^ou_[A-Za-z0-9_-]+$/;
-const FIELDS = new Set<keyof GroupOverride>(["codeRepos", "writeAllowed", "memoryEditors", "mcp", "knowledge", "proactive"]);
+const FIELDS = new Set<keyof GroupOverride>(["enabled", "codeRepos", "writeAllowed", "memoryEditors", "mcp", "knowledge", "proactive"]);
 
 export interface GroupSettingsOptions {
   /** 配置文件 groups.json 和改动记录 changes.log 放在这个目录 */
@@ -164,6 +169,9 @@ type RecordInput = Omit<ChangeRecord, "at" | "target">;
 /** 去掉没写的项，空的 mcp 对象也去掉（没写的服务照服务器上的配置，空对象就是全照服务器） */
 function compact(override: GroupOverride): GroupOverride {
   const out: GroupOverride = {};
+  if (override.enabled !== undefined) {
+    out.enabled = override.enabled;
+  }
   if (override.codeRepos !== undefined) {
     out.codeRepos = [...new Set(override.codeRepos)];
   }
@@ -249,7 +257,7 @@ function checkOverride(value: unknown): string | undefined {
       }
     }
   }
-  for (const key of ["knowledge", "proactive"] as const) {
+  for (const key of ["enabled", "knowledge", "proactive"] as const) {
     if (value[key] !== undefined && typeof value[key] !== "boolean") {
       return `${key} 要是 true 或 false`;
     }

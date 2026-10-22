@@ -14,8 +14,10 @@ export const SETTINGS_TTL_MS = 30 * 60_000;
 /** 「配置」「配置 运营群」「配置 管理员」，说「设置」也行 */
 const COMMAND = /^\s*群?(?:配置|设置)(?:\s+(.+?))?\s*$/s;
 const ADMINS_QUERY = /^管理员(?:名单)?$/;
-/** 总览卡片上最多列几个群，再多的说「配置 群名」打开 */
+/** 总览卡片上开通了的、还没开通的群各最多列几个，再多的说「配置 群名」打开 */
 const MAX_LISTED = 20;
+/** 找机器人在哪些群时最多翻多少个 */
+const MAX_CHATS = 500;
 /** 从群成员里选人时最多列多少人（名单里已经有的另外算）。卡片上两个选人框各列一遍，飞书卡片最大 30 KB */
 const MAX_MEMBERS = 100;
 /** 卡片超过这么大时日志里警告一句（飞书卡片最大 30 KB，超了发不出去） */
@@ -26,9 +28,10 @@ const MAX_SESSIONS = 50;
 const OPTION_CHARS = 60;
 const OPEN_ID = /^ou_[A-Za-z0-9_-]+$/;
 const OPEN_IDS = /ou_[A-Za-z0-9_-]+/g;
+const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
 
 const HINT =
-  "这里是管理群：@ 我说「配置」看各群的设置、改设置，「配置 群名」直接打开那个群，「配置 管理员」看管理员名单。别的问题请到各群里问我。";
+  "这里是管理群：@ 我说「配置」看各群的设置、改设置、开通新群，「配置 群名」直接打开那个群，「配置 管理员」看管理员名单。别的问题请到各群里问我。";
 const EXPIRED = "这张卡片已经失效（机器人重启过，或者已经处理完了）。在管理群里 @ 我说「配置」重新打开";
 
 export interface AdminDeskOptions {
@@ -37,9 +40,8 @@ export interface AdminDeskOptions {
   /** 所有者（.env 里的 CONFIG_OWNERS）：能改各群的设置，也能加减管理员 */
   owners: ReadonlySet<string>;
   settings: GroupSettings;
-  groups: Pick<GroupPolicies, "of" | "preview" | "carded">;
-  /** 白名单群：卡片上只列、只改这些群 */
-  allowedChatIds: ReadonlySet<string>;
+  /** 各群的配置；allowed 是现在开通的群（服务器白名单加上卡片上开通的、去掉停用的），存了以后 refresh */
+  groups: Pick<GroupPolicies, "of" | "preview" | "carded" | "allowed" | "onServer" | "refresh">;
   /** 卡片上能勾的仓库：服务器上接入了的仓库和 group/* 通配。没开代码工具时为空，卡片上不显示这一项 */
   repos: () => readonly string[];
   /** 配了的 MCP 服务 */
@@ -48,13 +50,13 @@ export interface AdminDeskOptions {
   mcpTools: (server: string) => readonly string[] | undefined;
   /** 全局开着团队经验库。关着时卡片上不显示这一项 */
   knowledge: boolean;
-  /** 群名和群成员。不传、或者没开权限时，卡片上写群的编号、只能从名单里已经有的人里减 */
+  /** 群名、群成员、机器人在哪些群。不传、或者没开权限时，卡片上写群的编号、只能从名单里已经有的人里减、列不出还没开通的群 */
   directory?: ChatDirectory;
   send: (to: string, input: SendInput, opts?: SendOptions) => Promise<SendResult>;
   updateCard: (messageId: string, card: object) => Promise<void>;
   /** 卡片回调里没有点的人的名字：用它找。找不到写「有人」 */
   nameOf?: NameLookup;
-  /** 存好了一个群的新设置（经验库表格按新名单调整共享） */
+  /** 存好了一个群的新设置（经验库表格按新名单调整共享）。开通了的群已经算进 groups.allowed */
   onSaved?: (chatId: string) => void;
   logger?: Logger;
   now?: () => number;
@@ -78,22 +80,29 @@ interface BaseSession {
   note?: string;
 }
 
-/** 总览：列出白名单里的群和各自现在的设置 */
+/** 总览：列出开通了的群和各自现在的设置，再列机器人在、还没开通的群 */
 interface ListSession extends BaseSession {
   kind: "list";
   chatIds: string[];
+  /** 机器人在、还没开通的群 */
+  pending: string[];
+  /** 列不出还没开通的群时的说明 */
+  pendingNote?: string;
   /** 卡片最上面的一句，比如「没找到叫 X 的群」 */
   intro?: string;
 }
 
-/** 一个群的设置：先在表单里改（form），点「下一步」核对改前改后（review），点「确认」才存 */
+/**
+ * 一个群的设置：先在表单里改（form），点「下一步」核对改前改后（review），点「确认」才存。
+ * 还没开通的群打开就是开通：表单上的设置先收紧，确认后开通；开通了的群可以点「停用这个群」
+ */
 interface GroupSession extends BaseSession {
   kind: "group";
   chatId: string;
   name: string;
   /** 打开卡片时这个群的设置改过几次：确认时还是这个数才存，这期间别人改过的不覆盖 */
   version: number;
-  /** 表单上现在的选择（这个群卡片上单独定的项） */
+  /** 表单上现在的选择（这个群卡片上单独定的项）。表单上一直是开通的，点「停用这个群」时才换成停用去核对 */
   draft: GroupOverride;
   /** 能选的人：这个群的成员，加上名单里已经有的 */
   people: string[];
@@ -166,7 +175,7 @@ export class AdminDesk {
     }
     const match = COMMAND.exec(msg.content);
     if (!match) {
-      if (this.opts.allowedChatIds.has(msg.chatId)) {
+      if (this.opts.groups.allowed.has(msg.chatId)) {
         return false;
       }
       await this.opts.send(msg.chatId, { markdown: HINT }, { replyTo: msg.messageId }).catch((err: unknown) => this.logger.warn("管理群：回怎么用失败", err));
@@ -218,22 +227,29 @@ export class AdminDesk {
     return true;
   }
 
-  /** 「配置」后面跟的：没有是总览，「管理员」是管理员名单，群名（或 chat_id、GROUPS 里的名字）对上一个就直接打开那个群 */
+  /**
+   * 「配置」后面跟的：没有是总览，「管理员」是管理员名单，群名（或 chat_id、GROUPS 里的名字）对上一个就直接打开那个群，
+   * 还没开通的群打开就是开通
+   */
   private async open(query: string | undefined, opener: Person): Promise<Session> {
     if (query && ADMINS_QUERY.test(query)) {
       return this.adminsSession(opener);
     }
-    const all = [...this.opts.allowedChatIds];
     if (!query) {
-      return this.listSession(opener, all);
+      return this.listSession(opener);
     }
-    const found = await this.find(query, all);
+    // 直接写 chat_id 的，机器人列不出来的群（没开权限）也能开通
+    if (CHAT_ID.test(query) && query !== this.opts.chatId) {
+      return this.groupSession(query, opener);
+    }
+    const pending = await this.pending();
+    const found = await this.find(query, [...this.opts.groups.allowed, ...pending.chatIds]);
     if (found.length === 1) {
       return this.groupSession(found[0]!, opener);
     }
     return found.length > 1
-      ? this.listSession(opener, found, `有 ${found.length} 个群对得上「${query}」，点要改的那个`)
-      : this.listSession(opener, all, `没找到叫「${query}」的群，下面是机器人在的所有群`);
+      ? this.listSession(opener, `有 ${found.length} 个群对得上「${query}」，点要改的那个`, found, pending)
+      : this.listSession(opener, `没找到叫「${query}」的群，下面是机器人在的所有群`, undefined, pending);
   }
 
   private async find(query: string, chatIds: readonly string[]): Promise<string[]> {
@@ -241,7 +257,9 @@ export class AdminDesk {
     if (chatIds.includes(query)) {
       return [query];
     }
-    const named = await Promise.all(chatIds.map(async (chatId) => ({ chatId, names: [await this.chatName(chatId), this.opts.groups.of(chatId).name ?? ""] })));
+    // 还没开通的群名列群的时候已经拿到了，不再一个个去问（可能有几百个）
+    const nameOf = (chatId: string) => (this.opts.groups.allowed.has(chatId) ? this.chatName(chatId) : this.chatNames.get(chatId) ?? "");
+    const named = await Promise.all(chatIds.map(async (chatId) => ({ chatId, names: [await nameOf(chatId), this.opts.groups.of(chatId).name ?? ""] })));
     const exact = named.filter(({ names }) => names.some((name) => name.toLowerCase() === q));
     if (exact.length > 0) {
       return exact.map(({ chatId }) => chatId);
@@ -249,16 +267,54 @@ export class AdminDesk {
     return named.filter(({ names }) => names.some((name) => name && name.toLowerCase().includes(q))).map(({ chatId }) => chatId);
   }
 
-  private async listSession(opener: Person, chatIds: string[], intro?: string): Promise<ListSession> {
+  /** 总览：only 给了时只列这几个群（对得上名字的）；known 是刚列过的还没开通的群 */
+  private async listSession(opener: Person, intro?: string, only?: readonly string[], known?: { chatIds: string[]; note?: string }): Promise<ListSession> {
+    const pending = known ?? (await this.pending());
+    const pick = (list: readonly string[]) => (only ? list.filter((chatId) => only.includes(chatId)) : [...list]);
+    const chatIds = pick([...this.opts.groups.allowed]);
+    const waiting = pick(pending.chatIds);
     // 先把群名找好，画卡片时直接用
     await Promise.all(chatIds.slice(0, MAX_LISTED).map((chatId) => this.chatName(chatId)));
-    return { kind: "list", id: randomUUID(), createdAt: this.now(), opener, rev: 0, chatIds, ...(intro ? { intro } : {}) };
+    return {
+      kind: "list",
+      id: randomUUID(),
+      createdAt: this.now(),
+      opener,
+      rev: 0,
+      chatIds,
+      pending: waiting,
+      ...(pending.note && !only ? { pendingNote: pending.note } : {}),
+      ...(intro ? { intro } : {}),
+    };
+  }
+
+  /** 机器人在、还没开通的群（管理群自己不算）。列不出来（没开权限）时没有，附一句说明 */
+  private async pending(): Promise<{ chatIds: string[]; note?: string }> {
+    const howTo = "也可以说「配置 群的编号」开通（群的编号是 oc_ 开头的那串，有人在那个群里 @ 机器人时服务器日志里会打出来）";
+    if (!this.opts.directory) {
+      return { chatIds: [], note: `列不出机器人还在哪些群里，${howTo}` };
+    }
+    try {
+      const chats = await this.opts.directory.chats(MAX_CHATS);
+      for (const chat of chats) {
+        if (chat.name) {
+          this.chatNames.set(chat.chatId, chat.name);
+        }
+      }
+      return { chatIds: chats.map((chat) => chat.chatId).filter((chatId) => chatId !== this.opts.chatId && !this.opts.groups.allowed.has(chatId)) };
+    } catch (err) {
+      if (!this.directoryWarned) {
+        this.directoryWarned = true;
+        this.logger.warn("管理群：列不出机器人在哪些群（要 im:chat:readonly 权限），总览卡片上不列还没开通的群", err);
+      }
+      return { chatIds: [], note: `列不出机器人还在哪些群里（要给应用开「获取群组信息」权限），${howTo}` };
+    }
   }
 
   private async groupSession(chatId: string, opener: Person): Promise<GroupSession> {
     // 版本号和表单要同一时刻取：下面读群成员、群名要等，这期间别人存了的话，旧表单配上新版本号确认时就会盖掉别人的改动
     const version = this.opts.settings.version(chatId);
-    const draft = structuredClone(this.opts.settings.override(chatId) ?? {});
+    const draft = this.formDraft(chatId);
     const { people, note } = await this.members(chatId, this.listed(chatId, draft), "这个群");
     return {
       kind: "group",
@@ -351,7 +407,7 @@ export class AdminDesk {
 
   private async onList(session: ListSession, value: ActionValue, operator: Person): Promise<void> {
     let next: Promise<Session> | undefined;
-    if (value.op === "open" && typeof value.chat === "string" && session.chatIds.includes(value.chat) && this.opts.allowedChatIds.has(value.chat)) {
+    if (value.op === "open" && typeof value.chat === "string" && (session.chatIds.includes(value.chat) || session.pending.includes(value.chat))) {
       next = this.groupSession(value.chat, operator);
     } else if (value.op === "admins") {
       next = this.adminsSession(operator);
@@ -388,7 +444,7 @@ export class AdminDesk {
       session.note = `打开这张卡片以后有人改过「${session.name}」的设置，${who}这次点的没有保存。下面已经换成最新的设置，请重新改一遍`;
       return this.render(session);
     }
-    if (op === "next" || op === "reset") {
+    if (op === "next" || op === "reset" || op === "disable") {
       if (session.view !== "form") {
         session.note = `${who}点的是旧卡片：卡片已经换成核对改动了，请看一眼再点`;
         return this.render(session);
@@ -405,8 +461,18 @@ export class AdminDesk {
           session.note = `${who}点了下一步，有几处不对，没往下走：\n${errors.map((error) => `- ${error}`).join("\n")}`;
           return this.render(session);
         }
-      } else {
+      } else if (op === "reset") {
+        // 开通、停用不算在「全部照服务器上的配置」里：表单上一直是开通的
         session.draft = {};
+        this.setEnabled(session.chatId, session.draft, true);
+      } else {
+        if (!this.opts.groups.allowed.has(session.chatId)) {
+          session.note = `${who}点了停用：这个群本来就没开通`;
+          return this.render(session);
+        }
+        // 停用只改开通这一项：表单上没确认的改动不算，其余的项照存着的留下，再开通时照用
+        session.draft = structuredClone(this.opts.settings.override(session.chatId) ?? {});
+        this.setEnabled(session.chatId, session.draft, false);
       }
       const changes = this.groupChanges(session.chatId, this.opts.settings.override(session.chatId) ?? {}, session.draft);
       if (changes.length === 0) {
@@ -419,6 +485,10 @@ export class AdminDesk {
       return this.render(session);
     }
     if (op === "edit") {
+      // 从停用的核对返回：表单上还是开通的，其余的项照存着的
+      if (!this.on(session.chatId, session.draft)) {
+        session.draft = this.formDraft(session.chatId);
+      }
       session.view = "form";
       session.note = undefined;
       return this.render(session);
@@ -430,6 +500,8 @@ export class AdminDesk {
       session.note = `${who}点确认的时候卡片上的改动刚被换过，这次没有保存。请核对下面的改动再点「确认」`;
       return this.render(session);
     }
+    const wasOn = this.opts.groups.allowed.has(session.chatId);
+    const nowOn = this.on(session.chatId, session.draft);
     let result: "saved" | "stale";
     try {
       result = await this.opts.settings.saveGroup(session.chatId, session.draft, session.version, {
@@ -449,16 +521,30 @@ export class AdminDesk {
       return this.render(session);
     }
     this.sessions.delete(session.id);
+    // 开通、停用马上算进各处收不收这个群的消息
+    this.opts.groups.refresh();
     this.logger.info(
       `管理群：${operator.openId} 改了群 ${session.chatId} 的设置：${session.changes.map((change) => `${change.field} ${change.before} → ${change.after}`).join("；")}`,
     );
     this.opts.onSaved?.(session.chatId);
-    const after = this.summary(this.opts.groups.of(session.chatId));
-    await this.update(
-      session.cardMessageId!,
-      closedCard(`${session.name} 的设置已保存`, `${personTag(operator.openId)} 点了确认，下一条消息起生效：\n${changeLines(session.changes)}\n\n${grey(`改完以后：${after}`)}`, "green"),
+    const name = escapeCardMarkdown(session.name);
+    const [title, done, notice] = !nowOn
+      ? [`已停用「${session.name}」`, "机器人从下一条消息起不在这个群里回话（群记忆、定时任务都留着，定时任务到点不跑；再开通照用）", `停用了「${name}」`]
+      : !wasOn
+        ? [`已开通「${session.name}」`, "机器人从下一条消息起在这个群里回话，按下面的设置", `开通了「${name}」`]
+        : [`${session.name} 的设置已保存`, "下一条消息起生效", `改了「${name}」的设置`];
+    const after = nowOn ? `\n\n${grey(`改完以后：${this.summary(this.opts.groups.of(session.chatId))}`)}` : "";
+    await this.update(session.cardMessageId!, closedCard(title, `${personTag(operator.openId)} 点了确认，${done}：\n${changeLines(session.changes)}${after}`, "green"));
+    await this.notify(
+      nowOn && wasOn ? `${session.name} 的设置改了` : title,
+      `${personTag(operator.openId)} ${notice}，${done}：\n${changeLines(session.changes)}`,
+      session.cardMessageId,
     );
-    await this.notify(`${session.name} 的设置改了`, `${personTag(operator.openId)} 改了「${escapeCardMarkdown(session.name)}」的设置，下一条消息起生效：\n${changeLines(session.changes)}`, session.cardMessageId);
+  }
+
+  /** 按这份设置这个群开不开通 */
+  private on(chatId: string, override: GroupOverride): boolean {
+    return override.enabled ?? this.opts.groups.onServer(chatId);
   }
 
   private async onAdmins(session: AdminsSession, op: string, current: boolean, operator: Person, form: Record<string, unknown> | undefined): Promise<void> {
@@ -543,9 +629,39 @@ export class AdminDesk {
     await this.notify("管理员名单改了", `${personTag(operator.openId)} 改了管理员名单：\n${changeLines(session.changes)}`, session.cardMessageId);
   }
 
+  /**
+   * 表单开始时的选择：卡片上存着的。还没开通的群表单上是开通它：在卡片上开通过又停用了的、服务器白名单里有的，照原来存着的；
+   * 第一次开通的先收紧（不开代码仓库和 MCP 工具、谁都不能让它改），管理员在表单上放开
+   */
+  private formDraft(chatId: string): GroupOverride {
+    const saved = this.opts.settings.override(chatId);
+    const draft = structuredClone(saved ?? {});
+    if (!this.opts.groups.allowed.has(chatId) && !saved && !this.opts.groups.onServer(chatId)) {
+      const base = this.opts.groups.of(chatId, { card: false });
+      if (base.codeRepos.length > 0) {
+        draft.codeRepos = [];
+      }
+      draft.writeAllowed = [];
+      if (base.mcp.size > 0) {
+        draft.mcp = Object.fromEntries([...base.mcp.keys()].map((server) => [server, "off" as const]));
+      }
+    }
+    this.setEnabled(chatId, draft, true);
+    return draft;
+  }
+
+  /** 开通、停用：和服务器白名单一样时不写（照白名单），不一样才写 */
+  private setEnabled(chatId: string, draft: GroupOverride, on: boolean): void {
+    if (on === this.opts.groups.onServer(chatId)) {
+      delete draft.enabled;
+    } else {
+      draft.enabled = on;
+    }
+  }
+
   private reloadGroup(session: GroupSession): void {
     session.version = this.opts.settings.version(session.chatId);
-    session.draft = structuredClone(this.opts.settings.override(session.chatId) ?? {});
+    session.draft = this.formDraft(session.chatId);
     session.people = unique([...session.people, ...this.listed(session.chatId, session.draft)]);
     session.view = "form";
     session.changes = [];
@@ -662,8 +778,8 @@ export class AdminDesk {
   /** 卡片上定的从 before 换成 after，每一项改前改后（没变的不列） */
   private groupChanges(chatId: string, before: GroupOverride, after: GroupOverride): SettingsChange[] {
     const base = this.opts.groups.of(chatId, { card: false });
-    const was = this.items(before, base);
-    const now = this.items(after, base);
+    const was = this.items(chatId, before, base);
+    const now = this.items(chatId, after, base);
     const changes: SettingsChange[] = [];
     for (const [field, item] of now) {
       const old = was.get(field);
@@ -675,10 +791,12 @@ export class AdminDesk {
     return changes;
   }
 
-  /** 一个群卡片上定的每一项，没定的写「照服务器上的配置（现在：…）」 */
-  private items(override: GroupOverride, base: GroupPolicy): Map<string, Item> {
+  /** 一个群卡片上定的每一项，没定的写「照服务器上的配置（现在：…）」；开通写在最前面 */
+  private items(chatId: string, override: GroupOverride, base: GroupPolicy): Map<string, Item> {
     const items = new Map<string, Item>();
     const env = (now: string): Item => ({ raw: "env", text: `照服务器上的配置（现在：${now}）` });
+    const on = this.on(chatId, override);
+    items.set("开通", { raw: String(on), text: on ? "已开通（在群里回话）" : "没开通（在群里不回话）" });
     if (this.opts.repos().length > 0 || override.codeRepos !== undefined) {
       const repos = override.codeRepos;
       items.set(
@@ -785,13 +903,14 @@ export class AdminDesk {
 
   private listCard(session: ListSession): object {
     const shown = session.chatIds.slice(0, MAX_LISTED);
+    const waiting = session.pending.slice(0, MAX_LISTED);
     const button = (text: string, op: string, extra: Record<string, string> = {}) =>
       actionButton(text, "default", { action: SETTINGS_ACTION, card: session.id, op, r: String(session.rev), ...extra });
     const elements: object[] = [
       ...(session.intro ? [markdown(`⚠️ ${escapeCardMarkdown(session.intro)}`)] : []),
       markdown(
         session.chatIds.length === 0
-          ? "机器人还没在任何群里启用：先在服务器配置的白名单（FEISHU_ALLOWED_CHAT_IDS）里加群"
+          ? "还没开通任何群。" + (session.pending.length > 0 ? "下面是机器人在、还没开通的群，点「开通」。" : "先把机器人拉进要用的群。") + "只有管理员能开通，其他人只能看。"
           : "点「改设置」打开一个群的设置，也可以直接说「配置 群名」。只有管理员能改，其他人只能看。",
       ),
       ...shown.map((chatId) =>
@@ -807,6 +926,14 @@ export class AdminDesk {
         ),
       ),
       ...(session.chatIds.length > shown.length ? [markdown(grey(`还有 ${session.chatIds.length - shown.length} 个群没列出来，说「配置 群名」打开`))] : []),
+      ...(session.pending.length > 0
+        ? [
+            markdown("**机器人在、还没开通的群**（不回话，开通后才回）"),
+            ...waiting.map((chatId) => row([markdown(escapeCardMarkdown(this.chatNames.get(chatId) ?? chatId))], [button("开通", "open", { chat: chatId })])),
+            ...(session.pending.length > waiting.length ? [markdown(grey(`还有 ${session.pending.length - waiting.length} 个没列出来，说「配置 群名」打开`))] : []),
+          ]
+        : []),
+      ...(session.pendingNote ? [markdown(grey(session.pendingNote))] : []),
       row(
         [markdown(`**管理员**：所有者 ${this.opts.owners.size} 人，管理员 ${this.opts.settings.admins().size} 人`)],
         [button("管理员名单", "admins")],
@@ -819,9 +946,11 @@ export class AdminDesk {
   private groupCard(session: GroupSession): object {
     const value = (op: string) => ({ action: SETTINGS_ACTION, card: session.id, op, r: String(session.rev) });
     const note = session.note ? [markdown(`⚠️ ${richText(session.note)}`)] : [];
+    const enabled = this.opts.groups.allowed.has(session.chatId);
     if (session.view === "review") {
-      const after = this.summary(this.opts.groups.preview(session.chatId, session.draft));
-      return card(`核对「${session.name}」的改动`, "orange", [
+      const on = this.on(session.chatId, session.draft);
+      const after = on ? this.summary(this.opts.groups.preview(session.chatId, session.draft)) : "机器人在这个群里不回话，其余的设置留着，再开通照用";
+      return card(!on ? `核对：停用「${session.name}」` : enabled ? `核对「${session.name}」的改动` : `核对：开通「${session.name}」`, !on ? "red" : "orange", [
         markdown(`要改的（点「确认」才生效）：\n${changeLines(session.changes)}`),
         markdown(grey(`改完以后：${after}`)),
         ...note,
@@ -902,13 +1031,27 @@ export class AdminDesk {
       ]),
     );
 
-    return card(`「${session.name}」的设置`, "blue", [
+    return card(enabled ? `「${session.name}」的设置` : `开通「${session.name}」`, enabled ? "blue" : "turquoise", [
+      ...(enabled
+        ? []
+        : [
+            markdown(
+              "这个群还没开通，机器人在群里不回话。开通前先定好它在这个群里能做什么" +
+                (this.opts.settings.override(session.chatId) || this.opts.groups.onServer(session.chatId)
+                  ? "：下面是这个群原来的设置。"
+                  : "：新开通的群先收紧，不开代码仓库和运维工具，谁都不能让它改文档和代码，要开哪样在下面改。"),
+            ),
+          ]),
       markdown(
         grey("每一项选「照服务器上的配置」就用服务器上写的（括号里是现在的）。改好点「下一步」核对改动，点「确认」才生效。只有管理员能改，卡片 30 分钟内有效"),
       ),
       ...note,
-      { tag: "form", name: "settings", elements: [...fields, submitButton("下一步：核对改动", value("next"))] },
-      buttons([actionButton("全部照服务器上的配置", "default", value("reset")), actionButton("取消", "default", value("cancel"))]),
+      { tag: "form", name: "settings", elements: [...fields, submitButton(enabled ? "下一步：核对改动" : "下一步：核对后开通", value("next"))] },
+      buttons([
+        actionButton("全部照服务器上的配置", "default", value("reset")),
+        ...(enabled ? [actionButton("停用这个群", "danger", value("disable"))] : []),
+        actionButton("取消", "default", value("cancel")),
+      ]),
     ]);
   }
 

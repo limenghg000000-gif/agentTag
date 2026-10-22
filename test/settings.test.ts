@@ -71,6 +71,8 @@ test("配置文件逐项核对：不认识的项、不是 open_id 的人、不�
   assert.throws(bad({ groups: { oc_a: { writeAllowed: ["ou_a", 1] } } }), /writeAllowed 要是 open_id 的列表/);
   assert.throws(bad({ groups: { oc_a: { mcp: { aiops: "some" } } } }), /mcp\.aiops 要是 all、off 或工具名的列表/);
   assert.throws(bad({ groups: { oc_a: { proactive: "yes" } } }), /proactive 要是 true 或 false/);
+  assert.throws(bad({ groups: { oc_a: { enabled: 1 } } }), /enabled 要是 true 或 false/);
+  assert.deepEqual(parseSettings(JSON.stringify({ groups: { oc_a: { enabled: false, knowledge: true } } }), "groups.json").groups, { oc_a: { enabled: false, knowledge: true } });
   assert.throws(bad({ versions: { oc_a: -1 } }), /versions 要是不小于 0 的整数/);
   assert.deepEqual(parseSettings("{}", "groups.json"), { admins: [], groups: {}, versions: {} });
 });
