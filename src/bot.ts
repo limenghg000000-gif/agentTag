@@ -2331,8 +2331,9 @@ export function blockedRequestAnswer(madeUp: readonly string[]): string {
 const TASK_ID = String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`;
 /** 说的是定时任务：定时任务、周期任务、提醒（「告警提醒」不算）、T3 */
 const SCHEDULE_OBJECT = String.raw`(?:定时任务|周期任务|(?<!告警)提醒|${TASK_ID})`;
-/** 说法后面还归它的字：同一个分句里，到「而」「并」「和」这类连着下一件事的字为止 */
-const CLAIM_TAIL = /^[^，,。；;！!？?\n而并且和及同另还]*/;
+/** 一个分句里接着往下说的字：「而」「并」「和」这类。按它切开，切出来的每一段（除了开头那段）都以它开头 */
+const CONNECTOR = /(?=[而并且和及同另还])/;
+const STARTS_WITH_CONNECTOR = /^[而并且和及同另还]/;
 /**
  * 说法和定时任务之间的字：同一个分句里，不跨书名号，中间也没说到别的东西。
  * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
@@ -2343,6 +2344,7 @@ const CLAIM_GAP = String.raw`(?:(?!文档|表格|页面|知识库|多维表|合�
  */
 const EARLIER = /(?:之前|此前|以前|上次|原来|早先)(?!的)/;
 const CLAUSE_BEFORE = /[^，,。；;！!？?\n]*$/;
+const CLAUSE_AFTER = /^[^，,。；;！!？?\n]*/;
 /** 先说定时任务、再说做了什么的写法（「T1 已取消」） */
 const OBJECT_FIRST = new RegExp(String.raw`^${SCHEDULE_OBJECT}`);
 
@@ -2361,10 +2363,34 @@ function scheduleClaim(verb: string): RegExp {
   );
 }
 
+const SCHEDULE_CREATE_VERB = String.raw`(?:建|创建|新建|设置|设定|设好|定好|安排)`;
+const SCHEDULE_CHANGE_VERB = String.raw`(?:暂停|恢复|取消|停掉|停用|删除|删掉|关掉)`;
 /** 回答里说定时任务建好了 */
-const SCHEDULE_CREATED_CLAIM = scheduleClaim(String.raw`(?:建|创建|新建|设置|设定|设好|定好|安排)`);
+const SCHEDULE_CREATED_CLAIM = scheduleClaim(SCHEDULE_CREATE_VERB);
 /** 回答里说定时任务暂停、恢复、取消了 */
-const SCHEDULE_CHANGED_CLAIM = scheduleClaim(String.raw`(?:暂停|恢复|取消|停掉|停用|删除|删掉|关掉)`);
+const SCHEDULE_CHANGED_CLAIM = scheduleClaim(SCHEDULE_CHANGE_VERB);
+/** 说了做一件事（「建议」不算） */
+const SCHEDULE_ACTION = new RegExp(String.raw`${SCHEDULE_CREATE_VERB}(?!议)|${SCHEDULE_CHANGE_VERB}`);
+
+/**
+ * 说法前面还归它的字：同一个分句里往前看，「而」「并」这类字前面说完了另一件事的，到那儿为止。
+ * 「之前 T1 已暂停而 T2 现在已取消」里「之前」归 T1，T2 的取消是这次的；「之前和你说的定时任务 T3 已建好」里「和」前面没说做什么，「之前」照样算
+ */
+function ownPrefix(before: string): string {
+  const parts = (before.match(CLAUSE_BEFORE)?.[0] ?? "").split(CONNECTOR);
+  const start = parts.findLastIndex((part, index) => STARTS_WITH_CONNECTOR.test(part) && SCHEDULE_ACTION.test(parts.slice(0, index).join("")));
+  return parts.slice(Math.max(start, 0)).join("");
+}
+
+/**
+ * 说法后面还归它的字（编号常写在后面：「已建好定时任务 T2」）：同一个分句里往后看，「而」「并」这类字后面又说了做一件事的，到那儿为止。
+ * 「已暂停 T1 并取消 T2」里 T2 不归暂停；「已取消定时任务 T1 和 T2」里「和」后面没说做什么，T2 也归取消
+ */
+function ownTail(after: string): string {
+  const parts = (after.match(CLAUSE_AFTER)?.[0] ?? "").split(CONNECTOR);
+  const end = parts.findIndex((part) => STARTS_WITH_CONNECTOR.test(part) && SCHEDULE_ACTION.test(part));
+  return parts.slice(0, end === -1 ? parts.length : end).join("");
+}
 
 /**
  * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change。
@@ -2380,15 +2406,11 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     ["create", SCHEDULE_CREATED_CLAIM, SCHEDULE_CREATE_TOOL],
     ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
   ] as const) {
-    // 说以前的不算：同一个分句里前面说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
+    // 说以前的不算：前面还归它的字里说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
     const claims = [...answer.matchAll(pattern)]
-      .filter(
-        (match) =>
-          !EARLIER.test(answer.slice(0, match.index).match(CLAUSE_BEFORE)?.[0] ?? "") && !(OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0])),
-      )
-      // 编号常写在说法后面（「已建好定时任务 T2」）：接着往后看，到分句结束或者「而」「并」这类连着下一件事的字为止（「已暂停 T1 并取消 T2」里 T2 不归暂停）。
-      // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
-      .map((match) => ({ said: match[0], ids: match[0] + (answer.slice(match.index + match[0].length).match(CLAIM_TAIL)?.[0] ?? "") }));
+      .filter((match) => !EARLIER.test(ownPrefix(answer.slice(0, match.index))) && !(OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0])))
+      // 编号看说法本身和后面还归它的字；是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
+      .map((match) => ({ said: match[0], ids: match[0] + ownTail(answer.slice(match.index + match[0].length)) }));
     const backed = ({ said, ids: text }: { said: string; ids: string }) => {
       const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
       if (!succeeded.has(tool) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {

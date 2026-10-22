@@ -472,6 +472,14 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   assert.deepEqual(unbackedScheduleClaims("T1 已暂停而 T2 已取消。", new Set(["schedule_change"]), twoReceipts), []);
   assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2。", new Set(["schedule_change"]), twoReceipts), []);
   assert.deepEqual(unbackedScheduleClaims("T1 已取消而 T2 已取消。", new Set(["schedule_change"]), twoReceipts), ["change"]);
+  // 「和」连着的是编号、后面没再说做什么的，几个编号都归这个改动
+  const cancelledT1 = "已取消定时任务 T1：每天 09:00，汇总";
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1 和 T2。", new Set(["schedule_change"]), cancelledT1), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1 和 T2。", new Set(["schedule_change"]), `${cancelledT1}\n已取消定时任务 T2：周报`), []);
+  // 「之前」只归它连着的那件事：「而」后面说的是这次的
+  const pausedT2 = "已暂停定时任务 T2：每周一 09:00，周报";
+  assert.deepEqual(unbackedScheduleClaims("之前 T1 已暂停而 T2 现在已取消。", new Set(["schedule_change"]), pausedT2), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("之前 T1 已暂停而 T2 现在也暂停了。", new Set(["schedule_change"]), pausedT2), []);
   // 「原来的 T1」说的是哪个任务，取消是这次的：没调 schedule_change 就不算
   assert.deepEqual(
     unbackedScheduleClaims("已建好定时任务 T3，原来的定时任务 T1 已取消。", new Set(["schedule_create"]), "已建好定时任务 T3（到点去做）"),
