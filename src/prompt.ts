@@ -37,6 +37,8 @@ export interface PromptContext {
   restate?: boolean;
   /** 这句话是在给它定以后的规矩，没说现在就查什么：只给了记群记忆的工具 */
   ruleOnly?: boolean;
+  /** 话题里在说建定时任务，这次却没给 schedule_create：为什么没给（「这句没 @ 你」） */
+  scheduleLocked?: string;
   /** 这个话题之前查到过的结果（listEarlierResults 的那几行），给了 topic_earlier_results 时才有 */
   earlierResults?: readonly string[];
   /** 这个话题之前查过（记着查到的结果）、这次没说要从头查：追问接着之前的结论往下查，只补查缺的 */
@@ -119,6 +121,7 @@ export function buildSystemPrompt({
   followUp,
   restate,
   ruleOnly,
+  scheduleLocked,
   earlierResults,
   continuing,
   extra,
@@ -210,7 +213,15 @@ export function buildSystemPrompt({
         "问有哪些定时任务用 schedule_list；暂停、恢复、取消用 schedule_change，要改时间或内容的先建新的再取消旧的。定时任务的编号写成 T3，和群记忆的 #3、经验 K3 不是一套。" +
         "到点按建任务的人的权限跑：他不能改文档的，任务里也改不了；定时任务只查代码，不改代码、不开合并请求；不改已有文档，只能追加到他这句话里自己贴了链接的那篇（填 append_doc）。" +
         "他说「有异常 @ 我」的填 alert_creator。到点正常跑完不 @ 人，没跑成、被别人暂停时机器人会 @ 建的人；只能 @ 建任务的人，要 @ 别人、@ 所有人的告诉他做不到。" +
-        "暂停群里谁都能；恢复、取消只有建任务的人和管理员能做。",
+        "暂停群里谁都能；恢复、取消只有建任务的人和管理员能做。" +
+        "要追加到文档却没贴真的文档链接（只写了「链接」两个字这类）的先别建，请他 @ 你把整句话连同链接再说一遍：之后只补一个链接、或者补的那句没 @ 你，都建不了。",
+    );
+  }
+  if (scheduleLocked) {
+    lines.push(
+      `- 这次不能建、改定时任务（${scheduleLocked}）${toolNames.includes("schedule_list") ? "，只能用 schedule_list 看有哪些" : ""}。` +
+        "话题里有人要建、暂停、取消定时任务的，照实说这次没建、没改，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里重新说全：这件事要他重说一遍，只补一个时间、一个链接建不了。" +
+        "没调 schedule_create、schedule_change 拿到结果，不能说已经建好、已经暂停或取消了。",
     );
   }
   if (memoryLocked) {

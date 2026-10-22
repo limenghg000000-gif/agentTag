@@ -50,6 +50,7 @@ import {
   createScheduleAlertTool,
   SCHEDULE_ALERT_TOOL,
   SCHEDULE_CHANGE_TOOL,
+  SCHEDULE_CREATE_TOOL,
   SCHEDULE_LIST_TOOL,
   SCHEDULE_TOOL_NAMES,
 } from "./tools/schedules.js";
@@ -181,6 +182,8 @@ const SCHEDULE_TALK = new RegExp(
   "i",
 );
 const SCHEDULE_TOOLS: ReadonlySet<string> = new Set(SCHEDULE_TOOL_NAMES);
+/** 看话题里最近几条消息有没有在说定时任务（提示词里说这次建不了用）：只补了一个时间、一个链接的，前面几条多半说过。群里刚才的聊天不算 */
+const SCHEDULE_TALK_LOOKBACK = 6;
 
 /** 提问本身说到了经验库的事：「沉淀成经验」「记到经验库」「把 #5 归档」「群记忆和经验库有没有冲突」。「数据对不上」「代码冲突」不算 */
 const KNOWLEDGE_REQUEST = /沉淀|经验|知识库|归档/;
@@ -854,6 +857,21 @@ async function runTask(
         (createDoc || tool.spec.name !== "feishu_doc_create"),
     );
     toolCount = taskTools.length;
+    // 话题里在说建定时任务，这次却建不了：没 @ 的跟聊、按钮问的只给看的，这句话本身没说到定时（只补了一个时间、一个链接）的不给。
+    // 提示词里说清楚建不了、请他 @ 着一句说全。2026-10-22 测试群：话题里没 @ 补了一句「每天 15:34，从现在开始」、
+    // 只贴了文档链接，模型一个工具没调都回了「已建好定时任务」，其实没建
+    const scheduleLocked =
+      scheduled === undefined &&
+      !restate &&
+      allTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
+      !taskTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
+      [question, ...history.filter((m) => !isChatContext(m)).slice(-SCHEDULE_TALK_LOOKBACK).map((m) => m.content)].some((text) => SCHEDULE_ASK.test(text))
+        ? followUp
+          ? "这次是点按钮问的"
+          : options.unaddressed === true
+            ? "这句没 @ 你"
+            : "这句话本身没说要以后做什么"
+        : undefined;
     if (followUp) {
       logger.info(`点按钮接着问的，这次只给读的工具，第 1 轮先调工具 message=${msg.messageId} sender=${msg.senderId}`);
     } else if (noPermission) {
@@ -894,6 +912,8 @@ async function runTask(
             ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded, toolNames.includes(EARLIER_RESULTS_TOOL))] : []),
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
           ]),
+      // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
+      ...(restate || scheduled ? [] : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, succeeded, () => toolTexts.join("\n"), toolNames))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -954,6 +974,7 @@ async function runTask(
         followUp,
         restate,
         ...(ruleOnly ? { ruleOnly: true } : {}),
+        ...(scheduleLocked ? { scheduleLocked } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
@@ -1105,8 +1126,21 @@ async function runTask(
         }
       }
     }
+    // 打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成：不发出去，不然大家以为到点会做
+    const blockedSchedule =
+      !restate &&
+      !scheduled &&
+      !readChat &&
+      result.finish !== "filtered" &&
+      answer !== BLOCKED_OPS_ANSWER &&
+      !blockedCode &&
+      unbackedScheduleClaims(shown, succeeded, toolTexts.join("\n")).length > 0;
+    if (blockedSchedule) {
+      logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
+      answer = BLOCKED_SCHEDULE_ANSWER;
+    }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
-    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || result.finish === "filtered") {
+    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || blockedSchedule || result.finish === "filtered") {
       state.thoughts = undefined;
     }
     state.phase = "done";
@@ -1115,7 +1149,7 @@ async function runTask(
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified, labelUserMessage(context.askerName, askedFull || "（@ 了你，没有写别的内容）"));
     // 被拦下、被审核拦下的回答里没有结论，不记
-    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && result.finish !== "filtered") {
+    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && !blockedSchedule && result.finish !== "filtered") {
       await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
@@ -2275,6 +2309,90 @@ export function madeUpRequestAnswer(madeUp: readonly string[]): string {
 export function blockedRequestAnswer(madeUp: readonly string[]): string {
   return `这次没能给出结论：回答里写的合并请求 ${madeUp.join("、")} 查不到，为免误导没有发出来。请再说一次，要开合并请求可以说清楚开到哪个分支。`;
 }
+
+/** 定时任务的编号：T3（T3a、AT3 不算） */
+const TASK_ID = String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`;
+/** 说的是定时任务：定时任务、周期任务、提醒（「告警提醒」不算）、T3 */
+const SCHEDULE_OBJECT = String.raw`(?:定时任务|周期任务|(?<!告警)提醒|${TASK_ID})`;
+/** 同一个分句里：中间不隔逗号、句号 */
+const CLAIM_GAP = String.raw`[^，,。；;！!？?\n]`;
+const CLAIM_CLAUSE = new RegExp(String.raw`^${CLAIM_GAP}*`);
+/** 「之前已经建好」「上次已暂停」说的是以前的 */
+const NOT_EARLIER = String.raw`(?<!之前|此前|以前|上次|原来|早先)`;
+
+function scheduleClaim(verb: string): RegExp {
+  return new RegExp(
+    [
+      // 「已建好定时任务 T2」「已经帮你设置每天 15:34 的提醒」「已暂停 T3」。「已建好的定时任务有…」说的是有哪些，不算
+      String.raw`${NOT_EARLIER}已经?\s*(?:(?:帮你|给你|为你)\s*)?${verb}(?![好了]*的)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
+      // 「帮你建好了定时任务」「给你暂停了 T3」。「我帮你建一个定时任务吧」是在问，不算
+      String.raw`(?:帮你|给你|为你)\s*${verb}(?:好|了|掉)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
+      // 「定时任务 T2 已建好」「提醒已设置」「T3 已被你暂停」「定时任务建好了」「T3 暂停了」。「T3 暂停了吗」是在问
+      String.raw`${SCHEDULE_OBJECT}${CLAIM_GAP}{0,6}?(?:已经?\s*(?:被${CLAIM_GAP}{0,8}?)?${verb}|${verb}(?:好了|了|成功)(?![吗么呢]))`,
+    ].join("|"),
+    "g",
+  );
+}
+
+/** 回答里说定时任务建好了 */
+const SCHEDULE_CREATED_CLAIM = scheduleClaim(String.raw`(?:建|创建|新建|设置|设定|设好|定好|安排)`);
+/** 回答里说定时任务暂停、恢复、取消了 */
+const SCHEDULE_CHANGED_CLAIM = scheduleClaim(String.raw`(?:暂停|恢复|取消|停掉|停用|删除|删掉|关掉)`);
+
+/**
+ * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change，
+ * 用 schedule_list 查到的现状也算（「T3 已被张三暂停」）。说到的编号（T2）还要在这次的工具结果里出现过：列表里没有 T2，说「已建好 T2」照样不算。
+ * known 是这次工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
+ */
+export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
+  const kinds: Array<"create" | "change"> = [];
+  for (const [kind, pattern, tool] of [
+    ["create", SCHEDULE_CREATED_CLAIM, SCHEDULE_CREATE_TOOL],
+    ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
+  ] as const) {
+    // 编号常写在说法后面（「已建好定时任务 T2」）：看到这个分句结束
+    const claims = [...answer.matchAll(pattern)].map((match) => answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0]);
+    if (claims.length === 0) {
+      continue;
+    }
+    const ran = succeeded.has(tool) || succeeded.has(SCHEDULE_LIST_TOOL);
+    const ids = claims.flatMap((claim) => [...claim.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]));
+    if (!ran || ids.some((id) => !new RegExp(`(?<![A-Za-z0-9])${id}(?!\\d)`).test(known))) {
+      kinds.push(kind);
+    }
+  }
+  return kinds;
+}
+
+/**
+ * 说建好、暂停、取消了定时任务，这次却没调成对应的工具：打回一次，叫它照实说；这次没有这个工具的，请他 @ 着一句说全。
+ * known 在检查时再取，这次调到的才算
+ */
+export function reviewScheduleClaims(
+  answer: string,
+  succeeded: ReadonlySet<string>,
+  known: () => string,
+  toolNames: readonly string[],
+): string | undefined {
+  const kinds = unbackedScheduleClaims(answer, succeeded, known());
+  if (kinds.length === 0) {
+    return undefined;
+  }
+  const tools = kinds.map((kind) => (kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL));
+  const claimed = kinds.map((kind) => (kind === "create" ? "建好了" : "暂停、恢复或取消了")).join("、");
+  const missing = tools.filter((name) => !toolNames.includes(name));
+  return (
+    `（系统检查）你这次没有用 ${tools.join("、")} 做成（没调、调了出错、这次没有这个工具，或者写的编号这次查到的定时任务里没有），回答里却说定时任务已经${claimed}。` +
+    (missing.length < tools.length ? "这次有这个工具的，要做就现在调，照它返回的写；" : "") +
+    (missing.length > 0
+      ? `这次没有 ${missing.join("、")}（没 @ 你的话、点按钮问的、这句话本身没说要以后做什么，都只能查）：照实说这次没建成、没改成，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全。`
+      : "做不成就照实说没建成、没改成。") +
+    "其余内容不用改，重新给出完整的回答，不要提这段检查。"
+  );
+}
+
+export const BLOCKED_SCHEDULE_ANSWER =
+  "这次没有建成，也没有改动定时任务。要建、要改请 @ 我，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全，比如「@我 每天 15:30 汇总今天群里的讨论，追加到 https://…」。";
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
 // 重做后的最后一道检查（blockUnverifiedOps）：Pod 名、定位结果有就拦；时间一般也是有就拦，问的是时间本身（换算、时区、格式）时

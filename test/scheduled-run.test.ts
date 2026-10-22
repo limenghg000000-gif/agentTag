@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
-import { type BotDeps, createMessageHandler, READ_CHAT_NOTE, type ThreadContextSource } from "../src/bot.js";
+import { BLOCKED_SCHEDULE_ANSWER, type BotDeps, createMessageHandler, READ_CHAT_NOTE, type ThreadContextSource, unbackedScheduleClaims } from "../src/bot.js";
 import { CHAT_CONTEXT_HEADER, type ThreadContext } from "../src/history.js";
 import type { ChatModel, ChatRequest, ChatResult } from "../src/llm.js";
 import { TaskRegistry } from "../src/tasks.js";
@@ -407,4 +407,103 @@ test("建定时任务时把发起人这句话交给工具：核对要追加的�
     message(question),
   );
   assert.deepEqual(seen, [question]);
+});
+
+const markdowns = (sent: { input: SendInput }[]) =>
+  sent.filter((s) => "markdown" in s.input).map((s) => (s.input as { markdown: string }).markdown);
+
+test("回答说建好、改好了定时任务，要这次真的调成了：常见的说法都认，说的是以前的、在问的、告警提醒不算", () => {
+  const claims = [
+    "已建好定时任务 T2（到点去做）：每天 15:34",
+    "好的，已为你设置每天 15:34 的提醒。",
+    "已经帮你建好了一个每天 15:30 汇总群聊、追加到测试周报的定时任务",
+    "定时任务 T2 已建好，下次是 15:34。",
+    "提醒已设置：明天下午 3 点",
+    "✅ 定时任务建好了：每天 15:30",
+    "帮你建好了定时任务 T1",
+    "定时任务创建成功！",
+    "已暂停 T3",
+    "T3 已被你暂停",
+    "已经帮你取消了提醒",
+  ];
+  for (const answer of claims) {
+    assert.notDeepEqual(unbackedScheduleClaims(answer, new Set(), ""), [], answer);
+  }
+  const fine = [
+    "已建好文档《测试周报》，链接：https://x.feishu.cn/docx/abc。要定时追加请 @ 我说「每天 15:30 …」",
+    "已经建好文档了，要建定时任务请 @ 我把时间说全",
+    "要的话我帮你建一个定时任务吧？",
+    "这个群目前没有已建好的定时任务。",
+    "之前已经建好的定时任务 T2 还在",
+    "T3 暂停了吗？我查一下",
+    "服务已恢复，告警提醒已取消",
+    "这次没建成定时任务：这句没 @ 我",
+    "已记住：以后线上报错提醒赵作武",
+  ];
+  for (const answer of fine) {
+    assert.deepEqual(unbackedScheduleClaims(answer, new Set(), ""), [], answer);
+  }
+  // 调成了对应的工具才算；查了列表的，说到的编号要在列表里
+  assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_create"]), "已建好定时任务 T2（到点去做）"), []);
+  assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_list"]), "这个群还没有定时任务"), ["create"]);
+  assert.deepEqual(unbackedScheduleClaims("T1 已被张三暂停", new Set(["schedule_list"]), "T1 · 每天 9:00 · 汇总 · 李四 · 已暂停（张三暂停的）"), []);
+  assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2，已暂停 T1", new Set(["schedule_create"]), "已建好定时任务 T2"), ["change"]);
+});
+
+test("没 @ 的跟聊说「已建好定时任务」：打回一次照实说，提示词里说这次建不了、请他 @ 着一句说全", async () => {
+  const replies = ["已建好定时任务 T2：每天 15:34 汇总群聊。", "这次没建成：这句没 @ 我。请 @ 我把时间、做什么、文档链接一句说全。"];
+  const { model, requests } = fakeModel(() => ({ text: replies.shift()!, finish: "stop" }));
+  const { handle, sent } = setup(
+    { model, taskTools: () => [tool("feishu_doc_read"), ...scheduleTools()] },
+    { history: [{ role: "user", content: "[ML] 每天 15:30 汇总今天群里的讨论，追加到 链接" }] },
+  );
+  await handle(message("每天15:34，从现在开始", { rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(names(requests[0]), ["feishu_doc_read", "schedule_list"]);
+  assert.match(requests[0]!.system, /这次不能建、改定时任务（这句没 @ 你），只能用 schedule_list 看有哪些/);
+  assert.match(JSON.stringify(requests[1]!.messages.at(-1)), /没有用 schedule_create 做成/);
+  assert.deepEqual(markdowns(sent), ["这次没建成：这句没 @ 我。请 @ 我把时间、做什么、文档链接一句说全。"]);
+});
+
+test("打回以后还说建好了定时任务：不发出去，换成说没建成、怎么建；只补了个链接的提示词里也说这次建不了", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "已建好定时任务 T1，每天 15:30 追加到测试周报。", finish: "stop" }));
+  const { handle, sent } = setup(
+    { model, taskTools: () => [tool("feishu_doc_read"), ...scheduleTools()] },
+    { history: [{ role: "user", content: "[ML] 每天 15:30 汇总今天群里的讨论，追加到 链接" }] },
+  );
+  await handle(message("https://x.feishu.cn/docx/abc12345", { rootId: "om_root" }));
+  assert.deepEqual(names(requests[0]), ["feishu_doc_read"]);
+  assert.match(requests[0]!.system, /这次不能建、改定时任务（这句话本身没说要以后做什么）。/);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [BLOCKED_SCHEDULE_ANSWER]);
+});
+
+test("真建好了照常发；读过群聊的不查（总结里说的是别人建的）", async () => {
+  const create = tool("schedule_create", false, async () => "已建好定时任务 T3（到点去做）：每天 15:30（北京时间），下次是 10-22 15:30。");
+  const built = fakeModel(
+    (() => {
+      const rounds: ChatResult[] = [
+        { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "schedule_create", arguments: "{}" }] },
+        { text: "已建好定时任务 T3：每天 15:30。", finish: "stop" },
+      ];
+      return () => rounds.shift()!;
+    })(),
+  );
+  const first = setup({ model: built.model, taskTools: () => [create, tool("schedule_list"), tool("schedule_change")] });
+  await first.handle(message("每天 15:30 汇总今天群里的讨论"));
+  assert.equal(built.requests.length, 2);
+  assert.deepEqual(markdowns(first.sent), ["已建好定时任务 T3：每天 15:30。"]);
+
+  const summary = fakeModel(
+    (() => {
+      const rounds: ChatResult[] = [
+        { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "chat_history", arguments: "{}" }] },
+        { text: "今天赵作武已经设置了两个提醒。", finish: "stop" },
+      ];
+      return () => rounds.shift()!;
+    })(),
+  );
+  const second = setup({ model: summary.model, taskTools: () => [tool("chat_history", false, async () => "[赵作武 10:00] 提醒建好了")] });
+  await second.handle(message("总结一下今天群里聊了什么"));
+  assert.equal(summary.requests.length, 2);
+  assert.deepEqual(markdowns(second.sent), ["今天赵作武已经设置了两个提醒。"]);
 });
