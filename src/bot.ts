@@ -155,17 +155,18 @@ const FUTURE_RULE = new RegExp(FUTURE_RULE_PARTS.join("|"));
  */
 const NOW_REQUEST =
   /(?:(?<!从)现在(?!起)|这次|眼下|马上|立刻|立即|顺便|顺手)[^，。,.!?！？\n]{0,6}?(?:查|看|排查|分析|处理|跟进)|(?:查|看|排查|分析|处理)(?:一?下|看)|(?:帮我|给我|替我)[^，。,.!?！？\n]{0,4}?(?:查|看|排查|分析|处理|定位|找|解释)/;
-/** 指着眼前这件：「这个」「上面」「刚才那个」（「这个群」说的是群，不算） */
-const THIS_ONE = String.raw`(?:这个|这条|这些|上面|刚才|那个|那条)(?!群)`;
+/** 指着眼前这件：「这个」「上面」「刚才那个」（「这个群」「这条规矩」说的是群、规矩，不算） */
+const THIS_ONE = String.raw`(?:这个|这条|这些|上面|刚才|那个|那条)(?!群|规矩|规定|约定|记忆)`;
+const LOOK_INTO = String.raw`(?:查|看|排查|分析|处理|跟进|定位|找|解释)`;
 /**
  * 定规矩的那一小句里也算现在就要查的：说了「现在」「这次」「顺便」查，或者指着眼前这件要查（「这个」「上面那个」「刚才」）。
- * 规矩本身说的「直接帮我查」「帮忙查一下」不算：「以后报错直接帮我查」是在定以后怎么做
+ * 规矩本身说的「直接帮我查」「帮忙查一下」「马上帮我查」不算：「以后报错马上帮我查」是在定以后怎么做
  */
 const NOW_IN_RULE = new RegExp(
   [
-    String.raw`(?:(?<!从)现在(?!起)|这次|眼下|马上|立刻|立即|顺便|顺手)[^，。,.!?！？\n]{0,6}?(?:查|看|排查|分析|处理|跟进)`,
-    String.raw`${THIS_ONE}[^，。,.!?！？\n]{0,12}?(?:查|看|排查|分析|处理|定位)`,
-    String.raw`(?:查|看|排查|分析|处理|定位)[^，。,.!?！？\n]{0,6}?${THIS_ONE}`,
+    String.raw`(?:(?<!从)现在(?!起)|这次|眼下|顺便|顺手)[^，。,.!?！？\n]{0,12}?${LOOK_INTO}`,
+    String.raw`${THIS_ONE}[^，。,.!?！？\n]{0,12}?${LOOK_INTO}`,
+    String.raw`${LOOK_INTO}[^，。,.!?！？\n]{0,6}?${THIS_ONE}`,
   ].join("|"),
 );
 const POINTS_AT_THIS = new RegExp(THIS_ONE);
@@ -186,6 +187,12 @@ function asksNow(question: string): boolean {
     if (match.index < from) {
       continue;
     }
+    // 那一小句从前一个逗号、句号后面算起：「这次不用 @ 你直接帮我查 Redis」的「这次」要和后面一起看。
+    // 规矩前面那段同时也留给 NOW_REQUEST 看（「帮我查下 Redis，不用 @ 你」）
+    let start = match.index;
+    while (start > from && !RULE_CLAUSE_END.test(question.charAt(start - 1))) {
+      start -= 1;
+    }
     const after = match.index + match[0].length;
     const tail = question.slice(after).search(RULE_CLAUSE_END);
     let end = tail < 0 ? question.length : after + tail;
@@ -194,7 +201,7 @@ function asksNow(question: string): boolean {
       end = next < 0 ? question.length : end + 1 + next;
     }
     rest += `${question.slice(from, match.index)}，`;
-    rules.push(question.slice(match.index, end));
+    rules.push(question.slice(start, end));
     from = end;
   }
   rest += question.slice(from);

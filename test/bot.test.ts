@@ -931,6 +931,8 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     "以后告警直接帮忙查一下",
     "从现在起报错不用 @ 你，直接帮我看看",
     "以后这个群的报错直接帮我查",
+    "记住这条规矩：以后报错直接帮忙查",
+    "以后报错都马上帮我查",
   ];
   for (const [i, question] of rules.entries()) {
     await handle(message(question, { messageId: `om_r${i}` }));
@@ -956,6 +958,8 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     "以后告警别管先帮我看下这个 Redis",
     "以后报错直接帮我查，现在先查一下 Redis",
     "以后这类报错直接帮我查，上面这个也是",
+    "以后告警别管现在先帮我定位 Redis 故障",
+    "这次不用 @ 你直接帮我查 Redis",
   ];
   for (const [i, question] of asks.entries()) {
     const n = rules.length + i;
