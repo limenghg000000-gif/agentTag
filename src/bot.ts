@@ -2457,14 +2457,20 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
       return ids.every(listed);
     }
     // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
-    // 暂停了说成取消、列表写着还在跑说成已取消，都不算；没写编号的（「已取消定时任务」），这次的回执里得有一条是取消
+    // 暂停了说成取消、列表写着还在跑说成已取消，都不算
     const state = CHANGE_STATES.find(([verb]) => verb.test(said))?.[1];
     if (state === undefined) {
       return false;
     }
-    return ids.length === 0
-      ? known.split("\n").some((line) => CHANGE_RECEIPT.test(line) && state.test(line.slice(0, 3)))
-      : ids.every((id) => state.test(taskState(known, id) ?? ""));
+    const now = (id: string) => state.test(taskState(known, id) ?? "");
+    if (ids.length > 0) {
+      return ids.every(now);
+    }
+    // 没写编号的（「已暂停定时任务」），这次改过的任务里得有一个现在真是这样：暂停了、后来又被人恢复了的不算
+    return known.split("\n").some((line) => {
+      const id = line.match(CHANGE_RECEIPT)?.[1];
+      return id !== undefined && now(id);
+    });
   };
   const wrong = new Set(scheduleClaims(answer).filter((claim) => !backed(claim)).map((claim) => claim.kind));
   return (["create", "change"] as const).filter((kind) => wrong.has(kind));
@@ -2481,7 +2487,7 @@ const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
 ];
 
 /** schedule_change 的回执：「已暂停定时任务 T1：…」 */
-const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 T\d+[：:]/;
+const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 (T\d+)[：:]/;
 
 /**
  * 这个编号现在的状态：看这次最后一处说到它的，是回执就看回执开头，是列表就看那一行的最后一段。

@@ -494,6 +494,9 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   // 没写编号的，这次的回执里得有这么一个改动：暂停了说成「已取消定时任务」不算
   assert.deepEqual(unbackedScheduleClaims("已取消定时任务。", new Set(["schedule_change"]), pausedReceipt), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("已暂停定时任务。", new Set(["schedule_change"]), pausedReceipt), []);
+  // 暂停了、后来又被人恢复了的（之后查的列表写着还在跑），也不算
+  assert.deepEqual(unbackedScheduleClaims("已暂停定时任务。", new Set(["schedule_change", "schedule_list"]), `${pausedReceipt}\n${activeList}`), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已暂停定时任务。", new Set(["schedule_change"]), `${pausedReceipt}\n已恢复定时任务 T1：每天 09:00，汇总`), ["change"]);
   // 「之前」只归它连着的那件事：「而」后面说的是这次的
   const pausedT2 = "已暂停定时任务 T2：每周一 09:00，周报";
   assert.deepEqual(unbackedScheduleClaims("之前 T1 已暂停而 T2 现在已取消。", new Set(["schedule_change"]), pausedT2), ["change"]);
