@@ -438,6 +438,7 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
     "之前已经帮你建好了定时任务 T3，不用重复创建。",
     "上次给你暂停了 T3，要恢复请说「恢复定时任务 T3」",
     "定时任务创建成功后会在群里通知你。",
+    "之前 T1 已建好，不用重复创建。",
     "T3 暂停了吗？我查一下",
     "服务已恢复，告警提醒已取消",
     "这次没建成定时任务：这句没 @ 我",
@@ -466,6 +467,11 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   const pausedReceipt = "已暂停定时任务 T1：每天 09:00，汇总";
   assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1。", new Set(["schedule_change"]), pausedReceipt), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("已暂停定时任务 T1。", new Set(["schedule_change"]), pausedReceipt), []);
+  // 一句里说了两件事，各自的编号只归各自的改动
+  const twoReceipts = "已暂停定时任务 T1：每天 09:00，汇总\n已取消定时任务 T2：每周一 09:00，周报";
+  assert.deepEqual(unbackedScheduleClaims("T1 已暂停而 T2 已取消。", new Set(["schedule_change"]), twoReceipts), []);
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1 并取消 T2。", new Set(["schedule_change"]), twoReceipts), []);
+  assert.deepEqual(unbackedScheduleClaims("T1 已取消而 T2 已取消。", new Set(["schedule_change"]), twoReceipts), ["change"]);
   // 「原来的 T1」说的是哪个任务，取消是这次的：没调 schedule_change 就不算
   assert.deepEqual(
     unbackedScheduleClaims("已建好定时任务 T3，原来的定时任务 T1 已取消。", new Set(["schedule_create"]), "已建好定时任务 T3（到点去做）"),

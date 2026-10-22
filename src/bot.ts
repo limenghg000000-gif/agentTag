@@ -2331,8 +2331,8 @@ export function blockedRequestAnswer(madeUp: readonly string[]): string {
 const TASK_ID = String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`;
 /** 说的是定时任务：定时任务、周期任务、提醒（「告警提醒」不算）、T3 */
 const SCHEDULE_OBJECT = String.raw`(?:定时任务|周期任务|(?<!告警)提醒|${TASK_ID})`;
-/** 同一个分句里：中间不隔逗号、句号 */
-const CLAIM_CLAUSE = new RegExp(String.raw`^[^，,。；;！!？?\n]*`);
+/** 说法后面还归它的字：同一个分句里，到「而」「并」「和」这类连着下一件事的字为止 */
+const CLAIM_TAIL = /^[^，,。；;！!？?\n而并且和及同另还]*/;
 /**
  * 说法和定时任务之间的字：同一个分句里，不跨书名号，中间也没说到别的东西。
  * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
@@ -2380,15 +2380,17 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     ["create", SCHEDULE_CREATED_CLAIM, SCHEDULE_CREATE_TOOL],
     ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
   ] as const) {
-    // 说以前的不算：先说做了什么的（「之前已经帮你建好了 T3」）看前面，先说任务的（「T1 之前已取消」）看说法里面
+    // 说以前的不算：同一个分句里前面说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
     const claims = [...answer.matchAll(pattern)]
-      .filter((match) =>
-        OBJECT_FIRST.test(match[0]) ? !EARLIER.test(match[0]) : !EARLIER.test(answer.slice(0, match.index).match(CLAUSE_BEFORE)?.[0] ?? ""),
+      .filter(
+        (match) =>
+          !EARLIER.test(answer.slice(0, match.index).match(CLAUSE_BEFORE)?.[0] ?? "") && !(OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0])),
       )
-      // 编号常写在说法后面（「已建好定时任务 T2」）：看到这个分句结束。是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
-      .map((match) => ({ said: match[0], clause: answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0] }));
-    const backed = ({ said, clause }: { said: string; clause: string }) => {
-      const ids = [...clause.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
+      // 编号常写在说法后面（「已建好定时任务 T2」）：接着往后看，到分句结束或者「而」「并」这类连着下一件事的字为止（「已暂停 T1 并取消 T2」里 T2 不归暂停）。
+      // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
+      .map((match) => ({ said: match[0], ids: match[0] + (answer.slice(match.index + match[0].length).match(CLAIM_TAIL)?.[0] ?? "") }));
+    const backed = ({ said, ids: text }: { said: string; ids: string }) => {
+      const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
       if (!succeeded.has(tool) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
         return false;
       }
