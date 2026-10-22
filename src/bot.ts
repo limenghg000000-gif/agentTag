@@ -622,6 +622,8 @@ async function runTask(
     // 回答里引用的文件路径、行号、提交号要查到过（代码工具查到的代码位置，或者 aiops 查到的报错堆栈里写着），才算查证过
     const succeeded = new Set<string>();
     const attempted = new Set<string>();
+    // 这次真的建成、改成的定时任务（工具回执的第一行）：回答说得不对被拦下时，照这个告诉大家实际做成了什么，免得重复建
+    const scheduleDone: string[] = [];
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
     // 这次取出来的之前查到的结果：取到代码工具的结果算读过代码，原文算整理的依据（代码工具的证据里只有代码位置，没有列出来的路径原文）
@@ -721,6 +723,9 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === SCHEDULE_CREATE_TOOL || tool.spec.name === SCHEDULE_CHANGE_TOOL) {
+            scheduleDone.push(output.split("\n")[0]!);
+          }
           if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
             mergedNow = true;
           }
@@ -1126,7 +1131,8 @@ async function runTask(
         }
       }
     }
-    // 打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成：不发出去，不然大家以为到点会做
+    // 打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成：不发出去，不然大家以为到点会做。
+    // 这次有建成、改成的（建了 T3 却说成 T4）照实列出来，不说成什么都没做，免得大家再建一个重复的
     const blockedSchedule =
       !restate &&
       !scheduled &&
@@ -1137,7 +1143,7 @@ async function runTask(
       unbackedScheduleClaims(shown, succeeded, toolTexts.join("\n")).length > 0;
     if (blockedSchedule) {
       logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
-      answer = BLOCKED_SCHEDULE_ANSWER;
+      answer = blockedScheduleAnswer(scheduleDone);
     }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
     if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || blockedSchedule || result.finish === "filtered") {
@@ -2315,8 +2321,12 @@ const TASK_ID = String.raw`(?<![A-Za-z0-9])T\d+(?![A-Za-z0-9])`;
 /** 说的是定时任务：定时任务、周期任务、提醒（「告警提醒」不算）、T3 */
 const SCHEDULE_OBJECT = String.raw`(?:定时任务|周期任务|(?<!告警)提醒|${TASK_ID})`;
 /** 同一个分句里：中间不隔逗号、句号 */
-const CLAIM_GAP = String.raw`[^，,。；;！!？?\n]`;
-const CLAIM_CLAUSE = new RegExp(String.raw`^${CLAIM_GAP}*`);
+const CLAIM_CLAUSE = new RegExp(String.raw`^[^，,。；;！!？?\n]*`);
+/**
+ * 说法和定时任务之间的字：同一个分句里，不跨书名号，中间也没说到别的东西。
+ * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
+ */
+const CLAIM_GAP = String.raw`(?:(?!文档|表格|页面|知识库|多维表|合并请求|分支|经验|记忆|规矩)[^，,。；;！!？?\n《》])`;
 /** 「之前已经建好」「上次已暂停」说的是以前的 */
 const NOT_EARLIER = String.raw`(?<!之前|此前|以前|上次|原来|早先)`;
 
@@ -2393,6 +2403,18 @@ export function reviewScheduleClaims(
 
 export const BLOCKED_SCHEDULE_ANSWER =
   "这次没有建成，也没有改动定时任务。要建、要改请 @ 我，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里说全，比如「@我 每天 15:30 汇总今天群里的讨论，追加到 https://…」。";
+
+/** 回答说的定时任务和这次做成的对不上时发出去的：什么都没做成就是 BLOCKED_SCHEDULE_ANSWER，做成了的照工具回执列出来 */
+export function blockedScheduleAnswer(done: readonly string[]): string {
+  if (done.length === 0) {
+    return BLOCKED_SCHEDULE_ANSWER;
+  }
+  return (
+    "这次回答里说的定时任务和实际做成的对不上，为免误导没有发出来。这次实际做成的：\n" +
+    done.map((line) => `- ${line}`).join("\n") +
+    "\n不用再建一次；要核对可以 @ 我问「这个群有哪些定时任务」。"
+  );
+}
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
 // 重做后的最后一道检查（blockUnverifiedOps）：Pod 名、定位结果有就拦；时间一般也是有就拦，问的是时间本身（换算、时区、格式）时

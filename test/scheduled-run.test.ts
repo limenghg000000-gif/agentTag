@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
-import { BLOCKED_SCHEDULE_ANSWER, type BotDeps, createMessageHandler, READ_CHAT_NOTE, type ThreadContextSource, unbackedScheduleClaims } from "../src/bot.js";
+import { BLOCKED_SCHEDULE_ANSWER, blockedScheduleAnswer, type BotDeps, createMessageHandler, READ_CHAT_NOTE, type ThreadContextSource, unbackedScheduleClaims } from "../src/bot.js";
 import { CHAT_CONTEXT_HEADER, type ThreadContext } from "../src/history.js";
 import type { ChatModel, ChatRequest, ChatResult } from "../src/llm.js";
 import { TaskRegistry } from "../src/tasks.js";
@@ -439,6 +439,9 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
     "服务已恢复，告警提醒已取消",
     "这次没建成定时任务：这句没 @ 我",
     "已记住：以后线上报错提醒赵作武",
+    "已建好文档《提醒事项》。",
+    "已新建一篇《提醒事项》：https://x.feishu.cn/docx/abc",
+    "已建好飞书文档「提醒清单」",
   ];
   for (const answer of fine) {
     assert.deepEqual(unbackedScheduleClaims(answer, new Set(), ""), [], answer);
@@ -506,4 +509,21 @@ test("真建好了照常发；读过群聊的不查（总结里说的是别人�
   await second.handle(message("总结一下今天群里聊了什么"));
   assert.equal(summary.requests.length, 2);
   assert.deepEqual(markdowns(second.sent), ["今天赵作武已经设置了两个提醒。"]);
+});
+
+test("建成了却说错了编号：拦下时照实列出这次建成的，不说成什么都没做", async () => {
+  const create = tool("schedule_create", false, async () => "已建好定时任务 T3（到点去做）：每天 15:30（北京时间），下次是 10-22 15:30。\n到点做的事：汇总群聊");
+  const rounds: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "schedule_create", arguments: "{}" }] },
+    { text: "已建好定时任务 T4：每天 15:30。", finish: "stop" },
+    { text: "已建好定时任务 T4，旧的 T1 已取消。", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => rounds.shift()!);
+  const { handle, sent } = setup({ model, taskTools: () => [create, tool("schedule_list"), tool("schedule_change")] });
+  await handle(message("每天 15:30 汇总今天群里的讨论"));
+  assert.equal(requests.length, 3);
+  const answer = blockedScheduleAnswer(["已建好定时任务 T3（到点去做）：每天 15:30（北京时间），下次是 10-22 15:30。"]);
+  assert.deepEqual(markdowns(sent), [answer]);
+  assert.match(answer, /实际做成的：\n- 已建好定时任务 T3/);
+  assert.match(answer, /不用再建一次/);
 });
