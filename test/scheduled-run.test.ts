@@ -461,6 +461,10 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   assert.deepEqual(unbackedScheduleClaims("T1 已暂停", new Set(["schedule_list"]), activeList), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("T1 已恢复，下次 10-23 09:00", new Set(["schedule_list"]), activeList), []);
   assert.deepEqual(unbackedScheduleClaims("T1 已恢复", new Set(["schedule_list"]), pausedList), ["change"]);
+  // 一次里查了两回列表、中间有人改过的，以后面那回为准
+  const cancelledList = "这个群有 1 个定时任务：\n- T1 · 每天 9:00 · 汇总 · 李四建的 · 已取消（已跑 0 次）";
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1。", new Set(["schedule_list"]), `${cancelledList}\n${activeList}`), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1。", new Set(["schedule_list"]), `${activeList}\n${cancelledList}`), []);
   // 是哪种改动只看说法本身：括号里说能恢复，不算说恢复了
   assert.deepEqual(unbackedScheduleClaims("T1 已暂停（需要时可以恢复）。", new Set(["schedule_list"]), pausedList), []);
   // 调成了 schedule_change 的，说的改动要和回执一样：暂停了说成取消不算

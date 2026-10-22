@@ -2480,14 +2480,17 @@ const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
 /** schedule_change 的回执：「已暂停定时任务 T1：…」 */
 const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 T\d+[：:]/;
 
-/** 这个编号现在的状态：这次改过的看最后一条回执，没改过的看列表那一行的最后一段 */
+/**
+ * 这个编号现在的状态：看这次最后一处说到它的，是回执就看回执开头，是列表就看那一行的最后一段。
+ * 工具结果按调用先后排，一次里查了两回列表、中间别人改过的，以后面那回为准
+ */
 function taskState(known: string, id: string): string | undefined {
-  const lines = known.split("\n");
-  const receipt = lines.findLast((text) => new RegExp(`^已(?:暂停|恢复|取消)定时任务 ${id}[：:]`).test(text));
-  if (receipt !== undefined) {
-    return receipt.slice(0, 3);
+  const receipt = new RegExp(`^已(?:暂停|恢复|取消)定时任务 ${id}[：:]`);
+  const line = known.split("\n").findLast((text) => receipt.test(text) || text.startsWith(`- ${id} · `));
+  if (line === undefined) {
+    return undefined;
   }
-  return lines.find((text) => text.startsWith(`- ${id} · `))?.split(" · ").at(-1);
+  return receipt.test(line) ? line.slice(0, 3) : line.split(" · ").at(-1);
 }
 
 /**
