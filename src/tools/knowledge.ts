@@ -45,6 +45,8 @@ import type { Tool } from "./tool.js";
 
 /** 确认卡片上按钮回传的 action */
 export const KNOWLEDGE_ACTION = "knowledge";
+/** 卡片发出后这个群关了经验库时卡片上写的 */
+const KNOWLEDGE_OFF = "这个群已经不用团队经验库了（管理员在管理群里关掉了）";
 /** 确认卡片多久以后点了不算 */
 export const PROPOSAL_TTL_MS = 24 * 60 * 60_000;
 /** 回答前检索时每个库最多写进提示词几条 */
@@ -239,6 +241,8 @@ export interface KnowledgeScope {
   memoryEditors?: ReadonlySet<string>;
   /** 这个群能用 aiops：回答前查 aiops 经验库、排查经验同步过去、能归档 aiops 里的经验 */
   aiops: boolean;
+  /** 这个群现在还用不用团队经验库：管理员在管理群的卡片上关掉以后是 false，已经发出去的确认卡片、冲突卡片点了不再执行。不传当成用 */
+  knowledge?: boolean;
 }
 
 /**
@@ -284,6 +288,7 @@ export class KnowledgeDesk {
         updateCard: options.updateCard,
         approvers: (chatId) => this.approversOf(chatId),
         ...(options.scope ? { memoryEditors: (chatId: string) => options.scope!(chatId).memoryEditors } : {}),
+        ...(options.scope ? { enabled: (chatId: string) => options.scope!(chatId).knowledge !== false } : {}),
         allowedChatIds: options.allowedChatIds,
         ...(options.nameOf ? { nameOf: options.nameOf } : {}),
         logger: this.logger,
@@ -575,6 +580,18 @@ export class KnowledgeDesk {
         await this.render(proposal);
       } else {
         await this.render(proposal, expiredCard("这张卡片超过 24 小时，已经失效。要存的话，在话题里再说一次「沉淀成经验」"));
+      }
+      return true;
+    }
+    // 卡片发出后管理员在管理群里给这个群关了经验库：名单里的人也不能再拿旧卡片存、归档（表格也不再共享给这个群）
+    if (this.options.scope?.(proposal.chatId).knowledge === false) {
+      this.proposals.delete(proposal.id);
+      this.logger.info(`经验库卡片 这个群已经不用经验库，没有执行 proposal=${proposal.id} operator=${operator.openId}`);
+      if (proposal.state === "partial") {
+        giveUp(proposal, `${KNOWLEDGE_OFF}，下面没做成的不再试了，需要的话请手动处理：`);
+        await this.render(proposal);
+      } else {
+        await this.render(proposal, expiredCard(`${KNOWLEDGE_OFF}，这张卡片已经失效`));
       }
       return true;
     }

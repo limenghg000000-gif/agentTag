@@ -135,13 +135,14 @@ const knowledge = config.knowledge
       ...(mcp?.names.includes("aiops") ? { aiops: new AiopsLessons(mcp, "aiops") } : {}),
       send: (to, input, opts) => channel.send(to, input, opts),
       updateCard: (messageId, card) => channel.updateCard(messageId, card),
-      // 谁能点「保存」「归档」、谁能改群记忆、能不能用 aiops 经验库，都按卡片所在的群
+      // 谁能点「保存」「归档」、谁能改群记忆、能不能用 aiops 经验库、还用不用经验库，都按卡片所在的群（每次点都重新取，管理群里改了马上算）
       scope: (chatId) => {
         const policy = groups.of(chatId);
         return {
           ...(policy.writeAllowed ? { approvers: policy.writeAllowed } : {}),
           ...(policy.memoryEditors ? { memoryEditors: policy.memoryEditors } : {}),
           aiops: groups.usesAiopsLessons(chatId),
+          knowledge: policy.knowledge,
         };
       },
       allowedChatIds: config.feishu.allowedChatIds,

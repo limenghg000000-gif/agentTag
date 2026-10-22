@@ -122,6 +122,8 @@ export interface ConflictDeskOptions {
   approvers: (chatId: string) => ReadonlySet<string> | undefined;
   /** 这个群能改群记忆的人：要改群记忆（选了以经验库为准）时只有他们能点同步。不传、或者这个群没限定时谁都能 */
   memoryEditors?: (chatId: string) => ReadonlySet<string> | undefined;
+  /** 这个群现在还用不用团队经验库：管理员在管理群里关掉以后，发出去的冲突卡片点了不再执行。不传时都用 */
+  enabled?: (chatId: string) => boolean;
   allowedChatIds: ReadonlySet<string>;
   /** 卡片回调里没有点的人的名字：用它找（见 createNameLookup）。不传时找不到名字的写「有人」 */
   nameOf?: NameLookup;
@@ -236,6 +238,12 @@ export class ConflictDesk {
     if (this.now() - card.createdAt > CONFLICT_TTL_MS) {
       this.cards.delete(card.id);
       await this.render(card, expiredCard("这张卡片超过 24 小时，已经失效。需要的话在话题里再说一次「查一下群记忆和经验库有没有冲突」"));
+      return true;
+    }
+    if (this.options.enabled?.(card.chatId) === false) {
+      this.cards.delete(card.id);
+      this.logger.info(`冲突卡片 这个群已经不用经验库，没有执行 card=${card.id} operator=${operator.openId}`);
+      await this.render(card, expiredCard("这个群已经不用团队经验库了（管理员在管理群里关掉了），这张卡片已经失效"));
       return true;
     }
     const approver = this.options.approvers(card.chatId)?.has(operator.openId) === true;
