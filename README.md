@@ -66,6 +66,7 @@
 点卡片上的「停止」→ 飞书长连接推送卡片回调 card.action.trigger → 中止对应任务（正在进行的模型请求和工具调用一并取消）
 点经验库确认卡片上的「保存」「归档」→ 同一个卡片回调 → 写权限名单里的人点的才执行，按卡片上的内容写进多维表格（排查经验再同步到 aiops）
 点冲突卡片上的下拉框、「按选择同步」→ 同一个卡片回调（tools/conflicts.ts）→ 记下每处的选择；同步时改群记忆，要改经验库的写权限名单里的人点的才执行
+管理群里 @机器人「配置」→ admin.ts 直接回设置卡片（不经过模型）→ 管理员选好、点「下一步」核对改前改后、点「确认」→ settings.ts 存进 data/settings/groups.json、记一行改动 → groups.ts 下一条消息起按新的取
 ```
 
 ## 目录
@@ -98,7 +99,10 @@
 | `RELEASE_NOTES.md` | 产品版更新说明，用大白话写给同事看，机器人发到群里的就是这份；写法见 `CLAUDE.md` |
 | `src/catchup.ts` | 补漏轮询：定时读白名单群和机器人参与过的话题，补上没从事件收到的 @、跟聊要跟的追问和主动接话要看的消息；事件和轮询共用一份「已处理」记录，同一条消息只处理一次 |
 | `src/alarm.ts` | 补漏报警：补上的 @ 多了就在群里提醒一次；事件晚到的不算 |
-| `src/backup.ts` | 群记忆每日备份，按天存放，超过保留天数的删掉 |
+| `src/backup.ts` | 群记忆（和管理群改的群配置）每日备份，按天存放，超过保留天数的删掉 |
+| `src/groups.ts` | 每个群用的配置：管理群卡片上改的盖过 `.env` 里这个群的，再没有照全局 |
+| `src/settings.ts` | 管理群卡片上改的配置：存在 `data/settings/groups.json`，只有机器人写，改之前核对版本号，每次改动追加一行到 `changes.log` |
+| `src/admin.ts` | 管理群：「配置」回设置卡片，核对点的人是不是管理员、表单里填的值，核对改动、确认后保存，管理群里另发一条谁改了什么 |
 | `src/progress.ts` | 进度卡片的样子，以及合并、限速地更新卡片 |
 | `src/stream-card.ts` | 卡片即回答：飞书卡片实体接口，按组件流式更新思考和回答 |
 | `src/card-answers.ts` | 卡片即回答时记下卡片里的回答，读话题历史时换回文字 |
@@ -126,7 +130,7 @@
 5. **版本管理与发布** → 创建版本并发布，让机器人和权限生效。
 6. 按第三步把程序跑起来，保持运行。
 7. **事件与回调** → 事件配置 → 订阅方式选「使用长连接接收事件」并保存（程序没在运行时保存会失败）→ 添加事件「接收消息」`im.message.receive_v1`。
-8. 可选，用飞书云文档和团队经验库时开：**权限管理** 里再开通下面这些。可以用「批量导入」粘贴 `{"scopes":{"tenant":["docx:document","docx:document.block:convert","wiki:wiki:readonly","docs:permission.member:create","docs:permission.member:update","docs:permission.member:delete","docs:permission.setting:write_only","drive:drive.metadata:readonly","bitable:app","contact:user.base:readonly"],"user":[]}}`，个别权限名在你的后台搜不到时去掉它，缺什么机器人用到时会报出来。
+8. 可选，用飞书云文档、团队经验库、管理群时开：**权限管理** 里再开通下面这些。可以用「批量导入」粘贴 `{"scopes":{"tenant":["docx:document","docx:document.block:convert","wiki:wiki:readonly","docs:permission.member:create","docs:permission.member:update","docs:permission.member:delete","docs:permission.setting:write_only","drive:drive.metadata:readonly","bitable:app","im:chat:readonly","im:chat.members:read","contact:user.base:readonly"],"user":[]}}`，个别权限名在你的后台搜不到时去掉它，缺什么机器人用到时会报出来。
    - `docx:document`（查看、编辑新版文档）：读文档、新建文档、改文档
    - `docx:document.block:convert`（把 Markdown 转成文档块）：写入内容
    - `wiki:wiki:readonly`（查看知识库）：读知识库链接背后的文档
@@ -135,6 +139,7 @@
    - `docs:permission.setting:write_only`（更新云文档权限设置）：把团队经验库的多维表格设成只有机器人能加、移除协作者，关掉链接分享。不开的话机器人不把表格共享给任何人（群里打不开表格，检索和保存照常），免得拿到权限的人再共享出去，日志里有警告；开了以后下次启动或保存时自动共享
    - `drive:drive.metadata:readonly`（查看文件元数据）：拿新建文档的链接。不开也行，机器人会用群里贴过的文档链接的域名拼
    - `bitable:app`（查看、评论、编辑和管理多维表格）：团队经验库。不开时回答前的检索照常（还没有表），保存经验时卡片上会提示缺这个权限。建表后共享给群、撤掉或改权限要用上面三个 `docs:permission.member:*`，限制谁能共享要用 `docs:permission.setting:write_only`
+   - `im:chat:readonly`（获取群组信息）、`im:chat.members:read`（获取群组成员）：开了管理群（`CONFIG_CHAT_ID`）时用，设置卡片上写群名、从群成员里选人。不开时卡片上写群的编号，名单只能减人不能加人，日志里有一行警告
    - `contact:user.base:readonly`（获取用户基本信息）：飞书点卡片按钮时只给点的人的 open_id、不给名字。经验库确认卡片、冲突卡片上写「谁点了」、表格记「确认人」时，机器人先在卡片所在话题里找这个人说过的话，没找到再查通讯录拿名字。要查得到，这个人还得在权限管理里「通讯录权限范围」之内。不开时只在话题里找，找不到写「有人」「写权限名单里的同事」
 9. **事件与回调** → 回调配置 → 订阅方式选「使用长连接接收回调」并保存 → 添加回调「卡片回传交互」`card.action.trigger`。不配的话点进度卡片上的「停止」会报错，但在话题里 @ 机器人说「停止」照样能停。
 10. 再创建一个版本并发布，让事件和回调订阅生效。以后改权限、事件或回调都需要重新发布。
@@ -215,6 +220,8 @@ npm start
 | `GROUP_<名字>_MCP` | 否 | 这个群能用的 MCP 服务（`MCP_SERVERS` 里的名字，逗号分隔），`off` 是都不能用。不能用的服务提示词里也不提 |
 | `GROUP_<名字>_MCP_<服务>_TOOLS` | 否 | 这个服务在这个群只开其中几个工具，只能在全局开了的（`MCP_<服务>_TOOLS`）里挑。aiops 不开 `search_knowledge`（全局开给模型的 `get_knowledge` 也要开）时，这个群回答前不查 aiops 经验库、排查经验不同步过去、不能归档 aiops 里的经验（归档同步过去的经验时 aiops 里那条也不动） |
 | `GROUP_<名字>_KNOWLEDGE` | 否 | `off`：这个群回答前不查团队经验库，也没有经验库的工具；机器人建的表格不共享给这个群（之前共享过的启动时撤掉）。经验库是各群共用的一张表，`on` 和不写一样 |
+| `CONFIG_CHAT_ID` | 否 | 管理群的 chat_id。在这个群里 @ 机器人说「配置」，回一张设置卡片改各群的配置（上面 `GROUP_<名字>_…` 那几项，加上主动接话），点「确认」马上生效，不用改 `.env`、不用重启。卡片上改的盖过 `.env` 里这个群的同一项，存在 `<DATA_DIR>/settings/groups.json`，每次改动记在同目录的 `changes.log`，每天备份到 `<DATA_DIR>/backup/settings/`。管理群不用在 `FEISHU_ALLOWED_CHAT_IDS` 里（不在时这个群里只回「配置」）；建议建成私有群，只拉管理员。要和 `CONFIG_OWNERS` 一起配 |
+| `CONFIG_OWNERS` | 配了管理群时必填 | 所有者，逗号分隔的 open_id：能改各群的设置，也能在卡片上加减管理员（管理员能改各群的设置，不能加减管理员）。只能在这里改。管理群里别的人能看卡片、不能改 |
 | `GITLAB_URL` | 接 GitLab 时必填 | 公司 GitLab 的地址，如 `https://gitlab.example.com` |
 | `GITLAB_TOKEN` | 接 GitLab 时必填 | GitLab 访问令牌，权限选 `api`，角色至少 Developer。只接一个项目时用它的项目访问令牌；接多个项目时用群组访问令牌或个人访问令牌（项目访问令牌只能访问建它的那个项目） |
 | `GITHUB_TOKEN` | 接 GitHub 时必填 | 没配 `GITLAB_URL` 时接 GitHub。fine-grained token，只选这些仓库，权限给 Contents 和 Pull requests 的读写 |
@@ -265,6 +272,7 @@ npm start
 - **经验库表格的记录文件**：机器人自己建的经验库表格记在 `data/knowledge/bitable.json`，里面是表格在哪、共享给了哪些群和人。同一个目录下的 `issued.json` 记着发过的最大经验编号。换服务器或重新部署时，连同 `data/` 整个拷过去。这个文件丢了，机器人就不知道以前共享给了谁，以后移出名单的群和人也撤不掉；而这张表设成了只有机器人能管协作者，别人在飞书里也改不了。真丢了的话，不要把旧表填进 `KNOWLEDGE_BITABLE` 接着用：让机器人新建一张（`KNOWLEDGE_BITABLE` 留空），把旧表里的经验复制过去。旧表还共享着以前的群和人，机器人也管不了它了。
 - **群记忆存在哪、怎么恢复或清空**：每个群一个文件 `data/memory/<chat_id>.json`（`DATA_DIR` 可改位置），只有运行程序的用户能读写。每天的备份在 `data/backup/memory/<日期>/`，和记忆在同一块盘上，防的是误删、写坏，不防整块盘坏掉。恢复一个群：先停服务，把备份里的 `<chat_id>.json` 复制回 `data/memory/`，再启动（程序运行时会缓存记忆，不停服务直接复制会被覆盖）。清空一个群的记忆就停服务、删掉它的文件、再启动。记忆的增删改会记在日志里（`群记忆 chat=… 新增 #3 操作人=…`），只记编号和操作人，不记内容。
 - **经验库回答前总是「查到」不相干的、或者该查到的查不到**：在机器人目录下跑 `npm run build && npm run eval:knowledge`，拿各群最近话题里问过的问题去团队经验库检索，列出几档门槛下有几个问题查到了、每个问题最像的 3 条和分数（现在的门槛是语义相似度 0.6，或者关键词、错误码、告警名对上 2 个）。也可以给一个提问文件：`npm run eval:knowledge -- 提问.txt`，一行一个，行尾写「=> K3」或「=> 无」标上应该查到哪条，会多算查对了几条。只读：不改表格、不调 aiops、不发消息，机器人开着也能跑。输出里有提问原文和经验标题，贴给别人前看一眼。
+- **管理群里改的配置存在哪、怎么恢复**：存在 `data/settings/groups.json`，每次改动（谁、什么时候、哪个群、每一项改前改后）追加一行到同目录的 `changes.log`；每天备份到 `data/backup/settings/<日期>/`。恢复：先停服务，把备份里的 `groups.json` 复制回去，再启动。这个文件写坏了时机器人启动就报错退出（不当成空的，免得卡片上收紧过的群悄悄放宽），按报错改好或者从备份拿一份回来。去掉 `CONFIG_CHAT_ID` 关掉管理群以后，卡片上以前改过的照样生效；要全部改回照 `.env`，停服务删掉这个文件再启动。
 - **日志里出现「群记忆文件损坏」**：程序把坏文件改名成 `…json.corrupt-时间戳` 留着，这个群从空记忆重新开始，可以手动从坏文件里把内容找回来。
 
 ## 当前限制（后续阶段解决）
@@ -278,6 +286,7 @@ npm start
 - 代码仓库支持 GitLab 和 GitHub；机器人推代码前只编译检查（`BUILD_CHECK`），不运行代码和测试（要隔离的运行环境，阶段 5 做）。合到 master、prod 这类只许维护者合并的分支要人审查后点。没配 `WRITE_ALLOWED_USERS` 时，群里任何人都能让它改 `CODE_REPOS` 里的仓库并开合并请求。
 - 团队经验库是用它的群共用的一张表（可以用 `GROUP_<名字>_KNOWLEDGE=off` 让某个群不用），还不能给某个群单独一张表，也不能把某条经验标成只在本群看得到。确认卡片的草稿存在内存里，机器人重启后旧卡片点了提示失效，要重新让它起草。确认卡片要求同一个飞书应用只跑一个机器人进程：多跑一个的话飞书会把卡片回调分给另一个进程，它不认识这张卡片，会把卡片改成失效（@ 消息和「停止」按钮也会被分走）。直接在多维表格里改的排查经验不会同步到 aiops 经验库，要改的话让机器人起草新的一条替换旧的。
 - MCP 只支持 HTTP（Streamable HTTP）服务，还不能接 stdio 类的本地 MCP 服务。模型只能用 aiops 的只读工具；存经验、归档经验只能经确认卡片，由写权限名单里的人点确认。没单独配的群都能用全局开了的 MCP 工具，按群限制用 `GROUP_<名字>_MCP`、`GROUP_<名字>_MCP_<服务>_TOOLS`。aiops 用的是一个共用令牌，按群限制只在机器人这边，aiops 那边看不出是哪个群。
+- 管理群的设置卡片只能改已经在白名单里的群；机器人在哪些群里说话（`FEISHU_ALLOWED_CHAT_IDS`）、模型、GitLab、MCP 服务的地址和令牌还只能在 `.env` 里改。还没有只管自己那个群的「群负责人」，也还没有网页后台。卡片的草稿存在内存里，机器人重启后旧卡片点了提示失效，要重新说「配置」。
 - 单聊暂不响应，只处理群里 @ 机器人的消息、它回答过的话题里的追问和开了主动接话的群里的消息。
 - 主动接话每小时的次数、当天有没有提示过怎么关记在内存里，重启后重新算。
 - 停机那会儿话题里没 @ 的话，重启后不补着判断（补漏轮询只看启动以后发的）；`data/follow.json` 读坏了时，重启前跟着的话题要再 @ 一次才接着跟。

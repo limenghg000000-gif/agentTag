@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk";
+import { AdminDesk } from "./admin.js";
 import { MissedEventAlarm } from "./alarm.js";
 import { parseReleaseNotes, UpdateAnnouncer } from "./announce.js";
 import { MemoryBackup } from "./backup.js";
@@ -10,7 +11,7 @@ import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { FEATURES_FILE, loadConfig, RELEASE_NOTES_FILE } from "./config.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { DuplicateAsks } from "./duplicates.js";
-import { createFeishuApi } from "./feishu.js";
+import { createChatDirectory, createFeishuApi } from "./feishu.js";
 import { JUDGE_MEMORY_CHARS, ThreadFollower } from "./follow.js";
 import { createFollowUp } from "./follow-up.js";
 import { GroupPolicies } from "./groups.js";
@@ -27,6 +28,7 @@ import type { AboutBot } from "./prompt.js";
 import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
+import { GroupSettings } from "./settings.js";
 import { describeSchedule, escapePost, label, type RunResult, type ScheduleActor, type ScheduledTask, Scheduler } from "./schedules.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
@@ -45,8 +47,17 @@ if (existsSync(".env")) {
   process.loadEnvFile(".env");
 }
 const config = loadConfig();
-// 按群的配置（GROUPS）：每个群用哪些仓库、谁能改、能用哪些 MCP 工具、用不用经验库，群里没写的项照全局
-const groups = new GroupPolicies(config);
+// 管理群的设置卡片上改的各群配置。没开管理群也照样读：卡片上收紧过的群，不会因为关掉管理群就悄悄放宽
+const settings = new GroupSettings({ dir: config.settingsDir });
+try {
+  await settings.init();
+} catch (err) {
+  console.error(err instanceof Error ? err.message : `群配置目录 ${config.settingsDir} 读不了，请检查 DATA_DIR 和目录权限。`, err);
+  process.exit(1);
+}
+// 按群的配置：每个群用哪些仓库、谁能改、能用哪些 MCP 工具、用不用经验库、主动接话。
+// 管理群卡片上改的盖过 .env 里这个群的（GROUPS 加 GROUP_<名字>_…），都没写的项照全局
+const groups = new GroupPolicies(config, (chatId) => settings.override(chatId));
 
 // Channel 是飞书 SDK 在长连接之上的封装：拉取机器人身份、识别 @、按消息 id 去重、丢弃过期重推、Markdown 转富文本发送
 const channel = createLarkChannel({
@@ -58,6 +69,8 @@ const channel = createLarkChannel({
   policy: { requireMention: false, dmMode: "disabled" },
   // 关掉按群排队合并：同一个群里几个人同时 @，各自独立处理。同一话题里的任务由 TaskRegistry 排队
   safety: { chatQueue: { enabled: false } },
+  // 带上原始事件：管理群设置卡片上表单里填的值，SDK 整理过的按钮事件里没有
+  includeRawEvent: true,
 });
 
 const tasks = new TaskRegistry();
@@ -77,8 +90,21 @@ const backup =
   config.memoryBackupDays > 0
     ? new MemoryBackup({ memoryDir: config.memoryDir, backupDir: config.memoryBackupDir, keepDays: config.memoryBackupDays })
     : undefined;
+// 管理群卡片上改的配置也每天备份一份，保留天数和群记忆一样
+const settingsBackup =
+  config.memoryBackupDays > 0 && (config.admin || settings.chatIds().length > 0 || settings.admins().size > 0)
+    ? new MemoryBackup({
+        memoryDir: config.settingsDir,
+        backupDir: config.settingsBackupDir,
+        keepDays: config.memoryBackupDays,
+        label: "群配置",
+        unit: "个文件",
+      })
+    : undefined;
 
 const feishuApi = createFeishuApi(channel.rawClient, config.feishu.appId, () => channel.botIdentity);
+// 卡片按钮回调里没有点的人的名字：经验库卡片、管理群设置卡片上写「谁点了」时去话题和通讯录里找
+const nameOf = createNameLookup(feishuApi);
 // 关掉 STREAM_CARD 以后，之前写在卡片里的回答照样能从这里读回话题历史
 const cardAnswers = new CardAnswerStore(config.cardAnswersDir);
 // 群成员在新话题里说「上面那个」时，模型用 chat_recent_threads 看本群最近几个话题的问答
@@ -94,8 +120,8 @@ const knowledgeTable = config.knowledge
       api: createBitableApi(channel.rawClient),
       stateFile: config.knowledge.stateFile,
       ...(config.knowledge.bitable ? { target: config.knowledge.bitable } : {}),
-      // 共享给用经验库的群（只读）和这些群里能点「保存」的人
-      share: groups.knowledgeShare(),
+      // 共享给用经验库的群（只读）和这些群里能点「保存」的人；每次调整时按现在的（管理群里改了名单不用重启）
+      share: () => groups.knowledgeShare(),
     })
   : undefined;
 const knowledge = config.knowledge
@@ -109,20 +135,45 @@ const knowledge = config.knowledge
       ...(mcp?.names.includes("aiops") ? { aiops: new AiopsLessons(mcp, "aiops") } : {}),
       send: (to, input, opts) => channel.send(to, input, opts),
       updateCard: (messageId, card) => channel.updateCard(messageId, card),
-      // 谁能点「保存」「归档」、谁能改群记忆、能不能用 aiops 经验库，都按卡片所在的群
+      // 谁能点「保存」「归档」、谁能改群记忆、能不能用 aiops 经验库、还用不用经验库，都按卡片所在的群（每次点都重新取，管理群里改了马上算）
       scope: (chatId) => {
         const policy = groups.of(chatId);
         return {
           ...(policy.writeAllowed ? { approvers: policy.writeAllowed } : {}),
           ...(policy.memoryEditors ? { memoryEditors: policy.memoryEditors } : {}),
           aiops: groups.usesAiopsLessons(chatId),
+          knowledge: policy.knowledge,
         };
       },
       allowedChatIds: config.feishu.allowedChatIds,
       // 群记忆和经验库说法对不上时发冲突卡片，选好以哪边为准后两边一起改
       memory,
       // 卡片按钮回调里没有点的人的名字，卡片上写「谁点了」、记确认人时去话题和通讯录里找
-      nameOf: createNameLookup(feishuApi),
+      nameOf,
+    })
+  : undefined;
+// 管理群（CONFIG_CHAT_ID）：管理员 @ 机器人说「配置」，程序回设置卡片（不经过模型），点「确认」存进 settings、下一条消息起生效
+const admin = config.admin
+  ? new AdminDesk({
+      chatId: config.admin.chatId,
+      owners: config.admin.owners,
+      settings,
+      groups,
+      allowedChatIds: config.feishu.allowedChatIds,
+      // 只能在服务器上接入了的仓库、全局开了的工具里挑
+      repos: () => (workspaces ? [...workspaces.repos, ...workspaces.patterns] : []),
+      mcpServers: config.mcp.map((server) => server.name),
+      mcpTools: (server) => {
+        const listed = config.mcp.find((item) => item.name === server)?.tools;
+        return mcp?.enabledTools(server) ?? (listed && listed !== "*" ? listed : undefined);
+      },
+      knowledge: config.knowledge !== undefined,
+      directory: createChatDirectory(channel.rawClient),
+      send: (to, input, opts) => channel.send(to, input, opts),
+      updateCard: (messageId, card) => channel.updateCard(messageId, card),
+      nameOf,
+      // 写权限名单、经验库开关改了：机器人建的经验库表格按新名单调整共享
+      onSaved: () => void knowledgeTable?.syncSharing().catch((err: unknown) => console.warn("经验库：调整多维表格的共享失败", err)),
     })
   : undefined;
 // 提问里的截图先交给看图模型转成文字
@@ -171,7 +222,7 @@ const answerMessage = createMessageHandler({
   // 仓库、写权限名单、能改群记忆的人、MCP 工具、经验库按消息所在的群取
   scope: chatScope,
   ...(images ? { images } : {}),
-  chatAlong: config.followThreads || config.chatContext || config.proactive.chatIds.size > 0,
+  chatAlong: config.followThreads || config.chatContext || [...config.feishu.allowedChatIds].some((chatId) => groups.of(chatId).proactive),
   showThinking: config.showThinking,
   about: aboutBot(),
   ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient) } : {}),
@@ -224,7 +275,8 @@ const follower = config.followThreads
 // 跟着的话题里不是对它说的话，答案在群记忆里时也接一句
 const proactive = new ProactiveReplier({
   allowedChatIds: config.feishu.allowedChatIds,
-  enabledChatIds: config.proactive.chatIds,
+  // PROACTIVE_CHAT_IDS 里的群，和管理群卡片上打开的群（每次都问，卡片上改了马上生效）
+  enabledChatIds: { has: (chatId) => config.feishu.allowedChatIds.has(chatId) && groups.of(chatId).proactive },
   stateFile: config.proactive.stateFile,
   maxPerHour: config.proactive.maxPerHour,
   api: feishuApi,
@@ -354,9 +406,16 @@ const answerUnaddressed = (msg: NormalizedMessage): Promise<void> =>
   follower
     ? follower.answerInTurn(msg, () => handleMessage(msg, { unaddressed: true, proactive: true }), false)
     : handleMessage(msg, { unaddressed: true, proactive: true });
-/** @ 了机器人的消息：照常回答（开关类的话由 command 先处理），之后跟着这个话题；同一话题里排在还在判断的没 @ 的消息后面 */
-const answerMention = (msg: NormalizedMessage): Promise<void> =>
-  follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);
+/**
+ * @ 了机器人的消息：管理群里说「配置」的由程序回设置卡片；别的照常回答（开关类的话由 command 先处理），之后跟着这个话题；
+ * 同一话题里排在还在判断的没 @ 的消息后面
+ */
+const answerMention = async (msg: NormalizedMessage): Promise<void> => {
+  if (await admin?.handleMessage(msg)) {
+    return;
+  }
+  return follower ? follower.answerInTurn(msg, () => handleMessage(msg)) : handleMessage(msg);
+};
 /** 没 @ 机器人的群消息归谁判断：跟着的话题里的归跟聊，群主界面的归主动接话，都不要就不管 */
 const listenerFor = (msg: NormalizedMessage, fromApp = false) =>
   follower?.wants(msg, fromApp) ? follower : proactive.wants(msg, fromApp) ? proactive : undefined;
@@ -399,6 +458,8 @@ const catchUp = new CatchUpPoller({
   intervalMs: config.catchUpIntervalMs || undefined,
 });
 channel.on("message", async (msg: NormalizedMessage) => {
+  // 原始事件只有卡片按钮要用（includeRawEvent），消息的不留
+  delete (msg as { raw?: unknown }).raw;
   // 主动接话判断完要回之前，看判断的这会儿群里有没有人接了话
   proactive.noteActivity(msg);
   if (!msg.mentionedBot) {
@@ -433,7 +494,14 @@ const followUp = createFollowUp({
     return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options), false) : handleMessage(msg, options);
   },
 });
-channel.on("cardAction", createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) }));
+const onCardAction = createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) });
+channel.on("cardAction", async (evt) => {
+  // 管理群设置卡片上的按钮先看（管理群不在白名单里也认）
+  if (await admin?.handleCardAction(evt)) {
+    return;
+  }
+  await onCardAction(evt);
+});
 // 有人给机器人没被 @ 时说的话点了表情：算有人理（要在飞书开发者后台订阅「消息被 reaction」事件才收得到，没订阅就只看回复和 @）
 channel.on("reaction", (evt) => proactive.noteReaction(evt.messageId, evt.operator.openId, evt.emojiType, evt.action));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));
@@ -473,11 +541,13 @@ console.log(
     ? "群里直接 @ 时带上之前半小时内的群聊（最多 20 条），「看下上面那个报错」接得上（CHAT_CONTEXT=off 可以关掉）"
     : "群里直接 @ 时不带群聊（CHAT_CONTEXT=off）",
 );
-if (config.proactive.chatIds.size > 0) {
-  const paused = [...config.proactive.chatIds].filter((chatId) => !proactive.active(chatId));
-  const quiet = [...config.proactive.chatIds].filter((chatId) => proactive.active(chatId) && !proactive.listening(chatId));
+// PROACTIVE_CHAT_IDS 里的，加上管理群卡片上打开的（卡片上关掉的不算）
+const proactiveChats = [...config.feishu.allowedChatIds].filter((chatId) => groups.of(chatId).proactive);
+if (proactiveChats.length > 0) {
+  const paused = proactiveChats.filter((chatId) => !proactive.active(chatId));
+  const quiet = proactiveChats.filter((chatId) => proactive.active(chatId) && !proactive.listening(chatId));
   console.log(
-    `主动接话：群 ${[...config.proactive.chatIds].join(", ")} 里没 @ 的消息看情况接一句，` +
+    `主动接话：群 ${proactiveChats.join(", ")} 里没 @ 的消息看情况接一句，` +
       (Number.isFinite(config.proactive.maxPerHour)
         ? `每个群每小时最多 ${config.proactive.maxPerHour} 次`
         : `不限回几次（每个群每小时最多判断 ${MAX_JUDGED_PER_HOUR} 条）`) +
@@ -485,7 +555,7 @@ if (config.proactive.chatIds.size > 0) {
       (quiet.length > 0 ? `；${quiet.join(", ")} 太热闹或太久没人 @，先不看了（@ 机器人一次接着看）` : ""),
   );
 } else {
-  console.log("主动接话没开：只回 @ 机器人的消息和跟着的话题（PROACTIVE_CHAT_IDS 填群的 chat_id 可以打开）");
+  console.log("主动接话没开：只回 @ 机器人的消息和跟着的话题（PROACTIVE_CHAT_IDS 填群的 chat_id，或者在管理群的设置卡片上可以打开）");
 }
 if (config.proactive.ignored.length > 0) {
   console.warn(`PROACTIVE_CHAT_IDS 里这些群不在 FEISHU_ALLOWED_CHAT_IDS 里，不生效：${config.proactive.ignored.join(", ")}`);
@@ -529,6 +599,16 @@ if (workspaces) {
 for (const line of groups.describe()) {
   console.log(line);
 }
+if (config.admin) {
+  console.log(
+    `管理群：在群 ${config.admin.chatId} 里 @ 机器人说「配置」，回设置卡片改各群的配置，点「确认」马上生效；` +
+      `所有者 ${config.admin.owners.size} 人（CONFIG_OWNERS），管理员 ${settings.admins().size} 人。` +
+      `卡片上改的存在 ${settings.file}，每次改动记在 ${settings.logFile}` +
+      (config.feishu.allowedChatIds.has(config.admin.chatId) ? "" : "（管理群不在白名单里：在这个群里只回「配置」）"),
+  );
+} else if (settings.chatIds().length > 0) {
+  console.log(`管理群没开（CONFIG_CHAT_ID），以前在卡片上改过的 ${settings.chatIds().length} 个群照样按 ${settings.file} 来`);
+}
 if (mcp) {
   console.log(`MCP 服务：${mcp.names.join(", ")}，在后台连接，连上后日志里有一行「MCP <名字>：已连上」`);
 }
@@ -559,6 +639,10 @@ if (scheduler) {
 if (backup) {
   backup.start();
   console.log(`群记忆每天备份一次到 ${config.memoryBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
+}
+if (settingsBackup) {
+  settingsBackup.start();
+  console.log(`管理群改的群配置每天备份一次到 ${config.settingsBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
 }
 // 部署新版本要重启：连上飞书后把 RELEASE_NOTES.md 里各群还没收到过的版本发过去，在后台做
 const announcer =
@@ -594,6 +678,7 @@ const shutdown = async () => {
   // 停掉进行中的任务，让它们把卡片更新成「已停止」再退出
   await catchUp.stop();
   await backup?.stop();
+  await settingsBackup?.stop();
   // 正在发的更新通知发完再退出（最多等 5 秒），没发完的下次启动再发
   await Promise.race([announcer?.stop(), new Promise((resolve) => setTimeout(resolve, 5_000))]);
   tasks.stopAll();

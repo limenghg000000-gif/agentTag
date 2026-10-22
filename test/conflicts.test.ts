@@ -348,6 +348,22 @@ test("冲突卡片：有选以群记忆为准的（要改经验库）只有写�
   }
 });
 
+test("冲突卡片：卡片发出后管理员给这个群关了经验库，名单里的人点同步也不改，卡片写已失效", async () => {
+  let knowledge = true;
+  const s = await setup({ approvers: null, scope: () => ({ approvers: new Set(["ou_admin"]), aiops: false, knowledge }) });
+  try {
+    await s.tool().run({ conflicts: s.both }, { signal });
+    knowledge = false;
+    await s.apply();
+    assert.match(text(s.card()), /这个群已经不用团队经验库了（管理员在管理群里关掉了），这张卡片已经失效/);
+    assert.equal((await s.store.list("oc_1"))[0].content, "发版固定在每周三", "群记忆没改");
+    assert.equal(s.backend.entries.length, 2, "经验库没改");
+    assert.ok(s.backend.entries.every((entry) => entry.status === "active"));
+  } finally {
+    await s.cleanup();
+  }
+});
+
 test("冲突卡片：写权限名单里的人点同步，以群记忆为准的经验换成新的一条、旧的归档；以经验库为准的群记忆删掉", async () => {
   const s = await setup();
   try {

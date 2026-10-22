@@ -493,3 +493,18 @@ test("GROUP_<名字>_KNOWLEDGE：off 是这个群不用经验库；全局关着�
   assert.throws(() => loadConfig({ ...groups, KNOWLEDGE: "off", GROUP_TEST_KNOWLEDGE: "on" }), /全局 KNOWLEDGE=off/);
   assert.throws(() => loadConfig({ ...groups, GROUP_TEST_KNOWLEDGE: "yes" }), /GROUP_TEST_KNOWLEDGE 只能是 on 或 off/);
 });
+
+test("管理群：CONFIG_CHAT_ID 和 CONFIG_OWNERS 一起配才开；卡片上改的配置放在数据目录的 settings 里，没开管理群也有", () => {
+  const plain = loadConfig({ ...base, DATA_DIR: "/srv/bot" });
+  assert.equal(plain.admin, undefined);
+  assert.equal(plain.settingsDir, path.resolve("/srv/bot", "settings"));
+  assert.equal(plain.settingsBackupDir, path.resolve("/srv/bot", "backup", "settings"));
+
+  const config = loadConfig({ ...base, CONFIG_CHAT_ID: " oc_admin ", CONFIG_OWNERS: "ou_ml, ou_b" });
+  assert.deepEqual(config.admin, { chatId: "oc_admin", owners: new Set(["ou_ml", "ou_b"]) });
+
+  assert.throws(() => loadConfig({ ...base, CONFIG_CHAT_ID: "oc_admin" }), /配了 CONFIG_CHAT_ID 就要配 CONFIG_OWNERS/);
+  assert.throws(() => loadConfig({ ...base, CONFIG_OWNERS: "ou_ml" }), /配了 CONFIG_OWNERS 就要配 CONFIG_CHAT_ID/);
+  assert.throws(() => loadConfig({ ...base, CONFIG_CHAT_ID: "管理群", CONFIG_OWNERS: "ou_ml" }), /CONFIG_CHAT_ID 要填群的 chat_id/);
+  assert.throws(() => loadConfig({ ...base, CONFIG_CHAT_ID: "oc_admin", CONFIG_OWNERS: "张三" }), /CONFIG_OWNERS/);
+});

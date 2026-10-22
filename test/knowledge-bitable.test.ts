@@ -224,6 +224,19 @@ test("共享跟着名单走：启动时把移出白名单的群、移出写权�
   assert.match(notes.join("\n"), /用的是 KNOWLEDGE_BITABLE 指定的表，机器人不管它的共享。白名单群和写权限名单变了，请在飞书里自己调整这张表的协作者/);
 });
 
+test("名单传函数时每次调整都取最新的：管理群里改了写权限名单，不用重启就按新名单共享", async () => {
+  const stateFile = path.join(dir, "live-share", "bitable.json");
+  const { api, calls, shared } = fakeBitable();
+  let share = { chatIds: ["oc_1"], editors: ["ou_admin"] };
+  const backend = new BitableKnowledgeBackend({ api, stateFile, share: () => share, logger: quiet });
+  await new KnowledgeBase(backend, { logger: quiet }).save(dau);
+  const before = calls.length;
+  share = { chatIds: ["oc_1"], editors: ["ou_new"] };
+  await backend.syncSharing();
+  assert.deepEqual(calls.slice(before), ["remove ou_admin"]);
+  assert.deepEqual(shared.at(-1), [{ type: "openid", id: "ou_new" }, "edit"]);
+});
+
 test("撤权限失败（没开 docs:permission.member:delete）时警告写明缺的权限，记录留着，下次启动再撤", async () => {
   const stateFile = path.join(dir, "revoke-fail", "bitable.json");
   const { api, calls } = fakeBitable();

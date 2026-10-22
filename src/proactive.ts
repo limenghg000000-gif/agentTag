@@ -65,8 +65,8 @@ export const RESUME_COMMAND =
 export interface ProactiveOptions {
   /** 白名单群：别的群里说开关的话不理 */
   allowedChatIds: ReadonlySet<string>;
-  /** 打开了主动接话的群（PROACTIVE_CHAT_IDS，只算白名单里的） */
-  enabledChatIds: ReadonlySet<string>;
+  /** 打开了主动接话的群（PROACTIVE_CHAT_IDS 或管理群的卡片上打开的，只算白名单里的）。每次都问，卡片上改了马上生效 */
+  enabledChatIds: Pick<ReadonlySet<string>, "has">;
   /** 群里说「别主动插话」以后记在这里，重启后照样不主动接话 */
   stateFile: string;
   api: Pick<FeishuApi, "listChatMessages">;
@@ -288,7 +288,7 @@ export class ProactiveReplier {
     return this.replied.has(msg.messageId) || (last !== undefined && last.messageId !== msg.messageId && last.at > msg.createTime);
   }
 
-  /** 这个群现在主动接话：在 PROACTIVE_CHAT_IDS 里，也没人说过「别主动插话」 */
+  /** 这个群现在主动接话：打开了（PROACTIVE_CHAT_IDS 或管理群的卡片上），也没人说过「别主动插话」 */
   active(chatId: string): boolean {
     return this.opts.enabledChatIds.has(chatId) && !this.paused.has(chatId);
   }
@@ -434,7 +434,7 @@ export class ProactiveReplier {
       return this.opts
         .reply(
           msg,
-          `这个群没开主动接话，我本来就只在被 @ 时回${this.opts.followsThreads ? "（我回答过的话题里，追问不用 @）" : ""}。要打开，请管理员把这个群加进 PROACTIVE_CHAT_IDS。`,
+          `这个群没开主动接话，我本来就只在被 @ 时回${this.opts.followsThreads ? "（我回答过的话题里，追问不用 @）" : ""}。要打开，请找管理员打开这个群的主动接话。`,
         )
         .then(() => undefined);
     }

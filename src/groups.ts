@@ -1,8 +1,10 @@
 import type { Config, GroupConfig, McpScope } from "./config.js";
+import type { GroupOverride } from "./settings.js";
 
 /**
- * 一个群现在用的配置：群里单独写了的项（GROUPS 加 GROUP_<名字>_…）用群里的，没写的用全局的。
- * 回答、定时任务、经验库卡片、主动接话都按消息所在的群取一份，限制在程序里：工具只按这一份建，A 群拿不到 B 群的仓库和工具
+ * 一个群现在用的配置：管理群的卡片上定了的项用卡片的，没定的看 .env 里这个群单独写了没有（GROUPS 加 GROUP_<名字>_…），再没有用全局的。
+ * 回答、定时任务、经验库卡片、主动接话都按消息所在的群取一份，限制在程序里：工具只按这一份建，A 群拿不到 B 群的仓库和工具。
+ * 卡片上改了以后下一次取就是新的，不用重启
  */
 export interface GroupPolicy {
   /** GROUPS 里给群起的名字；没单独配的群没有 */
@@ -17,17 +19,24 @@ export interface GroupPolicy {
   mcp: McpScope;
   /** 回答前查团队经验库、给经验库的工具 */
   knowledge: boolean;
+  /** 不 @ 也主动接话（PROACTIVE_CHAT_IDS，或者管理群的卡片上打开的） */
+  proactive: boolean;
 }
 
 type PolicyConfig = Pick<Config, "code" | "mcp" | "knowledge" | "groups"> & {
   feishu: Pick<Config["feishu"], "allowedChatIds" | "writeAllowedUsers" | "memoryEditors">;
+  proactive: Pick<Config["proactive"], "chatIds">;
 };
 
 export class GroupPolicies {
   private readonly byChat: ReadonlyMap<string, GroupConfig>;
-  private readonly global: GroupPolicy;
+  private readonly global: Omit<GroupPolicy, "proactive">;
 
-  constructor(private readonly config: PolicyConfig) {
+  /** cards：管理群的卡片上给这个群单独定的项（GroupSettings.override），没开管理群时不传 */
+  constructor(
+    private readonly config: PolicyConfig,
+    private readonly cards?: (chatId: string) => GroupOverride | undefined,
+  ) {
     this.byChat = new Map(config.groups.map((group) => [group.chatId, group]));
     this.global = {
       codeRepos: config.code?.repos ?? [],
@@ -38,11 +47,32 @@ export class GroupPolicies {
     };
   }
 
-  /** 这个群的配置：单独配过的群逐项覆盖全局，没配过的就是全局那份 */
-  of(chatId: string): GroupPolicy {
+  /**
+   * 这个群的配置：卡片上定了的项盖过 .env 里的，.env 里单独配过的群逐项覆盖全局，没配过的就是全局那份。
+   * card: false 只看服务器上的配置（卡片上显示「照服务器上的配置（现在：…）」用）。白名单外的群不看卡片
+   */
+  of(chatId: string, { card = true }: { card?: boolean } = {}): GroupPolicy {
+    const base = this.fromEnv(chatId);
+    const override = card && this.config.feishu.allowedChatIds.has(chatId) ? this.cards?.(chatId) : undefined;
+    return override ? this.withCard(base, override) : base;
+  }
+
+  /** 卡片上把这个群换成 override 以后用的配置（卡片上核对改前改后用；空对象就是全照服务器上的配置） */
+  preview(chatId: string, override: GroupOverride): GroupPolicy {
+    const base = this.fromEnv(chatId);
+    return Object.keys(override).length > 0 ? this.withCard(base, override) : base;
+  }
+
+  /** 卡片上给这个群单独定的项（白名单外的群不算），没定过返回 undefined */
+  carded(chatId: string): GroupOverride | undefined {
+    return this.config.feishu.allowedChatIds.has(chatId) ? this.cards?.(chatId) : undefined;
+  }
+
+  private fromEnv(chatId: string): GroupPolicy {
+    const proactive = this.config.proactive.chatIds.has(chatId);
     const group = this.byChat.get(chatId);
     if (!group) {
-      return this.global;
+      return { ...this.global, proactive };
     }
     const writeAllowed = group.writeAllowedUsers ?? this.global.writeAllowed;
     const memoryEditors = group.memoryEditors ?? this.global.memoryEditors;
@@ -53,7 +83,45 @@ export class GroupPolicies {
       ...(memoryEditors ? { memoryEditors } : {}),
       mcp: group.mcp ?? this.global.mcp,
       knowledge: this.global.knowledge && group.knowledge !== false,
+      proactive,
     };
+  }
+
+  /**
+   * 卡片上定的项盖上去。仓库照写（用的时候只认服务器上接入了的）；MCP 只认配置里有的服务，工具只能在全局开了的里挑；
+   * 全局关着经验库时卡片上打开也不算
+   */
+  private withCard(base: GroupPolicy, card: GroupOverride): GroupPolicy {
+    const { writeAllowed, memoryEditors, ...rest } = base;
+    const writers = card.writeAllowed ? new Set(card.writeAllowed) : writeAllowed;
+    const editors = card.memoryEditors ? new Set(card.memoryEditors) : memoryEditors;
+    return {
+      ...rest,
+      codeRepos: card.codeRepos ?? base.codeRepos,
+      ...(writers ? { writeAllowed: writers } : {}),
+      ...(editors ? { memoryEditors: editors } : {}),
+      mcp: card.mcp ? this.mcpWithCard(base.mcp, card.mcp) : base.mcp,
+      knowledge: card.knowledge === undefined ? base.knowledge : this.global.knowledge && card.knowledge,
+      proactive: card.proactive ?? base.proactive,
+    };
+  }
+
+  private mcpWithCard(base: McpScope, card: NonNullable<GroupOverride["mcp"]>): McpScope {
+    const scope = new Map(base);
+    for (const [server, choice] of Object.entries(card)) {
+      const global = this.config.mcp.find((item) => item.name === server)?.tools;
+      if (global === undefined) {
+        continue;
+      }
+      if (choice === "off") {
+        scope.delete(server);
+      } else if (choice === "all") {
+        scope.set(server, "*");
+      } else {
+        scope.set(server, global === "*" ? [...choice] : choice.filter((tool) => global.includes(tool)));
+      }
+    }
+    return scope;
   }
 
   /**
@@ -85,8 +153,16 @@ export class GroupPolicies {
     return { chatIds, editors: [...editors] };
   }
 
-  /** 启动日志：每个单独配过的群用的是什么（没写的项写「同全局」） */
+  /** 启动日志：.env 里单独配过的群用的是什么（没写的项写「同全局」），再加卡片上改过的群各一行 */
   describe(): string[] {
+    const carded = [...this.config.feishu.allowedChatIds].flatMap((chatId) => {
+      const card = this.carded(chatId);
+      return card ? [`群 ${this.of(chatId).name ?? chatId}（${chatId}）在管理群的卡片上改过：${describeOverride(card)}`] : [];
+    });
+    return [...this.describeEnv(), ...carded];
+  }
+
+  private describeEnv(): string[] {
     return this.config.groups.map((group) => {
       const policy = this.of(group.chatId);
       const people = (set: ReadonlySet<string> | undefined, fallback: string) =>
@@ -104,6 +180,21 @@ export class GroupPolicies {
       );
     });
   }
+}
+
+/** 卡片上改过的项（启动日志用，人名不写，写几个人） */
+function describeOverride(card: GroupOverride): string {
+  const people = (list: readonly string[]) => (list.length === 0 ? "没人" : `${list.length} 人`);
+  return [
+    ...(card.codeRepos ? [`仓库 ${card.codeRepos.length > 0 ? card.codeRepos.join(", ") : "不开"}`] : []),
+    ...(card.writeAllowed ? [`写权限 ${people(card.writeAllowed)}`] : []),
+    ...(card.memoryEditors ? [`改群记忆 ${people(card.memoryEditors)}`] : []),
+    ...Object.entries(card.mcp ?? {}).map(
+      ([server, choice]) => `MCP ${server} ${choice === "all" ? "全开" : choice === "off" ? "不开" : `${choice.length} 个工具`}`,
+    ),
+    ...(card.knowledge === undefined ? [] : [`经验库 ${card.knowledge ? "用" : "不用"}`]),
+    ...(card.proactive === undefined ? [] : [`主动接话 ${card.proactive ? "开" : "关"}`]),
+  ].join("；");
 }
 
 /** 仓库清单里的一项是不是 group/* 通配 */

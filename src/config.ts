@@ -18,6 +18,23 @@ export interface Config {
   };
   /** 按群分开的配置（GROUPS 加 GROUP_<名字>_…），群里没写的项照全局。没配 GROUPS 时为空 */
   groups: GroupConfig[];
+  /**
+   * 管理群（CONFIG_CHAT_ID 和 CONFIG_OWNERS）：在这个群里 @ 机器人说「配置」，回一张设置卡片改各群的配置，改完马上生效。
+   * 没配时为空，各群的配置只能在 .env 里改
+   */
+  admin?: {
+    /** 管理群的 chat_id */
+    chatId: string;
+    /** 所有者（open_id）：能改各群的设置，也能在卡片上加减管理员。只能在 .env 里改 */
+    owners: ReadonlySet<string>;
+  };
+  /**
+   * 管理群的卡片上改的配置（groups.json）和改动记录（changes.log）放在这里。没开管理群也照样读：
+   * 卡片上收紧过的群，关掉管理群以后不会悄悄放宽
+   */
+  settingsDir: string;
+  /** 卡片上改的配置每天备份到这里（每天一个子目录），和群记忆一样保留 MEMORY_BACKUP_DAYS 天 */
+  settingsBackupDir: string;
   llm: LlmConfig;
   /** 群记忆的存放目录（每个群一个 JSON 文件） */
   memoryDir: string;
@@ -357,6 +374,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const proactiveChatIds = [...new Set((env.PROACTIVE_CHAT_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean))];
+  const admin = loadAdminConfig(env);
 
   return {
     feishu: {
@@ -368,6 +386,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ...(memoryEditors.length > 0 ? { memoryEditors: new Set(memoryEditors) } : {}),
     },
     groups,
+    ...(admin ? { admin } : {}),
     llm: {
       baseURL,
       apiKey: env.MODEL_API_KEY!,
@@ -379,6 +398,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     catchUpIntervalMs: catchUpSeconds * 1000,
     alertChatId: env.ALERT_CHAT_ID?.trim() || undefined,
     memoryBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "memory"),
+    settingsDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "settings"),
+    settingsBackupDir: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "backup", "settings"),
     memoryBackupDays: backupDays,
     ...(visionModel ? { vision: { model: visionModel, ...(isBailian(baseURL) ? { thinking: false as const } : {}) } } : {}),
     // 百炼的联网搜索只有千问模型支持：主模型换成 Kimi、GLM、DeepSeek 等时，搜索仍用千问旗舰
@@ -406,6 +427,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(docsLink ? { docsLink } : {}),
     ...(announce ? { announce } : {}),
   };
+}
+
+/** 管理群：CONFIG_CHAT_ID 和 CONFIG_OWNERS 要一起配，只配一个的启动时报错 */
+function loadAdminConfig(env: NodeJS.ProcessEnv): Config["admin"] {
+  const chatId = env.CONFIG_CHAT_ID?.trim() ?? "";
+  const owners = openIds(env.CONFIG_OWNERS ?? "", "CONFIG_OWNERS");
+  if (!chatId && owners.length === 0) {
+    return undefined;
+  }
+  if (!chatId) {
+    throw new Error("配了 CONFIG_OWNERS 就要配 CONFIG_CHAT_ID（管理群的 chat_id）");
+  }
+  if (!/^oc_[\w-]+$/.test(chatId)) {
+    throw new Error(`CONFIG_CHAT_ID 要填群的 chat_id（oc_ 开头），当前为 ${chatId}`);
+  }
+  if (owners.length === 0) {
+    throw new Error("配了 CONFIG_CHAT_ID 就要配 CONFIG_OWNERS（所有者的 open_id，逗号分隔）：没有所有者就没人能加管理员");
+  }
+  return { chatId, owners: new Set(owners) };
 }
 
 /** ANNOUNCE_LINK（产品功能说明）、DOCS_LINK（文档中心）：要是 https 地址 */
