@@ -567,6 +567,7 @@ async function runTask(
       logger.info(`整理话题里之前的内容，这次不查经验库、不给查询的工具 message=${msg.messageId}`);
     }
     // 只是在给它定以后的规矩（没同时说现在就查哪件事、不是在问）：只给记群记忆的工具，不查经验库。
+    // 说到定时任务（「以后每周一 9 点帮忙汇总」）、要改代码或文档的不算：那是要它建任务、去改，照常给工具。
     // 2026-10-22 在群主界面 @ 它说「改一下线上报错不需要 @ 你直接帮忙查」，提示词说了只记不查，它记完还是把群聊里的 Redis 报错查了一遍
     const ruleOnly =
       !followUp &&
@@ -575,7 +576,10 @@ async function runTask(
       options.proactive !== true &&
       RULE_REQUEST.test(question) &&
       !NOW_REQUEST.test(question) &&
-      !ASKING.test(question.trim());
+      !ASKING.test(question.trim()) &&
+      !SCHEDULE_TALK.test(question) &&
+      !CHANGE_REQUEST.test(question) &&
+      !DOC_REQUEST.test(question);
     if (ruleOnly) {
       logger.info(`给它定规矩，这次只给记群记忆的工具，不查经验库 message=${msg.messageId}`);
     }

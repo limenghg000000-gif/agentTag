@@ -937,6 +937,21 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     assert.doesNotMatch(requests[n].system, /这次只给了记群记忆的工具/, question);
   }
   assert.equal(queries.length, asks.length);
+
+  // 说到定时任务、要写文档的：照常给对应的工具，不当成只是在定规矩
+  const schedule: Tool = {
+    spec: { name: "schedule_create", description: "建定时任务", parameters: { type: "object", properties: {} } },
+    describe: () => "建定时任务",
+    run: async () => "T1",
+  };
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle: other } = setup({ model: plain.model, memory, tools: [aiops, schedule] });
+  for (const [i, question] of ["以后每周一 9 点帮忙汇总上周进展", "每天上午 10 点检查线上告警，没有异常不用回复", "以后告警别管，把这条规矩写进飞书文档"].entries()) {
+    await other(message(question, { messageId: `om_s${i}` }));
+    assert.ok(plain.requests[i].tools?.some((t) => t.name === "aiops_query_logs"), question);
+    assert.doesNotMatch(plain.requests[i].system, /这次只给了记群记忆的工具/, question);
+  }
+  assert.ok(plain.requests[0].tools?.some((t) => t.name === "schedule_create"));
 });
 
 test("群里还没有记忆时也告诉模型可以记", async () => {
