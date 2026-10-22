@@ -435,6 +435,8 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
     "要的话我帮你建一个定时任务吧？",
     "这个群目前没有已建好的定时任务。",
     "之前已经建好的定时任务 T2 还在",
+    "之前已经帮你建好了定时任务 T3，不用重复创建。",
+    "上次给你暂停了 T3，要恢复请说「恢复定时任务 T3」",
     "T3 暂停了吗？我查一下",
     "服务已恢复，告警提醒已取消",
     "这次没建成定时任务：这句没 @ 我",
@@ -487,6 +489,29 @@ test("打回以后还说建好了定时任务：不发出去，换成说没建�
   assert.deepEqual(names(requests[0]), ["feishu_doc_read"]);
   assert.match(requests[0]!.system, /这次不能建、改定时任务（这句话本身没说要以后做什么）。/);
   assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent), [BLOCKED_SCHEDULE_ANSWER]);
+});
+
+test("说到的编号只认定时任务工具的结果：文档里碰巧写着 T4，列表说没有定时任务，说「已建好 T4」照样不算", async () => {
+  const rounds: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [
+        { id: "c1", name: "schedule_list", arguments: "{}" },
+        { id: "c2", name: "feishu_doc_read", arguments: "{}" },
+      ],
+    },
+    { text: "已建好定时任务 T4。", finish: "stop" },
+    { text: "已建好定时任务 T4。", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => rounds.shift()!);
+  const { handle, sent } = setup({
+    model,
+    taskTools: () => [tool("feishu_doc_read", false, async () => "排期：T4 阶段上线"), tool("schedule_list", false, async () => "这个群还没有定时任务。")],
+  });
+  await handle(message("看下这篇文档，顺便看看群里有哪些定时任务", { rootId: "om_root" }), { unaddressed: true });
+  assert.equal(requests.length, 3);
   assert.deepEqual(markdowns(sent), [BLOCKED_SCHEDULE_ANSWER]);
 });
 

@@ -624,6 +624,8 @@ async function runTask(
     const attempted = new Set<string>();
     // 这次真的建成、改成的定时任务（工具回执的第一行）：回答说得不对被拦下时，照这个告诉大家实际做成了什么，免得重复建
     const scheduleDone: string[] = [];
+    // 这次定时任务工具（建、改、列表）的结果原文：回答里说的编号只认这里的，文档、代码里碰巧写着的 T4 不算
+    const scheduleTexts: string[] = [];
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
     // 这次取出来的之前查到的结果：取到代码工具的结果算读过代码，原文算整理的依据（代码工具的证据里只有代码位置，没有列出来的路径原文）
@@ -725,6 +727,9 @@ async function runTask(
           succeeded.add(tool.spec.name);
           if (tool.spec.name === SCHEDULE_CREATE_TOOL || tool.spec.name === SCHEDULE_CHANGE_TOOL) {
             scheduleDone.push(output.split("\n")[0]!);
+          }
+          if (SCHEDULE_TOOLS.has(tool.spec.name)) {
+            scheduleTexts.push(output);
           }
           if (tool.spec.name === MERGE_TOOL && /^已合并|已经合并过了/.test(output)) {
             mergedNow = true;
@@ -920,7 +925,7 @@ async function runTask(
       // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
       ...(restate || scheduled
         ? []
-        : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, succeeded, () => toolTexts.join("\n"), toolNames, () => scheduleDone))]),
+        : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, succeeded, () => scheduleTexts.join("\n"), toolNames, () => scheduleDone))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -1142,7 +1147,7 @@ async function runTask(
       result.finish !== "filtered" &&
       answer !== BLOCKED_OPS_ANSWER &&
       !blockedCode &&
-      unbackedScheduleClaims(shown, succeeded, toolTexts.join("\n")).length > 0;
+      unbackedScheduleClaims(shown, succeeded, scheduleTexts.join("\n")).length > 0;
     if (blockedSchedule) {
       logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
       answer = blockedScheduleAnswer(scheduleDone);
@@ -2329,14 +2334,15 @@ const CLAIM_CLAUSE = new RegExp(String.raw`^[^，,。；;！!？?\n]*`);
  * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
  */
 const CLAIM_GAP = String.raw`(?:(?!文档|表格|页面|知识库|多维表|合并请求|分支|经验|记忆|规矩)[^，,。；;！!？?\n《》])`;
-/** 「之前已经建好」「上次已暂停」说的是以前的 */
-const NOT_EARLIER = String.raw`(?<!之前|此前|以前|上次|原来|早先)`;
+/** 「之前已经建好」「上次已暂停」说的是以前的：同一个分句里说法前面有这些词的不算 */
+const EARLIER = /之前|此前|以前|上次|原来|早先/;
+const CLAUSE_BEFORE = /[^，,。；;！!？?\n]*$/;
 
 function scheduleClaim(verb: string): RegExp {
   return new RegExp(
     [
       // 「已建好定时任务 T2」「已经帮你设置每天 15:34 的提醒」「已暂停 T3」。「已建好的定时任务有…」说的是有哪些，不算
-      String.raw`${NOT_EARLIER}已经?\s*(?:(?:帮你|给你|为你)\s*)?${verb}(?![好了]*的)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
+      String.raw`已经?\s*(?:(?:帮你|给你|为你)\s*)?${verb}(?![好了]*的)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
       // 「帮你建好了定时任务」「给你暂停了 T3」。「我帮你建一个定时任务吧」是在问，不算
       String.raw`(?:帮你|给你|为你)\s*${verb}(?:好|了|掉)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
       // 「定时任务 T2 已建好」「提醒已设置」「T3 已被你暂停」「定时任务建好了」「T3 暂停了」。「T3 暂停了吗」是在问
@@ -2356,7 +2362,7 @@ const SCHEDULE_CHANGED_CLAIM = scheduleClaim(String.raw`(?:暂停|恢复|取消|
  * 调成了的，说到的编号（T2）还要在这次的工具结果里：建了 T3 说成 T4 不算。
  * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算；
  * 说暂停、取消、恢复了的，列表里那个任务现在也得是这个状态。
- * known 是这次工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
+ * known 是这次定时任务工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
   const kinds: Array<"create" | "change"> = [];
@@ -2366,7 +2372,9 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
   ] as const) {
     // 编号常写在说法后面（「已建好定时任务 T2」）：看到这个分句结束
-    const claims = [...answer.matchAll(pattern)].map((match) => answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0]);
+    const claims = [...answer.matchAll(pattern)]
+      .filter((match) => !EARLIER.test(answer.slice(0, match.index).match(CLAUSE_BEFORE)?.[0] ?? ""))
+      .map((match) => answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0]);
     const backed = (claim: string) => {
       const ids = [...claim.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
       if (succeeded.has(tool)) {
