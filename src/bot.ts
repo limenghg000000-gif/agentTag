@@ -658,6 +658,8 @@ async function runTask(
     const scheduleDone: string[] = [];
     // 这次定时任务工具（建、改、列表）的结果原文：回答里说的编号只认这里的，文档、代码里碰巧写着的 T4 不算
     const scheduleTexts: string[] = [];
+    // 这次真调成了的定时任务工具：从 topic_earlier_results 拿回来的以前的结果不算（那次建的不是这次建的）
+    const scheduleRan = new Set<string>();
     // 这次工具结果的原文（模型看到的部分）：回答里写的合并请求编号要在这里、话题里或提问里出现过。模型自己写进群记忆的不算
     const toolTexts: string[] = [];
     // 这次取出来的之前查到的结果：取到代码工具的结果算读过代码，原文算整理的依据（代码工具的证据里只有代码位置，没有列出来的路径原文）
@@ -764,6 +766,7 @@ async function runTask(
             }
           }
           if (SCHEDULE_TOOLS.has(tool.spec.name)) {
+            scheduleRan.add(tool.spec.name);
             // 建好的回执只留第一行：后面「到点做的事」是建任务的人写的原话，可能有好几行，不能当回执、列表用
             scheduleTexts.push(tool.spec.name === SCHEDULE_CREATE_TOOL ? (output.split("\n")[0] ?? "") : output);
           }
@@ -966,7 +969,7 @@ async function runTask(
       // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
       ...(restate || scheduled
         ? []
-        : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, succeeded, () => scheduleTexts.join("\n"), toolNames, () => scheduleDone))]),
+        : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, scheduleRan, () => scheduleTexts.join("\n"), toolNames, () => scheduleDone))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -1190,7 +1193,7 @@ async function runTask(
       result.finish !== "filtered" &&
       answer !== BLOCKED_OPS_ANSWER &&
       !blockedCode &&
-      unbackedScheduleClaims(shown, succeeded, scheduleTexts.join("\n")).length > 0;
+      unbackedScheduleClaims(shown, scheduleRan, scheduleTexts.join("\n")).length > 0;
     if (blockedSchedule) {
       logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
       answer = blockedScheduleAnswer(scheduleDone);
@@ -2454,6 +2457,9 @@ const FOLLOWING_CLAIMS = [
 
 type ScheduleClaim = { kind: "create" | "change"; said: string; ids: string };
 
+/** 括号里顺带提的（「已建好定时任务 T3（跟 T4 一样每周跑）」里的 T4）不归这个说法 */
+const ASIDE = /（[^）]*）|\([^)]*\)/g;
+
 /** 回答里说做成了的定时任务改动：说的是什么（看是哪种改动）、连着后面归它的字（找编号）。说以前的不算 */
 function scheduleClaims(answer: string): ScheduleClaim[] {
   const claims: ScheduleClaim[] = [];
@@ -2468,11 +2474,11 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
       }
       // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
       const [own = "", ...following] = tailGroups(answer.slice(match.index + match[0].length));
-      claims.push({ kind, said: match[0], ids: match[0] + own });
+      claims.push({ kind, said: match[0], ids: match[0] + own.replace(ASIDE, "") });
       for (const group of following) {
         const [next, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, group.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
         if (next !== undefined && said !== undefined) {
-          claims.push({ kind: next, said, ids: group });
+          claims.push({ kind: next, said, ids: group.replace(ASIDE, "") });
         }
       }
     }
@@ -2497,9 +2503,9 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
       return false;
     }
     if (kind === "create") {
-      // 这次建成了的，说到的编号里得有这次建的那个：建了 T3、列表里原来就有 T4，说「已建好定时任务 T4」不算
+      // 这次建成了的，说建好的编号都得是这次建的：建了 T3、列表里原来就有 T4，说「已建好定时任务 T4」「已建好 T3 和 T4」都不算
       const created = (id: string) => lines.some((line) => line.startsWith(`已建好定时任务 ${id}（`));
-      return ids.every(listed) && (!succeeded.has(SCHEDULE_CREATE_TOOL) || ids.length === 0 || ids.some(created));
+      return ids.every(succeeded.has(SCHEDULE_CREATE_TOOL) ? created : listed);
     }
     // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
     // 暂停了说成取消、列表写着还在跑说成已取消，都不算

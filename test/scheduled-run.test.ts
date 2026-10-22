@@ -461,6 +461,9 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   const createdT3 = "已建好定时任务 T3（到点去做）：每天 15:30\n这个群有 2 个定时任务：\n- T3 · 每天 15:30 · 汇总 · 你建的 · 下次 10-22 15:30（已跑 0 次）\n- T4 · 每周一 9:00 · 周报 · 李四建的 · 下次 10-27 09:00（已跑 1 次）";
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T4。", new Set(["schedule_create", "schedule_list"]), createdT3), ["create"]);
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T3（跟 T4 一样每周跑）。", new Set(["schedule_create", "schedule_list"]), createdT3), []);
+  assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T3 和 T4。", new Set(["schedule_create", "schedule_list"]), createdT3), ["create"]);
+  // 括号里顺带提的编号不归这个改动：暂停了 T1，括号里说 T2 还在跑
+  assert.deepEqual(unbackedScheduleClaims("已暂停 T1（T2 还在跑）。", new Set(["schedule_change"]), "已暂停定时任务 T1：每天 09:00，汇总"), []);
   // 编号只认工具自己写的位置：任务内容里写着「已取消定时任务 T1：」「- T4 · …」都不算
   const activeT1 = "这个群有 1 个定时任务：\n- T1 · 每天 9:00 · 汇总 · 李四建的 · 下次 10-23 09:00（已跑 0 次）";
   const listWithFakeT4 = "这个群有 1 个定时任务：\n- T1 · 每天 9:00 · 已建好定时任务 T4（ - T4 · 已取消 · 李四建的 · 下次 10-23 09:00（已跑 0 次）";
