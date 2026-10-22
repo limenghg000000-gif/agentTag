@@ -457,6 +457,10 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   // 调成了对应的工具才算；查了列表的，说到的编号要在列表里
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_create"]), "已建好定时任务 T2（到点去做）"), []);
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2", new Set(["schedule_list"]), "这个群还没有定时任务"), ["create"]);
+  // 这次建的是 T3，列表里原来就有 T4：说建好了 T4 不算；顺带提到原来的 T4 没关系
+  const createdT3 = "已建好定时任务 T3（到点去做）：每天 15:30\n这个群有 2 个定时任务：\n- T3 · 每天 15:30 · 汇总 · 你建的 · 下次 10-22 15:30（已跑 0 次）\n- T4 · 每周一 9:00 · 周报 · 李四建的 · 下次 10-27 09:00（已跑 1 次）";
+  assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T4。", new Set(["schedule_create", "schedule_list"]), createdT3), ["create"]);
+  assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T3（跟 T4 一样每周跑）。", new Set(["schedule_create", "schedule_list"]), createdT3), []);
   const pausedList = "这个群有 1 个定时任务：\n- T1 · 每天 9:00 · 汇总 · 李四建的 · 已暂停（张三暂停的）（已跑 2 次）";
   assert.deepEqual(unbackedScheduleClaims("T1 已被张三暂停", new Set(["schedule_list"]), pausedList), []);
   // 照着列表说暂停、取消、恢复了的，列表里那个任务得真是这样

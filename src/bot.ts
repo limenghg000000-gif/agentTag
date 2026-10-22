@@ -2454,7 +2454,9 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
       return false;
     }
     if (kind === "create") {
-      return ids.every(listed);
+      // 这次建成了的，说到的编号里得有这次建的那个：建了 T3、列表里原来就有 T4，说「已建好定时任务 T4」不算
+      const created = (id: string) => new RegExp(`^已建好定时任务 ${id}(?!\\d)`, "m").test(known);
+      return ids.every(listed) && (!succeeded.has(SCHEDULE_CREATE_TOOL) || ids.length === 0 || ids.some(created));
     }
     // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
     // 暂停了说成取消、列表写着还在跑说成已取消，都不算
