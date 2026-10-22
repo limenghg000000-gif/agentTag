@@ -4265,6 +4265,24 @@ test("按群：谁能点「保存」看卡片所在群的写权限名单；这�
   }
 });
 
+test("按群：卡片发出后管理员给这个群关了经验库，名单里的人再点「保存」也不存，卡片写已失效", async () => {
+  let current: KnowledgeScope = { approvers: new Set(["ou_ops"]), aiops: true, knowledge: true };
+  const { backend, desk, sent, tool, click, lastCard } = deskSetup({ scope: () => current });
+  await tool("knowledge_propose").run(code8, { signal });
+  const card = (sent[0].input as { card: any }).card;
+  current = { ...current, knowledge: false };
+  await desk.handleCardAction(click(card, "save", "ou_ops", "运维"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 0);
+  assert.match(cardText(lastCard()), /这个群已经不用团队经验库了（管理员在管理群里关掉了），这张卡片已经失效/);
+  // 再打开也不认这张旧卡片
+  current = { ...current, knowledge: true };
+  await desk.handleCardAction(click(card, "save", "ou_ops", "运维"));
+  await desk.idle();
+  assert.equal(backend.entries.length, 0);
+  assert.match(cardText(lastCard()), /这张卡片已经失效/);
+});
+
 test("按群：不能用 aiops 的群回答前不查 aiops 经验库，起草不同步、不提案例，硬填 aiops_id 也不归档 aiops 里的", async () => {
   const { desk, calls, tool, sent } = deskSetup({ scope: () => ({ approvers: new Set(["ou_admin"]), aiops: false }) });
   const found = await desk.lookup("gateway code=8", task);

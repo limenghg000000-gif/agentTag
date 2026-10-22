@@ -268,6 +268,50 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
   };
 }
 
+/** 群里的一个人：管理群的设置卡片上从群成员里选人用 */
+export interface ChatMember {
+  openId: string;
+  name?: string;
+}
+
+/**
+ * 群名和群成员，管理群的设置卡片用。群名要 im:chat:readonly（获取群信息），群成员要 im:chat.members:read（获取群成员列表）；
+ * 没开权限、机器人不在群里时抛 FeishuApiError，卡片上退回用群的编号、只列已经在名单里的人
+ */
+export interface ChatDirectory {
+  chatName(chatId: string): Promise<string | undefined>;
+  /** 群成员（不含机器人），最多 limit 个 */
+  members(chatId: string, limit: number): Promise<ChatMember[]>;
+}
+
+export function createChatDirectory(client: Client): ChatDirectory {
+  return {
+    async chatName(chatId) {
+      const data = await callFeishu(() => client.im.v1.chat.get({ path: { chat_id: chatId } }) as Promise<ApiResponse<{ name?: string }>>);
+      return data?.name || undefined;
+    },
+    async members(chatId, limit) {
+      const members: ChatMember[] = [];
+      let pageToken: string | undefined;
+      do {
+        const data = await callFeishu(() =>
+          client.im.v1.chatMembers.get({
+            path: { chat_id: chatId },
+            params: { member_id_type: "open_id", page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+          }),
+        );
+        for (const item of data?.items ?? []) {
+          if (item.member_id && item.member_id.startsWith("ou_")) {
+            members.push({ openId: item.member_id, ...(item.name ? { name: item.name } : {}) });
+          }
+        }
+        pageToken = data?.has_more ? data.page_token : undefined;
+      } while (pageToken && members.length < limit);
+      return members.slice(0, limit);
+    },
+  };
+}
+
 /** 消息里图片的 image_key（SDK 转文本时记在 resources 里） */
 export function imageKeysOf(message: Pick<NormalizedMessage, "resources">): string[] {
   return (message.resources ?? []).filter((resource) => resource.type === "image").map((resource) => resource.fileKey);
