@@ -502,6 +502,11 @@ console.log(
     ? `写权限：只有 ${config.feishu.writeAllowedUsers.size} 人能让机器人改文档、改代码（WRITE_ALLOWED_USERS），其他人只能问和读`
     : "写权限：群里所有人都能让机器人改文档、改代码。要限制就在 WRITE_ALLOWED_USERS 里填允许的人的 open_id",
 );
+console.log(
+  config.feishu.memoryEditors
+    ? `改群记忆：只有 ${config.feishu.memoryEditors.size} 人能让机器人记、改、删群记忆（MEMORY_EDITORS），其他人只能看`
+    : "改群记忆：群里所有人都能让机器人记、改、删（和 Claude Tag 一样）。要限制就在 MEMORY_EDITORS 里填允许的人的 open_id",
+);
 if (config.webSearch) {
   console.log(`联网搜索已开启，用百炼的 ${config.webSearch.model} 搜索`);
 } else {
