@@ -155,6 +155,52 @@ const FUTURE_RULE = new RegExp(FUTURE_RULE_PARTS.join("|"));
  */
 const NOW_REQUEST =
   /(?:(?<!从)现在(?!起)|这次|眼下|马上|立刻|立即|顺便|顺手)[^，。,.!?！？\n]{0,6}?(?:查|看|排查|分析|处理|跟进)|(?:查|看|排查|分析|处理)(?:一?下|看)|(?:帮我|给我|替我)[^，。,.!?！？\n]{0,4}?(?:查|看|排查|分析|处理|定位|找|解释)/;
+/** 指着眼前这件：「这个」「上面」「刚才那个」（「这个群」说的是群，不算） */
+const THIS_ONE = String.raw`(?:这个|这条|这些|上面|刚才|那个|那条)(?!群)`;
+/**
+ * 定规矩的那一小句里也算现在就要查的：说了「现在」「这次」「顺便」查，或者指着眼前这件要查（「这个」「上面那个」「刚才」）。
+ * 规矩本身说的「直接帮我查」「帮忙查一下」不算：「以后报错直接帮我查」是在定以后怎么做
+ */
+const NOW_IN_RULE = new RegExp(
+  [
+    String.raw`(?:(?<!从)现在(?!起)|这次|眼下|马上|立刻|立即|顺便|顺手)[^，。,.!?！？\n]{0,6}?(?:查|看|排查|分析|处理|跟进)`,
+    String.raw`${THIS_ONE}[^，。,.!?！？\n]{0,12}?(?:查|看|排查|分析|处理|定位)`,
+    String.raw`(?:查|看|排查|分析|处理|定位)[^，。,.!?！？\n]{0,6}?${THIS_ONE}`,
+  ].join("|"),
+);
+const POINTS_AT_THIS = new RegExp(THIS_ONE);
+const RULE_CLAUSES = new RegExp(FUTURE_RULE.source, "g");
+const RULE_CLAUSE_END = /[，。,.;；!?！？\n]/;
+/** 逗号后面接着说这条规矩怎么做的：「以后报错不用 @ 你，直接帮我查」 */
+const RULE_GOES_ON = /^[，,]\s*(?:直接|也|就|都|一律|主动|自己)/;
+
+/**
+ * 定规矩的这句话里还要它现在就查。定规矩的那一小句（从认出规矩的地方到下一个逗号、句号，逗号后面接着说「直接……」的也算）只看 NOW_IN_RULE，别的部分看 NOW_REQUEST：
+ * 「以后报错直接帮我查」「以后告警直接帮忙查一下」是规矩本身；「以后告警别管，帮我分析 Redis 带宽」「以后告警别管先帮我看下这个 Redis」要现在查
+ */
+function asksNow(question: string): boolean {
+  const rules: string[] = [];
+  let rest = "";
+  let from = 0;
+  for (const match of question.matchAll(RULE_CLAUSES)) {
+    if (match.index < from) {
+      continue;
+    }
+    const after = match.index + match[0].length;
+    const tail = question.slice(after).search(RULE_CLAUSE_END);
+    let end = tail < 0 ? question.length : after + tail;
+    while (RULE_GOES_ON.test(question.slice(end))) {
+      const next = question.slice(end + 1).search(RULE_CLAUSE_END);
+      end = next < 0 ? question.length : end + 1 + next;
+    }
+    rest += `${question.slice(from, match.index)}，`;
+    rules.push(question.slice(match.index, end));
+    from = end;
+  }
+  rest += question.slice(from);
+  // 规矩以外的部分指着眼前这件（「……，上面这个也是」），也算要现在查
+  return NOW_REQUEST.test(rest) || POINTS_AT_THIS.test(rest) || rules.some((clause) => NOW_IN_RULE.test(clause));
+}
 /** 这句话是在问（「这个告警不用管吗」「为什么不用 @ 你也查了」），不是在定规矩 */
 const ASKING = /[?？]\s*$|[吗么呢][。.!！~～\s]*$|为什么|为啥|怎么(?:回事|办|了)|咋(?:回事|办|了)|是不是|能不能|可不可以|会不会/;
 /** 只是在定规矩时给的工具：记、改、删、查群记忆 */
@@ -617,7 +663,7 @@ async function runTask(
       scheduled === undefined &&
       options.proactive !== true &&
       FUTURE_RULE.test(question) &&
-      !NOW_REQUEST.test(question) &&
+      !asksNow(question) &&
       !ASKING.test(question.trim()) &&
       !SCHEDULE_TALK.test(question) &&
       !CHANGE_REQUEST.test(question) &&

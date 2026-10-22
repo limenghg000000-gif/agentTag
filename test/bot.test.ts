@@ -920,7 +920,18 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
   });
   const memoryTools = ["memory_save", "memory_update", "memory_delete"];
 
-  const rules = ["改一下线上报错不需要 @ 你直直接帮忙查", "记住：以后告警别管", "从现在起，报错直接帮忙查", "下次线上报错直接帮忙查", "你以后只回 @ 你的消息"];
+  const rules = [
+    "改一下线上报错不需要 @ 你直直接帮忙查",
+    "记住：以后告警别管",
+    "从现在起，报错直接帮忙查",
+    "下次线上报错直接帮忙查",
+    "你以后只回 @ 你的消息",
+    // 规矩本身说的「直接帮我查」「帮忙查一下」不算现在就要查
+    "以后报错直接帮我查",
+    "以后告警直接帮忙查一下",
+    "从现在起报错不用 @ 你，直接帮我看看",
+    "以后这个群的报错直接帮我查",
+  ];
   for (const [i, question] of rules.entries()) {
     await handle(message(question, { messageId: `om_r${i}` }));
     assert.deepEqual(requests[i].tools?.map((t) => t.name), memoryTools, question);
@@ -942,6 +953,9 @@ test("只是在定规矩（没说现在就查、不是在问）：只给记群�
     "这个报错不用管，Redis 带宽打满的原因是什么",
     "这个报错不用管，接着排查 Redis 带宽",
     "你别管这个，接着排查 Redis",
+    "以后告警别管先帮我看下这个 Redis",
+    "以后报错直接帮我查，现在先查一下 Redis",
+    "以后这类报错直接帮我查，上面这个也是",
   ];
   for (const [i, question] of asks.entries()) {
     const n = rules.length + i;
