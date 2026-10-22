@@ -2334,9 +2334,13 @@ const CLAIM_CLAUSE = new RegExp(String.raw`^[^，,。；;！!？?\n]*`);
  * 「已建好文档《提醒事项》」建的是文档，标题里的「提醒」不算
  */
 const CLAIM_GAP = String.raw`(?:(?!文档|表格|页面|知识库|多维表|合并请求|分支|经验|记忆|规矩)[^，,。；;！!？?\n《》])`;
-/** 「之前已经建好」「上次已暂停」说的是以前的：同一个分句里说法前面有这些词的不算 */
-const EARLIER = /之前|此前|以前|上次|原来|早先/;
+/**
+ * 「之前已经建好」「上次已暂停」说的是以前的。「原来的 T1 已取消」「之前的提醒已取消」里的「原来的」说的是哪个任务，取消是这次的，照样要查
+ */
+const EARLIER = /(?:之前|此前|以前|上次|原来|早先)(?!的)/;
 const CLAUSE_BEFORE = /[^，,。；;！!？?\n]*$/;
+/** 先说定时任务、再说做了什么的写法（「T1 已取消」） */
+const OBJECT_FIRST = new RegExp(String.raw`^${SCHEDULE_OBJECT}`);
 
 function scheduleClaim(verb: string): RegExp {
   return new RegExp(
@@ -2346,7 +2350,8 @@ function scheduleClaim(verb: string): RegExp {
       // 「帮你建好了定时任务」「给你暂停了 T3」。「我帮你建一个定时任务吧」是在问，不算
       String.raw`(?:帮你|给你|为你)\s*${verb}(?:好|了|掉)${CLAIM_GAP}{0,30}?${SCHEDULE_OBJECT}`,
       // 「定时任务 T2 已建好」「提醒已设置」「T3 已被你暂停」「定时任务建好了」「T3 暂停了」。「T3 暂停了吗」是在问
-      String.raw`${SCHEDULE_OBJECT}${CLAIM_GAP}{0,6}?(?:已经?\s*(?:被${CLAIM_GAP}{0,8}?)?${verb}|${verb}(?:好了|了|成功)(?![吗么呢]))`,
+      // 「定时任务创建成功后会通知你」说的是以后
+      String.raw`${SCHEDULE_OBJECT}${CLAIM_GAP}{0,6}?(?:已经?\s*(?:被${CLAIM_GAP}{0,8}?)?${verb}|${verb}(?:好了|了|成功)(?![吗么呢后]|以后|之后))`,
     ].join("|"),
     "g",
   );
@@ -2361,7 +2366,7 @@ const SCHEDULE_CHANGED_CLAIM = scheduleClaim(String.raw`(?:暂停|恢复|取消|
  * 回答里说建好、暂停、恢复、取消了定时任务，这次却没调成对应的工具：建要 schedule_create，暂停、恢复、取消要 schedule_change。
  * 调成了的，说到的编号（T2）还要在这次的工具结果里：建了 T3 说成 T4 不算。
  * 只查了 schedule_list 的（照着列表说现状：「T3 已被张三暂停」），每一处都要写着编号、编号在列表里：列表说没有定时任务，说「已为你设置每天 15:34 的提醒」不算；
- * 说暂停、取消、恢复了的，列表里那个任务现在也得是这个状态。
+ * 说暂停、取消、恢复了的，那个任务现在也得是这个状态（照这次的回执，没改过的照列表）。
  * known 是这次定时任务工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
@@ -2371,24 +2376,25 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     ["create", SCHEDULE_CREATED_CLAIM, SCHEDULE_CREATE_TOOL],
     ["change", SCHEDULE_CHANGED_CLAIM, SCHEDULE_CHANGE_TOOL],
   ] as const) {
-    // 编号常写在说法后面（「已建好定时任务 T2」）：看到这个分句结束
+    // 说以前的不算：先说做了什么的（「之前已经帮你建好了 T3」）看前面，先说任务的（「T1 之前已取消」）看说法里面
     const claims = [...answer.matchAll(pattern)]
-      .filter((match) => !EARLIER.test(answer.slice(0, match.index).match(CLAUSE_BEFORE)?.[0] ?? ""))
-      .map((match) => answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0]);
-    const backed = (claim: string) => {
-      const ids = [...claim.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
-      if (succeeded.has(tool)) {
-        return ids.every(listed);
-      }
-      if (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0) {
+      .filter((match) =>
+        OBJECT_FIRST.test(match[0]) ? !EARLIER.test(match[0]) : !EARLIER.test(answer.slice(0, match.index).match(CLAUSE_BEFORE)?.[0] ?? ""),
+      )
+      // 编号常写在说法后面（「已建好定时任务 T2」）：看到这个分句结束。是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
+      .map((match) => ({ said: match[0], clause: answer.slice(match.index).match(CLAIM_CLAUSE)?.[0] ?? match[0] }));
+    const backed = ({ said, clause }: { said: string; clause: string }) => {
+      const ids = [...clause.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
+      if (!succeeded.has(tool) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
         return false;
       }
       if (kind === "create") {
         return ids.every(listed);
       }
-      // 照着列表说暂停、取消、恢复了的，列表里这个任务现在得真是这样：列表写着「下次 …」（还在跑），说「已取消 T1」不算
-      const state = LISTED_STATES.find(([verb]) => verb.test(claim))?.[1];
-      return state !== undefined && ids.every((id) => state.test(listedState(known, id) ?? ""));
+      // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
+      // 暂停了说成取消、列表写着还在跑说成已取消，都不算
+      const state = CHANGE_STATES.find(([verb]) => verb.test(said))?.[1];
+      return state !== undefined && ids.every((id) => state.test(taskState(known, id) ?? ""));
     };
     if (claims.some((claim) => !backed(claim))) {
       kinds.push(kind);
@@ -2397,17 +2403,24 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
   return kinds;
 }
 
-/** 说的是哪种改动，列表里那一行的状态该是什么样（schedule_list 的写法：「下次 10-23 09:00」「已暂停」「连着失败，自动暂停了」「已取消」） */
-const LISTED_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
-  [/恢复/, /^下次 /],
+/**
+ * 说的是哪种改动，这个任务现在该是什么样。schedule_change 的回执开头是「已暂停」「已恢复」「已取消」；
+ * schedule_list 那一行最后一段是「下次 10-23 09:00」「已暂停」「连着失败，自动暂停了」「已取消」
+ */
+const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
+  [/恢复/, /^(?:下次 |已恢复)/],
   [/取消|删除|删掉/, /^已取消/],
   [/暂停|停掉|停用|关掉/, /暂停/],
 ];
 
-/** schedule_list 结果里这个编号那一行的状态（最后一段） */
-function listedState(known: string, id: string): string | undefined {
-  const line = known.split("\n").find((text) => text.startsWith(`- ${id} · `));
-  return line?.split(" · ").at(-1);
+/** 这个编号现在的状态：这次改过的看最后一条回执，没改过的看列表那一行的最后一段 */
+function taskState(known: string, id: string): string | undefined {
+  const lines = known.split("\n");
+  const receipt = lines.findLast((text) => new RegExp(`^已(?:暂停|恢复|取消)定时任务 ${id}[：:]`).test(text));
+  if (receipt !== undefined) {
+    return receipt.slice(0, 3);
+  }
+  return lines.find((text) => text.startsWith(`- ${id} · `))?.split(" · ").at(-1);
 }
 
 /**

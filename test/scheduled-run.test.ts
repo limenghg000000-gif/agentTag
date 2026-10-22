@@ -437,6 +437,7 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
     "之前已经建好的定时任务 T2 还在",
     "之前已经帮你建好了定时任务 T3，不用重复创建。",
     "上次给你暂停了 T3，要恢复请说「恢复定时任务 T3」",
+    "定时任务创建成功后会在群里通知你。",
     "T3 暂停了吗？我查一下",
     "服务已恢复，告警提醒已取消",
     "这次没建成定时任务：这句没 @ 我",
@@ -459,6 +460,17 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   assert.deepEqual(unbackedScheduleClaims("T1 已暂停", new Set(["schedule_list"]), activeList), ["change"]);
   assert.deepEqual(unbackedScheduleClaims("T1 已恢复，下次 10-23 09:00", new Set(["schedule_list"]), activeList), []);
   assert.deepEqual(unbackedScheduleClaims("T1 已恢复", new Set(["schedule_list"]), pausedList), ["change"]);
+  // 是哪种改动只看说法本身：括号里说能恢复，不算说恢复了
+  assert.deepEqual(unbackedScheduleClaims("T1 已暂停（需要时可以恢复）。", new Set(["schedule_list"]), pausedList), []);
+  // 调成了 schedule_change 的，说的改动要和回执一样：暂停了说成取消不算
+  const pausedReceipt = "已暂停定时任务 T1：每天 09:00，汇总";
+  assert.deepEqual(unbackedScheduleClaims("已取消定时任务 T1。", new Set(["schedule_change"]), pausedReceipt), ["change"]);
+  assert.deepEqual(unbackedScheduleClaims("已暂停定时任务 T1。", new Set(["schedule_change"]), pausedReceipt), []);
+  // 「原来的 T1」说的是哪个任务，取消是这次的：没调 schedule_change 就不算
+  assert.deepEqual(
+    unbackedScheduleClaims("已建好定时任务 T3，原来的定时任务 T1 已取消。", new Set(["schedule_create"]), "已建好定时任务 T3（到点去做）"),
+    ["change"],
+  );
   assert.deepEqual(unbackedScheduleClaims("已建好定时任务 T2，已暂停 T1", new Set(["schedule_create"]), "已建好定时任务 T2"), ["change"]);
   // 只查了列表的：要写着列表里有的编号，列表说没有定时任务时没写编号的说法也不算
   assert.deepEqual(unbackedScheduleClaims("已为你设置每天 15:34 的提醒。", new Set(["schedule_list"]), "这个群还没有定时任务。"), ["create"]);
