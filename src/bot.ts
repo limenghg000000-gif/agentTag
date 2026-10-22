@@ -41,10 +41,18 @@ import type { TaskRegistry } from "./tasks.js";
 import { containsSecret, maskPersonal } from "./knowledge.js";
 import { CHAT_HISTORY_TOOL } from "./tools/chat-history.js";
 import { CONFLICT_TOOL } from "./tools/conflicts.js";
+import { DOC_EDIT_TOOL } from "./tools/docs.js";
 import type { KnowledgeDesk, KnowledgeLookup } from "./tools/knowledge.js";
 import { createMemoryTools } from "./tools/memory.js";
 import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-threads.js";
-import { SCHEDULE_CHANGE_TOOL, SCHEDULE_LIST_TOOL, SCHEDULE_TOOL_NAMES } from "./tools/schedules.js";
+import {
+  checkScheduledDocEdit,
+  createScheduleAlertTool,
+  SCHEDULE_ALERT_TOOL,
+  SCHEDULE_CHANGE_TOOL,
+  SCHEDULE_LIST_TOOL,
+  SCHEDULE_TOOL_NAMES,
+} from "./tools/schedules.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
 /**
@@ -366,6 +374,10 @@ export interface ScheduledRun {
   creatorName?: string;
   /** 建的时候就只能读（建的人当时不在写权限名单里、带着群聊建的）：到点也只给读的工具 */
   readOnly?: boolean;
+  /** 建的人建任务时自己贴的文档链接：到点改文档只能追加到这篇的文末。没有的到点不能改已有文档 */
+  appendDoc?: string;
+  /** 建的人说了「有异常 @ 我」：给模型一个工具，查到异常时调，调用方跑完以后 @ 建的人 */
+  alert?: (summary: string) => void;
   /** 跑完时告诉调用方结果 */
   onEnd?: (phase: "done" | "failed" | "stopped") => void;
 }
@@ -601,7 +613,9 @@ async function runTask(
         }
       }
     };
-    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools].map(
+    // 定时任务建的人说了「有异常 @ 我」：查到异常时调，@ 谁由程序定（只 @ 建的人）
+    const alertTools = scheduled?.alert ? [createScheduleAlertTool(scheduled.alert, scheduled.creatorName ?? context.askerName)] : [];
+    const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools, ...alertTools].map(
       (tool): Tool => ({
         ...tool,
         run: async (args, ctx) => {
@@ -621,9 +635,15 @@ async function runTask(
             );
           }
           checkRestatedWrite(tool, args);
+          // 定时任务到点改文档只能追加到建任务时点名的那篇的文末（没人看着，不改、不删已有内容）。
+          // 这样的追加读过群聊也可以：群里埋的话最多让汇总里多几句，和新建文档一样，碰不到已有内容
+          const scheduledAppend = scheduled !== undefined && tool.spec.name === DOC_EDIT_TOOL;
+          if (scheduledAppend) {
+            checkScheduledDocEdit(args, scheduled.appendDoc);
+          }
           if (
             readChat &&
-            ((tool.writes && tool.spec.name !== "feishu_doc_create") ||
+            ((tool.writes && tool.spec.name !== "feishu_doc_create" && !scheduledAppend) ||
               tool.spec.name === SCHEDULE_CHANGE_TOOL ||
               (MEMORY_WRITE_TOOLS.has(tool.spec.name) && !asksToRemember))
           ) {
@@ -649,6 +669,7 @@ async function runTask(
               ...ctx,
               onFacts: (found) => (facts = [...facts, ...found]),
               writable: hasWrites && !readOnly && !readChat && asksToWrite,
+              question,
             });
           } catch (err) {
             // 代码工具找到了文件、只是读不了（太大、二进制）：报错里带着这个文件，算查到了路径，不算查到哪一行
@@ -748,7 +769,9 @@ async function runTask(
     // 这句话本身说了要改文档、改代码、写进文档（到点跑的定时任务看任务内容，建任务时看建的人说的这句）
     const asksToWrite = CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question);
     // 定时任务到点跑的：没人看着，建任务时写好的这句话没说要改文档的只给读的工具；建的时候就只能读（不在写权限名单里、带着群聊建的、建的人没说要改的）的照样只能读
-    const scheduledReadOnly = scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || !asksToWrite);
+    // 建的人点名了要追加的文档的，任务内容（模型写的）没写「写进文档」也给：要不要写由建的人那句话定
+    const scheduledReadOnly =
+      scheduled !== undefined && hasWrites && !noPermission && (scheduled.readOnly === true || (!asksToWrite && scheduled.appendDoc === undefined));
     const readOnly = noPermission || followUp || ambientOnly || unaddressed || scheduledReadOnly;
     // 群记忆谁都能让机器人记、删，不归写权限管，但会一直带进以后的提问：带上了群聊、或者是没 @ 的跟聊时，
     // 只有这句话本身让它记住、忘掉、改记忆，或者在给它定以后的规矩，才给记、改、删记忆的工具（群聊里、话题里别人埋的「记住…」「忘掉 #3」不算）
@@ -769,8 +792,9 @@ async function runTask(
     const taskTools = allTools.filter(
       (tool) =>
         !(readOnly && tool.writes) &&
-        // 定时任务到点跑的不改代码、不开合并请求、不合并
+        // 定时任务到点跑的不改代码、不开合并请求、不合并；建任务时没点名要追加的文档的，不给改已有文档
         !(scheduled && tool.writes && isCodeTool(tool.spec.name)) &&
+        !(scheduled && tool.spec.name === DOC_EDIT_TOOL && scheduled.appendDoc === undefined) &&
         // 带着群聊的不给暂停、恢复、取消定时任务
         !(tool.spec.name === SCHEDULE_CHANGE_TOOL && modelHistory.some(isChatContext)) &&
         !(
@@ -874,7 +898,18 @@ async function runTask(
         ...(ambientOnly ? { ambientOnly: true } : {}),
         ...(chatDropped ? { chatDropped: true } : {}),
         ...(unaddressed ? { unaddressed: true } : {}),
-        ...(scheduled ? { scheduled: { label: scheduled.label, schedule: scheduled.schedule, creatorName: scheduled.creatorName ?? context.askerName, readOnly: scheduledReadOnly } } : {}),
+        ...(scheduled
+          ? {
+              scheduled: {
+                label: scheduled.label,
+                schedule: scheduled.schedule,
+                creatorName: scheduled.creatorName ?? context.askerName,
+                readOnly: scheduledReadOnly,
+                ...(scheduled.appendDoc && toolNames.includes(DOC_EDIT_TOOL) ? { appendDoc: scheduled.appendDoc } : {}),
+                ...(alertTools.length > 0 ? { alert: true } : {}),
+              },
+            }
+          : {}),
         ...(memoryLocked && memory ? { memoryLocked: true } : {}),
         followUp,
         restate,
@@ -1551,7 +1586,15 @@ export function unseenCodeCitations(answer: string, seen: CitationCheck): CodeCi
  * 结果里的内容是模型自己写进去的工具：记忆（记的、查的都是之前模型写的）、最近话题（之前的回答）、定时任务（回执和列表里是模型写的任务内容）。
  * 它们结果里的数不算查到的数：模型先记一句「CPU 99%」，不能再拿回执里的 99 去画图
  */
-const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set(["memory_save", "memory_update", "memory_delete", "memory_search", RECENT_THREADS_TOOL, ...SCHEDULE_TOOL_NAMES]);
+const MODEL_ECHO_TOOLS: ReadonlySet<string> = new Set([
+  "memory_save",
+  "memory_update",
+  "memory_delete",
+  "memory_search",
+  RECENT_THREADS_TOOL,
+  ...SCHEDULE_TOOL_NAMES,
+  SCHEDULE_ALERT_TOOL,
+]);
 
 /** 读过本群聊天记录以后还要改已有文档、代码，或者没让记却要记群记忆时，交给模型的说明 */
 export const READ_CHAT_NOTE =

@@ -13,7 +13,7 @@ import {
   Scheduler,
   type SchedulerOptions,
 } from "../src/schedules.js";
-import { createScheduleTools } from "../src/tools/schedules.js";
+import { checkScheduledDocEdit, createScheduleAlertTool, createScheduleTools, ownDocLink } from "../src/tools/schedules.js";
 import type { Tool } from "../src/tools/tool.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
@@ -34,7 +34,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 function setup(overrides: Partial<SchedulerOptions> = {}) {
   const clock = { now: bj("2026-10-21 10:00") };
   const ran: { task: ScheduledTask; late: number }[] = [];
-  const notes: { chatId: string; markdown: string }[] = [];
+  const notes: { chatId: string; markdown: string; mention?: { openId: string; name?: string } }[] = [];
   let result: RunResult = "done";
   const scheduler = new Scheduler({
     allowedChatIds: new Set(["oc_1", "oc_2"]),
@@ -42,8 +42,8 @@ function setup(overrides: Partial<SchedulerOptions> = {}) {
       ran.push({ task: { ...task }, late });
       return result;
     },
-    notify: async (chatId, markdown) => {
-      notes.push({ chatId, markdown });
+    notify: async (chatId, markdown, mention) => {
+      notes.push({ chatId, markdown, ...(mention ? { mention } : {}) });
     },
     logger: quiet,
     now: () => clock.now,
@@ -122,26 +122,41 @@ test("上限：两次至少隔 1 小时、每群 20 个、每人 10 个、每群
   other.create({ ...base, creator: { openId: "ou_4" }, prompt: "每小时提醒喝水", cron: "15 * * * *", remind: true });
 });
 
-test("暂停、恢复、取消：只有建的人和管理员能做，别的群的任务找不到", () => {
-  const { scheduler, clock } = setup();
+test("暂停谁都能，别人暂停、取消的在群里 @ 建的人；恢复、取消只有建的人和管理员；别的群的任务找不到", () => {
+  const { scheduler, clock, notes } = setup();
   const task = scheduler.create({ ...base, prompt: "汇总", cron: "0 9 * * 1" });
   const guest = { openId: "ou_guest", name: "访客" };
 
-  assert.throws(() => scheduler.change("oc_1", task.id, "pause", guest, false), /是ML建的，只有建的人和管理员/);
   assert.throws(() => scheduler.change("oc_2", task.id, "pause", ml, false), /这个群里没有定时任务 T1/);
-
+  // 建的人自己暂停：不用通知
   scheduler.change("oc_1", task.id, "pause", ml, false);
   assert.equal(task.status, "paused");
   assert.equal(task.nextRunAt, undefined);
-  assert.throws(() => scheduler.change("oc_1", task.id, "pause", ml, false), /已经是暂停的了/);
+  assert.equal(notes.length, 0);
+  assert.throws(() => scheduler.change("oc_1", task.id, "pause", guest, false), /已经是暂停的了/);
+  // 恢复、取消别人建的：不是管理员不行，提示可以暂停
+  assert.throws(() => scheduler.change("oc_1", task.id, "resume", guest, false), /是ML建的，只有建的人和管理员（写权限名单里的人）能恢复。要先停下来可以暂停/);
   clock.now = bj("2026-10-27 10:00");
-  // 管理员能恢复别人建的：从现在算下一次
+  // 管理员能恢复别人建的：从现在算下一次；恢复不 @ 人
   scheduler.change("oc_1", task.id, "resume", guest, true);
   assert.equal(task.status, "active");
   assert.equal(task.nextRunAt, bj("2026-11-02 09:00"));
   assert.deepEqual(task.changedBy, { ...guest, at: clock.now });
-  scheduler.change("oc_1", task.id, "cancel", ml, false);
+  assert.equal(notes.length, 0);
+
+  // 不是管理员也能暂停别人建的：@ 建的人（只 @ 他），说谁停的、怎么恢复
+  scheduler.change("oc_1", task.id, "pause", { openId: "ou_x", name: "张<at>三" }, false);
+  assert.equal(task.status, "paused");
+  assert.equal(notes.length, 1);
+  assert.deepEqual(notes[0]!.mention, ml);
+  assert.equal(notes[0]!.chatId, "oc_1");
+  assert.match(notes[0]!.markdown, /^⏸️ 你建的定时任务 T1（每周一 09:00：汇总）被张＜at＞三暂停了。要接着跑的话 @ 我说「恢复定时任务 T1」/);
+  assert.throws(() => scheduler.change("oc_1", task.id, "cancel", guest, false), /只有建的人和管理员（写权限名单里的人）能取消/);
+  // 管理员取消别人建的：也 @ 建的人
+  scheduler.change("oc_1", task.id, "cancel", guest, true);
   assert.equal(task.status, "cancelled");
+  assert.match(notes[1]!.markdown, /你建的定时任务 T1（每周一 09:00：汇总）被访客取消了。要的话 @ 我再建一个/);
+  assert.deepEqual(notes[1]!.mention, ml);
   assert.throws(() => scheduler.change("oc_1", task.id, "resume", ml, false), /已经取消了/);
 
   // 一次性的暂停过了时间，恢复不了
@@ -149,9 +164,10 @@ test("暂停、恢复、取消：只有建的人和管理员能做，别的群�
   scheduler.change("oc_1", once.id, "pause", ml, false);
   clock.now = bj("2026-10-27 13:00");
   assert.throws(() => scheduler.change("oc_1", once.id, "resume", ml, false), /已经过了/);
+  assert.equal(notes.length, 2);
 });
 
-test("连着失败 3 次自动暂停，在群里说一声；成功一次就清零", async () => {
+test("没跑成每次 @ 建的人；连着失败 3 次自动暂停，@ 建的人说一声；成功一次就清零", async () => {
   const { scheduler, clock, notes, setResult } = setup();
   const task = scheduler.create({ ...base, prompt: "查报错", cron: "0 * * * *" });
   setResult("failed");
@@ -174,8 +190,11 @@ test("连着失败 3 次自动暂停，在群里说一声；成功一次就清�
   }
   assert.equal(task.status, "paused");
   assert.equal(task.pausedFor, "failures");
-  assert.equal(notes.length, 1);
-  assert.match(notes[0]!.markdown, /定时任务 T1（每小时 00 分）连着 3 次没跑成，先暂停了.*恢复定时任务 T1/);
+  // 每次没跑成都 @ 建的人：前两次说下次照常跑，第 3 次说暂停了
+  assert.equal(notes.length, 2 + MAX_FAILURES);
+  assert.ok(notes.every((note) => note.mention?.openId === "ou_ml"));
+  assert.match(notes[0]!.markdown, /^⚠️ 你建的定时任务 T1（每小时 00 分：查报错）这次没跑成，原因看那条「⏰ 定时任务 T1」下面的话题。下次 .* 照常跑；连着 3 次没跑成会先暂停/);
+  assert.match(notes.at(-1)!.markdown, /^⏸️ 你建的定时任务 T1（每小时 00 分：查报错）连着 3 次没跑成，原因看那条「⏰ 定时任务 T1」下面的话题，先暂停了.*恢复定时任务 T1/);
   // 跑的时候抛错也算失败
   const crashing = setup({ run: async () => Promise.reject(new Error("boom")) });
   const t2 = crashing.scheduler.create({ ...base, prompt: "x", cron: "0 * * * *" });
@@ -184,6 +203,21 @@ test("连着失败 3 次自动暂停，在群里说一声；成功一次就清�
   await tick();
   assert.equal(t2.lastResult, "failed");
   assert.equal(t2.failures, 1);
+  assert.match(crashing.notes[0]!.markdown, /T1（每小时 00 分：x）这次没跑成。下次/);
+  // 一次性的没跑成：说要的话再建；被停止（有人点了停止、重启）的不 @
+  const once = setup();
+  once.setResult("failed");
+  const t3 = once.scheduler.create({ ...base, prompt: "看发版", at: "2026-10-21 15:00" });
+  const t4 = once.scheduler.create({ ...base, prompt: "看报错", at: "2026-10-21 16:00" });
+  once.clock.now = t3.nextRunAt!;
+  once.scheduler.tick();
+  await tick();
+  assert.match(once.notes[0]!.markdown, /^⚠️ 你建的定时任务 T1（10-21（周三）15:00 一次：看发版）没跑成，原因看.*。要的话 @ 我再建一个。$/);
+  once.setResult("stopped");
+  once.clock.now = t4.nextRunAt!;
+  once.scheduler.tick();
+  await tick();
+  assert.equal(once.notes.length, 1);
 });
 
 test("停机错过了：2 小时内补跑（带上晚了多久），再晚的周期任务等下一次、一次性的在群里说一声", async () => {
@@ -213,7 +247,9 @@ test("停机错过了：2 小时内补跑（带上晚了多久），再晚的周
   assert.equal(other.ran.length, 0);
   assert.equal(reminder.status, "finished");
   assert.equal(reminder.lastResult, "missed");
-  assert.match(other.notes[0]!.markdown, /定时任务 T1 本该在 10-22（周四）10:00 跑/);
+  assert.match(other.notes[0]!.markdown, /你建的定时任务 T1 本该在 10-22（周四）10:00 跑/);
+  // 一次性的本来就 @ 建的人，错过了也 @ 他
+  assert.deepEqual(other.notes[0]!.mention, ml);
   // 群成员写的尖括号换成全角，不会变成 @所有人
   assert.doesNotMatch(other.notes[0]!.markdown, /<at/);
   assert.match(other.notes[0]!.markdown, /＜at user_id="all"＞/);
@@ -327,7 +363,7 @@ test("下一次的时间写不进文件（磁盘满、没权限）：这次不�
   const blocker = await tempFile();
   await writeFile(blocker, "");
   const errors: string[] = [];
-  const { scheduler, clock, ran } = setup({
+  const { scheduler, clock, ran, notes } = setup({
     file: path.join(blocker, "schedules.json"),
     logger: { ...quiet, error: (text: string) => errors.push(text) },
   });
@@ -341,6 +377,7 @@ test("下一次的时间写不进文件（磁盘满、没权限）：这次不�
   assert.equal(task!.failures, 1);
   assert.equal(task!.nextRunAt, bj("2026-11-02 09:00"));
   assert.match(errors.join("\n"), /T1 下一次的时间没写进文件，这次不跑/);
+  assert.match(notes[0]!.markdown, /这次没跑成：机器人这边记不下任务进度，这次没跑，请管理员看一下机器人的日志/);
 });
 
 test("停下时不再看新到点的，等正在跑的记完结果", async () => {
@@ -359,13 +396,17 @@ test("停下时不再看新到点的，等正在跑的记完结果", async () =>
   assert.equal(task.failures, 0);
 });
 
-/** 跑一个工具 */
-async function call(tool: Tool | undefined, args: Record<string, unknown>, writable?: boolean): Promise<string> {
+/** 跑一个工具：writable 是这次能不能改，question 是发起人这句话 */
+async function call(tool: Tool | undefined, args: Record<string, unknown>, writable?: boolean, question?: string): Promise<string> {
   assert.ok(tool);
-  return tool.run(args, { signal: new AbortController().signal, ...(writable !== undefined ? { writable } : {}) });
+  return tool.run(args, {
+    signal: new AbortController().signal,
+    ...(writable !== undefined ? { writable } : {}),
+    ...(question !== undefined ? { question } : {}),
+  });
 }
 
-test("工具：建好照实说时间和怎么取消；只能看、改本群的；别人建的要管理员才能停", async () => {
+test("工具：建好照实说时间和怎么暂停；只能看、改本群的；别人建的谁都能暂停，恢复、取消要管理员", async () => {
   const { scheduler } = setup();
   const tools = (senderId: string, canManageAll: boolean, chatId = "oc_1") =>
     new Map(
@@ -382,22 +423,24 @@ test("工具：建好照实说时间和怎么取消；只能看、改本群的�
   const mine = tools("ou_ml", false);
   const created = await call(mine.get("schedule_create"), { task: "汇总上周群里的进展", cron: "0 9 * * 1" }, true);
   assert.match(created, /已建好定时任务 T1（到点去做）：每周一 09:00（北京时间），下次是 10-26（周一）09:00/);
-  assert.match(created, /取消定时任务 T1/);
+  assert.match(created, /暂停定时任务 T1」（群里谁都能暂停，别人暂停时会 @ 建的人）；恢复、取消只有建任务的人和管理员能操作/);
   assert.equal(scheduler.list("oc_1")[0]!.readOnly, undefined);
   assert.equal(scheduler.list("oc_1")[0]!.creator.name, "ML");
-  assert.doesNotMatch(created, /只能查、不能改文档/);
+  assert.doesNotMatch(created, /只能查、不能写文档/);
+  // 能改、但没贴要追加的文档：照实说到点不改已有文档
+  assert.match(created, /到点不会改已有文档（建的人这句话里没贴要追加的文档链接）/);
 
   // 这次没有改文档的工具（不在写权限名单里、带着群聊）：记成只读
   const reminder = await call(mine.get("schedule_create"), { task: "看发版", at: "2026-10-22 15:00", remind: true }, false);
   assert.match(reminder, /T2（纯提醒）：10-22（周四）15:00 一次/);
   assert.equal(scheduler.list("oc_1").find((t) => t.id === 2)!.readOnly, true);
-  assert.doesNotMatch(reminder, /只能查、不能改文档/);
+  assert.doesNotMatch(reminder, /只能查、不能写文档|不会改已有文档/);
   await assert.rejects(call(mine.get("schedule_create"), { task: "x", cron: "*/10 * * * *" }, true), /至少隔 60 分钟/);
 
   // 到点去做、但只能读的：照实告诉模型，别说到点会改文档
   const other = setup().scheduler;
   const [create] = createScheduleTools({ scheduler: other, chatId: "oc_1", senderId: "ou_ml", askerName: "ML", messageId: "om_1", canManageAll: false, now: () => bj("2026-10-21 10:00") });
-  assert.match(await call(create, { task: "汇总进展", cron: "0 18 * * 5" }, false), /T1（到点去做）[\s\S]*到点只能查、不能改文档/);
+  assert.match(await call(create, { task: "汇总进展", cron: "0 18 * * 5" }, false), /T1（到点去做）[\s\S]*到点只能查、不能写文档/);
 
   const listed = await call(mine.get("schedule_list"), {});
   assert.match(listed, /这个群有 2 个定时任务/);
@@ -406,10 +449,75 @@ test("工具：建好照实说时间和怎么取消；只能看、改本群的�
 
   const guest = tools("ou_guest", false);
   await assert.rejects(call(guest.get("schedule_change"), { id: "T1", action: "cancel" }), /只有建的人和管理员/);
+  // 谁都能暂停别人建的：告诉模型已经 @ 了建的人
+  assert.match(await call(guest.get("schedule_change"), { id: "T1", action: "pause" }), /已暂停定时任务 T1.*这是ML建的，已在群里 @ 他说一声/);
+  assert.match(await call(guest.get("schedule_list"), {}), /T1 .*已暂停（访客暂停的）/);
+  await assert.rejects(call(guest.get("schedule_change"), { id: "T1", action: "resume" }), /只有建的人和管理员（写权限名单里的人）能恢复/);
+  assert.match(await call(mine.get("schedule_change"), { id: "T1", action: "resume" }), /已恢复定时任务 T1/);
   await assert.rejects(call(tools("ou_ml", false, "oc_2").get("schedule_change"), { id: "T1", action: "cancel" }), /这个群里没有定时任务 T1/);
   await assert.rejects(call(mine.get("schedule_change"), { id: "第一个", action: "cancel" }), /编号/);
   assert.match(await call(mine.get("schedule_change"), { id: "#1", action: "pause" }), /已暂停定时任务 T1/);
   assert.match(await call(tools("ou_guest", true).get("schedule_change"), { id: 1, action: "resume" }), /已恢复定时任务 T1：每周一 09:00，汇总上周群里的进展。下次是/);
   assert.match(await call(mine.get("schedule_change"), { id: "t1", action: "cancel" }), /已取消定时任务 T1/);
   assert.match(await call(mine.get("schedule_list"), {}), /最近跑完、取消了的：\n- T1 .*已取消/);
+});
+
+test("周报文档：只认建的人这句话里自己贴的链接、这次能改才记上；纯提醒不写文档；列表和结果里照实说", async () => {
+  const { scheduler } = setup();
+  const [create, list] = createScheduleTools({ scheduler, chatId: "oc_1", senderId: "ou_ml", askerName: "ML", messageId: "om_1", canManageAll: false, now: () => bj("2026-10-21 10:00") });
+  const question = "每周一 9 点汇总上周群里的进展，追加到周报 https://x.feishu.cn/wiki/WeeklyReport123?from=from_copylink 里";
+  const args = { task: "汇总上周群里的进展，追加到周报文档", cron: "0 9 * * 1" };
+
+  // 这次不能改（不在写权限名单里、带着群聊、读过群聊）：不记
+  await assert.rejects(call(create, { ...args, append_doc: "https://x.feishu.cn/wiki/WeeklyReport123" }, false, question), /这次不能定要追加的文档/);
+  // 链接不是他这句话里贴的（群聊里、话题里别人贴的）：不记
+  await assert.rejects(call(create, { ...args, append_doc: "https://x.feishu.cn/docx/OtherDoc12345" }, true, question), /只能填建任务的人这句话里自己贴的文档链接/);
+  await assert.rejects(call(create, { ...args, append_doc: "https://x.feishu.cn/wiki/WeeklyReport123" }, true), /只能填建任务的人这句话里自己贴的文档链接/);
+  await assert.rejects(call(create, { ...args, append_doc: "上面那篇周报" }, true, question), /认不出来/);
+  await assert.rejects(
+    call(create, { ...args, append_doc: "https://x.feishu.cn/sheets/Sheet1234567" }, true, "追加到 https://x.feishu.cn/sheets/Sheet1234567"),
+    /表格、旧版文档追加不了/,
+  );
+  await assert.rejects(
+    call(create, { task: "提醒写周报", cron: "0 9 * * 1", remind: true, append_doc: "https://x.feishu.cn/wiki/WeeklyReport123" }, true, question),
+    /纯提醒到点只发一句提醒，不写文档/,
+  );
+  assert.equal(scheduler.list("oc_1").length, 0);
+
+  const created = await call(create, { ...args, append_doc: "https://x.feishu.cn/wiki/WeeklyReport123", alert_creator: true }, true, question);
+  const [task] = scheduler.list("oc_1");
+  assert.equal(task!.appendDoc, "https://x.feishu.cn/wiki/WeeklyReport123");
+  assert.equal(task!.alertCreator, true);
+  assert.match(created, /到点只追加到这篇文档的文末，不改、不删已有内容：https:\/\/x\.feishu\.cn\/wiki\/WeeklyReport123/);
+  assert.match(created, /到点查到异常才在结果下面 @ 建任务的人，没异常不 @/);
+  assert.doesNotMatch(created, /不会改已有文档/);
+  assert.match(await call(list, {}), /T1 · 每周一 09:00 · 追加到 https:\/\/x\.feishu\.cn\/wiki\/WeeklyReport123 · 有异常 @ 建的人 · /);
+  // 纯提醒本来就 @ 建的人：有异常 @ 不记
+  await call(create, { task: "提醒看发版", at: "2026-10-22 15:00", remind: true, alert_creator: true }, true, question);
+  assert.equal(scheduler.list("oc_1").find((t) => t.remind)!.alertCreator, undefined);
+  // 只给了文档编号：在他这句话的链接里找到同一篇才算，记成链接
+  assert.equal(ownDocLink("DocxToken1234567890", "写进 https://x.feishu.cn/docx/DocxToken1234567890。"), "https://x.feishu.cn/docx/DocxToken1234567890");
+});
+
+test("定时任务到点改文档：只能 append 到建任务时点名的那篇；没点名的、插入替换删除、别的文档都不行", () => {
+  const bound = "https://x.feishu.cn/wiki/WeeklyReport123";
+  checkScheduledDocEdit({ document: "https://x.feishu.cn/wiki/WeeklyReport123?from=copy", action: "append", content: "x" }, bound);
+  checkScheduledDocEdit({ document: "https://other.feishu.cn/wiki/WeeklyReport123", action: "append", content: "x" }, bound);
+  assert.throws(() => checkScheduledDocEdit({ document: bound, action: "append" }, undefined), /建的时候没贴要追加的文档链接，到点不能改已有文档/);
+  for (const action of ["replace", "delete", "insert_before", "insert_after", undefined]) {
+    assert.throws(() => checkScheduledDocEdit({ document: bound, action, block_id: "b1" }, bound), /只能在文档末尾追加（action=append）/);
+  }
+  assert.throws(() => checkScheduledDocEdit({ document: "https://x.feishu.cn/docx/OtherDoc12345", action: "append" }, bound), /只能追加到建任务时点名的那篇文档.*WeeklyReport123/);
+  assert.throws(() => checkScheduledDocEdit({ action: "append" }, bound), /只能追加到建任务时点名的那篇文档/);
+});
+
+test("有异常 @ 建的人的工具：模型只决定 @ 不 @，交出一句查到了什么", async () => {
+  const alerts: string[] = [];
+  const tool = createScheduleAlertTool((summary) => alerts.push(summary), "ML");
+  assert.match(tool.spec.description, /建任务的ML/);
+  assert.match(await call(tool, { summary: "  订单服务  过去 1 小时 502 有 37 次  " }), /回答发完以后会在下面 @ 建任务的ML/);
+  assert.deepEqual(alerts, ["订单服务 过去 1 小时 502 有 37 次"]);
+  await assert.rejects(call(tool, {}), /缺少参数 summary/);
+  await call(tool, { summary: "x".repeat(300) });
+  assert.equal(alerts[1]!.length, 101);
 });

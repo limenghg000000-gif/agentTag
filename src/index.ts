@@ -26,7 +26,7 @@ import type { AboutBot } from "./prompt.js";
 import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
-import { describeSchedule, escapePost, label, type RunResult, type ScheduledTask, Scheduler } from "./schedules.js";
+import { describeSchedule, escapePost, label, type RunResult, type ScheduleActor, type ScheduledTask, Scheduler } from "./schedules.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { createCardKitApi } from "./stream-card.js";
@@ -248,9 +248,15 @@ const scheduler = config.schedules
       file: config.schedules.file,
       allowedChatIds: config.feishu.allowedChatIds,
       run: (task, late) => runScheduledTask(task, late),
-      notify: (chatId, markdown) => channel.send(chatId, { markdown }),
+      // 要 @ 的只会是建任务的人：@ 由这里拼，模型写的字里的尖括号都换成了全角，@ 不了别人
+      notify: (chatId, markdown, mention) => channel.send(chatId, { markdown }, mention ? mentionOf(mention) : undefined),
     })
   : undefined;
+
+/** @ 一个人（定时任务只 @ 建的人） */
+function mentionOf(actor: ScheduleActor): { mentions: Array<{ key: string; openId: string; name: string }> } {
+  return { mentions: [{ key: "", openId: actor.openId, name: actor.name ? escapePost(actor.name) : "" }] };
+}
 try {
   await scheduler?.init();
 } catch (err) {
@@ -260,7 +266,8 @@ try {
 
 /**
  * 定时任务到点：在原来的群里发一条「⏰ 定时任务 T3」（一次性的和纯提醒 @ 建的人），纯提醒到这里就完了；
- * 要做事的把这条当成建任务的人 @ 机器人说了建任务时写好的那句话，交给同一个处理函数，按他现在的权限跑，回答发在这条下面的话题里
+ * 要做事的把这条当成建任务的人 @ 机器人说了建任务时写好的那句话，交给同一个处理函数，按他现在的权限跑，回答发在这条下面的话题里。
+ * 建的人说了「有异常 @ 我」的，模型查到异常时调 schedule_alert_creator，跑完以后在话题里 @ 建的人
  */
 async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunResult> {
   const creator = task.creator.name ? escapePost(task.creator.name) : undefined;
@@ -268,7 +275,7 @@ async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunR
   const lateNote = late >= 5 * 60_000 ? `\n（比定的时间晚了 ${Math.round(late / 60_000)} 分钟：那会儿机器人在重启或者在忙）` : "";
   // 一次性的、纯提醒的多半是给建的人看的，@ 他；周期任务每次都 @ 太吵
   const notifyCreator = task.remind || task.at !== undefined;
-  const mentions = notifyCreator ? { mentions: [{ key: "", openId: task.creator.openId, name: creator ?? "" }] } : undefined;
+  const mentions = notifyCreator ? mentionOf(task.creator) : undefined;
   if (task.remind) {
     await channel.send(task.chatId, { markdown: `⏰ **提醒**：${escapePost(task.prompt)}\n（${about}）${lateNote}` }, mentions);
     return "done";
@@ -290,16 +297,39 @@ async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunR
   };
   // 结果话题里接着问不用 @（和回答过的话题一样）
   follower?.track(msg);
-  let result: RunResult = "failed";
+  // 跑完时 onEnd 里改（TypeScript 看不到回调里的赋值，写成 as）
+  let result = "failed" as RunResult;
+  const alerts: string[] = [];
   await handleMessage(msg, {
     scheduled: {
       label: label(task),
       schedule: describeSchedule(task),
       ...(task.creator.name ? { creatorName: task.creator.name } : {}),
       ...(task.readOnly ? { readOnly: true } : {}),
+      ...(task.appendDoc ? { appendDoc: task.appendDoc } : {}),
+      ...(task.alertCreator
+        ? {
+            alert: (summary: string) => {
+              if (!alerts.includes(summary)) {
+                alerts.push(summary);
+              }
+            },
+          }
+        : {}),
       onEnd: (phase) => (result = phase),
     },
   });
+  // 查到异常、回答也发出来了：在结果话题里 @ 建的人。没跑成的由 Scheduler @ 他说没跑成，这里不再 @
+  if (alerts.length > 0 && result === "done") {
+    const found = alerts.slice(0, 3).map((summary) => `- ${escapePost(summary)}`).join("\n");
+    await channel
+      .send(task.chatId, { markdown: `⚠️ 定时任务 ${label(task)} 查到异常（你说过有异常 @ 你）：\n${found}\n详情看上面的回答。` }, {
+        replyTo: messageId,
+        replyInThread: true,
+        ...mentionOf(task.creator),
+      })
+      .catch((err: unknown) => console.warn(`定时任务：${label(task)} 有异常 @ 建的人的消息没发出去`, err));
+  }
   return result;
 }
 /**
