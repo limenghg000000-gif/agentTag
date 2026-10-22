@@ -522,6 +522,18 @@ test("回答说建好、改好了定时任务，要这次真的调成了：常�
   // 只查了列表的：要写着列表里有的编号，列表说没有定时任务时没写编号的说法也不算
   assert.deepEqual(unbackedScheduleClaims("已为你设置每天 15:34 的提醒。", new Set(["schedule_list"]), "这个群还没有定时任务。"), ["create"]);
   assert.deepEqual(unbackedScheduleClaims("T1 已暂停，提醒已取消", new Set(["schedule_list"]), "T1 · 每天 · 已暂停"), ["change"]);
+  // 后面归它的字到下一个说法为止：T2 归后面的「已取消」，不归前面的「已暂停」
+  assert.deepEqual(unbackedScheduleClaims("T1 已暂停 T2 已取消。", new Set(["schedule_change"]), twoReceipts), []);
+  assert.deepEqual(unbackedScheduleClaims("T1 已暂停 T2 已取消。", new Set(["schedule_change"]), pausedReceipt), ["change"]);
+});
+
+test("回答再长、说法再多，定时任务说法检查也很快算完，不会把机器人卡住", () => {
+  // 一长串「而」、一个分句里几百个说法、几百个没配对的括号：以前每个说法都往前往后找一遍，这样一段要算一分多钟
+  const answer = "而".repeat(6000) + "已建好定时任务 T3" + "已建好定时任务T3".repeat(300) + "（".repeat(300);
+  const started = performance.now();
+  assert.deepEqual(unbackedScheduleClaims(answer, new Set(["schedule_create"]), "已建好定时任务 T3（到点去做）：每天 09:00"), []);
+  assert.deepEqual(unbackedScheduleClaims(`${answer}已建好定时任务 T4`, new Set(["schedule_create"]), "已建好定时任务 T3（到点去做）：每天 09:00"), ["create"]);
+  assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)}ms`);
 });
 
 test("没 @ 的跟聊说「已建好定时任务」：打回一次照实说，提示词里说这次建不了、请他 @ 着一句说全", async () => {

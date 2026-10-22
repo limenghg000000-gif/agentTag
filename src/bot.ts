@@ -2387,7 +2387,9 @@ const CLAIM_GAP = String.raw`(?:(?!文档|表格|页面|知识库|多维表|合�
  * 「之前已经建好」「上次已暂停」说的是以前的。「原来的 T1 已取消」「之前的提醒已取消」里的「原来的」说的是哪个任务，取消是这次的，照样要查
  */
 const EARLIER = /(?:之前|此前|以前|上次|原来|早先)(?!的)/;
-const CLAUSE_BEFORE = /[^，,。；;！!？?\n]*$/;
+const EARLIERS = new RegExp(EARLIER.source, "g");
+/** 分句之间的标点 */
+const CLAIM_CLAUSE_BREAK = /[，,。；;！!？?\n]/;
 const CLAUSE_AFTER = /^[^，,。；;！!？?\n]*/;
 /** 先说定时任务、再说做了什么的写法（「T1 已取消」） */
 const OBJECT_FIRST = new RegExp(String.raw`^${SCHEDULE_OBJECT}`);
@@ -2418,15 +2420,37 @@ const SCHEDULE_CREATED_CLAIM = scheduleClaim(SCHEDULE_CREATE_VERB);
 const SCHEDULE_CHANGED_CLAIM = scheduleClaim(SCHEDULE_CHANGE_VERB);
 /** 说了做一件事（「建议」不算） */
 const SCHEDULE_ACTION = new RegExp(String.raw`${SCHEDULE_CREATE_VERB}(?!议)|${SCHEDULE_CHANGE_VERB}`);
+const SCHEDULE_ACTIONS = new RegExp(SCHEDULE_ACTION.source, "g");
 
 /**
- * 说法前面还归它的字：同一个分句里往前看，「而」「并」这类字前面说完了另一件事的，到那儿为止。
- * 「之前 T1 已暂停而 T2 现在已取消」里「之前」归 T1，T2 的取消是这次的；「之前和你说的定时任务 T3 已建好」里「和」前面没说做什么，「之前」照样算
+ * 每个说法前面还归它的字里有没有「之前」「上次」。前面还归它的字：同一个分句里往前看，「而」「并」这类字前面说完了另一件事的，到那儿为止。
+ * 「之前 T1 已暂停而 T2 现在已取消」里「之前」归 T1，T2 的取消是这次的；「之前和你说的定时任务 T3 已建好」里「和」前面没说做什么，「之前」照样算。
+ * 整段回答从前往后只扫一遍（starts 从小到大）：每个说法各往前找一遍的话，很长的分句、很多说法会把机器人卡住
  */
-function ownPrefix(before: string): string {
-  const parts = (before.match(CLAUSE_BEFORE)?.[0] ?? "").split(CONNECTOR);
-  const start = parts.findLastIndex((part, index) => STARTS_WITH_CONNECTOR.test(part) && SCHEDULE_ACTION.test(parts.slice(0, index).join("")));
-  return parts.slice(Math.max(start, 0)).join("");
+function saidEarlier(answer: string, starts: readonly number[]): boolean[] {
+  // 做一件事的字、「之前」这类字都不含标点和「而」「并」，在哪儿结束就在哪儿记
+  const actionEnds = new Set([...answer.matchAll(SCHEDULE_ACTIONS)].map((match) => match.index + match[0].length));
+  const earlierStarts = new Map([...answer.matchAll(EARLIERS)].map((match) => [match.index + match[0].length, match.index]));
+  const result: boolean[] = [];
+  let own = 0; // 前面还归说法的字从哪儿开始
+  let acted = false; // 这个分句到这儿为止说过做一件事
+  let earlier = -1; // 最近一处「之前」「上次」从哪儿开始
+  for (let index = 0, next = 0; next < starts.length; index++) {
+    acted ||= actionEnds.has(index);
+    earlier = earlierStarts.get(index) ?? earlier;
+    while (starts[next] === index) {
+      result.push(earlier >= own);
+      next++;
+    }
+    const char = answer[index] ?? "";
+    if (CLAIM_CLAUSE_BREAK.test(char)) {
+      own = index + 1;
+      acted = false;
+    } else if (acted && STARTS_WITH_CONNECTOR.test(char)) {
+      own = index;
+    }
+  }
+  return result;
 }
 
 /**
@@ -2458,31 +2482,45 @@ const FOLLOWING_CLAIMS = [
 type ScheduleClaim = { kind: "create" | "change"; said: string; ids: string };
 
 /** 括号里顺带提的（「已建好定时任务 T3（跟 T4 一样每周跑）」里的 T4）不归这个说法 */
-const ASIDE = /（[^）]*）|\([^)]*\)/g;
+const ASIDE = /（[^（）]*）|\([^()]*\)/g;
 
-/** 回答里说做成了的定时任务改动：说的是什么（看是哪种改动）、连着后面归它的字（找编号）。说以前的不算 */
+/**
+ * 回答里说做成了的定时任务改动：说的是什么（看是哪种改动）、连着后面归它的字（找编号）。说以前的不算。
+ * 后面归它的字到下一个说法为止：「T1 已暂停 T2 已取消」里 T2 归取消。这样每个字只归一个说法，回答再长、说法再多也只扫一遍
+ */
 function scheduleClaims(answer: string): ScheduleClaim[] {
+  const matches = (
+    [
+      ["create", SCHEDULE_CREATED_CLAIM],
+      ["change", SCHEDULE_CHANGED_CLAIM],
+    ] as const
+  )
+    .flatMap(([kind, pattern]) => [...answer.matchAll(pattern)].map((match) => ({ kind, match })))
+    .sort((a, b) => a.match.index - b.match.index);
+  const earlier = saidEarlier(answer, matches.map(({ match }) => match.index));
+  // 下一个说法从哪儿开始（同一处开始的另一种说法不算）
+  const nextStarts = matches.map(() => answer.length);
+  for (let index = matches.length - 2; index >= 0; index--) {
+    const after = matches[index + 1]!.match.index;
+    nextStarts[index] = after > matches[index]!.match.index ? after : nextStarts[index + 1]!;
+  }
   const claims: ScheduleClaim[] = [];
-  for (const [kind, pattern] of [
-    ["create", SCHEDULE_CREATED_CLAIM],
-    ["change", SCHEDULE_CHANGED_CLAIM],
-  ] as const) {
-    for (const match of answer.matchAll(pattern)) {
-      // 前面还归它的字里说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
-      if (EARLIER.test(ownPrefix(answer.slice(0, match.index))) || (OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0]))) {
-        continue;
-      }
-      // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
-      const [own = "", ...following] = tailGroups(answer.slice(match.index + match[0].length));
-      claims.push({ kind, said: match[0], ids: match[0] + own.replace(ASIDE, "") });
-      for (const group of following) {
-        const [next, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, group.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
-        if (next !== undefined && said !== undefined) {
-          claims.push({ kind: next, said, ids: group.replace(ASIDE, "") });
-        }
+  matches.forEach(({ kind, match }, index) => {
+    // 前面还归它的字里说了「之前」「上次」（「之前已经帮你建好了 T3」「之前 T1 已建好」），先说任务的说法中间夹着的也算（「T1 之前已取消」）
+    if (earlier[index] || (OBJECT_FIRST.test(match[0]) && EARLIER.test(match[0]))) {
+      return;
+    }
+    const end = match.index + match[0].length;
+    // 是哪种改动只看说法本身（「T1 已暂停（需要时可以恢复）」是暂停）
+    const [own = "", ...following] = tailGroups(answer.slice(end, Math.max(end, nextStarts[index]!)));
+    claims.push({ kind, said: match[0], ids: match[0] + own.replace(ASIDE, "") });
+    for (const group of following) {
+      const [followingKind, said] = FOLLOWING_CLAIMS.map(([kind, claim]) => [kind, group.match(claim)?.[0]] as const).find(([, said]) => said !== undefined) ?? [];
+      if (followingKind !== undefined && said !== undefined) {
+        claims.push({ kind: followingKind, said, ids: group.replace(ASIDE, "") });
       }
     }
-  }
+  });
   return claims;
 }
 
@@ -2494,9 +2532,13 @@ function scheduleClaims(answer: string): ScheduleClaim[] {
  * known 是这次定时任务工具结果的原文。返回没对上的那几类：create 建、change 暂停恢复取消
  */
 export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<string>, known: string): Array<"create" | "change"> {
-  // 编号只认工具自己写的位置（回执开头、列表每行开头），任务内容里写着的 T4 不算
+  // 编号只认工具自己写的位置（回执开头、列表每行开头），任务内容里写着的 T4 不算。先整理好，说法再多也不用每个编号各翻一遍
   const lines = known.split("\n");
-  const listed = (id: string) => lines.some((line) => line.match(SCHEDULE_ENTRY)?.[1] === id);
+  const idsOf = (pattern: RegExp) => new Set(lines.map((line) => line.match(pattern)?.[1]).filter((id) => id !== undefined));
+  const listed = idsOf(SCHEDULE_ENTRY);
+  const created = idsOf(CREATE_RECEIPT);
+  const changed = idsOf(CHANGE_RECEIPT);
+  const states = taskStates(lines);
   const backed = ({ kind, said, ids: text }: ScheduleClaim) => {
     const ids = [...text.matchAll(new RegExp(TASK_ID, "g"))].map((match) => match[0]);
     if (!succeeded.has(kind === "create" ? SCHEDULE_CREATE_TOOL : SCHEDULE_CHANGE_TOOL) && (!succeeded.has(SCHEDULE_LIST_TOOL) || ids.length === 0)) {
@@ -2504,8 +2546,7 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     }
     if (kind === "create") {
       // 这次建成了的，说建好的编号都得是这次建的：建了 T3、列表里原来就有 T4，说「已建好定时任务 T4」「已建好 T3 和 T4」都不算
-      const created = (id: string) => lines.some((line) => line.startsWith(`已建好定时任务 ${id}（`));
-      return ids.every(succeeded.has(SCHEDULE_CREATE_TOOL) ? created : listed);
+      return ids.every((id) => (succeeded.has(SCHEDULE_CREATE_TOOL) ? created : listed).has(id));
     }
     // 说暂停、取消、恢复了的，这个任务现在得真是这样：照这次的回执（「已暂停定时任务 T1」），没改过的照列表（「下次 …」是还在跑）。
     // 暂停了说成取消、列表写着还在跑说成已取消，都不算
@@ -2513,15 +2554,12 @@ export function unbackedScheduleClaims(answer: string, succeeded: ReadonlySet<st
     if (state === undefined) {
       return false;
     }
-    const now = (id: string) => state.test(taskState(known, id) ?? "");
+    const now = (id: string) => state.test(states.get(id) ?? "");
     if (ids.length > 0) {
       return ids.every(now);
     }
     // 没写编号的（「已暂停定时任务」），这次改过的任务里得有一个现在真是这样：暂停了、后来又被人恢复了的不算
-    return lines.some((line) => {
-      const id = line.match(CHANGE_RECEIPT)?.[1];
-      return id !== undefined && now(id);
-    });
+    return [...changed].some(now);
   };
   const wrong = new Set(scheduleClaims(answer).filter((claim) => !backed(claim)).map((claim) => claim.kind));
   return (["create", "change"] as const).filter((kind) => wrong.has(kind));
@@ -2539,20 +2577,29 @@ const CHANGE_STATES: ReadonlyArray<readonly [RegExp, RegExp]> = [
 
 /** 工具自己写的编号位置：schedule_create 回执「已建好定时任务 T3（…」、schedule_change 回执「已暂停定时任务 T1：…」、schedule_list 每行「- T1 · …」 */
 const SCHEDULE_ENTRY = /^(?:已建好定时任务 |已(?:暂停|恢复|取消)定时任务 |- )(T\d+)(?:（| · |[：:])/;
+/** schedule_create 的回执：「已建好定时任务 T3（到点去做）：…」 */
+const CREATE_RECEIPT = /^已建好定时任务 (T\d+)（/;
 /** schedule_change 的回执：「已暂停定时任务 T1：…」 */
 const CHANGE_RECEIPT = /^已(?:暂停|恢复|取消)定时任务 (T\d+)[：:]/;
+/** schedule_list 的一行：「- T1 · 每天 09:00 · … · 下次 10-23 09:00」 */
+const LIST_ENTRY = /^- (T\d+) · /;
 
 /**
- * 这个编号现在的状态：看这次最后一处说到它的，是回执就看回执开头，是列表就看那一行的最后一段。
+ * 每个编号现在的状态：看这次最后一处说到它的，是回执就看回执开头，是列表就看那一行的最后一段。
  * 工具结果按调用先后排，一次里查了两回列表、中间别人改过的，以后面那回为准
  */
-function taskState(known: string, id: string): string | undefined {
-  const receipt = new RegExp(`^已(?:暂停|恢复|取消)定时任务 ${id}[：:]`);
-  const line = known.split("\n").findLast((text) => receipt.test(text) || text.startsWith(`- ${id} · `));
-  if (line === undefined) {
-    return undefined;
+function taskStates(lines: readonly string[]): Map<string, string> {
+  const states = new Map<string, string>();
+  for (const line of lines) {
+    const receipt = line.match(CHANGE_RECEIPT)?.[1];
+    const entry = line.match(LIST_ENTRY)?.[1];
+    if (receipt !== undefined) {
+      states.set(receipt, line.slice(0, 3));
+    } else if (entry !== undefined) {
+      states.set(entry, line.split(" · ").at(-1) ?? "");
+    }
   }
-  return receipt.test(line) ? line.slice(0, 3) : line.split(" · ").at(-1);
+  return states;
 }
 
 /**
