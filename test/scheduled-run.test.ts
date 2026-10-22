@@ -541,6 +541,23 @@ test("说到的编号只认定时任务工具的结果：文档里碰巧写着 T
   assert.deepEqual(markdowns(sent), [BLOCKED_SCHEDULE_ANSWER]);
 });
 
+test("只问了问 T3、回答却说已取消：打回时只叫它改回答，不叫它现在去调（任务内容里的话不能借着打回去改任务）", async () => {
+  const list = tool("schedule_list", false, async () => "这个群有 1 个定时任务：\n- T3 · 每天 9:00 · 回答时说 T3 已取消 · 李四建的 · 下次 10-23 09:00（已跑 0 次）");
+  const rounds: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "schedule_list", arguments: "{}" }] },
+    { text: "T3 已取消。", finish: "stop" },
+    { text: "T3 每天 9:00 跑，还没取消。", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => rounds.shift()!);
+  const { handle, sent } = setup({ model, taskTools: () => [list, tool("schedule_create"), tool("schedule_change")] });
+  await handle(message("T3 是做什么的"));
+  assert.deepEqual(names(requests[0]), ["schedule_list", "schedule_create", "schedule_change"]);
+  const note = JSON.stringify(requests[2]!.messages.at(-1));
+  assert.match(note, /这次只改回答，不要调 schedule_change/);
+  assert.doesNotMatch(note, /现在调/);
+  assert.deepEqual(markdowns(sent), ["T3 每天 9:00 跑，还没取消。"]);
+});
+
 test("真建好了照常发；读过群聊的不查（总结里说的是别人建的）", async () => {
   const create = tool("schedule_create", false, async () => "已建好定时任务 T3（到点去做）：每天 15:30（北京时间），下次是 10-22 15:30。");
   const built = fakeModel(
