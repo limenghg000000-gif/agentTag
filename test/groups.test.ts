@@ -57,6 +57,20 @@ test("全局没开经验库、没写写权限名单时，配了的群也没有",
   assert.deepEqual(groups.of("oc_test").writeAllowed, new Set(["ou_a"]));
 });
 
+test("aiops 经验库：按群收窄过工具的，全局开给模型的检索和取详情都要开着才用", () => {
+  const of = (tools: string, global?: string) =>
+    new GroupPolicies(loadConfig({ ...env, GROUP_OPS_MCP_AIOPS_TOOLS: tools, ...(global ? { MCP_AIOPS_TOOLS: global } : {}) })).usesAiopsLessons("oc_ops");
+  // 全局默认的工具里有 get_knowledge：只开检索不够（程序归档前、同步时会替这个群取经验详情）
+  assert.equal(of("query_logs,search_knowledge"), false);
+  assert.equal(of("search_knowledge,get_knowledge"), true);
+  assert.equal(of("query_logs"), false);
+  // 全局本来就没开 get_knowledge 给模型的，只看检索
+  assert.equal(of("search_knowledge", "query_logs,search_knowledge"), true);
+  const groups = new GroupPolicies(loadConfig(env));
+  assert.equal(groups.usesAiopsLessons("oc_plain"), true, "没单独配的群同全局");
+  assert.equal(groups.usesAiopsLessons("oc_test"), false, "MCP 不开的群不用");
+});
+
 test("所有群写到的仓库合在一起（不分大小写去重），给代码工作目录用", () => {
   assert.deepEqual(new GroupPolicies(loadConfig(env)).repoEntries(), ["ai/aiops-mcp", "ai/agent-tag", "golang/*"]);
   assert.deepEqual(new GroupPolicies(loadConfig(env)).repoEntries().filter(isRepoPattern), ["golang/*"]);

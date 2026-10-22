@@ -115,7 +115,7 @@ const knowledge = config.knowledge
         return {
           ...(policy.writeAllowed ? { approvers: policy.writeAllowed } : {}),
           ...(policy.memoryEditors ? { memoryEditors: policy.memoryEditors } : {}),
-          aiops: usesAiopsLessons(chatId),
+          aiops: groups.usesAiopsLessons(chatId),
         };
       },
       allowedChatIds: config.feishu.allowedChatIds,
@@ -671,15 +671,6 @@ function chatScope(chatId: string): ChatScope {
     ...(scopedMcp ? { mcp: scopedMcp } : {}),
     ...(knowledge && policy.knowledge ? { knowledge } : {}),
   };
-}
-
-/**
- * 这个群能用 aiops 经验库：能用 aiops 的查经验工具（search_knowledge）。回答前查 aiops 经验库、排查经验同步过去、
- * 归档 aiops 里的经验都看它
- */
-function usesAiopsLessons(chatId: string): boolean {
-  const tools = groups.of(chatId).mcp.get("aiops");
-  return tools === "*" || (tools !== undefined && tools.includes("search_knowledge"));
 }
 
 /** 代码仓库工具要用 git。没装 git 时不开这些工具，别的照常。repos 是全局和各群写到的所有仓库 */

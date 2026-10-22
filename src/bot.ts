@@ -290,7 +290,17 @@ function scopeDeps(deps: BotDeps, chatId: string): BotDeps {
     return deps;
   }
   const { codeRepos: _codeRepos, writeAllowed: _writeAllowed, memoryEditors: _memoryEditors, mcp: _mcp, knowledge: _knowledge, ...rest } = deps;
-  return { ...rest, ...deps.scope(chatId) };
+  const scoped: BotDeps = { ...rest, ...deps.scope(chatId) };
+  // 每条消息都是新的一份：之前查到的结果、查过经验库的话题记在原来那份下面，下次问还认得
+  SESSIONS.set(scoped, deps);
+  return scoped;
+}
+
+/** 按群换过的那份 deps → 原来那份：跨提问记在内存里的东西（EARLIER_RESULTS、LOOKED_UP_TOPICS）按原来那份记 */
+const SESSIONS = new WeakMap<BotDeps, BotDeps>();
+
+function sessionOf(deps: BotDeps): BotDeps {
+  return SESSIONS.get(deps) ?? deps;
 }
 
 /**
@@ -1657,10 +1667,11 @@ const MERGE_TOOL = "code_merge";
 const EARLIER_RESULTS = new WeakMap<BotDeps, EarlierResults>();
 
 function earlierResults(deps: BotDeps): EarlierResults {
-  let store = EARLIER_RESULTS.get(deps);
+  const session = sessionOf(deps);
+  let store = EARLIER_RESULTS.get(session);
   if (!store) {
-    store = new EarlierResults(deps.now ?? Date.now);
-    EARLIER_RESULTS.set(deps, store);
+    store = new EarlierResults(session.now ?? Date.now);
+    EARLIER_RESULTS.set(session, store);
   }
   return store;
 }
@@ -1672,10 +1683,11 @@ const LOOKED_UP_TOPICS_MAX = 2000;
 const LOOKED_UP_TOPICS_MS = 7 * 24 * 60 * 60 * 1000;
 
 function lookedUpTopics(deps: BotDeps): { has(key: string): boolean; map: Map<string, number> } {
-  let map = LOOKED_UP_TOPICS.get(deps);
+  const session = sessionOf(deps);
+  let map = LOOKED_UP_TOPICS.get(session);
   if (!map) {
     map = new Map();
-    LOOKED_UP_TOPICS.set(deps, map);
+    LOOKED_UP_TOPICS.set(session, map);
   }
   const topics = map;
   return {

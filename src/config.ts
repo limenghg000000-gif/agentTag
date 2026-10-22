@@ -692,12 +692,17 @@ function loadGroupNames(env: NodeJS.ProcessEnv, allowedChatIds: ReadonlySet<stri
   });
   // 变量名写错（群名拼错、项拼错）的不能悄悄不生效：那个群会照全局走，权限就比想的大了
   for (const key of Object.keys(env)) {
-    const match = /^GROUP_([A-Z][A-Z0-9]*)_(.+)$/.exec(key);
+    const match = /^GROUP_([A-Z][A-Z0-9]*)_(.+)$/i.exec(key);
     if (!match || !env[key]?.trim()) {
       continue;
     }
-    const [, upper, field] = match;
+    const upper = match[1].toUpperCase();
+    const field = match[2].toUpperCase();
     const known = GROUP_FIELDS.has(field) || /^MCP_[A-Z][A-Z0-9]*_TOOLS$/.test(field);
+    // 程序只读全大写的变量名：GROUP_test_MEMORY_EDITORS 这样写不会生效
+    if (key !== key.toUpperCase() && (known || names.has(upper.toLowerCase()))) {
+      throw new Error(`${key} 要写成全大写的 ${key.toUpperCase()}，不然不会生效，这个群就照全局走了`);
+    }
     if (names.has(upper.toLowerCase())) {
       if (!known) {
         throw new Error(

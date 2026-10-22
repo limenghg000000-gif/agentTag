@@ -4926,6 +4926,23 @@ test("停止了也记下已经查到的结果，接着问时用得上", async ()
   assert.ok(requests.at(-1)!.tools?.some((t) => t.name === "topic_earlier_results"));
 });
 
+test("按群取配置（scope）时每条消息换一份，同一个话题接着问照样用得上之前查到的结果", async () => {
+  const queryLogs: Tool = { ...namedTool("aiops_query_logs"), run: async () => NOT_PROMOTED_LOGS };
+  const { requests, queries, handle } = earlierSetup(
+    [
+      { text: "", finish: "tool_calls", toolCalls: [queryCall("c1")] },
+      { text: FIRST_ANSWER, finish: "stop" },
+      { text: "好", finish: "stop" },
+    ],
+    // 和 index.ts 的 chatScope 一样每次现建一份
+    { scope: () => ({ mcp: { names: ["aiops"], tools: () => [queryLogs], prompt: () => undefined } }) },
+  );
+  await handle(message("给我查一下转链日志", { messageId: "om_1" }));
+  await handle(message("链接发出来", { messageId: "om_2", rootId: "om_1", threadId: "omt_1" }));
+  assert.equal(queries.length, 0, "用的是 scope 给的那份工具");
+  assert.ok(requests[2].tools?.some((t) => t.name === "topic_earlier_results"), "换了一份 deps 也认得这个话题之前查到的");
+});
+
 test("「把查到的链接整理一下发出来」：按整理走，从之前查到的原文里取链接和时间，整理的检查认这些", async () => {
   const listed = "整理好了，11:59 那次查到的：https://3.cn/37p41-Ig?jkl=@G8nDlB3GcH@（11:59:36）、https://u.jd.com/FGRs5E6（12:57:15）";
   const { requests, sent, queries, handle } = earlierSetup(

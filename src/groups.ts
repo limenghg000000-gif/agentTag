@@ -56,6 +56,19 @@ export class GroupPolicies {
     };
   }
 
+  /**
+   * 这个群能用 aiops 经验库（回答前查、同步排查经验、归档 aiops 里的经验）：程序替这个群调的 aiops 读工具，这个群都要开着。
+   * 要有 search_knowledge；全局开给模型的 get_knowledge 这个群收窄掉了的也不用（程序归档前、同步时会取经验详情）
+   */
+  usesAiopsLessons(chatId: string, server = "aiops"): boolean {
+    const tools = this.of(chatId).mcp.get(server);
+    if (tools === undefined || tools === "*") {
+      return tools === "*";
+    }
+    const global = this.config.mcp.find((item) => item.name === server)?.tools ?? [];
+    return tools.includes("search_knowledge") && (tools.includes("get_knowledge") || (global !== "*" && !global.includes("get_knowledge")));
+  }
+
   /** 全局和各群写到的所有仓库（不分大小写去重，保留第一次的写法）：代码工作目录、启动时检查令牌用 */
   repoEntries(): string[] {
     const all = [...this.global.codeRepos, ...this.config.groups.flatMap((group) => group.codeRepos ?? [])];

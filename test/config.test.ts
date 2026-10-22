@@ -416,6 +416,12 @@ test("GROUP_ 变量名写错时报错，不悄悄照全局：群名拼错、项�
   const groups = { ...groupBase, GROUPS: "test=oc_test" };
   assert.throws(() => loadConfig({ ...groups, GROUP_TSET_WRITE_ALLOWED_USERS: "ou_a" }), /GROUP_TSET_WRITE_ALLOWED_USERS 里的群名 tset 不在 GROUPS 里/);
   assert.throws(() => loadConfig({ ...groups, GROUP_TEST_CODE_REPO: "ai/x" }), /GROUP_TEST_CODE_REPO 不认识/);
+  // 小写、大小写混着写的变量程序读不到，也要报错
+  assert.throws(() => loadConfig({ ...groups, GROUP_test_MEMORY_EDITORS: "none" }), /GROUP_test_MEMORY_EDITORS 要写成全大写的 GROUP_TEST_MEMORY_EDITORS/);
+  assert.throws(() => loadConfig({ ...groups, GROUP_TEST_mcp: "off" }), /要写成全大写的 GROUP_TEST_MCP/);
+  assert.throws(() => loadConfig({ ...groups, Group_Ops_Write_Allowed_Users: "ou_a" }), /要写成全大写的 GROUP_OPS_WRITE_ALLOWED_USERS/);
+  // 和按群配置不沾边的 GROUP_ 变量不管
+  assert.equal(loadConfig({ ...groups, group_id: "x", GROUP_build_NUMBER: "3" }).groups.length, 1);
   assert.throws(() => loadConfig({ ...base, GROUP_OPS_MCP: "off" }), /群名 ops 不在 GROUPS 里/);
   // 空的当没写
   assert.deepEqual(loadConfig({ ...groups, GROUP_TSET_CODE_REPOS: " " }).groups, [{ name: "test", chatId: "oc_test" }]);

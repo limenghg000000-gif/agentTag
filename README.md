@@ -208,12 +208,12 @@ npm start
 | `BUILD_GOPROXY` | 否 | 编译时 go 下载依赖和工具链的代理，不填用 `https://goproxy.cn,direct`；校验用 `sum.golang.google.cn` |
 | `WRITE_ALLOWED_USERS` | 否 | 写权限名单，逗号分隔的飞书 open_id（`ou_` 开头）。只有这些人能让机器人新建或修改飞书文档、改代码、开合并请求，其他人只能问和读。自己的 open_id 在日志「收到提问 … sender=ou_xxx」里。不填时所有人都能（团队经验库例外：不填时只能查、不能存） |
 | `MEMORY_EDITORS` | 否 | 能让机器人记、改、删群记忆的人，逗号分隔的 open_id。不填时群里所有人都能（和 Claude Tag 一样）。名单外的人说「记住」「忘掉」、给它定规矩时，这次没有记忆的工具，它会说这个群只有指定的人能改；群记忆和经验库的冲突卡片上要改群记忆的，也只有名单里的人能点 |
-| `GROUPS` | 否 | 按群分开配置：`名字=chat_id`，多个用逗号分隔，名字只用小写字母和数字，群要在 `FEISHU_ALLOWED_CHAT_IDS` 里。每个群单独写下面几项 `GROUP_<名字大写>_…`，没写的项照全局，没写进 `GROUPS` 的群整个照全局。启动日志每个群一行「群 xx（oc_…）单独配置：…」。群名或项写错（如 `GROUP_TSET_…`、`GROUP_TEST_CODE_REPO`）启动时报错 |
+| `GROUPS` | 否 | 按群分开配置：`名字=chat_id`，多个用逗号分隔，名字只用小写字母和数字，群要在 `FEISHU_ALLOWED_CHAT_IDS` 里。每个群单独写下面几项 `GROUP_<名字大写>_…`，没写的项照全局，没写进 `GROUPS` 的群整个照全局。启动日志每个群一行「群 xx（oc_…）单独配置：…」。群名或项写错（如 `GROUP_TSET_…`、`GROUP_TEST_CODE_REPO`），或者没写成全大写（如 `GROUP_test_…`），启动时报错 |
 | `GROUP_<名字>_CODE_REPOS` | 否 | 这个群能操作的仓库，写法和 `CODE_REPOS` 一样，用同一个 `GITLAB_TOKEN`；同一个仓库在两处写 `@分支` 要写成一样的。`off` 是这个群没有代码工具。模型点名别的群的仓库会被代码工具直接拒绝 |
 | `GROUP_<名字>_WRITE_ALLOWED_USERS` | 否 | 这个群的写权限名单，`none` 是这个群谁都不能让机器人改文档、改代码。经验库的「保存」「归档」、暂停和取消别人建的定时任务也按这个名单 |
 | `GROUP_<名字>_MEMORY_EDITORS` | 否 | 这个群能让机器人记、改、删群记忆的人，`none` 是群记忆只能看 |
 | `GROUP_<名字>_MCP` | 否 | 这个群能用的 MCP 服务（`MCP_SERVERS` 里的名字，逗号分隔），`off` 是都不能用。不能用的服务提示词里也不提 |
-| `GROUP_<名字>_MCP_<服务>_TOOLS` | 否 | 这个服务在这个群只开其中几个工具，只能在全局开了的（`MCP_<服务>_TOOLS`）里挑。aiops 不开 `search_knowledge` 时，这个群回答前不查 aiops 经验库、排查经验不同步过去、不能归档 aiops 里的经验 |
+| `GROUP_<名字>_MCP_<服务>_TOOLS` | 否 | 这个服务在这个群只开其中几个工具，只能在全局开了的（`MCP_<服务>_TOOLS`）里挑。aiops 不开 `search_knowledge`（全局开给模型的 `get_knowledge` 也要开）时，这个群回答前不查 aiops 经验库、排查经验不同步过去、不能归档 aiops 里的经验 |
 | `GROUP_<名字>_KNOWLEDGE` | 否 | `off`：这个群回答前不查团队经验库，也没有经验库的工具；机器人建的表格不共享给这个群（之前共享过的启动时撤掉）。经验库是各群共用的一张表，`on` 和不写一样 |
 | `GITLAB_URL` | 接 GitLab 时必填 | 公司 GitLab 的地址，如 `https://gitlab.example.com` |
 | `GITLAB_TOKEN` | 接 GitLab 时必填 | GitLab 访问令牌，权限选 `api`，角色至少 Developer。只接一个项目时用它的项目访问令牌；接多个项目时用群组访问令牌或个人访问令牌（项目访问令牌只能访问建它的那个项目） |
