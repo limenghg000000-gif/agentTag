@@ -4,6 +4,8 @@ import type { Tool } from "./tool.js";
 /** 读文档时一次返回的字数上限，超出的用 offset 接着读 */
 export const DOC_PAGE_CHARS = 12000;
 export const DOC_TOOL_NAMES = ["feishu_doc_read", "feishu_doc_create", "feishu_doc_edit"] as const;
+/** 改已有文档的工具：定时任务到点只能用它的 append 追加到建任务时点名的那篇 */
+export const DOC_EDIT_TOOL = "feishu_doc_edit";
 
 const EDIT_ACTIONS: Record<EditAction, string> = {
   append: "在文档末尾追加内容",
@@ -112,7 +114,7 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
   const edit: Tool = {
     writes: true,
     spec: {
-      name: "feishu_doc_edit",
+      name: DOC_EDIT_TOOL,
       description:
         "修改飞书云文档。只在群成员明确要你改某篇文档时使用。除 append 外都要块 id：先用 feishu_doc_read 并设 with_block_ids=true 读一遍，" +
         "按 <!-- id:… --> 标记确定要动的块。改完把改了什么和文档链接告诉群成员。",

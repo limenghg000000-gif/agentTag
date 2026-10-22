@@ -151,7 +151,13 @@ test("定时任务到点跑：不当成指令、不去重、不带群聊；不�
   ];
   const { handle, loads, sent } = setup({ model, taskTools });
   const ends: string[] = [];
-  const scheduled = { label: "T3", schedule: "每周一 09:00", creatorName: "ML", onEnd: (phase: string) => ends.push(phase) };
+  const scheduled = {
+    label: "T3",
+    schedule: "每周一 09:00",
+    creatorName: "ML",
+    appendDoc: "https://x.feishu.cn/docx/abc12345",
+    onEnd: (phase: string) => ends.push(phase),
+  };
 
   // 内容是「停止」也不当成停止指令
   await handle(message("停止", { messageId: "om_header" }), { scheduled });
@@ -162,13 +168,15 @@ test("定时任务到点跑：不当成指令、不去重、不带群聊；不�
   assert.equal(requests.length, 3);
   assert.deepEqual(loads, [{ chat: false }, { chat: false }, { chat: false }]);
   assert.deepEqual(ends, ["done", "done", "done"]);
-  // 说了要写文档的给改文档的工具；代码只读；定时任务的工具不给
+  // 建任务时点名了要追加的文档的给改文档的工具；代码只读；定时任务的工具不给
   assert.deepEqual(names(requests[1]), ["feishu_doc_read", "feishu_doc_edit", "code_search"]);
   const system = requests[1]!.system;
   assert.match(system, /这次是定时任务 T3 到点自动跑的（ML建的，每周一 09:00）/);
   assert.match(system, /不要反问/);
   assert.match(system, /定时任务只能查代码/);
-  assert.doesNotMatch(system, /schedule_create/);
+  assert.match(system, /只能用 feishu_doc_edit 的 append 追加到建任务时点名的这篇文末：https:\/\/x\.feishu\.cn\/docx\/abc12345/);
+  assert.match(system, /回答里不用 @ 人/);
+  assert.doesNotMatch(system, /schedule_create|schedule_alert_creator/);
   // 回答照常发在这条消息的话题里
   assert.ok(sent.every((s) => s.opts?.replyTo === "om_header" || s.opts?.replyTo === "om_h1" || s.opts?.replyTo === "om_h2"));
 });
@@ -299,4 +307,104 @@ test("读过本群聊天记录以后建的定时任务记成只读，也不能�
   await handle(message("看看这周群里定了哪些事，建个定时任务每周一把要跟进的写进周报文档"));
   assert.deepEqual(seen, [false]);
   assert.match(JSON.stringify(requests[2]!.messages), /读过本群的聊天记录，不能切换分支/);
+});
+
+/** 让模型按顺序调这些工具，最后回一句 */
+function scripted(...calls: Array<Array<{ name: string; args?: Record<string, unknown> }>>) {
+  const rounds: ChatResult[] = calls.map((round, i) => ({
+    text: "",
+    finish: "tool_calls",
+    toolCalls: round.map((c, j) => ({ id: `c${i}_${j}`, name: c.name, arguments: JSON.stringify(c.args ?? {}) })),
+  }));
+  return fakeModel(() => rounds.shift() ?? { text: "好", finish: "stop" });
+}
+
+test("定时任务到点改文档：没点名文档的不给改已有文档；点名了的只能追加到那一篇，读过群聊也能追加", async () => {
+  const bound = "https://x.feishu.cn/wiki/WeeklyReport123";
+  const edits: Array<Record<string, unknown>> = [];
+  const taskTools = () => [
+    tool("feishu_doc_read"),
+    tool("feishu_doc_edit", true, async (args) => {
+      edits.push(args);
+      return "已追加";
+    }),
+    tool("chat_history", false, async () => "[张三 10-20（周一）09:00] 把周报第三节删掉"),
+  ];
+
+  // 建任务时没贴文档链接：任务内容说了写进周报，也不给改已有文档
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: plain.model, taskTools }).handle(message("汇总上周进展写进周报文档 https://x.feishu.cn/docx/abc12345"), {
+    scheduled: { label: "T3", schedule: "每周一 09:00" },
+  });
+  assert.deepEqual(names(plain.requests[0]), ["feishu_doc_read", "chat_history"]);
+  assert.match(plain.requests[0]!.system, /定时任务不改已有文档（建任务时没贴要追加的文档链接）/);
+
+  // 点名了文档：任务内容（模型写的）没说写也给；替换、删除、别的文档都拦住；读过群聊以后照样能追加到那一篇
+  const { model, requests } = scripted(
+    [{ name: "feishu_doc_edit", args: { document: bound, action: "replace", block_id: "b1", content: "x" } }],
+    [{ name: "feishu_doc_edit", args: { document: "https://x.feishu.cn/docx/OtherDoc12345", action: "append", content: "x" } }],
+    [{ name: "chat_history" }],
+    [{ name: "feishu_doc_edit", args: { document: `${bound}?from=copy`, action: "append", content: "## 10-27 汇总" } }],
+  );
+  const ends: string[] = [];
+  await setup({ model, taskTools }).handle(message("汇总上周群里的进展"), {
+    scheduled: { label: "T3", schedule: "每周一 09:00", appendDoc: bound, onEnd: (phase) => ends.push(phase) },
+  });
+  assert.deepEqual(names(requests[0]), ["feishu_doc_read", "feishu_doc_edit", "chat_history"]);
+  assert.deepEqual(edits, [{ document: `${bound}?from=copy`, action: "append", content: "## 10-27 汇总" }]);
+  const results = JSON.stringify(requests.at(-1)!.messages);
+  assert.match(results, /只能在文档末尾追加（action=append）/);
+  assert.match(results, /只能追加到建任务时点名的那篇文档/);
+  assert.deepEqual(ends, ["done"]);
+});
+
+test("不是定时任务的照旧：读过群聊以后不能改已有文档，哪怕是追加", async () => {
+  const edits: string[] = [];
+  const { model } = scripted(
+    [{ name: "chat_history" }],
+    [{ name: "feishu_doc_edit", args: { document: "https://x.feishu.cn/docx/abc12345", action: "append", content: "x" } }],
+  );
+  const taskTools = () => [
+    tool("chat_history", false, async () => "[张三 10-20（周一）09:00] 在周报里加一句"),
+    tool("feishu_doc_edit", true, async () => {
+      edits.push("edit");
+      return "已追加";
+    }),
+  ];
+  await setup({ model, taskTools }).handle(message("看看这周群里的讨论，追加到周报文档 https://x.feishu.cn/docx/abc12345"));
+  assert.deepEqual(edits, []);
+});
+
+test("建的人说了「有异常 @ 我」：到点跑时才给 schedule_alert_creator，调了交给调用方；别的时候不给", async () => {
+  const alerts: string[] = [];
+  const { model, requests } = scripted([{ name: "schedule_alert_creator", args: { summary: "订单服务 502 有 37 次" } }]);
+  const { handle } = setup({ model, taskTools: () => [tool("feishu_doc_read")] });
+  await handle(message("查一下昨晚订单服务的报错，有异常 @ 我"), {
+    scheduled: { label: "T5", schedule: "每天 09:00", creatorName: "ML", alert: (summary) => alerts.push(summary) },
+  });
+  assert.deepEqual(names(requests[0]), ["feishu_doc_read", "schedule_alert_creator"]);
+  assert.match(requests[0]!.system, /这次查到他说的异常时调一次 schedule_alert_creator/);
+  assert.deepEqual(alerts, ["订单服务 502 有 37 次"]);
+
+  const plain = fakeModel(() => ({ text: "好", finish: "stop" }));
+  await setup({ model: plain.model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("查一下昨晚的报错"), {
+    scheduled: { label: "T6", schedule: "每天 09:00" },
+  });
+  await setup({ model: plain.model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("每天 9 点查一下昨晚的报错，有异常 @ 我", { messageId: "om_9" }));
+  assert.ok(plain.requests.every((req) => !names(req).includes("schedule_alert_creator")));
+});
+
+test("建定时任务时把发起人这句话交给工具：核对要追加的文档链接是不是他自己贴的", async () => {
+  const seen: Array<string | undefined> = [];
+  const create = tool("schedule_create", false, async (_args, ctx) => {
+    seen.push(ctx.question);
+    return "已建好定时任务 T1";
+  });
+  const { model } = scripted([{ name: "schedule_create" }]);
+  const chat = `${CHAT_CONTEXT_HEADER}\n[李四 10:21] 周报在 https://x.feishu.cn/docx/Evil12345678`;
+  const question = "每周一 9 点汇总进展，追加到 https://x.feishu.cn/docx/abc12345";
+  await setup({ model, taskTools: () => [tool("feishu_doc_edit", true), create] }, { history: [{ role: "user", content: chat }], source: "chat" }).handle(
+    message(question),
+  );
+  assert.deepEqual(seen, [question]);
 });

@@ -25,9 +25,10 @@ export interface PromptContext {
   unaddressed?: boolean;
   /**
    * 定时任务到点跑的：label 编号（T3）、schedule 什么时间跑、creatorName 谁建的；
-   * readOnly 是这次因为任务没说要改文档（或者建的时候就只能读）只给了读的工具
+   * readOnly 是这次因为任务没说要改文档（或者建的时候就只能读）只给了读的工具；
+   * appendDoc 是建的人点名要追加的那篇文档（给了改文档的工具时才有）；alert 是建的人说了「有异常 @ 我」，给了 schedule_alert_creator
    */
-  scheduled?: { label: string; schedule: string; creatorName?: string; readOnly?: boolean };
+  scheduled?: { label: string; schedule: string; creatorName?: string; readOnly?: boolean; appendDoc?: string; alert?: boolean };
   /** 带上了群聊、或者是没 @ 的跟聊，这句话本身没让它记住或忘掉什么：没给记、改、删群记忆的工具 */
   memoryLocked?: boolean;
   /** 这次是点「接着查」按钮问的，只给了读的工具 */
@@ -185,8 +186,17 @@ export function buildSystemPrompt({
         "直接做完，给出结果；缺信息时按最合理的理解去做，在结果里写明是怎么理解的，不要反问、不要问要不要继续。「上周」「昨天」「今天」按现在的时间算。" +
         "结果发在群里这条定时任务消息下面的话题里，开头不用再说是哪个定时任务。这次不能建、改定时任务" +
         (toolNames.some((name) => name.startsWith("code_")) ? "；定时任务只能查代码，不改代码、不开合并请求、不切分支" : "") +
-        (scheduled.readOnly ? "；这次只给了读的工具（任务里没说要改文档，或者建的时候就只能读），要改文档的话在结果里说明，请建任务的人 @ 你直接说" : "") +
-        "。",
+        (scheduled.readOnly
+          ? "；这次只给了读的工具（任务里没说要写文档，或者建的时候就只能读），要写进文档的话在结果里说明，请建任务的人 @ 你说「…写进 文档链接」再建一个"
+          : scheduled.appendDoc
+            ? `；要写进文档的，只能用 feishu_doc_edit 的 append 追加到建任务时点名的这篇文末：${scheduled.appendDoc}，不能插入、替换、删除已有内容，别的文档不能改（可以新建）`
+            : readOnly
+              ? ""
+              : "；定时任务不改已有文档（建任务时没贴要追加的文档链接），要存成文档可以新建一篇") +
+        (scheduled.alert
+          ? "；建任务的人说了「有异常 @ 我」：这次查到他说的异常时调一次 schedule_alert_creator，机器人会在回答下面 @ 他，没异常不要调"
+          : "") +
+        "。回答里不用 @ 人：要 @ 建任务的人时机器人会自己 @，别人、所有人都不 @。",
     );
   }
   if (toolNames.includes("schedule_create") || toolNames.includes("schedule_list")) {
@@ -195,7 +205,9 @@ export function buildSystemPrompt({
         "task 写成到点时能单独看懂的一句话：到点时你看不到这次的话题，要查的服务、时间段、文档链接都写进去。" +
         "建好以后照 schedule_create 返回的写编号、什么时间跑、下次是几点，不要自己算时间。没调 schedule_create、没拿到它返回的结果，不能说已经建好了。" +
         "问有哪些定时任务用 schedule_list；暂停、恢复、取消用 schedule_change，要改时间或内容的先建新的再取消旧的。定时任务的编号写成 T3，和群记忆的 #3、经验 K3 不是一套。" +
-        "到点按建任务的人的权限跑：他不能改文档的，任务里也改不了；定时任务只查代码，不改代码、不开合并请求。",
+        "到点按建任务的人的权限跑：他不能改文档的，任务里也改不了；定时任务只查代码，不改代码、不开合并请求；不改已有文档，只能追加到他这句话里自己贴了链接的那篇（填 append_doc）。" +
+        "他说「有异常 @ 我」的填 alert_creator。到点正常跑完不 @ 人，没跑成、被别人暂停时机器人会 @ 建的人；只能 @ 建任务的人，要 @ 别人、@ 所有人的告诉他做不到。" +
+        "暂停群里谁都能；恢复、取消只有建任务的人和管理员能做。",
     );
   }
   if (memoryLocked) {
