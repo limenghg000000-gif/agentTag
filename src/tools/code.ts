@@ -358,22 +358,33 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
           },
         };
       }
-      const pending = await ws.pendingChanges(ctx.signal);
+      let pending = await ws.pendingChanges(ctx.signal);
       const elsewhere = target !== undefined && target !== pending.base ? target : undefined;
       if (pending.files.length === 0 && !elsewhere) {
         const pr = ws.pullRequest;
         throw new Error(pr ? `没有新的改动要推，${requestName}还是 ${pr.url}` : "还没有任何改动，先用 code_edit_file 改代码");
       }
       const pr = ws.pullRequest;
+      // 这个话题之前开的合并请求合了、关了：推的时候不往那个分支推，另拉一个分支另开（关掉的那份连同新改动整份带上）
+      const primary = pr && !elsewhere ? await ws.pullRequestState(ctx.signal) : undefined;
+      const replaced = primary === "merged" || primary === "closed" ? primary : undefined;
+      if (replaced === "closed") {
+        pending = await ws.pendingChanges(ctx.signal, true);
+      }
+      const whole = replaced === "closed";
       const branch = pending.branch ?? optional(args.branch);
       const route = elsewhere
         ? `从这个话题的分支 ${branch ?? "（机器人新建）"} 开${requestName}到 ${elsewhere}（这个分支是从 ${pending.base} 拉的，已经推过的改动一起带上）`
-        : pending.branch
-          ? `推到这个话题之前用的分支 ${pending.branch}${pr ? `，${refOf(pr.number)} 跟着更新` : `，开${requestName}到 ${pending.base}`}`
-          : `新建分支 ${branch ?? "（机器人起名）"}，开${requestName}到 ${pending.base}`;
-      // 这个话题之前开到别的分支（uat 这类）的：有新改动时开着的跟着更新，合过了的再开一个，卡片上一起写
+        : pr && replaced === "merged"
+          ? `${refOf(pr.number)} 已经合进 ${pending.base} 了：另拉一个分支，只带这次的新改动，开${requestName}到 ${pending.base}`
+          : pr && replaced === "closed"
+            ? `${refOf(pr.number)} 已经关掉了（没合并）：另拉一个分支，之前那份改动连同这次的整份带上，开${requestName}到 ${pending.base}`
+            : pending.branch
+              ? `推到这个话题之前用的分支 ${pending.branch}${pr ? `，${refOf(pr.number)} 跟着更新` : `，开${requestName}到 ${pending.base}`}`
+              : `新建分支 ${branch ?? "（机器人起名）"}，开${requestName}到 ${pending.base}`;
+      // 这个话题之前开到别的分支（uat 这类）的：有新改动时开着的跟着更新，合过了的再开一个，卡片上一起写（另开的时候不动它们）
       const fresh = pending.files.length > 0;
-      const targets = await ws.targetRequests(ctx.signal);
+      const targets = replaced ? [] : await ws.targetRequests(ctx.signal);
       const alsoLines = targets.flatMap(({ target: other, number, state }) =>
         state === "closed"
           ? []
@@ -389,9 +400,11 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
       return {
         title: elsewhere ? `开${requestName}到 ${elsewhere}` : `推代码、开${requestName}`,
         lines: [`仓库：${ws.repo}`, route, ...alsoLines, `标题：${title}`, ...changeLines(pending.files)],
-        // 改动变了，或者开到别的分支的那几个合并请求合了、关了（要动的跟着变），都要重新确认
+        // 改动变了，或者这个话题的合并请求、开到别的分支的那几个合了、关了（要动的跟着变），都要重新确认
         unchanged: async () =>
-          (await ws.pendingChanges(ctx.signal)).fingerprint === pending.fingerprint && states(await ws.targetRequests(ctx.signal)) === states(targets),
+          (pr && !elsewhere ? await ws.pullRequestState(ctx.signal) : undefined) === primary &&
+          (await ws.pendingChanges(ctx.signal, whole)).fingerprint === pending.fingerprint &&
+          states(replaced ? [] : await ws.targetRequests(ctx.signal)) === states(targets),
       };
     },
     async run(args, ctx) {

@@ -726,6 +726,20 @@ test("推代码前请发起人确认：这个话题之前开到 uat 的，卡片
   // 关掉了的不动，卡片上不写
   states[2] = "closed";
   assert.ok(!(await ask({ title: "再改", body: "" }))!.lines.some((line) => line.includes("uat")));
+
+  // 这个话题自己的合并请求合了：另拉分支只带新改动
+  const pending = (await ask({ title: "再改", body: "" }))!;
+  states[1] = "merged";
+  assert.equal(await pending.unchanged!(), false, "等确认的时候合了：推的时候要另开，和卡片上写的不一样");
+  const merged = (await ask({ title: "再改", body: "" }))!;
+  assert.deepEqual(merged.lines.slice(1), ["!1 已经合进 main 了：另拉一个分支，只带这次的新改动，开合并请求到 main", "标题：再改", "改了 1 个文件（+1 -1）：", "　a.go（+1 -1）"]);
+  // 关掉了（没合并）：之前那份连同这次的整份另开，卡片上列整份改了哪些文件
+  await tools.code_edit_file.run({ path: "b.txt", old_text: "one", new_text: "one 1" }, { signal });
+  states[1] = "closed";
+  const closed = (await ask({ title: "再改", body: "" }))!;
+  assert.equal(closed.lines[1], "!1 已经关掉了（没合并）：另拉一个分支，之前那份改动连同这次的整份带上，开合并请求到 main");
+  assert.deepEqual(closed.lines.slice(3), ["改了 2 个文件（+2 -2）：", "　a.go（+1 -1）", "　b.txt（+1 -1）"]);
+  assert.equal(await closed.unchanged!(), true);
 });
 
 test("还没开合并请求就说开到 uat：从 main 拉的分支直接开到 uat，测完再开到 main；有冲突、uat 上已经有了都不推", async () => {

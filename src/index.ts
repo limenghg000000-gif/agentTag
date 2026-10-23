@@ -471,7 +471,8 @@ const catchUp = new CatchUpPoller({
   // 补上的消息也让主动接话知道群里有人说过话（判断完要回之前看一眼）
   observe: (msg) => proactive.noteActivity(msg),
   follow: {
-    wants: (msg, fromApp) => listenerFor(msg, fromApp) !== undefined,
+    // 等着确认的人在话题里回的话：跟聊关着、这个话题不跟了也要拿来看
+    wants: (msg, fromApp) => listenerFor(msg, fromApp) !== undefined || (!fromApp && (confirms?.waiting(msg) ?? false)),
     consider: async (msg) => {
       if (confirmedByText(msg)) {
         return;

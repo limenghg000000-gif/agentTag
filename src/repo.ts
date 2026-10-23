@@ -1871,15 +1871,21 @@ export class Workspace {
    * 开合并请求前请发起人确认时用：要推的改动（没推的提交和没提交的改动）改了哪些文件、要开到的分支，
    * 和这份改动的指纹。确认以后、推之前再取一遍，指纹变了（同一轮里又改了代码、切了分支）就不推
    */
-  pendingChanges(signal?: AbortSignal): Promise<{ base: string; branch?: string; files: ChangedFile[]; fingerprint: string }> {
+  pendingChanges(signal?: AbortSignal, whole = false): Promise<{ base: string; branch?: string; files: ChangedFile[]; fingerprint: string }> {
     return this.serial(async () => {
       await this.git(["add", "-A"], signal);
-      const base = this.compareBase() ?? `origin/${this.baseBranch}`;
+      // whole：从拉分支的地方算起的整份改动（之前开的合并请求被关掉了，推的时候整份另开一个）
+      const base = (whole ? this.state.baseSha : this.compareBase()) ?? `origin/${this.baseBranch}`;
       const files = await this.changedFiles(["--cached", base], signal);
       const diff = await this.git(["diff", "--cached", "--binary", base], signal);
       const fingerprint = createHash("sha256").update(`${this.baseBranch}\n${this.state.branch ?? ""}\n${base}\n${diff}`).digest("hex");
       return { base: this.baseBranch, ...(this.state.branch ? { branch: this.state.branch } : {}), files, fingerprint };
     });
+  }
+
+  /** 这个话题开的合并请求（开到线上分支的那个）现在的状态：合了、关了的，推新改动时另开一个。查不到时为空 */
+  pullRequestState(signal?: AbortSignal): Promise<RequestState | undefined> {
+    return this.requestState(this.pullRequest?.number, signal);
   }
 
   /**

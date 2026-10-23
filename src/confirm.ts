@@ -186,6 +186,8 @@ export class WriteConfirms {
         entry.request.chatId === msg.chatId &&
         entry.request.threadKey === threadKey &&
         entry.request.asker === msg.senderId &&
+        // 卡片发出去以后才认：他还没看到要做什么
+        entry.cardMessageId !== undefined &&
         !entry.outcome &&
         !(msg.createTime > 0 && msg.createTime < entry.askedAt - CLOCK_SLACK_MS),
     );
@@ -195,6 +197,14 @@ export class WriteConfirms {
     this.answers.set(msg.messageId, waiting.length > 0);
     trim(this.answers, KEEP_ANSWERS);
     return waiting.length > 0;
+  }
+
+  /** 这条消息的人在这个话题里有等着他确认的卡片：补漏轮询补上没 @ 的话时，这类也要拿来看（跟聊关着也一样） */
+  waiting(msg: NormalizedMessage): boolean {
+    const threadKey = threadKeyOf(msg);
+    return [...this.pending.values()].some(
+      (entry) => entry.request.chatId === msg.chatId && entry.request.threadKey === threadKey && entry.request.asker === msg.senderId && !entry.outcome,
+    );
   }
 
   /** 定了以后改卡片：按钮去掉，写清做没做 */

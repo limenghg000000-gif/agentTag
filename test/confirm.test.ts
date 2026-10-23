@@ -226,6 +226,37 @@ test("确认卡片：话题里回的同一条「确认」只算一次（补漏�
   assert.equal(await second, "cancelled");
 });
 
+test("确认卡片：卡片还没发出去时回的「好」不算（他还没看到要做什么）；发不出去照样不做", async () => {
+  let deliver!: (result: { messageId: string }) => void;
+  let reject!: (err: Error) => void;
+  const make = () =>
+    new WriteConfirms({
+      send: () =>
+        new Promise((resolve, fail) => {
+          deliver = resolve;
+          reject = fail;
+        }),
+      updateCard: async () => {},
+      logger: quiet,
+    });
+  const confirms = make();
+  const inThread = { threadId: "omt_1", rootId: "om_root" };
+  const pending = confirms.ask(request());
+  assert.equal(confirms.waiting(message("好", inThread)), true, "补漏轮询也要拿来看");
+  assert.equal(confirms.waiting(message("好", { ...inThread, senderId: "ou_other" })), false);
+  assert.equal(confirms.answer(message("好", { ...inThread, messageId: "om_early" })), false);
+  deliver({ messageId: "om_card_1" });
+  await tick();
+  assert.equal(confirms.answer(message("好", { ...inThread, messageId: "om_after" })), true);
+  assert.equal(await pending, "confirmed");
+
+  const failing = make();
+  const unsent = failing.ask(request());
+  assert.equal(failing.answer(message("好", { ...inThread, messageId: "om_early2" })), false);
+  reject(new Error("卡片被拒"));
+  assert.equal(await unsent, "unsent");
+});
+
 // ---- 机器人跑任务时怎么用确认 ----
 
 function fakeModel(results: ChatResult[]) {
