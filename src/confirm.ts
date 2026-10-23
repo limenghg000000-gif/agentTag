@@ -8,6 +8,12 @@ import type { ConfirmPreview } from "./tools/tool.js";
 export const CONFIRM_ACTION = "confirm_write";
 /** 等提问的人确认最多等多久，没点就不做 */
 export const CONFIRM_WAIT_MS = 15 * 60_000;
+/** 定了的卡片记住多少张：定了以后又有人点（双击、别人在卡片改好之前点了），照定了的结果重画，不说成没做 */
+const KEEP_SETTLED = 200;
+/** 话题里回过的「确认」「取消」记住多少条：同一条消息补漏轮询和事件各送来一次时，只算第一次 */
+const KEEP_ANSWERS = 1000;
+/** 话题里回的字要在开始请他确认以后发的；飞书和服务器的时钟可能差一点，放宽几秒 */
+const CLOCK_SLACK_MS = 5_000;
 
 /** confirmed 点了确认；cancelled 点了取消；expired 到时间没人确认；stopped 任务停了；unsent 卡片发不出去 */
 export type ConfirmOutcome = "confirmed" | "cancelled" | "expired" | "stopped" | "unsent";
@@ -36,6 +42,8 @@ export interface WriteConfirmsOptions {
 interface Pending {
   id: string;
   request: ConfirmRequest;
+  /** 开始请他确认的时间：在这之前发的「好」「确认」不算 */
+  askedAt: number;
   /** 卡片消息；发出去以后才有 */
   cardMessageId?: string;
   /** 每画一次加一，按钮上带着它：同一个按钮再点一次飞书 SDK 也不会当成重复的丢掉 */
@@ -59,6 +67,10 @@ const TRAILING = /[。.!！~～\s]+$/;
  */
 export class WriteConfirms {
   private readonly pending = new Map<string, Pending>();
+  /** 已经定了的卡片（最近 KEEP_SETTLED 张） */
+  private readonly settled = new Map<string, Pending>();
+  /** 话题里回过的确认、取消：消息 id → 那次有没有定下等着确认的 */
+  private readonly answers = new Map<string, boolean>();
   private readonly logger: Logger;
   private readonly waitMs: number;
 
@@ -79,6 +91,7 @@ export class WriteConfirms {
       const entry: Pending = {
         id,
         request,
+        askedAt: Date.now(),
         rev: 0,
         settle: (result, by) => {
           if (entry.outcome) {
@@ -88,6 +101,8 @@ export class WriteConfirms {
           clearTimeout(timer);
           request.signal.removeEventListener("abort", onAbort);
           this.pending.delete(id);
+          this.settled.set(id, entry);
+          trim(this.settled, KEEP_SETTLED);
           this.logger.info(`确认卡片：${request.preview.title} ${OUTCOME_LOG[result]}${by ? ` operator=${by}` : ""} message=${request.replyTo}`);
           if (entry.cardMessageId) {
             this.close(entry);
@@ -119,13 +134,21 @@ export class WriteConfirms {
     if (value?.action !== CONFIRM_ACTION || typeof value.id !== "string") {
       return false;
     }
+    const done = this.settled.get(value.id);
+    if (done) {
+      // 已经定了（双击、别人在卡片改好之前点了）：照定了的结果再画一次，不改结果
+      if (done.cardMessageId === evt.messageId && done.request.chatId === evt.chatId) {
+        this.close(done);
+      }
+      return true;
+    }
     const entry = this.pending.get(value.id);
     if (!entry || entry.cardMessageId !== evt.messageId || entry.request.chatId !== evt.chatId) {
-      // 重启过、已经定了的：卡片上的按钮换成一句说明，免得以为点了就做了
+      // 机器人重启过、记不得的旧卡片：按钮换成一句说明，免得以为点了就做了。做没做记不得了，不说没做
       if (!entry) {
-        await this.opts.updateCard(evt.messageId, closedCard("确认卡片已经失效", "这张卡片已经失效（机器人重启过，或者已经处理过），这件事没做。要做请 @ 我再说一次。", "grey")).catch(
-          (err: unknown) => this.logger.warn(`确认卡片：改失效的卡片失败 card=${evt.messageId}`, err),
-        );
+        await this.opts
+          .updateCard(evt.messageId, closedCard("确认卡片已经失效", "这张卡片已经失效（机器人重启过，或者已经处理过），点了不算。做没做以话题里的回答为准，要做请 @ 我再说一次。", "grey"))
+          .catch((err: unknown) => this.logger.warn(`确认卡片：改失效的卡片失败 card=${evt.messageId}`, err));
       }
       return true;
     }
@@ -144,7 +167,8 @@ export class WriteConfirms {
 
   /**
    * 提问的人在话题里回了「确认」「取消」：这个话题里等他确认的都按这句定，返回 true（这句不再当成提问）。
-   * 只认他本人在同一个话题里、整句就是这几个字的（@ 没 @ 都算）
+   * 只认他本人在同一个话题里、开始请他确认以后发的、整句就是这几个字的（@ 没 @ 都算）。
+   * 同一条消息只算一次：补漏轮询和事件各送来一次时，第二次照第一次的结果返回，不去定后来又等着确认的
    */
   answer(msg: NormalizedMessage): boolean {
     const text = msg.content.trim().replace(TRAILING, "");
@@ -152,13 +176,24 @@ export class WriteConfirms {
     if (!result) {
       return false;
     }
+    const seen = this.answers.get(msg.messageId);
+    if (seen !== undefined) {
+      return seen;
+    }
     const threadKey = threadKeyOf(msg);
     const waiting = [...this.pending.values()].filter(
-      (entry) => entry.request.chatId === msg.chatId && entry.request.threadKey === threadKey && entry.request.asker === msg.senderId && !entry.outcome,
+      (entry) =>
+        entry.request.chatId === msg.chatId &&
+        entry.request.threadKey === threadKey &&
+        entry.request.asker === msg.senderId &&
+        !entry.outcome &&
+        !(msg.createTime > 0 && msg.createTime < entry.askedAt - CLOCK_SLACK_MS),
     );
     for (const entry of waiting) {
       entry.settle(result, msg.senderId);
     }
+    this.answers.set(msg.messageId, waiting.length > 0);
+    trim(this.answers, KEEP_ANSWERS);
     return waiting.length > 0;
   }
 
@@ -200,6 +235,13 @@ const OUTCOME_LOG: Record<ConfirmOutcome, string> = {
   stopped: "任务停了，不做",
   unsent: "卡片发不出去，不做",
 };
+
+/** 只留最近放进去的 max 个 */
+function trim(map: Map<string, unknown>, max: number): void {
+  while (map.size > max) {
+    map.delete(map.keys().next().value!);
+  }
+}
 
 /** 要做的事一行一条：别处来的文字（分支名、文件名、文档内容）转义后放进卡片 */
 function bullets(lines: readonly string[]): string {

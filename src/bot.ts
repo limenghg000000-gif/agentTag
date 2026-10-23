@@ -873,6 +873,10 @@ async function runTask(
           "他确认以后，要做的事变了（同一轮里又改了代码、切了分支，或者文档、合并请求被人动过），这次没做。先把改动都弄好，再调用一次，会重新发卡片请他确认",
         );
       }
+      // 核对的这会儿点了停止：不做
+      if (ctx.signal.aborted) {
+        throw new Error(confirmRefusal("stopped"));
+      }
     };
     // 定时任务建的人说了「有异常 @ 我」：查到异常时调，@ 谁由程序定（只 @ 建的人）
     const alertTools = scheduled?.alert ? [createScheduleAlertTool(scheduled.alert, scheduled.creatorName ?? context.askerName)] : [];

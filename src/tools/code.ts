@@ -352,7 +352,10 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
             `${requestName}标题：${title}`,
             `${refOf(from)}：${request.url}`,
           ],
-          unchanged: async () => (await ws.requestDetail(from, ctx.signal)).headSha === request.headSha,
+          unchanged: async () => {
+            const now = await ws.requestDetail(from, ctx.signal);
+            return now.headSha === request.headSha && now.source === request.source;
+          },
         };
       }
       const pending = await ws.pendingChanges(ctx.signal);
@@ -439,8 +442,11 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
           ...(built ? [] : ["流水线（构建）还没跑完的，设成通过后自动合并"]),
           `${refOf(number)}：${check.url}`,
         ],
-        // 合的时候按平台上那时的源分支提交再核对一遍（只合机器人推的那个），这里再看一眼源分支没变
-        unchanged: async () => (await ws.mergePlan(number, ctx.signal)).check.sha === check.sha,
+        // 合的时候按平台上那时的源分支提交再核对一遍（只合机器人推的那个），这里再看一眼源分支的提交、从哪合到哪都没变（有人改了目标分支也要重新确认）
+        unchanged: async () => {
+          const now = (await ws.mergePlan(number, ctx.signal)).check;
+          return now.sha === check.sha && now.source === check.source && now.target === check.target;
+        },
       };
     },
     async run(args, ctx) {

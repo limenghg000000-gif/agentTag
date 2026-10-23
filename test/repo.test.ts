@@ -1830,6 +1830,9 @@ test("推代码、合并前请发起人确认：卡片上列仓库、开到哪�
   // 确认以后有人往源分支上推了提交：合的时候也会拒，这里先认出来
   checks[1] = { ...check, sha: "0".repeat(40) };
   await assert.rejects(merge.unchanged!(), /有机器人没推过的提交/);
+  // 确认以后有人把目标分支改了（提交没变）：卡片上写的是合到 uat，要重新确认
+  checks[1] = { ...check, target: "test" };
+  assert.equal(await merge.unchanged!(), false);
   // 合不了的（受保护、只许维护者合）不发卡片，直接说原因
   checks[1] = { ...check, target: "prod", targetProtected: true };
   await assert.rejects(confirmOf(tools.code_merge)({ number: 1 }, { signal }), /只许维护者合并/);

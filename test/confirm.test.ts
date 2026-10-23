@@ -124,14 +124,14 @@ test("确认卡片：提问的人在同一个话题里回「确认」也算，�
   const { confirms } = desk();
   const pending = confirms.ask(request());
   await tick();
-  assert.equal(confirms.answer(message("确认", { senderId: "ou_other", threadId: "omt_1", rootId: "om_root" })), false);
-  assert.equal(confirms.answer(message("确认", { threadId: "omt_2", rootId: "om_root2" })), false);
-  assert.equal(confirms.answer(message("确认", { chatId: "oc_2", threadId: "omt_1", rootId: "om_root" })), false);
-  assert.equal(confirms.answer(message("确认一下这个分支对不对", { threadId: "omt_1", rootId: "om_root" })), false);
-  assert.equal(confirms.answer(message("确认。", { threadId: "omt_1", rootId: "om_root", mentionedBot: false })), true);
+  assert.equal(confirms.answer(message("确认", { messageId: "om_a", senderId: "ou_other", threadId: "omt_1", rootId: "om_root" })), false);
+  assert.equal(confirms.answer(message("确认", { messageId: "om_b", threadId: "omt_2", rootId: "om_root2" })), false);
+  assert.equal(confirms.answer(message("确认", { messageId: "om_c", chatId: "oc_2", threadId: "omt_1", rootId: "om_root" })), false);
+  assert.equal(confirms.answer(message("确认一下这个分支对不对", { messageId: "om_d", threadId: "omt_1", rootId: "om_root" })), false);
+  assert.equal(confirms.answer(message("确认。", { messageId: "om_e", threadId: "omt_1", rootId: "om_root", mentionedBot: false })), true);
   assert.equal(await pending, "confirmed");
   // 定了以后再回不算，照常当提问
-  assert.equal(confirms.answer(message("确认", { threadId: "omt_1", rootId: "om_root" })), false);
+  assert.equal(confirms.answer(message("确认", { messageId: "om_f", threadId: "omt_1", rootId: "om_root" })), false);
 });
 
 test("确认卡片：回「算了」就是取消", async () => {
@@ -174,8 +174,56 @@ test("确认卡片：重启后点旧卡片，卡片改成已经失效；不是�
   };
   assert.equal(await confirms.handleCardAction(stale), true);
   assert.equal(updates[0].messageId, "om_old");
-  assert.match(JSON.stringify(updates[0].card), /这张卡片已经失效/);
+  assert.match(JSON.stringify(updates[0].card), /这张卡片已经失效.*点了不算。做没做以话题里的回答为准/);
+  assert.doesNotMatch(JSON.stringify(updates[0].card), /这件事没做/, "记不得了，不说没做");
   assert.equal(await confirms.handleCardAction({ ...stale, action: { value: { action: "stop_task" }, tag: "button" } }), false);
+});
+
+test("确认卡片：确认了以后又有人点（双击、别人在卡片改好之前点了），照定了的结果重画，不说成没做", async () => {
+  const { confirms, sent, updates } = desk();
+  const pending = confirms.ask(request());
+  await tick();
+  const card = (sent[0].input as { card: any }).card;
+  await confirms.handleCardAction(click(card, "yes"));
+  assert.equal(await pending, "confirmed");
+  await tick();
+  assert.equal(await confirms.handleCardAction(click(card, "no", "ou_other")), true);
+  assert.equal(await confirms.handleCardAction(click(card, "no")), true);
+  await tick();
+  assert.equal(updates.length, 3);
+  for (const update of updates) {
+    assert.match(JSON.stringify(update.card), /已确认：推代码、开合并请求/);
+    assert.doesNotMatch(JSON.stringify(update.card), /没做|失效/);
+  }
+  // 别的群里冒充这张卡片的点击不重画
+  assert.equal(await confirms.handleCardAction(click(card, "no", "ou_asker", "om_card_1", "oc_2")), true);
+  assert.equal(updates.length, 3);
+});
+
+test("确认卡片：话题里回的同一条「确认」只算一次（补漏轮询和事件各送来一次），开始请他确认之前发的也不算", async () => {
+  const { confirms } = desk();
+  const first = confirms.ask(request());
+  await tick();
+  const yes = message("确认", { messageId: "om_yes", threadId: "omt_1", rootId: "om_root", mentionedBot: false });
+  assert.equal(confirms.answer(yes), true);
+  assert.equal(await first, "confirmed");
+  // 任务接着往下做，又要确认下一件事；先前那条「确认」又送来一次：照第一次的结果返回，不去定这一件
+  const second = confirms.ask(request());
+  await tick();
+  assert.equal(confirms.answer(yes), true);
+  // 开始请他确认之前就发了的「好」，补漏轮询这会儿才送来：不算
+  assert.equal(confirms.answer(message("好", { messageId: "om_old_ok", threadId: "omt_1", rootId: "om_root", createTime: Date.now() - 60_000 })), false);
+  // 第一次送来时没有等着确认的、当成了提问的，再送来一次也不算确认
+  const idle = desk();
+  const early = message("好", { messageId: "om_early", threadId: "omt_1", rootId: "om_root" });
+  assert.equal(idle.confirms.answer(early), false);
+  const later = idle.confirms.ask(request());
+  await tick();
+  assert.equal(idle.confirms.answer(early), false);
+  assert.equal(idle.confirms.answer(message("好", { messageId: "om_ok", threadId: "omt_1", rootId: "om_root" })), true);
+  assert.equal(await later, "confirmed");
+  assert.equal(confirms.answer(message("取消", { messageId: "om_no", threadId: "omt_1", rootId: "om_root" })), true);
+  assert.equal(await second, "cancelled");
 });
 
 // ---- 机器人跑任务时怎么用确认 ----
@@ -289,6 +337,21 @@ test("确认以后要做的事变了（同一轮里又改了代码）：不做�
   await handle(message("把「周五发版」追加到文档 https://x.feishu.cn/docx/AbCdEfGh123"));
   assert.equal(edit.runs.length, 0);
   assert.match(toolResult(requests[1])[0], /他确认以后，要做的事变了.*这次没做/);
+});
+
+test("确认以后、核对的这会儿点了停止：不做", async () => {
+  const tasks = new TaskRegistry();
+  const edit = docEdit(async () => ({
+    title: "替换文档内容",
+    lines: [],
+    unchanged: async () => {
+      tasks.stopAll();
+      return true;
+    },
+  }));
+  const { handle } = botSetup([edit.tool], [{ text: "", finish: "tool_calls", toolCalls: [appendCall("c1")] }, { text: "没改。", finish: "stop" }], ["confirmed"], { tasks });
+  await handle(message("把「周五发版」追加到文档 https://x.feishu.cn/docx/AbCdEfGh123"));
+  assert.equal(edit.runs.length, 0);
 });
 
 test("不用确认的：工具说了不用（只改工作目录、新建文档）、这次其实不改什么（已经合并过）、没开确认的，都直接做", async () => {
