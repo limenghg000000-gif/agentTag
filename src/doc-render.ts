@@ -95,6 +95,12 @@ export function renderDocument(blocks: readonly DocBlock[], options: RenderOptio
   return { title, markdown: renderer.children(page.children).join("\n").replace(/\n{3,}/g, "\n\n").trim() };
 }
 
+/** 文档里的几块（同一层的兄弟块）渲染成 Markdown：改文档前请发起人确认时，卡片上写要动的那段原文 */
+export function renderBlocks(blocks: readonly DocBlock[], ids: readonly string[]): string {
+  const byId = new Map(blocks.map((block) => [block.block_id, block]));
+  return new Renderer(byId, {}).children(ids).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 class Renderer {
   constructor(
     private readonly byId: ReadonlyMap<string, DocBlock>,

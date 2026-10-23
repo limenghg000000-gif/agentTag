@@ -1,6 +1,7 @@
 import type { BuildResult } from "../build.js";
 import {
   addChanges,
+  type ChangedFile,
   type CodeWorkspaces,
   DEFAULT_LIST_REQUESTS,
   DEFAULT_LOG_COMMITS,
@@ -11,6 +12,9 @@ import {
   type Workspace,
 } from "../repo.js";
 import { type Piece, type Tool, type ToolContext, type ToolOutput, ToolOutputBuilder } from "./tool.js";
+
+/** 确认卡片上最多列几个改了的文件 */
+const CONFIRM_FILES = 20;
 
 export const CODE_TOOL_NAMES = [
   "code_branches",
@@ -248,6 +252,8 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
 
   const edit: Tool = {
     writes: true,
+    // 只改机器人自己的工作目录，推出去（code_open_pr）之前再请发起人确认
+    confirm: false,
     spec: {
       name: "code_edit_file",
       description:
@@ -327,6 +333,83 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
     },
     describe: (args) =>
       optional(args.target) ? `把改动开${requestName}到 ${optional(args.target)} 分支` : `提交代码并开${requestName}`,
+    // 推之前请发起人确认：卡片上写仓库、开到哪个分支、改了哪些文件。确认以后改动变了（同一轮里又改了代码）就不推
+    async confirm(args, ctx) {
+      const title = requireString(args, "title").split("\n")[0].trim();
+      const ws = await workspace(args, ctx);
+      const from = requestNumber(args.from, "from");
+      const target = optional(args.target);
+      if (from !== undefined) {
+        if (!target) {
+          throw new Error(`要把 ${refOf(from)} 的改动开到别的分支，target 要填开到哪个分支`);
+        }
+        const request = await ws.requestDetail(from, ctx.signal);
+        return {
+          title: `开${requestName}到 ${target}`,
+          lines: [
+            `仓库：${ws.repo}`,
+            `把 ${refOf(from)}「${oneLine(request.title)}」（${request.author ?? "别人"} 开的，${request.source} → ${request.target}）的分支直接开到 ${target}`,
+            `${requestName}标题：${title}`,
+            `${refOf(from)}：${request.url}`,
+          ],
+          unchanged: async () => {
+            const now = await ws.requestDetail(from, ctx.signal);
+            return now.headSha === request.headSha && now.source === request.source;
+          },
+        };
+      }
+      let pending = await ws.pendingChanges(ctx.signal);
+      const elsewhere = target !== undefined && target !== pending.base ? target : undefined;
+      if (pending.files.length === 0 && !elsewhere) {
+        const pr = ws.pullRequest;
+        throw new Error(pr ? `没有新的改动要推，${requestName}还是 ${pr.url}` : "还没有任何改动，先用 code_edit_file 改代码");
+      }
+      const pr = ws.pullRequest;
+      // 这个话题之前开的合并请求合了、关了：推的时候不往那个分支推，另拉一个分支另开（关掉的那份连同新改动整份带上）
+      const primary = pr && !elsewhere ? await ws.pullRequestStatus(ctx.signal) : undefined;
+      const replaced = primary?.state === "merged" || primary?.state === "closed" ? primary.state : undefined;
+      if (replaced === "closed") {
+        pending = await ws.pendingChanges(ctx.signal, true);
+      }
+      const whole = replaced === "closed";
+      const branch = pending.branch ?? optional(args.branch);
+      const route = elsewhere
+        ? `从这个话题的分支 ${branch ?? "（机器人新建）"} 开${requestName}到 ${elsewhere}（这个分支是从 ${pending.base} 拉的，已经推过的改动一起带上）`
+        : pr && replaced === "merged"
+          ? `${refOf(pr.number)} 已经合进 ${pending.base} 了：另拉一个分支，只带这次的新改动，开${requestName}到 ${pending.base}`
+          : pr && replaced === "closed"
+            ? `${refOf(pr.number)} 已经关掉了（没合并）：另拉一个分支，之前那份改动连同这次的整份带上，开${requestName}到 ${pending.base}`
+            : pending.branch
+              ? `推到这个话题之前用的分支 ${pending.branch}${pr ? `，${refOf(pr.number)}（开到 ${primary?.target ?? pending.base}）跟着更新` : `，开${requestName}到 ${pending.base}`}`
+              : `新建分支 ${branch ?? "（机器人起名）"}，开${requestName}到 ${pending.base}`;
+      // 这个话题之前开到别的分支（uat 这类）的：有新改动时开着的跟着更新，合过了的再开一个，卡片上一起写（另开的时候不动它们）
+      const fresh = pending.files.length > 0;
+      const targets = replaced ? [] : await ws.targetRequests(ctx.signal);
+      // 跟着更新的写平台上现在开到哪（有人改过目标分支时不是当初的）；合过了再开的照当初的分支开
+      const alsoLines = targets.flatMap(({ target: other, number, state, now }) =>
+        state === "closed"
+          ? []
+          : state === "merged"
+            ? fresh || other === elsewhere
+              ? [`开到 ${other} 的 ${refOf(number)} 已经合过了，这次的改动再开一个${requestName}到 ${other}`]
+              : []
+            : fresh
+              ? [`开到 ${now || other} 的 ${refOf(number)} 跟着更新`]
+              : [],
+      );
+      // 状态和平台上现在开到哪都算：等确认的时候有人改了目标分支，也要重新确认
+      const states = (list: typeof targets) => list.map(({ target: other, number, state, now }) => `${other}:${number}:${state ?? ""}:${now ?? ""}`).join(",");
+      const status = (value: typeof primary) => (value ? `${value.state}:${value.target}` : "");
+      return {
+        title: elsewhere ? `开${requestName}到 ${elsewhere}` : `推代码、开${requestName}`,
+        lines: [`仓库：${ws.repo}`, route, ...alsoLines, `标题：${title}`, ...changeLines(pending.files)],
+        // 改动变了，或者这个话题的合并请求、开到别的分支的那几个合了、关了（要动的跟着变），都要重新确认
+        unchanged: async () =>
+          status(pr && !elsewhere ? await ws.pullRequestStatus(ctx.signal) : undefined) === status(primary) &&
+          (await ws.pendingChanges(ctx.signal, whole)).fingerprint === pending.fingerprint &&
+          states(replaced ? [] : await ws.targetRequests(ctx.signal)) === states(targets),
+      };
+    },
     async run(args, ctx) {
       const title = requireString(args, "title").split("\n")[0].trim();
       const body = [
@@ -372,6 +455,32 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
         number = undefined;
       }
       return number ? `合并${requestName} ${refOf(number)}` : `合并${requestName}`;
+    },
+    // 合之前请发起人确认：先照合并的规矩核对一遍（合不了的直接说原因，不发卡片），卡片上写合哪个、从哪个分支合到哪个分支。已经合并过的不用确认
+    async confirm(args, ctx) {
+      const number = requestNumber(args.number, "number");
+      if (number === undefined) {
+        throw new Error(`缺少 number 参数，填要合并的${requestName}编号`);
+      }
+      const ws = await workspace(args, ctx);
+      const { check, built } = await ws.mergePlan(number, ctx.signal);
+      if (check.state === "merged") {
+        return undefined;
+      }
+      return {
+        title: `合并 ${refOf(number)}`,
+        lines: [
+          `仓库：${ws.repo}`,
+          `合并 ${refOf(number)}「${oneLine(check.title)}」：${check.source} → ${check.target}`,
+          ...(built ? [] : ["流水线（构建）还没跑完的，设成通过后自动合并"]),
+          `${refOf(number)}：${check.url}`,
+        ],
+        // 合的时候按平台上那时的源分支提交再核对一遍（只合机器人推的那个），这里再看一眼源分支的提交、从哪合到哪都没变（有人改了目标分支也要重新确认）
+        unchanged: async () => {
+          const now = (await ws.mergePlan(number, ctx.signal)).check;
+          return now.sha === check.sha && now.source === check.source && now.target === check.target;
+        },
+      };
     },
     async run(args, ctx) {
       const number = requestNumber(args.number, "number");
@@ -436,6 +545,23 @@ function openedLine(pr: OpenedRequest, requestName: string, refOf: (number: numb
     ? ["这个分支到 ", [pr.live.base, { branch: pr.live.base }], ` 的${requestName} ${refOf(pr.live.number)} 照旧，测完合它上线。`]
     : [];
   return [pr.created ? `已开${requestName} ${ref}` : `已把新改动推到这个话题之前开的${requestName} ${ref}`, ...route, ...(synced.length || live.length ? ["。"] : []), ...synced, ...live];
+}
+
+/** 确认卡片上列改了哪些文件：太多时只列前面的 */
+function changeLines(files: readonly ChangedFile[]): string[] {
+  const added = files.reduce((sum, file) => sum + (file.added ?? 0), 0);
+  const deleted = files.reduce((sum, file) => sum + (file.deleted ?? 0), 0);
+  const shown = files.slice(0, CONFIRM_FILES).map((file) => `　${oneLine(file.path)}（${file.added === undefined ? "二进制文件" : `+${file.added} -${file.deleted}`}）`);
+  return [
+    ...(files.length > 0 ? [`改了 ${files.length} 个文件（+${added} -${deleted}）：`] : ["没有新的改动"]),
+    ...shown,
+    ...(files.length > CONFIRM_FILES ? [`　……还有 ${files.length - CONFIRM_FILES} 个文件`] : []),
+  ];
+}
+
+/** 一行写完：标题、文件名里的换行换成空格 */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 /** 把结果里查到的代码位置交给机器人的回答检查，文字交给模型 */

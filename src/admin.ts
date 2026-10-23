@@ -187,9 +187,18 @@ export class AdminDesk {
     try {
       await this.publish(await this.open(query, opener), msg.messageId);
     } catch (err) {
-      this.logger.error("管理群：设置卡片没发出去", err);
+      await this.unsent(err, msg.messageId);
     }
     return true;
+  }
+
+  /** 设置卡片没发出去：记日志，管理群里回一句，免得点了、说了以后什么都没有 */
+  private async unsent(err: unknown, replyTo: string | undefined): Promise<void> {
+    this.logger.error("管理群：设置卡片没发出去", err);
+    const reason = describe(err).replace(/\s+/g, " ").slice(0, 200);
+    await this.opts
+      .send(this.opts.chatId, { markdown: `设置卡片没发出去（${reason}），设置没改。请稍后再试，还不行就把这句话发给维护机器人的人。` }, replyTo ? { replyTo } : undefined)
+      .catch((sendErr: unknown) => this.logger.warn("管理群：回卡片没发出去失败", sendErr));
   }
 
   /** 处理设置卡片上的按钮。不是设置卡片返回 false；别的群里点的不理 */
@@ -420,7 +429,7 @@ export class AdminDesk {
     // 读群成员要一会儿，放到后台，回调马上返回
     void next
       .then((opened) => this.publish(opened, session.cardMessageId))
-      .catch((err: unknown) => this.logger.error("管理群：设置卡片没发出去", err));
+      .catch((err: unknown) => this.unsent(err, session.cardMessageId));
   }
 
   private async onGroup(session: GroupSession, op: string, current: boolean, operator: Person, form: Record<string, unknown> | undefined): Promise<void> {
@@ -1073,7 +1082,8 @@ export class AdminDesk {
       ...note,
       {
         tag: "form",
-        name: "admins",
+        // 不能和下面的选人框（admins）重名：飞书整张卡片拒收（11310 name duplicate）
+        name: "admins_form",
         elements: [
           ...(session.people.length > 0 ? [personSelect("admins", session.people, session.draft.filter((openId) => session.people.includes(openId)))] : []),
           submitButton("下一步：核对改动", value("next")),

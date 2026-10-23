@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { BuildChecker, BuildResult } from "./build.js";
@@ -1294,13 +1294,47 @@ export class Workspace {
   async mergeRequest(number: number, signal?: AbortSignal): Promise<ToolOutput> {
     const name = this.host.requestName;
     const ref = this.host.refOf(number);
+    const { check, built } = await this.mergePlan(number, signal);
+    const route: Piece[] = ["（", [check.source, { branch: check.source }], " → ", [check.target, { branch: check.target }], "）"];
+    if (check.state === "merged") {
+      return this.output().parts(`${ref}「${oneLine(check.title)}」`, ...route, `已经合并过了：${check.url}`).build();
+    }
+    const merged = await this.host.mergeRequest!(this.repo, number, { sha: check.sha, target: check.target, requirePipeline: !built }, signal);
+    const url = merged.url || check.url;
+    const out = this.output();
+    return (
+      merged.state === "merged"
+        ? out.parts(`已合并${name} ${ref}「${oneLine(check.title)}」`, ...route, `，改动进了 ${check.target} 分支：${url}`)
+        : out.parts(
+            `${ref}「${oneLine(check.title)}」`,
+            ...route,
+            `要等流水线跑完才能合，已设成流水线通过后自动合并；流水线没过就不会合，到 ${this.host.name} 上看流水线：${url}`,
+          )
+    ).build();
+  }
+
+  /** 仓库里已有的合并请求（code_open_pr 的 from）：开到别的分支前请发起人确认时，卡片上写是哪个、源分支在哪个提交 */
+  async requestDetail(number: number, signal?: AbortSignal): Promise<RequestDetail> {
+    if (!this.host.getRequest) {
+      throw new RepoError(`${this.host.name} 还不支持把别的${this.host.requestName}开到别的分支`);
+    }
+    return this.host.getRequest(this.repo, number, signal);
+  }
+
+  /**
+   * 合并前的核对：机器人合不了的（别人开的、别的话题开的、分支上有别人的提交、受保护只许维护者合、流水线没过）抛错，说清原因。
+   * 已经合并过的照样返回（state 是 merged）。built：源分支最新的提交推之前在服务器上编过，不用等流水线。
+   * 合并前请发起人确认时，卡片上写的要合的是哪个也按它；真合的时候再核对一遍
+   */
+  async mergePlan(number: number, signal?: AbortSignal): Promise<{ check: MergeCheck; built: boolean }> {
+    const name = this.host.requestName;
+    const ref = this.host.refOf(number);
     if (!this.host.mergeCheck || !this.host.mergeRequest) {
       throw new RepoError(`${this.host.name} 上机器人还不能合并${name}，请人来点`);
     }
     const check = await this.host.mergeCheck(this.repo, number, signal);
-    const route: Piece[] = ["（", [check.source, { branch: check.source }], " → ", [check.target, { branch: check.target }], "）"];
     if (check.state === "merged") {
-      return this.output().parts(`${ref}「${oneLine(check.title)}」`, ...route, `已经合并过了：${check.url}`).build();
+      return { check, built: false };
     }
     if (check.state === "closed") {
       throw new RepoError(`${ref} 已经关掉了（没合并），合不了：${check.url}`);
@@ -1365,18 +1399,7 @@ export class Workspace {
       own.checkedSha !== undefined &&
       own.checkedSha === check.sha &&
       (own.checkedTarget === undefined || own.checkedTarget === (await this.remoteTip(check.target, signal)));
-    const merged = await this.host.mergeRequest(this.repo, number, { sha: check.sha, target: check.target, requirePipeline: !built }, signal);
-    const url = merged.url || check.url;
-    const out = this.output();
-    return (
-      merged.state === "merged"
-        ? out.parts(`已合并${name} ${ref}「${oneLine(check.title)}」`, ...route, `，改动进了 ${check.target} 分支：${url}`)
-        : out.parts(
-            `${ref}「${oneLine(check.title)}」`,
-            ...route,
-            `要等流水线跑完才能合，已设成流水线通过后自动合并；流水线没过就不会合，到 ${this.host.name} 上看流水线：${url}`,
-          )
-    ).build();
+    return { check, built };
   }
 
   /**
@@ -1497,11 +1520,17 @@ export class Workspace {
 
   /** 之前开的合并请求现在的状态。平台不支持查、或者查失败时不知道（当它还开着，和以前一样） */
   private async requestState(number: number | undefined, signal?: AbortSignal): Promise<RequestState | undefined> {
+    return (await this.requestStatus(number, signal))?.state;
+  }
+
+  /** 合并请求现在的状态和开到哪个分支（有人可能改过目标分支）。查不到时为空 */
+  private async requestStatus(number: number | undefined, signal?: AbortSignal): Promise<{ state: RequestState; target: string } | undefined> {
     if (!number || !this.host.getRequest) {
       return undefined;
     }
     try {
-      return (await this.host.getRequest(this.repo, number, signal)).state;
+      const { state, target } = await this.host.getRequest(this.repo, number, signal);
+      return { state, target };
     } catch (err) {
       if (signal?.aborted) {
         throw err;
@@ -1842,6 +1871,41 @@ export class Workspace {
     return out
       .line(`已修改 ${shown}，改动后的内容在第 ${last > line ? `${line} 到 ${last}` : line} 行。`, { path: rel, lines: [line, last] })
       .build();
+  }
+
+  /**
+   * 开合并请求前请发起人确认时用：要推的改动（没推的提交和没提交的改动）改了哪些文件、要开到的分支，
+   * 和这份改动的指纹。确认以后、推之前再取一遍，指纹变了（同一轮里又改了代码、切了分支）就不推
+   */
+  pendingChanges(signal?: AbortSignal, whole = false): Promise<{ base: string; branch?: string; files: ChangedFile[]; fingerprint: string }> {
+    return this.serial(async () => {
+      await this.git(["add", "-A"], signal);
+      // whole：从拉分支的地方算起的整份改动（之前开的合并请求被关掉了，推的时候整份另开一个）
+      const base = (whole ? this.state.baseSha : this.compareBase()) ?? `origin/${this.baseBranch}`;
+      const files = await this.changedFiles(["--cached", base], signal);
+      const diff = await this.git(["diff", "--cached", "--binary", base], signal);
+      const fingerprint = createHash("sha256").update(`${this.baseBranch}\n${this.state.branch ?? ""}\n${base}\n${diff}`).digest("hex");
+      return { base: this.baseBranch, ...(this.state.branch ? { branch: this.state.branch } : {}), files, fingerprint };
+    });
+  }
+
+  /** 这个话题开的合并请求（开到线上分支的那个）现在的状态和开到哪：合了、关了的，推新改动时另开一个。查不到时为空 */
+  pullRequestStatus(signal?: AbortSignal): Promise<{ state: RequestState; target: string } | undefined> {
+    return this.requestStatus(this.pullRequest?.number, signal);
+  }
+
+  /**
+   * 这个话题开到别的分支（uat 这类）的合并请求和它们现在的状态：推新改动时开着的跟着更新，合过了的再开一个。
+   * 开合并请求前请发起人确认时，卡片上写清这些也会动；查不到状态的照开着算（推的时候也是）
+   */
+  async targetRequests(signal?: AbortSignal): Promise<Array<{ target: string; number: number; state?: RequestState; now?: string }>> {
+    const list: Array<{ target: string; number: number; state?: RequestState; now?: string }> = [];
+    for (const request of this.state.requests ?? []) {
+      const status = await this.requestStatus(request.prNumber, signal);
+      // now：平台上现在开到哪个分支（有人改过目标分支时和 target 不一样）
+      list.push({ target: request.target, number: request.prNumber, ...(status ? { state: status.state, now: status.target } : {}) });
+    }
+    return list;
   }
 
   /** 当前所有改动（含新建的文件）：先列改了哪些文件，再给完整 diff */

@@ -35,7 +35,15 @@ interface Sent {
 }
 
 async function setup(
-  opts: { allowAdminChat?: boolean; directory?: boolean; env?: Record<string, string>; onMembers?: () => Promise<void>; chats?: () => Promise<string[]> } = {},
+  opts: {
+    allowAdminChat?: boolean;
+    directory?: boolean;
+    env?: Record<string, string>;
+    onMembers?: () => Promise<void>;
+    chats?: () => Promise<string[]>;
+    /** 飞书拒收卡片（比如卡片写错了） */
+    rejectCards?: boolean;
+  } = {},
 ) {
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), "agenttag-admin-")), "settings");
   const settings = new GroupSettings({ dir, logger: quiet });
@@ -74,6 +82,12 @@ async function setup(
     send: async (to, input, sendOpts) => {
       const messageId = `om_sent_${sent.length + 1}`;
       const item = input as { card?: Record<string, unknown>; markdown?: string };
+      if (item.card) {
+        assertFeishuAccepts(item.card);
+        if (opts.rejectCards) {
+          throw new Error("Failed to create card content, ext=ErrCode: 11310");
+        }
+      }
       sent.push({ to, messageId, ...(item.card ? { card: item.card } : {}), ...(item.markdown ? { markdown: item.markdown } : {}), ...(sendOpts?.replyTo ? { replyTo: sendOpts.replyTo } : {}) });
       if (item.card) {
         cards.set(messageId, item.card);
@@ -81,6 +95,7 @@ async function setup(
       return { messageId } as never;
     },
     updateCard: async (messageId, card) => {
+      assertFeishuAccepts(card);
       cards.set(messageId, card as Record<string, unknown>);
     },
     nameOf: async (openId) => ({ ou_owner: "老板", ou_admin: "管理员甲", ou_x: "路人" })[openId],
@@ -109,6 +124,27 @@ async function setup(
       return desk.handleCardAction(cardEvent(messageId, value, operator, form));
     },
   };
+}
+
+/** 飞书收卡片时的检查：一张卡片里组件的 name 不能重名（重名时整张卡片被拒，11310 name duplicate） */
+function assertFeishuAccepts(card: unknown): void {
+  const names: string[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+    } else if (node && typeof node === "object") {
+      const item = node as Record<string, unknown>;
+      if (typeof item.tag === "string" && typeof item.name === "string") {
+        names.push(item.name);
+      }
+      Object.values(item).forEach(walk);
+    }
+  };
+  walk(card);
+  const duplicate = names.find((name, i) => names.indexOf(name) !== i);
+  if (duplicate) {
+    throw new Error(`Failed to create card content, ext=ErrCode: 11310; ErrMsg: name(${duplicate}) duplicate`);
+  }
 }
 
 function message(content: string, senderId: string, chatId: string, mentionedBot: boolean): NormalizedMessage {
@@ -405,6 +441,22 @@ test("管理员名单：只有所有者能加减；加上的管理员能改各�
   await t.click(group, "next", "ou_admin", { ...keepAll, proactive: "on" });
   await t.click(group, "confirm", "ou_admin");
   assert.deepEqual(t.settings.override("oc_test"), { proactive: true });
+});
+
+test("管理员名单：群里有人可选时卡片照样发得出去（表单和选人框不重名）", async () => {
+  const t = await setup();
+  await t.say("配置 管理员", "ou_owner");
+  const card = t.cards.get(t.sent[0]!.messageId);
+  assert.match(text(card), /"multi_select_person"/);
+  assert.match(text(card), /"name":"admins_form"/);
+});
+
+test("设置卡片没发出去（飞书拒收）：管理群里回一句，不是什么都没有", async () => {
+  const t = await setup({ rejectCards: true });
+  assert.equal(await t.say("配置 管理员", "ou_owner"), true);
+  const reply = t.sent.at(-1)!;
+  assert.match(reply.replyTo ?? "", /^om_in_/);
+  assert.match(reply.markdown ?? "", /设置卡片没发出去（Failed to create card content, ext=ErrCode: 11310），设置没改/);
 });
 
 test("读不到群成员（没开权限）：只能从名单里已有的人里减，卡片上说明", async () => {
