@@ -24,7 +24,7 @@ function fakeClient(pages: object[], single: object = { code: 0, data: { items: 
   return { client, listCalls };
 }
 
-test("读话题消息：按时间正序，转成文本，去掉 @机器人，认出本机器人发的消息", async () => {
+test("读话题消息：按时间正序，转成文本，去掉 @机器人（标上 @ 了它），认出本机器人发的消息", async () => {
   const { client, listCalls } = fakeClient([
     {
       code: 0,
@@ -66,7 +66,7 @@ test("读话题消息：按时间正序，转成文本，去掉 @机器人，认
     with_sender_name: true,
   });
   assert.deepEqual(messages, [
-    { messageId: "om_1", fromBot: false, senderName: "张三", senderId: "ou_zhang", msgType: "text", content: "帮 @李四 写个标题", createTime: 1000 },
+    { messageId: "om_1", fromBot: false, senderName: "张三", senderId: "ou_zhang", msgType: "text", content: "帮 @李四 写个标题", createTime: 1000, mentionedBot: true },
     { messageId: "om_2", fromBot: true, senderName: undefined, msgType: "post", content: "《季度总结》", createTime: 2000 },
   ]);
 });

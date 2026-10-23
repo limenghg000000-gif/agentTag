@@ -55,7 +55,8 @@ export function createScheduleTools(opts: ScheduleToolsOptions): Tool[] {
             type: "string",
             description:
               "到点时交给你的话，写成一句能单独看懂的提问或指令（到点时你看不到这次的话题）：要查的服务、要看的时间段（「上周」「昨天」到点时按当时算）、文档链接都写进去，" +
-              `不要写「上面那个」「刚才说的」。要追加到文档的写明追加什么。纯提醒写要提醒的事，如「看一下 3.2 版本的发版进度」。不超过 ${MAX_PROMPT_CHARS} 字`,
+              `不要写「上面那个」「刚才说的」。要追加到文档的写明追加什么。纯提醒写要提醒的事，如「看一下 3.2 版本的发版进度」。` +
+              `到点这段会原样发在群里给大家看：用大白话写要做的事，不写工具名（chat_history、feishu_doc_edit 这类）。不超过 ${MAX_PROMPT_CHARS} 字`,
           },
           cron: {
             type: "string",
