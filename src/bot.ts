@@ -35,7 +35,7 @@ import {
 } from "./progress.js";
 import { type AboutBot, buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
-import { type ChangeAction, type ChangeGrant, describeGrants } from "./schedules.js";
+import { type ChangeAction, type ChangeGrant, describeGrants, preview } from "./schedules.js";
 import { createEarlierResultsTool, EARLIER_RESULTS_TOOL, type EarlierResult, EarlierResults, listEarlierResults } from "./topic-results.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
@@ -49,6 +49,7 @@ import { createRecentThreadsTool, RECENT_THREADS_TOOL } from "./tools/recent-thr
 import {
   checkScheduledDocEdit,
   createScheduleAlertTool,
+  MAX_ALERT_CHARS,
   SCHEDULE_ALERT_TOOL,
   SCHEDULE_CHANGE_TOOL,
   SCHEDULE_CREATE_TOOL,
@@ -1126,6 +1127,8 @@ async function runTask(
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
             reviewQuotaClaim(deps.mcp?.names ?? [], asked, () => toolTexts.join("\n")),
           ]),
+      // 建的人说了「有异常 @ 我」的定时任务：写了报错条数、没说清有没有异常，又没调 @ 人的工具的打回一次
+      ...(scheduled && alertTools.length > 0 ? [reviewScheduledAlert(scheduled.label)] : []),
       // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
       ...(restate || scheduled
         ? []
@@ -1358,6 +1361,15 @@ async function runTask(
     if (blockedSchedule) {
       logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
       answer = blockedScheduleAnswer(scheduleDone);
+    }
+    // 定时任务建的人说了「有异常 @ 我」：打回以后回答里还是写着报错条数、也没说不算异常，模型还是没调 @ 人的工具，程序照回答替它记上。
+    // 2026-10-23 T6 查到 180 条报错，打回那次说的是代码没查证，模型补查完代码照样没调，ML 一直没被 @
+    if (scheduled?.alert && !succeeded.has(SCHEDULE_ALERT_TOOL) && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER && !blockedCode) {
+      const missed = missedScheduledAlert(shown);
+      if (missed) {
+        logger.warn(`定时任务 ${scheduled.label} 回答里写了报错条数，模型没调 ${SCHEDULE_ALERT_TOOL}，照回答 @ 建的人 message=${msg.messageId}`);
+        scheduled.alert(preview(missed, MAX_ALERT_CHARS));
+      }
     }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
     if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || blockedSchedule || result.finish === "filtered") {
@@ -2776,6 +2788,68 @@ function taskStates(lines: readonly string[]): Map<string, string> {
     }
   }
   return states;
+}
+
+// 报错、异常、告警、失败的条数：「报错 180 条」「3 个 Pod 报错」。中间隔着标点、数字、否定字的不算；「1 个小时」不是条数
+const PROBLEM = "(?:异常|报错|错误|告警|失败|故障|error|5xx)";
+const PROBLEM_UNIT = "\\s*(?:条|次|笔|起|个(?!小时|钟头|月|星期|礼拜))";
+const PROBLEM_GAP = "[^。！!？?\\n；;，,\\d没不无未]";
+const COUNTED_PROBLEMS = new RegExp(`${PROBLEM}${PROBLEM_GAP}{0,10}?(\\d+)${PROBLEM_UNIT}|(\\d+)${PROBLEM_UNIT}${PROBLEM_GAP}{0,6}?${PROBLEM}`, "gi");
+// 明说没有：「没有报错」「未发现异常」「一切正常」。「有没有报错」「有无异常」是在复述问题，不算
+const SAYS_FINE = /(?<!有)(?:没有|没|未|无)(?:发现|查到|看到|出现|新的?|任何)*(?:异常|报错|错误|告警|故障|失败|问题)|一切正常|都正常|运行正常|状态正常|正常运行/;
+// 明说这次不算异常（「没有超过他说的线，没有异常」「不算异常」）。「没有新的告警」只说了一样，不算
+const NO_ANOMALY = /(?<!有)(?:没有|没|未|无)(?:发现|查到|看到|出现)?(?:任何)?异常|不算异常|不属于异常|一切正常/;
+
+/** 回答里写的第一个不是 0 的报错、异常条数，和写着它的那一句（去掉 markdown 符号） */
+export function reportedProblem(answer: string): { count: number; sentence: string } | undefined {
+  for (const match of answer.matchAll(COUNTED_PROBLEMS)) {
+    const count = Number(match[1] ?? match[2]);
+    if (count > 0) {
+      const start = Math.max(...["。", "！", "？", "!", "?", "\n"].map((mark) => answer.lastIndexOf(mark, match.index) + 1));
+      const ends = ["。", "！", "？", "!", "?", "\n"].map((mark) => answer.indexOf(mark, match.index)).filter((at) => at >= 0);
+      const sentence = answer
+        .slice(start, ends.length > 0 ? Math.min(...ends) : undefined)
+        .replace(/[*_`#>|]+/g, " ")
+        .replace(/^\s*(?:[-•]|\d+[.、)])\s+/, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      return { count, sentence };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 打回一次以后，回答里还是写着不是 0 的报错、异常条数，也没说这次不算异常，模型还是没调 schedule_alert_creator：
+ * 程序照回答替它记一次，跑完照样 @ 建的人。返回记下的那句，没记返回 undefined
+ */
+export function missedScheduledAlert(answer: string): string | undefined {
+  const problem = reportedProblem(answer);
+  return problem && !NO_ANOMALY.test(answer) ? problem.sentence || `回答里写了 ${problem.count} 条报错、异常` : undefined;
+}
+
+/**
+ * 定时任务建的人说了「有异常 @ 我」，这次没调 schedule_alert_creator：回答里写了报错、异常这类的条数（不是 0），
+ * 或者没明说「没有异常」的，打回一次，叫它照他说的再判断：查到了就调，确实没有就写明。
+ * 2026-10-23 ML 的 T6「每隔 1 个小时查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我」到点查到 180 条报错，没 @ 他
+ */
+export function reviewScheduledAlert(label: string) {
+  return (answer: string, usedTools: ReadonlySet<string>): string | undefined => {
+    if (usedTools.has(SCHEDULE_ALERT_TOOL)) {
+      return undefined;
+    }
+    const found = reportedProblem(answer)?.count;
+    // 写了 0 条、明说没有的不打回
+    if (found === undefined && (answer.search(COUNTED_PROBLEMS) >= 0 || SAYS_FINE.test(answer))) {
+      return undefined;
+    }
+    return found !== undefined
+      ? `这次是定时任务 ${label}，建的人说了「有异常 @ 我」。回答里写了查到 ${found} 条报错、异常这类的，却没调 ${SCHEDULE_ALERT_TOOL}，机器人不会 @ 他。` +
+          `他问有没有报错、异常的，条数不是 0 就算：先调一次 ${SCHEDULE_ALERT_TOOL}（summary 一句话写查到了什么），再照原样给出回答。` +
+          "只有他说了线（「超过 100 条」）、这次没超过的才不调，回答里写明「没超过他说的线，没有异常」。"
+      : `这次是定时任务 ${label}，建的人说了「有异常 @ 我」，回答里没说清这次有没有他说的异常，也没调 ${SCHEDULE_ALERT_TOOL}。` +
+          `查到了（报错、告警、失败的条数不是 0，或者超过了他说的线）就先调一次 ${SCHEDULE_ALERT_TOOL} 再回答；确实没有就在回答里写明「没有异常」。`;
+  };
 }
 
 /**

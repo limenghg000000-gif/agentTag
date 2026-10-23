@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { NormalizedMessage, SendInput, SendOptions } from "@larksuiteoapi/node-sdk";
-import { BLOCKED_SCHEDULE_ANSWER, blockedScheduleAnswer, type BotDeps, createMessageHandler, READ_CHAT_NOTE, type ThreadContextSource, topicScheduleChange, unbackedScheduleClaims } from "../src/bot.js";
+import {
+  BLOCKED_SCHEDULE_ANSWER,
+  blockedScheduleAnswer,
+  type BotDeps,
+  createMessageHandler,
+  missedScheduledAlert,
+  READ_CHAT_NOTE,
+  reviewScheduledAlert,
+  type ThreadContextSource,
+  topicScheduleChange,
+  unbackedScheduleClaims,
+} from "../src/bot.js";
 import { CHAT_CONTEXT_HEADER, type ThreadContext } from "../src/history.js";
 import type { ChatModel, ChatRequest, ChatResult } from "../src/llm.js";
 import { TaskRegistry } from "../src/tasks.js";
@@ -393,6 +404,72 @@ test("建的人说了「有异常 @ 我」：到点跑时才给 schedule_alert_c
   });
   await setup({ model: plain.model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("每天 9 点查一下昨晚的报错，有异常 @ 我", { messageId: "om_9" }));
   assert.ok(plain.requests.every((req) => !names(req).includes("schedule_alert_creator")));
+});
+
+test("说了「有异常 @ 我」的定时任务：回答写了报错条数、没说清有没有异常，又没调 @ 人的工具的打回一次；明说没有的不打回", () => {
+  const review = reviewScheduledAlert("T6");
+  const none = new Set<string>();
+  // 2026-10-23 ML 的 T6：查到 180 条报错，没 @ 他
+  const found = review("gateway-api 最近 1 小时报错 180 条，主要是 Redis 连接超时。", none);
+  assert.match(found ?? "", /定时任务 T6.*查到 180 条报错.*没调 schedule_alert_creator.*条数不是 0 就算：先调一次 schedule_alert_creator/);
+  assert.match(review("3 个 Pod 报错，都是 OOM。", none) ?? "", /查到 3 条/);
+  // 写了条数又说「不算异常」的也打回：条数不是 0 就算，除非他说了线
+  assert.match(review("报错 180 条，都是正常的业务报错，没有异常。", none) ?? "", /查到 180 条/);
+  assert.equal(review("gateway-api 最近 1 小时报错 180 条。", new Set(["schedule_alert_creator"])), undefined);
+  for (const fine of ["最近 1 个小时没有报错。", "过去 1 个小时内报错 0 条。", "查了有没有报错：gateway-api 运行正常。", "未发现异常，一切正常。"]) {
+    assert.equal(review(fine, none), undefined, fine);
+  }
+  // 没说清有没有：只复述了问题
+  assert.match(review("查了 gateway-api 最近 1 小时有没有报错，日志在下面。", none) ?? "", /没说清这次有没有他说的异常.*确实没有就在回答里写明「没有异常」/);
+});
+
+test("说了「有异常 @ 我」的定时任务：回答写了报错却没调 @ 人的工具，打回以后调了，交给调用方去 @ 建的人", async () => {
+  const alerts: string[] = [];
+  const rounds: ChatResult[] = [
+    { text: "gateway-api 最近 1 小时报错 180 条，主要是 Redis 连接超时。", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "schedule_alert_creator", arguments: JSON.stringify({ summary: "gateway-api 1 小时报错 180 条" }) }] },
+  ];
+  const { model, requests } = fakeModel(() => rounds.shift() ?? { text: "gateway-api 最近 1 小时报错 180 条，主要是 Redis 连接超时。", finish: "stop" });
+  const scheduled = { label: "T6", schedule: "每小时 00 分", creatorName: "ML", alert: (summary: string) => alerts.push(summary) };
+  await setup({ model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我"), { scheduled });
+  assert.deepEqual(alerts, ["gateway-api 1 小时报错 180 条"]);
+  assert.equal(requests.length, 3);
+  assert.match(String(requests[1]!.messages.at(-1)?.content), /查到 180 条报错.*没调 schedule_alert_creator/);
+  assert.match(requests[0]!.system, /查到的条数不是 0 就算异常/);
+
+  // 明说没有异常的：不打回，不 @
+  const quiet = fakeModel(() => ({ text: "gateway-api 最近 1 小时没有报错，一切正常。", finish: "stop" }));
+  const none: string[] = [];
+  await setup({ model: quiet.model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我"), {
+    scheduled: { ...scheduled, alert: (summary: string) => none.push(summary) },
+  });
+  assert.equal(quiet.requests.length, 1);
+  assert.deepEqual(none, []);
+});
+
+test("说了「有异常 @ 我」的定时任务：打回以后还是写着报错条数、没调 @ 人的工具，程序照回答 @ 建的人；明说不算异常的不 @", async () => {
+  // 2026-10-23 T6：打回那次说的是代码没查证，补查完代码照样没调
+  const answer = "**结论**：gateway-api 最近 1 小时 error 级别日志 180 条，主要是 Redis 连接超时。\n\n当前没有活跃告警。";
+  const stubborn = fakeModel(() => ({ text: answer, finish: "stop" }));
+  const alerts: string[] = [];
+  const scheduled = { label: "T6", schedule: "每小时 00 分", creatorName: "ML", alert: (summary: string) => alerts.push(summary) };
+  await setup({ model: stubborn.model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我"), { scheduled });
+  assert.equal(stubborn.requests.length, 2);
+  assert.deepEqual(alerts, ["结论 ：gateway-api 最近 1 小时 error 级别日志 180 条，主要是 Redis 连接超时"]);
+
+  const judged = fakeModel(() => ({ text: "报错 12 条，都是客户端断开的正常日志，没超过他说的线，没有异常。", finish: "stop" }));
+  const none: string[] = [];
+  await setup({ model: judged.model, taskTools: () => [tool("feishu_doc_read")] }).handle(message("查一下 gateway-api 报错超过 100 条 @ 我"), {
+    scheduled: { ...scheduled, alert: (summary: string) => none.push(summary) },
+  });
+  assert.equal(judged.requests.length, 2);
+  assert.deepEqual(none, []);
+
+  // 照回答认条数：0 条、明说不算异常的不记；「没有新的告警」只说了一样
+  assert.equal(missedScheduledAlert("1. 报错 180 条"), "报错 180 条");
+  assert.equal(missedScheduledAlert("过去 1 个小时内报错 0 条。"), undefined);
+  assert.equal(missedScheduledAlert("报错 180 条，不算异常。"), undefined);
+  assert.equal(missedScheduledAlert("没有新的告警；报错 180 条。"), "没有新的告警；报错 180 条");
 });
 
 test("建定时任务时把发起人这句话交给工具：核对要追加的文档链接是不是他自己贴的", async () => {

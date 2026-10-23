@@ -29,7 +29,7 @@ import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
 import { GroupSettings } from "./settings.js";
-import { describeSchedule, escapePost, label, type RunResult, type ScheduleActor, type ScheduledTask, Scheduler } from "./schedules.js";
+import { alertsCreator, describeSchedule, escapePost, label, type RunResult, type ScheduleActor, type ScheduledTask, Scheduler } from "./schedules.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { createCardKitApi } from "./stream-card.js";
@@ -333,7 +333,8 @@ try {
 /**
  * 定时任务到点：在原来的群里发一条「⏰ 定时任务 T3」（一次性的和纯提醒 @ 建的人），纯提醒到这里就完了；
  * 要做事的把这条当成建任务的人 @ 机器人说了建任务时写好的那句话，交给同一个处理函数，按他现在的权限跑，回答发在这条下面的话题里。
- * 建的人说了「有异常 @ 我」的，模型查到异常时调 schedule_alert_creator，跑完以后在话题里 @ 建的人
+ * 建的人说了「有异常 @ 我」的，模型查到异常时调 schedule_alert_creator，跑完以后在话题里 @ 建的人。
+ * 建的时候模型漏填了、任务内容里写着「有异常 @ 我」的也算
  */
 async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunResult> {
   const creator = task.creator.name ? escapePost(task.creator.name) : undefined;
@@ -366,6 +367,10 @@ async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunR
   // 跑完时 onEnd 里改（TypeScript 看不到回调里的赋值，写成 as）
   let result = "failed" as RunResult;
   const alerts: string[] = [];
+  const alertOn = alertsCreator(task);
+  if (alertOn && !task.alertCreator) {
+    console.info(`定时任务：${label(task)} 建的时候没记「有异常 @ 建的人」，任务内容里写着，这次照样查到异常 @ 他`);
+  }
   await handleMessage(msg, {
     scheduled: {
       label: label(task),
@@ -373,7 +378,7 @@ async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunR
       ...(task.creator.name ? { creatorName: task.creator.name } : {}),
       ...(task.readOnly ? { readOnly: true } : {}),
       ...(task.appendDoc ? { appendDoc: task.appendDoc } : {}),
-      ...(task.alertCreator
+      ...(alertOn
         ? {
             alert: (summary: string) => {
               if (!alerts.includes(summary)) {
