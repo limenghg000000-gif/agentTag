@@ -29,7 +29,7 @@ import { MemoryStore, renderMemoryForPrompt } from "./memory.js";
 import { MAX_JUDGED_PER_HOUR, ProactiveReplier } from "./proactive.js";
 import { RecentThreadStore } from "./recent-threads.js";
 import { GroupSettings } from "./settings.js";
-import { alertsCreator, describeSchedule, escapePost, label, type RunResult, type ScheduleActor, type ScheduledTask, Scheduler } from "./schedules.js";
+import { alertsCreator, describeSchedule, escapePost, label, mentionWhenDone, type RunResult, type ScheduleActor, type ScheduledTask, Scheduler } from "./schedules.js";
 import { createBuildChecker } from "./build.js";
 import { CodeWorkspaces, createGitHubHost, createGitLabHost, runGit } from "./repo.js";
 import { createCardKitApi } from "./stream-card.js";
@@ -331,7 +331,7 @@ try {
 }
 
 /**
- * 定时任务到点：在原来的群里发一条「⏰ 定时任务 T3」（一次性的和纯提醒 @ 建的人），纯提醒到这里就完了；
+ * 定时任务到点：在原来的群里发一条「⏰ 定时任务 T3」（纯提醒 @ 建的人），纯提醒到这里就完了；
  * 要做事的把这条当成建任务的人 @ 机器人说了建任务时写好的那句话，交给同一个处理函数，按他现在的权限跑，回答发在这条下面的话题里。
  * 建的人说了「有异常 @ 我」的，模型查到异常时调 schedule_alert_creator，跑完以后在话题里 @ 建的人。
  * 建的时候模型漏填了、任务内容里写着「有异常 @ 我」的也算
@@ -340,14 +340,12 @@ async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunR
   const creator = task.creator.name ? escapePost(task.creator.name) : undefined;
   const about = `定时任务 ${label(task)} · ${describeSchedule(task)}${creator ? ` · ${creator}建的` : ""}`;
   const lateNote = late >= 5 * 60_000 ? `\n（比定的时间晚了 ${Math.round(late / 60_000)} 分钟：那会儿机器人在重启或者在忙）` : "";
-  // 一次性的、纯提醒的多半是给建的人看的，@ 他；周期任务每次都 @ 太吵
-  const notifyCreator = task.remind || task.at !== undefined;
-  const mentions = notifyCreator ? mentionOf(task.creator) : undefined;
+  // 纯提醒发提醒时 @ 建的人；要做事的不在开始查之前 @，做完了再看要不要 @（mentionWhenDone、有异常 @）
   if (task.remind) {
-    await channel.send(task.chatId, { markdown: `⏰ **提醒**：${escapePost(task.prompt)}\n（${about}）${lateNote}` }, mentions);
+    await channel.send(task.chatId, { markdown: `⏰ **提醒**：${escapePost(task.prompt)}\n（${about}）${lateNote}` }, mentionOf(task.creator));
     return "done";
   }
-  const { messageId } = await channel.send(task.chatId, { markdown: `⏰ **${about}**\n${escapePost(task.prompt)}${lateNote}` }, mentions);
+  const { messageId } = await channel.send(task.chatId, { markdown: `⏰ **${about}**\n${escapePost(task.prompt)}${lateNote}` });
   const msg: NormalizedMessage = {
     messageId,
     chatId: task.chatId,
@@ -400,6 +398,16 @@ async function runScheduledTask(task: ScheduledTask, late: number): Promise<RunR
         ...mentionOf(task.creator),
       })
       .catch((err: unknown) => console.warn(`定时任务：${label(task)} 有异常 @ 建的人的消息没发出去`, err));
+  }
+  // 一次性的、没说「有异常 @ 我」的：做完了在结果话题里 @ 建的人来看
+  if (result === "done" && mentionWhenDone(task)) {
+    await channel
+      .send(task.chatId, { markdown: `✅ 定时任务 ${label(task)} 做完了，结果看上面的回答。` }, {
+        replyTo: messageId,
+        replyInThread: true,
+        ...mentionOf(task.creator),
+      })
+      .catch((err: unknown) => console.warn(`定时任务：${label(task)} 做完了 @ 建的人的消息没发出去`, err));
   }
   return result;
 }

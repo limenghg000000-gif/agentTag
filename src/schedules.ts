@@ -127,6 +127,15 @@ export function alertsCreator(task: Pick<ScheduledTask, "alertCreator" | "remind
   return !task.remind && (task.alertCreator === true || asksForAlert(task.prompt));
 }
 
+/**
+ * 要做事的定时任务做完了要不要 @ 建的人来看结果：一次性的、没说「有异常 @ 我」的 @。
+ * 到点一律不在开始查之前 @：说了「有异常 @ 我」的只在查到异常时 @，没异常不 @；周期任务正常做完不 @（每次都 @ 太吵）；纯提醒发提醒时 @。
+ * 2026-10-23 ML 建一次性的「今天 17:10 查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我」，到点还没查就 @ 了他
+ */
+export function mentionWhenDone(task: Pick<ScheduledTask, "alertCreator" | "remind" | "prompt" | "at">): boolean {
+  return !task.remind && task.at !== undefined && !alertsCreator(task);
+}
+
 export interface SchedulerOptions {
   /** 定时任务记在这个文件里，重启后接着跑。不给就只记在内存里（测试用） */
   file?: string;
