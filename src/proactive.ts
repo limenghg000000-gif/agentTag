@@ -48,6 +48,8 @@ const KNOWLEDGE_QUERY_TURNS = 3;
 const KNOWLEDGE_QUERY_CHARS = 500;
 /** 去掉图片标记以后少于这么多字的不判断（「好」「ok」「👍」） */
 const MIN_CHARS = 4;
+/** 消息里的图片标记（判断时看不到图里的内容） */
+const IMAGE_MARK = /!\[image\]\([^)]*\)/;
 
 /**
  * 只是表个态的不判断（「好的收到」「收到，谢谢」「嗯嗯」这样连着说几个的也算）。
@@ -384,7 +386,7 @@ export class ProactiveReplier {
     if (!msg.senderId.startsWith("ou_") || msg.senderId === this.opts.botOpenId() || msg.mentions.length > 0) {
       return false;
     }
-    const text = msg.content.replace(/!\[image\]\([^)]*\)/g, "").trim();
+    const text = msg.content.replace(new RegExp(IMAGE_MARK.source, "g"), "").trim();
     return text.length >= MIN_CHARS && !ACKNOWLEDGEMENT.test(text);
   }
 
@@ -774,7 +776,7 @@ export class ProactiveReplier {
     // 「做」只在群记忆里有不用 @ 也要它去做的规矩时给：规矩说要先 @ 它的（「线上报错必须 @ 你再查」），没 @ 不去做
     const work = this.opts.work !== undefined && hasWorkRule(memory);
     return this.withEngagement(msg.chatId, {
-      system: judgePrompt(this.opts.botName() || "机器人", topic, work),
+      system: judgePrompt(this.opts.botName() || "机器人", topic, work, IMAGE_MARK.test(msg.content)),
       content,
       memory,
       recent: recentLines,
@@ -971,8 +973,11 @@ function clip(text: string): string {
   return text.length <= JUDGE_MESSAGE_CHARS ? text : `${text.slice(0, JUDGE_MESSAGE_CHARS)}…`;
 }
 
-/** topic：消息在话题里（看的是话题最近几条，不是群聊）；work：能像被 @ 一样去做（配了处理函数、群记忆里有不用 @ 也要它去做的规矩），给模型多一个选择「做」 */
-function judgePrompt(botName: string, topic: boolean, work: boolean): string {
+/**
+ * topic：消息在话题里（看的是话题最近几条，不是群聊）；work：能像被 @ 一样去做（配了处理函数、群记忆里有不用 @ 也要它去做的规矩），
+ * 给模型多一个选择「做」，只管规矩说的那类事，别的事照样能问一句；image：这条带了图片，判断时看不到图里的内容
+ */
+function judgePrompt(botName: string, topic: boolean, work: boolean, image: boolean): string {
   const recent = topic ? "这个话题里最近的消息" : "刚才的群聊";
   return [
     `你是飞书群里的机器人「${botName}」，能查线上问题、读代码、读写飞书文档、记群里的约定。群成员一般 @ 你派活。`,
@@ -983,7 +988,12 @@ function judgePrompt(botName: string, topic: boolean, work: boolean): string {
     ...(work
       ? ["2. 群记忆里有规矩说这类事不用 @ 也要你处理（比如「线上报错不用 @ 你也直接帮忙查」），这条正是这类事：像被 @ 了一样去查、去做。"]
       : []),
-    `${work ? 3 : 2}. 有人明确说了一件你能帮上的事（查线上报错、看代码、整理文档、找以前定过的事），还没人接${work ? "，群里也没定过上面那样的规矩" : ""}：用一句话问要不要你来，说清你会怎么帮。不要自己开始查，也不要先给结论。`,
+    `${work ? 3 : 2}. 有人明确说了一件你能帮上的事（查线上报错、看代码、整理文档、找以前定过的事），还没人接${work ? "，又不归上面第 2 种的规矩管（群里定过规矩，只管规矩说的那类事；别的事照样按这一种问）" : ""}：用一句话问要不要你来，说清你会怎么帮。不要自己开始查，也不要先给结论。`,
+    ...(image
+      ? [
+          "这条消息带了图片（「![image](…)」），你看不到图里的内容，只按文字判断：文字里明确要人帮忙的（「排查一下这个问题」「帮忙看下这个报错」配一张截图），照样算说清了要帮什么；图里写了什么不能猜。",
+        ]
+      : []),
     "不接的：闲聊、表态、通知、转发、群成员之间已经在处理或已经答了的事、意思不清楚的、你帮不上的。拿不准就不接。",
     `不能编：线上数据、代码位置、数字、结论只能照抄群记忆或${recent}里的原文；没有的话最多只问要不要帮忙。`,
     `只输出一行。不接就输出「不接」；${work ? "第 1、3 种" : ""}接就输出「接：」加上要发的话，不超过 100 字${work ? "；第 2 种输出「做」" : ""}。`,
