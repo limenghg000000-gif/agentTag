@@ -10,6 +10,7 @@ import {
   type Prompt as RemotePrompt,
   type Tool as RemoteTool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { MAX_TOOL_ROUNDS } from "./agent.js";
 import type { McpScope, McpServerConfig } from "./config.js";
 import type { Logger } from "./history.js";
 import { findSensitive } from "./knowledge.js";
@@ -20,11 +21,13 @@ import { VERSION } from "./version.js";
 
 /** 普通工具的超时。个别工具在配置里单独定，如 aiops 的 diagnose_service 两分钟 */
 export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
-/** 一次任务里同一个 MCP 服务的工具最多调几次，到了就让模型按已有证据回答 */
-export const MAX_MCP_CALLS_PER_TASK = 10;
-/** 一次任务里同一个 MCP 服务的结果一共交给模型多少字。快用完时后面的结果截得更短，免得撑爆上下文 */
+/**
+ * 一次任务里同一个 MCP 服务的结果一共交给模型多少字。快用完时后面的结果截得更短，免得撑爆上下文。
+ * 调用次数不限：原先一次任务限 10 次，2026-10-23 反馈排查转链时查到一半就到了上限，模型说「aiops 工具额度已用完」、按一半的证据下结论。
+ * 现在靠工具轮数的上限（MAX_TOOL_ROUNDS）收住，上下文放不下时由 runAgent 压短较早的结果
+ */
 export const MAX_MCP_CHARS_PER_TASK = 300_000;
-/** 总字数快用完或用完时，单个结果至少还给这么多字（加上调用次数的上限，一次任务最多比总字数多出 5 个这么多） */
+/** 总字数快用完或用完时，单个结果至少还给这么多字 */
 const MIN_RESULT_CHARS = 6000;
 /** 服务端说「服务繁忙」时隔多久重试，重试几次就有几项 */
 const BUSY_RETRY_MS = [1000, 3000];
@@ -44,7 +47,7 @@ const MAX_INSTRUCTIONS_CHARS = 8000;
 export const PLAYBOOK_TOOL = "playbook";
 /** 一份剧本交给模型的字数上限 */
 const MAX_PLAYBOOK_CHARS = 40_000;
-/** 一次任务里同一个服务最多读几份剧本（不占查询的调用次数，单独限，免得剧本撑爆上下文） */
+/** 一次任务里同一个服务最多读几份剧本（免得剧本撑爆上下文） */
 export const MAX_PLAYBOOKS_PER_TASK = 3;
 /** 剧本说明写进提示词的字数上限（每份） */
 const MAX_PLAYBOOK_DESCRIPTION_CHARS = 300;
@@ -135,7 +138,6 @@ interface ServerState {
 interface TaskBudget {
   /** 这次任务读过或正在读的剧本：剧本名 → 读的结果。同一轮里并行读同一份时，后一个等前一个 */
   playbooks: Map<string, Promise<string>>;
-  calls: number;
   /** 已经交给模型的字数 */
   chars: number;
   /** 同一工具同样的参数直接复用结果；失败的不留 */
@@ -144,7 +146,7 @@ interface TaskBudget {
 
 /**
  * 通过 MCP 接入的外部服务（如 aiops）。启动后在后台连接、拉工具清单和服务端的使用说明，定时刷新；连不上不影响机器人，按退避重试。
- * 每个任务单独拿一套工具（tools），调用次数和同参去重按任务算，每次调用都记审计日志（谁、哪个群、哪个工具、参数摘要、结果大小、用时）。
+ * 每个任务单独拿一套工具（tools），结果的总字数和同参去重按任务算，每次调用都记审计日志（谁、哪个群、哪个工具、参数摘要、结果大小、用时）。
  */
 export class McpHub {
   private readonly servers: ServerState[];
@@ -201,7 +203,7 @@ export class McpHub {
       if (allowed === undefined) {
         return [];
       }
-      const budget: TaskBudget = { playbooks: new Map(), calls: 0, chars: 0, results: new Map() };
+      const budget: TaskBudget = { playbooks: new Map(), chars: 0, results: new Map() };
       const enabled = allowed === "*" ? server.enabled : server.enabled.filter((remote) => allowed.includes(remote.name));
       const tools = enabled.map((remote) => this.wrap(server, remote, task, budget));
       // 剧本是排查的说明：群里只开了这个服务的几个工具、其中一个都没连上时不给
@@ -332,8 +334,7 @@ export class McpHub {
     const lines = [
       `## ${name}（MCP 服务）`,
       `名字以 ${name}_ 开头的工具都来自 ${name}。${name} 的说明里写的工具名（如 ${example}）在你这里都带 ${name}_ 前缀（${toolName(name, example)}）。` +
-        `一次任务里 ${name} 的工具最多调 ${MAX_MCP_CALLS_PER_TASK} 次，同样的参数调第二次会直接拿到上次的结果。` +
-        `每次有人 @ 你都是一次新任务，次数重新算：话题里之前的回答说过「调用额度用完」「到上限了」，这次照样可以查。`,
+        `同样的参数调第二次会直接拿到上次的结果。`,
     ];
     lines.push(
       `结果里「xx${COMMON_SUFFIX}」是机器人把列表 xx 里每一项都一样的字段提出来只写了一次，列表的每一项都有这些字段。`,
@@ -355,6 +356,14 @@ export class McpHub {
           `剧本里写的代码文件、提交号是写剧本的人核对时用的，这次没有查过，不要写进回答。`,
       );
     }
+    // 放在服务端使用说明和剧本后面：aiops 的说明和通用排查剧本都写着「单次排查最多 10 次、到上限就出结论」，是给别的客户端的
+    lines.push(
+      "",
+      `### ${name} 的调用次数`,
+      `机器人这边不限 ${name} 工具的调用次数：服务端使用说明、剧本里要是限了单次排查调几次（比如「不超过 10 次」「到上限就出结论」），在这里不用守。` +
+        `证据不够就接着查，查清楚了再回答，也不要说 ${name} 额度用完、次数到上限。一次任务最多 ${MAX_TOOL_ROUNDS} 轮工具调用，互不依赖的查询（几个时间段、几个服务、日志和链路）放在同一轮里一起调。` +
+        `每次有人 @ 你都是一次新任务：话题里之前的回答说过「调用额度用完」「到上限了」的，这次照样可以查。`,
+    );
     if (server.prompt) {
       lines.push("", `### 在飞书群里用 ${name}`, server.prompt);
     }
@@ -516,12 +525,6 @@ export class McpHub {
           const ago = Math.round((this.now() - previous.at) / 1000);
           return `（这次任务里已经用同样的参数调过 ${remote.name}，没有再调，下面是 ${ago} 秒前那次的结果）\n${text}`;
         }
-        if (budget.calls >= MAX_MCP_CALLS_PER_TASK) {
-          throw new Error(
-            `这次任务里 ${name} 的工具已经调了 ${MAX_MCP_CALLS_PER_TASK} 次，到上限了，这次没有执行。请按已有的证据回答，写明还缺哪些证据、建议接着查什么`,
-          );
-        }
-        budget.calls++;
         // 先按这次的上限把字数占住，同一轮并行的几个调用加起来也不会超出总字数；拿到结果后按实际字数退回多占的
         const limit = Math.min(MCP_RESULT_LIMIT, Math.max(MIN_RESULT_CHARS, MAX_MCP_CHARS_PER_TASK - budget.chars));
         budget.chars += limit;
@@ -543,7 +546,7 @@ export class McpHub {
   }
 
   /**
-   * 读剧本：从服务端取 MCP prompt 的正文。不算调用次数（不查线上），另外限一次任务最多读几份；同一份一次任务里只给一次全文。
+   * 读剧本：从服务端取 MCP prompt 的正文。不查线上，单独限一次任务最多读几份；同一份一次任务里只给一次全文。
    * 用建工具时的剧本清单，任务进行中清单刷新了也不影响这个任务
    */
   private playbookTool(server: ServerState, task: McpTaskContext, budget: TaskBudget): Tool {

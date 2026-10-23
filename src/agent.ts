@@ -16,7 +16,10 @@ const COMPACT_LEVELS = [
   { keepRounds: 0, headChars: 300 },
 ] as const;
 
-const LAST_ROUND_NOTE = "工具调用次数已经用完了。请根据上面已经拿到的信息直接给出最终回答，不要再调用工具；没查到的部分如实说明。";
+/** 到了轮数上限、最后问一次时加的提醒。原先写「工具调用次数已经用完了」，模型在群里照着说「工具额度已用完」，大家看不懂、也不知道还能接着查 */
+const lastRoundNote = (rounds: number) =>
+  `这次任务已经调了 ${rounds} 轮工具，到了一次任务的轮数上限，这一轮不能再调工具了。` +
+  "请根据上面已经拿到的信息直接给出最终回答：查清楚的写结论，没查到的如实说明还缺什么、下一步查什么，并告诉对方 @ 你说「接着查」就能接着往下查。";
 const OUT_OF_ROUNDS_ANSWER = `这个任务需要的步骤超出了单次上限（${MAX_TOOL_ROUNDS} 轮工具调用），我先停在这里。可以把任务拆小一点再交给我。`;
 
 export type AgentEvent =
@@ -123,9 +126,9 @@ export async function runAgent({
       // 上一轮后面已经加过一条用户消息（打回重做、思考提醒）时并进去，不连着发两条用户消息
       const last = conversation.at(-1);
       if (last?.role === "user" && conversation.length > messages.length) {
-        conversation[conversation.length - 1] = { ...last, content: `${last.content}\n\n${LAST_ROUND_NOTE}` };
+        conversation[conversation.length - 1] = { ...last, content: `${last.content}\n\n${lastRoundNote(maxToolRounds)}` };
       } else {
-        conversation.push({ role: "user", content: LAST_ROUND_NOTE });
+        conversation.push({ role: "user", content: lastRoundNote(maxToolRounds) });
       }
     }
     const startedAt = now();
