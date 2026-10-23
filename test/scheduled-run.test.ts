@@ -705,3 +705,75 @@ test("建成了却说错了编号：拦下时照实列出这次建成的，不�
   assert.match(answer, /实际做成的：\n- 已建好定时任务 T3/);
   assert.match(answer, /不用再建一次/);
 });
+
+test("话题里没 @ 说「暂停定时任务 T5」：给暂停的工具；取消、恢复、没写编号的、说别暂停的、主动接话、按钮问的照旧只给看的", async () => {
+  const { model, requests } = fakeModel(() => ({ text: "好", finish: "stop" }));
+  const { handle } = setup({ model, taskTools: () => [tool("feishu_doc_read"), ...scheduleTools()] });
+
+  for (const question of ["暂停定时任务 T5", "T5 先暂停一下", "把t5和T6都暂停了吧"]) {
+    await handle(message(question, { messageId: `om_${question}`, rootId: "om_root" }), { unaddressed: true });
+    assert.deepEqual(names(requests.at(-1)), ["feishu_doc_read", "schedule_list", "schedule_change"], question);
+    assert.match(requests.at(-1)!.system, /这句没 @ 你：定时任务这次只能暂停他这句话里点名的 T5/, question);
+    assert.doesNotMatch(requests.at(-1)!.system, /这次不能建、改定时任务/, question);
+  }
+  assert.match(requests.at(-1)!.system, /点名的 T5、T6（/);
+
+  for (const question of ["取消定时任务 T5", "恢复 T5", "别暂停 T5", "不用暂停 T5 了", "暂停一下定时任务"]) {
+    await handle(message(question, { messageId: `om_${question}`, rootId: "om_root" }), { unaddressed: true });
+    assert.deepEqual(names(requests.at(-1)), ["feishu_doc_read", "schedule_list"], question);
+    assert.doesNotMatch(requests.at(-1)!.system, /只能暂停他这句话里点名的/, question);
+  }
+  assert.match(requests.at(-1)!.system, /这次不能建、改定时任务（这句没 @ 你）/);
+
+  // 前面问过同一句的会当成重复不再回：换个说法
+  const before = requests.length;
+  await handle(message("麻烦暂停 T5", { messageId: "om_proactive" }), { unaddressed: true, proactive: true });
+  assert.deepEqual(names(requests.at(-1)), ["feishu_doc_read"]);
+  await handle(message("帮忙暂停 T5", { messageId: "om_button", rootId: "om_root" }), { readOnly: true });
+  assert.deepEqual(names(requests.at(-1)), ["feishu_doc_read", "schedule_list"]);
+  assert.equal(requests.length, before + 2);
+});
+
+test("没 @ 说暂停 T5：只能暂停 T5，取消 T5、暂停别的任务都拦下", async () => {
+  const runs: string[] = [];
+  const change = tool("schedule_change", false, async (args) => {
+    runs.push(`${String(args.action)} ${String(args.id)}`);
+    return "已暂停定时任务 T5：每天 11:10（北京时间），查 gateway-api 的报错";
+  });
+  const rounds: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [
+        { id: "c1", name: "schedule_change", arguments: JSON.stringify({ id: "T5", action: "cancel" }) },
+        { id: "c2", name: "schedule_change", arguments: JSON.stringify({ id: "T3", action: "pause" }) },
+        { id: "c3", name: "schedule_change", arguments: JSON.stringify({ id: "#5", action: "resume" }) },
+      ],
+    },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c4", name: "schedule_change", arguments: JSON.stringify({ id: "t5", action: "pause" }) }] },
+    { text: "已暂停定时任务 T5。", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => rounds.shift()!);
+  const { handle, sent } = setup({ model, taskTools: () => [tool("schedule_create"), tool("schedule_list"), change] });
+  await handle(message("暂停定时任务 T5", { rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(runs, ["pause t5"]);
+  const refused = JSON.stringify(requests[1]!.messages);
+  assert.equal(refused.match(/这句没 @ 你，只能暂停他这句话里点名的定时任务（T5）；恢复、取消或者停别的任务，请他 @ 你说/g)?.length, 3);
+  assert.deepEqual(markdowns(sent), ["已暂停定时任务 T5。"]);
+});
+
+test("@ 了机器人的照旧：暂停、恢复、取消哪个任务都不另外拦（权限由定时任务工具自己管）", async () => {
+  const runs: string[] = [];
+  const change = tool("schedule_change", false, async (args) => {
+    runs.push(`${String(args.action)} ${String(args.id)}`);
+    return "已取消定时任务 T3：每天 09:00（北京时间），汇总群聊";
+  });
+  const rounds: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "schedule_change", arguments: JSON.stringify({ id: "T3", action: "cancel" }) }] },
+    { text: "已取消定时任务 T3。", finish: "stop" },
+  ];
+  const { model } = fakeModel(() => rounds.shift()!);
+  const { handle } = setup({ model, taskTools: () => [tool("schedule_create"), tool("schedule_list"), change] });
+  await handle(message("暂停 T5，再把 T3 取消掉", { rootId: "om_root" }));
+  assert.deepEqual(runs, ["cancel T3"]);
+});
