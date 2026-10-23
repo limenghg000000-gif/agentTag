@@ -385,7 +385,8 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
       // 这个话题之前开到别的分支（uat 这类）的：有新改动时开着的跟着更新，合过了的再开一个，卡片上一起写（另开的时候不动它们）
       const fresh = pending.files.length > 0;
       const targets = replaced ? [] : await ws.targetRequests(ctx.signal);
-      const alsoLines = targets.flatMap(({ target: other, number, state }) =>
+      // 跟着更新的写平台上现在开到哪（有人改过目标分支时不是当初的）；合过了再开的照当初的分支开
+      const alsoLines = targets.flatMap(({ target: other, number, state, now }) =>
         state === "closed"
           ? []
           : state === "merged"
@@ -393,7 +394,7 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
               ? [`开到 ${other} 的 ${refOf(number)} 已经合过了，这次的改动再开一个${requestName}到 ${other}`]
               : []
             : fresh
-              ? [`开到 ${other} 的 ${refOf(number)} 跟着更新`]
+              ? [`开到 ${now || other} 的 ${refOf(number)} 跟着更新`]
               : [],
       );
       // 状态和平台上现在开到哪都算：等确认的时候有人改了目标分支，也要重新确认

@@ -726,6 +726,8 @@ test("推代码前请发起人确认：这个话题之前开到 uat 的，卡片
   targets[1] = "main";
   targets[2] = "test";
   assert.equal(await card.unchanged!(), false);
+  // 发卡片之前就被改过目标分支的：卡片上写现在开到哪
+  assert.equal((await ask({ title: "再改", body: "" }))!.lines[2], "开到 test 的 !2 跟着更新");
   targets[2] = "uat";
   assert.equal(await card.unchanged!(), true);
   // 等确认的时候到 uat 的合了：推的时候会再开一个，和卡片上写的不一样了
