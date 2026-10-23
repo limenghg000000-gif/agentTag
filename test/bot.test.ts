@@ -24,9 +24,11 @@ import {
   madeUpRequestRefs,
   mergedClaimAnswer,
   openRequestAnswer,
+  QUOTA_CLAIM_ANSWER,
   reviewCodeAnswer,
   reviewDeflectedAnswer,
   reviewOpsAnswer,
+  reviewQuotaClaim,
   restatedAdditions,
   restatedAnswerNote,
   restatesEarlier,
@@ -2583,6 +2585,58 @@ test("经验库的工具拿到这次 aiops 的工具名：有没有 aiops_search
   await handle(message("发版是哪天"));
 
   assert.deepEqual(seen, [["aiops_search_knowledge"]]);
+});
+
+test("回答说机器人这边的查询工具额度用完、次数到上限时打回，叫它接着查；第三方接口的额度、提问问到额度的不管", () => {
+  const review = (question = "查一下 appservice 调用 page-detective 的日志", outputs = "") => reviewQuotaClaim(["aiops"], question, () => outputs);
+  const claims = [
+    // 2026-10-23 群里的原话
+    "本次没有查线上日志：aiops 工具额度已用完，Loki 没查成，下面的表里没有任何本次日志数据",
+    "工具调用次数已经用完了，先按已有的信息回答",
+    "这次任务里 aiops 的工具已经调了 10 次，到上限了",
+    "aiops 调用额度用完，没法再查",
+    "AIOPS 查询次数不够，Loki 那边没查",
+    "MCP 工具调用已达到上限",
+  ];
+  for (const answer of claims) {
+    assert.equal(review()(answer), QUOTA_CLAIM_ANSWER, answer);
+  }
+  const fine = [
+    // 被查的业务系统、第三方接口的额度可能正是原因
+    "淘宝联盟 API 调用额度用完了，tpwd.create 返回 code 7",
+    "大淘客接口的配额不足，返回 429",
+    "这个群的记忆已经有 50 条，到上限了",
+    "定时任务数量到上限了，先取消一个",
+    "到了一次任务的轮数上限，查到这里：…… @ 我说「接着查」就能接着往下查",
+    "查了 aiops 的日志，最近 1 小时 3 条 error",
+  ];
+  for (const answer of fine) {
+    assert.equal(review()(answer), undefined, answer);
+  }
+  // 提问问的就是额度；工具结果里原样有这句（日志里写着）
+  assert.equal(review("上次为什么说额度用完")(claims[0]), undefined);
+  assert.equal(review(undefined, `{"msg":"aiops 工具额度已用完"}`)(claims[0]), undefined);
+});
+
+test("回答说 aiops 额度用完、一条没查时打回，重做时去查了再答", async () => {
+  const logs: Tool = {
+    spec: { name: "aiops_query_logs", description: "查日志", parameters: { type: "object", properties: {} } },
+    describe: () => "aiops · 查日志",
+    run: async () => '{"logs":[{"msg":"call page-detective url_redirect cost=3512ms"}]}',
+  };
+  const results: ChatResult[] = [
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "aiops_query_logs", arguments: "{}" }] },
+    { text: "本次没有查线上日志：aiops 工具额度已用完，Loki 没查成。", finish: "stop" },
+    { text: "", finish: "tool_calls", toolCalls: [{ id: "c2", name: "aiops_query_logs", arguments: '{"logql":"page-detective"}' }] },
+    { text: "查到调 page-detective 的日志，耗时 3512ms。", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => results.shift()!);
+  const { sent, handle } = setup({ model, mcp: { names: ["aiops"], tools: () => [logs], prompt: () => undefined } });
+
+  await handle(message("查一下 appservice 调用 page-detective 的日志"));
+
+  assert.equal(requests[2].messages.at(-1)?.content, QUOTA_CLAIM_ANSWER);
+  assert.deepEqual(markdowns(sent), ["查到调 page-detective 的日志，耗时 3512ms。"]);
 });
 
 test("aiops 连不上、这次没有它的工具时，照搬话题里之前的数据也会被打回", async () => {

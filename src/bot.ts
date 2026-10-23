@@ -1029,6 +1029,7 @@ async function runTask(
             // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
             ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded, toolNames.includes(EARLIER_RESULTS_TOOL))] : []),
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+            reviewQuotaClaim(deps.mcp?.names ?? [], asked, () => toolTexts.join("\n")),
           ]),
       // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
       ...(restate || scheduled
@@ -2952,6 +2953,35 @@ export function reviewDeflectedAnswer(servers: readonly string[], attempted: Rea
   return (answer: string): string | undefined => {
     const investigated = [...attempted].some((name) => prefixes.some((prefix) => name.startsWith(prefix)));
     return investigated && deflects(answer) ? DEFLECTED_ANSWER : undefined;
+  };
+}
+
+export const QUOTA_CLAIM_ANSWER =
+  "（系统检查）你的回答里说机器人这边的查询工具额度用完、调用次数到上限，这次没有这回事：工具调用不限次数，这一轮也还能接着调。" +
+  "话题里之前的回答说过额度用完、到上限的，是以前的限制，不算数。该查的现在就去查，再按这次查到的结果重新给出完整的回答，不要再说额度用完。" +
+  "说的是被查的业务系统、第三方接口的额度（比如淘宝联盟接口的调用额度），照常保留。不要提这段检查。";
+
+/**
+ * 回答里说机器人自己的查询工具「额度已用完」「调用次数到上限」时打回一次，叫它接着查。
+ * 2026-10-23 转链排查：原先一次任务限调 10 次 aiops，到了模型就说「aiops 工具额度已用完」；话题里之前的回答写着这句，
+ * 后面追问「查一下 appservice 调用 page-detective 的日志」，模型又说「aiops 工具额度已用完，Loki 没查成」，一条日志都没查。
+ * 现在调用不限次数，只剩一次任务最多几轮（到了的那一轮 runAgent 不打回），这么说都不对。
+ * 只认说到 MCP 服务名或「工具」的：淘宝联盟这类第三方接口额度用完可能正是要查的原因，不能拦。
+ * 提问自己说到额度、上限的（「为什么上次说额度用完」）不管；这次工具结果里原样有这句话的（日志里写着「调用次数已达上限」）也不管
+ */
+export function reviewQuotaClaim(servers: readonly string[], question: string, toolOutputs: () => string) {
+  const subject = ["工具", "mcp", ...servers.map(escapeRegExp)].join("|");
+  const claim = new RegExp(
+    `(?:${subject})[^，,。；;！!？?\n]{0,12}(?:额度|配额|调用次数|次数)[^，,。；;！!？?\n]{0,6}(?:用完|用尽|耗尽|用光|不够|不足|到了?上限|达到上限|超(?:过|出)了?上限)` +
+      `|(?:${subject})[^。；;！!？?\n]{0,16}?(?:到了?上限|达到上限)`,
+    "i",
+  );
+  return (answer: string): string | undefined => {
+    const said = answer.match(claim)?.[0];
+    if (!said || /额度|配额|上限/.test(question) || toolOutputs().includes(said)) {
+      return undefined;
+    }
+    return QUOTA_CLAIM_ANSWER;
   };
 }
 
