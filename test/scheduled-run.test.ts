@@ -96,6 +96,7 @@ test("定时任务的工具只在提问说到定时、以后某个时间时给�
     assert.deepEqual(names(requests[i]), ["feishu_doc_read", "schedule_create", "schedule_list", "schedule_change"], question);
   }
   assert.match(requests[0]!.system, /定时任务：群成员要你在以后某个时间、或者定期做某件事/);
+  assert.match(requests[0]!.system, /在你回答过的话题里写上编号直接说就行、不用 @ 你；恢复、取消要 @ 你说/);
   await handle(message("gateway 最近报错多吗", { messageId: "om_plain" }));
   assert.deepEqual(names(requests.at(-1)), ["feishu_doc_read"]);
   assert.doesNotMatch(requests.at(-1)!.system, /schedule_create/);
