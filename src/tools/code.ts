@@ -366,8 +366,8 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
       }
       const pr = ws.pullRequest;
       // 这个话题之前开的合并请求合了、关了：推的时候不往那个分支推，另拉一个分支另开（关掉的那份连同新改动整份带上）
-      const primary = pr && !elsewhere ? await ws.pullRequestState(ctx.signal) : undefined;
-      const replaced = primary === "merged" || primary === "closed" ? primary : undefined;
+      const primary = pr && !elsewhere ? await ws.pullRequestStatus(ctx.signal) : undefined;
+      const replaced = primary?.state === "merged" || primary?.state === "closed" ? primary.state : undefined;
       if (replaced === "closed") {
         pending = await ws.pendingChanges(ctx.signal, true);
       }
@@ -380,7 +380,7 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
           : pr && replaced === "closed"
             ? `${refOf(pr.number)} 已经关掉了（没合并）：另拉一个分支，之前那份改动连同这次的整份带上，开${requestName}到 ${pending.base}`
             : pending.branch
-              ? `推到这个话题之前用的分支 ${pending.branch}${pr ? `，${refOf(pr.number)} 跟着更新` : `，开${requestName}到 ${pending.base}`}`
+              ? `推到这个话题之前用的分支 ${pending.branch}${pr ? `，${refOf(pr.number)}（开到 ${primary?.target ?? pending.base}）跟着更新` : `，开${requestName}到 ${pending.base}`}`
               : `新建分支 ${branch ?? "（机器人起名）"}，开${requestName}到 ${pending.base}`;
       // 这个话题之前开到别的分支（uat 这类）的：有新改动时开着的跟着更新，合过了的再开一个，卡片上一起写（另开的时候不动它们）
       const fresh = pending.files.length > 0;
@@ -396,13 +396,15 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
               ? [`开到 ${other} 的 ${refOf(number)} 跟着更新`]
               : [],
       );
-      const states = (list: typeof targets) => list.map(({ target: other, number, state }) => `${other}:${number}:${state ?? ""}`).join(",");
+      // 状态和平台上现在开到哪都算：等确认的时候有人改了目标分支，也要重新确认
+      const states = (list: typeof targets) => list.map(({ target: other, number, state, now }) => `${other}:${number}:${state ?? ""}:${now ?? ""}`).join(",");
+      const status = (value: typeof primary) => (value ? `${value.state}:${value.target}` : "");
       return {
         title: elsewhere ? `开${requestName}到 ${elsewhere}` : `推代码、开${requestName}`,
         lines: [`仓库：${ws.repo}`, route, ...alsoLines, `标题：${title}`, ...changeLines(pending.files)],
         // 改动变了，或者这个话题的合并请求、开到别的分支的那几个合了、关了（要动的跟着变），都要重新确认
         unchanged: async () =>
-          (pr && !elsewhere ? await ws.pullRequestState(ctx.signal) : undefined) === primary &&
+          status(pr && !elsewhere ? await ws.pullRequestStatus(ctx.signal) : undefined) === status(primary) &&
           (await ws.pendingChanges(ctx.signal, whole)).fingerprint === pending.fingerprint &&
           states(replaced ? [] : await ws.targetRequests(ctx.signal)) === states(targets),
       };

@@ -705,9 +705,10 @@ test("开到 uat：不另拉分支、不搬改动，同一个修复分支再开�
 
 test("推代码前请发起人确认：这个话题之前开到 uat 的，卡片上写跟着更新；合过了的写再开一个；合了、关了要重新确认", async () => {
   const states: Record<number, RequestState> = {};
+  const targets: Record<number, string> = { 1: "main", 2: "uat" };
   const { all } = portWorkspaces({
     async getRequest(_repo, number) {
-      return { number, title: "", url: "", state: states[number] ?? "opened", source: "bugfix/p9", target: "", baseSha: "", headSha: "" };
+      return { number, title: "", url: "", state: states[number] ?? "opened", source: "bugfix/p9", target: targets[number] ?? "", baseSha: "", headSha: "" };
     },
   });
   const tools = Object.fromEntries(createCodeTools({ workspaces: all, threadKey: "om_p9", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
@@ -717,7 +718,15 @@ test("推代码前请发起人确认：这个话题之前开到 uat 的，卡片
   await tools.code_open_pr.run({ title: "改 A（uat）", body: "", target: "uat" }, { signal });
   await tools.code_edit_file.run({ path: "a.go", old_text: "return 2", new_text: "return 3" }, { signal });
   const card = (await ask({ title: "再改", body: "" }))!;
-  assert.deepEqual(card.lines.slice(1, 3), ["推到这个话题之前用的分支 bugfix/p9，!1 跟着更新", "开到 uat 的 !2 跟着更新"]);
+  assert.deepEqual(card.lines.slice(1, 3), ["推到这个话题之前用的分支 bugfix/p9，!1（开到 main）跟着更新", "开到 uat 的 !2 跟着更新"]);
+  assert.equal(await card.unchanged!(), true);
+  // 等确认的时候有人把 !1、!2 的目标分支改了：推上去会进别的分支，要重新确认
+  targets[1] = "release";
+  assert.equal(await card.unchanged!(), false);
+  targets[1] = "main";
+  targets[2] = "test";
+  assert.equal(await card.unchanged!(), false);
+  targets[2] = "uat";
   assert.equal(await card.unchanged!(), true);
   // 等确认的时候到 uat 的合了：推的时候会再开一个，和卡片上写的不一样了
   states[2] = "merged";
@@ -1843,7 +1852,7 @@ test("推代码、合并前请发起人确认：卡片上列仓库、开到哪�
   // 推过以后又改：推到同一个分支，合并请求跟着更新
   await tools.code_edit_file.run({ path: "README.md", old_text: "# demo", new_text: "# demo 2" }, { signal });
   const again = (await confirmOf(tools.code_open_pr)({ title: "改说明", body: "" }, { signal }))!;
-  assert.deepEqual(again.lines, ["仓库：acme/demo", "推到这个话题之前用的分支 bugfix/a，!1 跟着更新", "标题：改说明", "改了 1 个文件（+1 -1）：", "　README.md（+1 -1）"]);
+  assert.deepEqual(again.lines, ["仓库：acme/demo", "推到这个话题之前用的分支 bugfix/a，!1（开到 main）跟着更新", "标题：改说明", "改了 1 个文件（+1 -1）：", "　README.md（+1 -1）"]);
   const uat = (await confirmOf(tools.code_open_pr)({ title: "上 uat", body: "", target: "uat" }, { signal }))!;
   assert.equal(uat.title, "开合并请求到 uat");
   assert.equal(uat.lines[1], "从这个话题的分支 bugfix/a 开合并请求到 uat（这个分支是从 main 拉的，已经推过的改动一起带上）");

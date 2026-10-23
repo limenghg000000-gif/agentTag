@@ -1520,11 +1520,17 @@ export class Workspace {
 
   /** 之前开的合并请求现在的状态。平台不支持查、或者查失败时不知道（当它还开着，和以前一样） */
   private async requestState(number: number | undefined, signal?: AbortSignal): Promise<RequestState | undefined> {
+    return (await this.requestStatus(number, signal))?.state;
+  }
+
+  /** 合并请求现在的状态和开到哪个分支（有人可能改过目标分支）。查不到时为空 */
+  private async requestStatus(number: number | undefined, signal?: AbortSignal): Promise<{ state: RequestState; target: string } | undefined> {
     if (!number || !this.host.getRequest) {
       return undefined;
     }
     try {
-      return (await this.host.getRequest(this.repo, number, signal)).state;
+      const { state, target } = await this.host.getRequest(this.repo, number, signal);
+      return { state, target };
     } catch (err) {
       if (signal?.aborted) {
         throw err;
@@ -1883,20 +1889,21 @@ export class Workspace {
     });
   }
 
-  /** 这个话题开的合并请求（开到线上分支的那个）现在的状态：合了、关了的，推新改动时另开一个。查不到时为空 */
-  pullRequestState(signal?: AbortSignal): Promise<RequestState | undefined> {
-    return this.requestState(this.pullRequest?.number, signal);
+  /** 这个话题开的合并请求（开到线上分支的那个）现在的状态和开到哪：合了、关了的，推新改动时另开一个。查不到时为空 */
+  pullRequestStatus(signal?: AbortSignal): Promise<{ state: RequestState; target: string } | undefined> {
+    return this.requestStatus(this.pullRequest?.number, signal);
   }
 
   /**
    * 这个话题开到别的分支（uat 这类）的合并请求和它们现在的状态：推新改动时开着的跟着更新，合过了的再开一个。
    * 开合并请求前请发起人确认时，卡片上写清这些也会动；查不到状态的照开着算（推的时候也是）
    */
-  async targetRequests(signal?: AbortSignal): Promise<Array<{ target: string; number: number; state?: RequestState }>> {
-    const list: Array<{ target: string; number: number; state?: RequestState }> = [];
+  async targetRequests(signal?: AbortSignal): Promise<Array<{ target: string; number: number; state?: RequestState; now?: string }>> {
+    const list: Array<{ target: string; number: number; state?: RequestState; now?: string }> = [];
     for (const request of this.state.requests ?? []) {
-      const state = await this.requestState(request.prNumber, signal);
-      list.push({ target: request.target, number: request.prNumber, ...(state ? { state } : {}) });
+      const status = await this.requestStatus(request.prNumber, signal);
+      // now：平台上现在开到哪个分支（有人改过目标分支时和 target 不一样）
+      list.push({ target: request.target, number: request.prNumber, ...(status ? { state: status.state, now: status.target } : {}) });
     }
     return list;
   }
