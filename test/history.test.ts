@@ -291,6 +291,17 @@ test("群聊太长时省略较早的，单条太长的截短", () => {
   assert.ok(!text.includes("[人0 "));
 });
 
+test("群聊里 @ 了机器人的标上「@了你」，开头说明这段没有它的回答、别凭这段说哪条做没做", () => {
+  const text = renderChat([
+    item("om_1", { senderName: "赵作武", content: "每天 09:55 汇总今天群里的讨论，追加到 https://x.feishu.cn/docx/Abc123", createTime: minutesBefore(3), mentionedBot: true }),
+    item("om_2", { senderName: "赵作武", content: "总结一下今天群里聊了什么", createTime: minutesBefore(2) }),
+  ]);
+  assert.match(text, /\[赵作武 \d\d:\d\d @了你\] 每天 09:55 汇总/);
+  assert.match(text, /\[赵作武 \d\d:\d\d\] 总结一下/);
+  assert.match(CHAT_CONTEXT_HEADER, /没有你的回答/);
+  assert.match(CHAT_CONTEXT_HEADER, /别凭这段说，也别主动提/);
+});
+
 test("卡片即回答：机器人的卡片记过回答的换成回答，没记过的（进度卡片）照样去掉", async () => {
   const { api } = fakeApi([
     item("om_1", { senderName: "张三", content: "@机器人 查一下" }),
