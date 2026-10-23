@@ -86,6 +86,17 @@ export interface CreateInput {
 }
 
 export type ChangeAction = "pause" | "resume" | "cancel";
+/** 暂停、恢复、取消的叫法，列的时候按这个顺序 */
+const CHANGE_WORDS: Readonly<Record<ChangeAction, string>> = { pause: "暂停", resume: "恢复", cancel: "取消" };
+
+/** 「暂停、取消」：按暂停、恢复、取消的顺序列 */
+export function changeWords(actions: Iterable<ChangeAction>): string {
+  const wanted = new Set(actions);
+  return (Object.keys(CHANGE_WORDS) as ChangeAction[])
+    .filter((action) => wanted.has(action))
+    .map((action) => CHANGE_WORDS[action])
+    .join("、");
+}
 
 export interface SchedulerOptions {
   /** 定时任务记在这个文件里，重启后接着跑。不给就只记在内存里（测试用） */

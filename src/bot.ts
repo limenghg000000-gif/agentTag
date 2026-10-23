@@ -35,6 +35,7 @@ import {
 } from "./progress.js";
 import { type AboutBot, buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
+import { type ChangeAction, changeWords } from "./schedules.js";
 import { createEarlierResultsTool, EARLIER_RESULTS_TOOL, type EarlierResult, EarlierResults, listEarlierResults } from "./topic-results.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
@@ -247,24 +248,55 @@ const SCHEDULE_TALK = new RegExp(
   "i",
 );
 const SCHEDULE_TOOLS: ReadonlySet<string> = new Set(SCHEDULE_TOOL_NAMES);
+/** 说的是不要做：「别暂停」「不用取消」「先别删」「不想恢复」 */
+const NOT_DO = String.raw`(?:别|不要|不用|甭|没|不(?:想|必|需要?|打算)?|无需|先别)\s*(?:再|先)?\s*`;
 /** 这句话本身要暂停定时任务（「暂停定时任务 T5」「T5 先暂停一下」），说「别暂停」「不用暂停」的不算 */
 const PAUSE_ASK = /暂停/;
-const NOT_PAUSE = /(?:别|不要|不用|甭|没|不)\s*暂停/;
+const NOT_PAUSE = new RegExp(`${NOT_DO}暂停`);
+/** 「取消暂停」「把暂停解除了」是要恢复，不是取消 */
+const UNPAUSE_ASK = /(?:取消|解除|撤销)\s*(?:掉\s*)?暂停|暂停\s*(?:取消|解除|撤销)/;
+const NOT_UNPAUSE = new RegExp(`${NOT_DO}(?:取消|解除|撤销)\\s*(?:掉\\s*)?暂停`);
+const RESUME_ASK = /恢复|重新开/;
+const NOT_RESUME = new RegExp(`${NOT_DO}(?:恢复|重新开)`);
+const CANCEL_ASK = /取消|删(?:掉|了|除)/;
+const NOT_CANCEL = new RegExp(`${NOT_DO}(?:取消|删)`);
+/** 在问要不要取消、取消了没有，不是要它取消：「要不要取消 T3」「T3 取消了吗」 */
+const WONDERING = /要不要|是否|该不该|需不需要|用不用|了没|[吗么][\s?？。.!！~～]*$/;
 /** 这句话里写着的定时任务编号：T5、t12（和群记忆的 #3、经验 K3 不是一套） */
 const NAMED_TASK = /(?<![A-Za-z0-9])T(\d+)(?![A-Za-z0-9])/gi;
 
+/** 话题里没 @ 的跟聊能对定时任务做的：这句话点名的编号、说了要做的暂停、恢复、取消 */
+export interface TopicScheduleChange {
+  ids: ReadonlySet<number>;
+  actions: ReadonlySet<ChangeAction>;
+}
+
 /**
- * 话题里没 @ 的跟聊，这句话本身要暂停定时任务、写了编号：返回这句话点名的编号，这次只能暂停这几个；不是这样的返回 undefined。
- * 暂停群里谁都能、随时能恢复，别人暂停了会 @ 建的人；恢复、取消、建新的照旧要 @ 机器人说（话题里谁都能写字，只认说话人自己这句点名的）。
- * 2026-10-23 ML 在 T5 的结果话题里没 @ 说「暂停定时任务 T5」，机器人回「没 @ 我停不了」
+ * 话题里没 @ 的跟聊，这句话本身要暂停、恢复、取消定时任务，写了编号：返回这句话点名的编号和要做的事，这次只能对这几个做这几样；不是这样的返回 undefined。
+ * 话题里谁都能写字，只认说话人自己这句点名的；能不能做由 schedule_change 按说话人核对：暂停谁都能，恢复、取消只有建的人和管理员。建新的照旧要 @ 机器人说。
+ * 取消了找不回来：句子里也说到暂停的（「取消暂停」「把暂停取消了」是要恢复）、在问的（「要不要取消 T3」）不给取消。
+ * 2026-10-23 ML 在 T5 的结果话题里没 @ 说「暂停定时任务 T5」，机器人回「没 @ 我停不了」，先放开了暂停；
+ * 接着他没 @ 说「取消定时任务 T1、T3、T4、T5」又被拒，说话题里回复本来就不 @，恢复、取消也放开
  */
-export function pausableTasks(question: string): ReadonlySet<number> | undefined {
-  if (!PAUSE_ASK.test(question) || NOT_PAUSE.test(question)) {
+export function topicScheduleChange(question: string): TopicScheduleChange | undefined {
+  const ids = new Set([...question.matchAll(NAMED_TASK)].map((match) => Number(match[1])));
+  if (ids.size === 0) {
     return undefined;
   }
-  const ids = new Set([...question.matchAll(NAMED_TASK)].map((match) => Number(match[1])));
-  return ids.size > 0 ? ids : undefined;
+  const unpause = UNPAUSE_ASK.test(question);
+  const actions = new Set<ChangeAction>();
+  if (PAUSE_ASK.test(question) && !unpause && !NOT_PAUSE.test(question)) {
+    actions.add("pause");
+  }
+  if ((RESUME_ASK.test(question) && !NOT_RESUME.test(question)) || (unpause && !NOT_UNPAUSE.test(question))) {
+    actions.add("resume");
+  }
+  if (CANCEL_ASK.test(question) && !PAUSE_ASK.test(question) && !NOT_CANCEL.test(question) && !WONDERING.test(question)) {
+    actions.add("cancel");
+  }
+  return actions.size > 0 ? { ids, actions } : undefined;
 }
+
 /** 看话题里最近几条消息有没有在说定时任务（提示词里说这次建不了用）：只补了一个时间、一个链接的，前面几条多半说过。群里刚才的聊天不算 */
 const SCHEDULE_TALK_LOOKBACK = 6;
 
@@ -685,10 +717,10 @@ async function runTask(
     };
     // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
     const followUp = options.readOnly === true;
-    // 话题里没 @ 的跟聊，这句话本身说了暂停哪个定时任务：给 schedule_change，只能暂停点名的这几个（见 pausableTasks）。
+    // 话题里没 @ 的跟聊，这句话本身说了暂停、恢复、取消哪个定时任务：给 schedule_change，只能对点名的这几个做这句说的事（见 topicScheduleChange）。
     // 主动接话照规矩去做的、按钮问的、到点跑的不算
-    const pausable =
-      options.unaddressed === true && options.proactive !== true && !followUp && scheduled === undefined ? pausableTasks(question) : undefined;
+    const topicChange =
+      options.unaddressed === true && options.proactive !== true && !followUp && scheduled === undefined ? topicScheduleChange(question) : undefined;
     // 只是整理话题里已经有的内容（总结、讲给谁听、换个说法）：不查经验库、不给查询的工具，直接按上文写。按钮上的话是接着要查的新问题，不算
     const restate =
       !followUp &&
@@ -801,9 +833,13 @@ async function runTask(
                   : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
             );
           }
-          if (pausable && tool.spec.name === SCHEDULE_CHANGE_TOOL && (args.action !== "pause" || !pausable.has(taskNumber(args.id)))) {
+          if (
+            topicChange &&
+            tool.spec.name === SCHEDULE_CHANGE_TOOL &&
+            (!topicChange.actions.has(args.action as ChangeAction) || !topicChange.ids.has(taskNumber(args.id)))
+          ) {
             throw new Error(
-              `这句没 @ 你，只能暂停他这句话里点名的定时任务（${[...pausable].map((id) => `T${id}`).join("、")}）；恢复、取消或者停别的任务，请他 @ 你说`,
+              `这句没 @ 你，只能${changeWords(topicChange.actions)}他这句话里点名的定时任务（${[...topicChange.ids].map((id) => `T${id}`).join("、")}）；别的改法、别的任务，请他 @ 你说`,
             );
           }
           checkRestatedWrite(tool, args);
@@ -973,7 +1009,7 @@ async function runTask(
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     // 定时任务的工具：这句话本身说到了定时任务才给；主动接话、整理、定时任务自己跑的都不给，按钮问的、没 @ 的跟聊只给看的
-    // （没 @ 的跟聊这句话本身说了暂停哪个的，再给 schedule_change，只能暂停点名的）
+    // （没 @ 的跟聊这句话本身说了暂停、恢复、取消哪个的，再给 schedule_change，只能对点名的做这句说的事）
     const scheduleTalk = SCHEDULE_TALK.test(question);
     const taskTools = allTools.filter(
       (tool) =>
@@ -991,7 +1027,7 @@ async function runTask(
             restate ||
             ((followUp || options.unaddressed === true) &&
               tool.spec.name !== SCHEDULE_LIST_TOOL &&
-              !(pausable && tool.spec.name === SCHEDULE_CHANGE_TOOL)))
+              !(topicChange && tool.spec.name === SCHEDULE_CHANGE_TOOL)))
         ) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
         !((memoryLocked || notMemoryEditor) && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
@@ -1006,11 +1042,11 @@ async function runTask(
     // 话题里在说建定时任务，这次却建不了：没 @ 的跟聊、按钮问的只给看的，这句话本身没说到定时（只补了一个时间、一个链接）的不给。
     // 提示词里说清楚建不了、请他 @ 着一句说全。2026-10-22 测试群：话题里没 @ 补了一句「每天 15:34，从现在开始」、
     // 只贴了文档链接，模型一个工具没调都回了「已建好定时任务」，其实没建
-    // 能暂停点名任务的（pausable）在提示词里另说一条
+    // 能改点名任务的（topicChange）在提示词里另说一条
     const scheduleLocked =
       scheduled === undefined &&
       !restate &&
-      pausable === undefined &&
+      topicChange === undefined &&
       allTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
       !taskTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
       [question, ...history.filter((m) => !isChatContext(m)).slice(-SCHEDULE_TALK_LOOKBACK).map((m) => m.content)].some((text) => SCHEDULE_ASK.test(text))
@@ -1032,8 +1068,10 @@ async function runTask(
     if (unaddressed) {
       logger.info(`没 @ 机器人的跟聊，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
     }
-    if (pausable && taskTools.some((tool) => tool.spec.name === SCHEDULE_CHANGE_TOOL)) {
-      logger.info(`没 @ 的跟聊说了暂停定时任务，这次只能暂停 ${[...pausable].map((id) => `T${id}`).join("、")} message=${msg.messageId} sender=${msg.senderId}`);
+    if (topicChange && taskTools.some((tool) => tool.spec.name === SCHEDULE_CHANGE_TOOL)) {
+      logger.info(
+        `没 @ 的跟聊说了${changeWords(topicChange.actions)}定时任务，这次只能对 ${[...topicChange.ids].map((id) => `T${id}`).join("、")} 做 message=${msg.messageId} sender=${msg.senderId}`,
+      );
     }
     if (notMemoryEditor && memory) {
       logger.info(`发起人不在能改群记忆的名单里，这次群记忆只能看 message=${msg.messageId} sender=${msg.senderId}`);
@@ -1134,7 +1172,9 @@ async function runTask(
         // 不在能改群记忆名单里的人定规矩：上面那条已经叫它说没记上，不再叫它「用 memory_save 记下」
         ...(ruleOnly && !(notMemoryEditor && memory) ? { ruleOnly: true } : {}),
         ...(scheduleLocked ? { scheduleLocked } : {}),
-        ...(pausable && toolNames.includes(SCHEDULE_CHANGE_TOOL) ? { schedulePauseOnly: [...pausable] } : {}),
+        ...(topicChange && toolNames.includes(SCHEDULE_CHANGE_TOOL)
+          ? { scheduleTopicOnly: { ids: [...topicChange.ids], actions: [...topicChange.actions] } }
+          : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
