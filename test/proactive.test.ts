@@ -1093,6 +1093,42 @@ test("群记忆里的规矩说要 @ 它才查：不给模型「做」这个选�
   }
 });
 
+test("没 @ 发截图说「排查一下」：告诉模型看不到图、按文字判断；群里定过不用 @ 也查的规矩，规矩没管到的事照样能问一句", async () => {
+  // 10-23 测试群（还没定不用 @ 也查的规矩）没 @ 发截图说「排查一下用户反馈的转链问题」，判断时只看到「![image](…)」，两次都判成不接
+  const ask = "接：要我来排查一下用户反馈的转链问题吗？我会先看日志";
+  const shot = await setup({ judge: ask, confirm: ask, work: true });
+  try {
+    await shot.replier.consider(msg("om_1", { content: "排查一下用户反馈的转链问题\n![image](img_1)" }));
+    assert.equal(shot.replies.length, 1);
+    const system = shot.requests[0].system;
+    assert.match(system, /这条消息带了图片（「!\[image\]\(…\)」），你看不到图里的内容，只按文字判断/);
+    assert.match(system, /2\. 有人明确说了一件你能帮上的事（查线上报错、看代码、整理文档、找以前定过的事），还没人接：用一句话问要不要你来/);
+  } finally {
+    await shot.cleanup();
+  }
+  // 定过不用 @ 也查的规矩：问一句那条以前写「群里也没定过上面那样的规矩」才能问，像是这个群一律不能问
+  const rule = await setup({ judge: ask, confirm: ask, work: true, rules: [WORK_RULE] });
+  try {
+    await rule.replier.consider(msg("om_1", { content: "排查一下用户反馈的转链问题\n![image](img_1)" }));
+    assert.equal(rule.replies.length, 1);
+    assert.deepEqual(rule.worked, []);
+    const system = rule.requests[0].system;
+    assert.match(system, /第 2 种输出「做」/);
+    assert.match(system, /3\. 有人明确说了一件你能帮上的事.*又不归上面第 2 种的规矩管（群里定过规矩，只管规矩说的那类事；别的事照样按这一种问）/);
+    assert.doesNotMatch(system, /群里也没定过上面那样的规矩/);
+  } finally {
+    await rule.cleanup();
+  }
+  // 不带图的不加图片那句
+  const text = await setup({ judge: "不接", work: true });
+  try {
+    await text.replier.consider(msg("om_1", { content: "排查一下用户反馈的转链问题" }));
+    assert.doesNotMatch(text.requests[0].system, /看不到图里的内容/);
+  } finally {
+    await text.cleanup();
+  }
+});
+
 /** 经验库里查到的：团队经验库一条、aiops 经验库一条 */
 const LESSONS = {
   text: "经验 K3 [排查经验]：gateway code=8\n- 原因：签名密钥过期\n- 处理办法：重新下发密钥，2026-09-30 处理过\n\naiops 经验 #12：gateway 签名失败\n- 根因：密钥过期",
