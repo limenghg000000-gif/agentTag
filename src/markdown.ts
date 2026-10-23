@@ -2,7 +2,15 @@ const FENCE = /^\s*```/;
 
 /** 飞书卡片 markdown 里的尖括号会被当成标签（<at id=all></at> 会 @所有人，还有 <font> 这些）：别处来的文字转成实体再放进卡片 */
 export function escapeCardMarkdown(text: string): string {
-  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return noCardImages(text.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+}
+
+/**
+ * 飞书卡片 markdown 把 ![说明](地址) 当成图片，地址不是飞书的图片 key 时整张卡片被退回（200570 invalid image keys）。
+ * 别处来的文字、回答的每一行、表格的每一格里的「![」把方括号换成全角，照原样显示。0.21.2 的更新日志里写了「![image](…)」，通知卡片就这样被退回、改发了文字
+ */
+function noCardImages(text: string): string {
+  return text.replace(/!\[/g, "!［");
 }
 
 /**
@@ -108,7 +116,7 @@ function richColor(tag: string, color: string): string | undefined {
  * 再把允许的标签恢复回来（颜色统一写成单引号；颜色不在名单里的照样转义，显示成原文）
  */
 export function richCardLine(line: string): string {
-  return line
+  return noCardImages(line)
     .replace(/^( {0,3})#{1,3}(?=[ \t])/, "$1####")
     .replace(/</g, "&lt;")
     .replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
@@ -126,7 +134,7 @@ const TAG_FONT_COLOR: Record<string, string> = { neutral: "grey" };
  * <text_tag> 换成同色的 <font>（格子里认不认 text_tag 文档里查不到，认不了会把标签原文显示出来）
  */
 export function richCardCell(cell: string): string {
-  return cell.replace(/</g, "&lt;").replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
+  return noCardImages(cell).replace(/</g, "&lt;").replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
     const value = richColor(tag, color);
     if (!value) {
       return all;

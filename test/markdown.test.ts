@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cellTag, richCardCell, richCardLine, splitMarkdown, splitTables, stripRichTags, toPostMarkdown } from "../src/markdown.js";
+import { cellTag, escapeCardMarkdown, richCardCell, richCardLine, splitMarkdown, splitTables, stripRichTags, toPostMarkdown } from "../src/markdown.js";
 
 test("短文本原样返回", () => {
   assert.deepEqual(splitMarkdown("你好", 100), ["你好"]);
@@ -31,6 +31,15 @@ test("切点落在代码块里时补上结束标记并在下一片重新打开",
 test("超长单行按字符硬切", () => {
   const chunks = splitMarkdown("字".repeat(250), 100);
   assert.deepEqual(chunks.map((c) => c.length), [100, 100, 50]);
+});
+
+test("别处来的文字放进卡片：尖括号转成实体，![说明](地址) 的方括号换成全角，不让飞书当成图片退回整张卡片", () => {
+  assert.equal(escapeCardMarkdown("<at id=all></at>"), "&lt;at id=all&gt;&lt;/at&gt;");
+  assert.equal(escapeCardMarkdown("以前只看到「![image](…)」，`![a](b)` 也一样"), "以前只看到「!［image](…)」，`!［a](b)` 也一样");
+  assert.equal(escapeCardMarkdown("[文档](https://example.com) 和感叹号！[注] 不动"), "[文档](https://example.com) 和感叹号！[注] 不动");
+  // 回答的每一行、表格的每一格也一样（模型照抄了上文里群成员发的图 ![image](image_key)）
+  assert.equal(richCardLine("### 图 ![image](img_1)"), "#### 图 !［image](img_1)");
+  assert.equal(richCardCell("![image](img_1)"), "!［image](img_1)");
 });
 
 test("卡片回答的一行：放过名单里的 <font>、<text_tag>，别的尖括号转义；# ～ ### 标题降成 ####", () => {
