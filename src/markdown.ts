@@ -2,7 +2,17 @@ const FENCE = /^\s*```/;
 
 /** 飞书卡片 markdown 里的尖括号会被当成标签（<at id=all></at> 会 @所有人，还有 <font> 这些）：别处来的文字转成实体再放进卡片 */
 export function escapeCardMarkdown(text: string): string {
-  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return escapeCardImages(text.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+}
+
+const IMAGE_SYNTAX = /!\[([^\]\n]*)\]\(([^)\n]*)\)/g;
+
+/**
+ * 卡片 markdown 里的「![说明](…)」飞书当成图片，括号里当 image_key 去找，找不到整张卡片都发不出去（ErrCode 200570）。
+ * 卡片里不放图片：叹号和圆括号换成全角，照字面显示（0.21.2 的技术说明里写了「![image](…)」，更新卡片退成了文字）
+ */
+export function escapeCardImages(text: string): string {
+  return text.replace(IMAGE_SYNTAX, "！[$1]（$2）");
 }
 
 /**
@@ -108,7 +118,7 @@ function richColor(tag: string, color: string): string | undefined {
  * 再把允许的标签恢复回来（颜色统一写成单引号；颜色不在名单里的照样转义，显示成原文）
  */
 export function richCardLine(line: string): string {
-  return line
+  return escapeCardImages(line)
     .replace(/^( {0,3})#{1,3}(?=[ \t])/, "$1####")
     .replace(/</g, "&lt;")
     .replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
@@ -126,7 +136,7 @@ const TAG_FONT_COLOR: Record<string, string> = { neutral: "grey" };
  * <text_tag> 换成同色的 <font>（格子里认不认 text_tag 文档里查不到，认不了会把标签原文显示出来）
  */
 export function richCardCell(cell: string): string {
-  return cell.replace(/</g, "&lt;").replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
+  return escapeCardImages(cell).replace(/</g, "&lt;").replace(ESCAPED_RICH_TAG, (all, tag: string, _quote: string, color: string, inner: string) => {
     const value = richColor(tag, color);
     if (!value) {
       return all;

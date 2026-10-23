@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -286,6 +287,21 @@ test("通知卡片：有技术说明的版本下面放一个默认收起的「�
   assert.ok(!json.includes("技术说明（0.11.0"));
   // 退回的文字不带技术说明
   assert.ok(!renderAnnouncementMarkdown(versions).includes("技术改动"));
+});
+
+test("通知卡片里的「![说明](…)」照字面显示，不让飞书当成图片：0.21.2 的技术说明里有这样一句，卡片被退回、改发了文字", () => {
+  const card = JSON.stringify(
+    renderAnnouncementCard([{ version: "0.21.2", notes: "- 以前只看到「![image](…)」", tech: "- 以前只看到「![image](…)」（#86）\n- [文档](https://docs.example.com)" }]),
+  );
+  assert.ok(!/!\[[^\]]*\]\(/.test(card), "卡片里不能有图片写法");
+  assert.match(card, /以前只看到「！\[image\]（…）」（#86）/);
+  assert.match(card, /\[文档\]\(https:\/\/docs\.example\.com\)/, "普通链接不动");
+  // 仓库里的两份更新日志：每一版画成卡片都不能有图片写法
+  const tech = parseChangelogTech(readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8"));
+  for (const v of parseReleaseNotes(readFileSync(new URL("../RELEASE_NOTES.md", import.meta.url), "utf8"))) {
+    const json = JSON.stringify(renderAnnouncementCard([{ ...v, ...(tech.has(v.version) ? { tech: tech.get(v.version)! } : {}) }]));
+    assert.ok(!/!\[[^\]]*\]\(/.test(json), `${v.version} 的卡片里有图片写法`);
+  }
 });
 
 test("通知卡片最多列几个版本，更早的只说还有几个", () => {

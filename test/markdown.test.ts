@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cellTag, richCardCell, richCardLine, splitMarkdown, splitTables, stripRichTags, toPostMarkdown } from "../src/markdown.js";
+import { cellTag, escapeCardImages, escapeCardMarkdown, richCardCell, richCardLine, splitMarkdown, splitTables, stripRichTags, toPostMarkdown } from "../src/markdown.js";
 
 test("短文本原样返回", () => {
   assert.deepEqual(splitMarkdown("你好", 100), ["你好"]);
@@ -190,4 +190,12 @@ test("表格的格子：只有一个 <text_tag> 时取出字和颜色", () => {
   for (const cell of ["<text_tag color='red'>高</text_tag> 92%", "<text_tag color='pink'>x</text_tag>", "<text_tag color='red'> </text_tag>", "<font color='red'>高</font>", "正常", ""]) {
     assert.equal(cellTag(cell), undefined, cell);
   }
+});
+
+test("卡片里的「![说明](…)」叹号和圆括号换成全角，飞书不当成图片去找 image_key；普通链接、单独的叹号不动", () => {
+  assert.equal(escapeCardImages("只看到「![image](…)」和 ![截图](img_v3_abc)"), "只看到「！[image]（…）」和 ！[截图]（img_v3_abc）");
+  assert.equal(escapeCardImages("看 [文档](https://example.com)！好的!"), "看 [文档](https://example.com)！好的!");
+  assert.equal(escapeCardMarkdown("<b>![image](x)</b>"), "&lt;b&gt;！[image]（x）&lt;/b&gt;");
+  assert.equal(richCardLine("### 图 ![image](img_1)"), "#### 图 ！[image]（img_1）");
+  assert.equal(richCardCell("![image](img_1)"), "！[image]（img_1）");
 });
