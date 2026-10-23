@@ -41,6 +41,8 @@ export interface PromptContext {
   ruleOnly?: boolean;
   /** 话题里在说建定时任务，这次却没给 schedule_create：为什么没给（「这句没 @ 你」） */
   scheduleLocked?: string;
+  /** 话题里没 @ 的跟聊，这句话本身说了暂停哪几个定时任务：这次只给暂停这几个（编号） */
+  schedulePauseOnly?: readonly number[];
   /** 这个话题之前查到过的结果（listEarlierResults 的那几行），给了 topic_earlier_results 时才有 */
   earlierResults?: readonly string[];
   /** 这个话题之前查过（记着查到的结果）、这次没说要从头查：追问接着之前的结论往下查，只补查缺的 */
@@ -125,6 +127,7 @@ export function buildSystemPrompt({
   restate,
   ruleOnly,
   scheduleLocked,
+  schedulePauseOnly,
   earlierResults,
   continuing,
   extra,
@@ -225,6 +228,13 @@ export function buildSystemPrompt({
       `- 这次不能建、改定时任务（${scheduleLocked}）${toolNames.includes("schedule_list") ? "，只能用 schedule_list 看有哪些" : ""}。` +
         "话题里有人要建、暂停、取消定时任务的，照实说这次没建、没改，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里重新说全：这件事要他重说一遍，只补一个时间、一个链接建不了。" +
         "没调 schedule_create、schedule_change 拿到结果，不能说已经建好、已经暂停或取消了。",
+    );
+  }
+  if (schedulePauseOnly && schedulePauseOnly.length > 0) {
+    const named = schedulePauseOnly.map((id) => `T${id}`).join("、");
+    lines.push(
+      `- 这句没 @ 你：定时任务这次只能暂停他这句话里点名的 ${named}（他要暂停时用 schedule_change 填 pause），建新的、恢复、取消、暂停别的都不行，要的话请他 @ 你说。` +
+        "没调 schedule_change 拿到结果，不能说已经暂停了。",
     );
   }
   if (notMemoryEditor) {

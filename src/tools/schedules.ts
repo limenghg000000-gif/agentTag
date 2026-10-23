@@ -176,7 +176,7 @@ export function createScheduleTools(opts: ScheduleToolsOptions): Tool[] {
     },
     describe: (args) => `${args.action === "cancel" ? "取消" : args.action === "pause" ? "暂停" : "恢复"}定时任务 ${String(args.id ?? "")}`,
     async run(args) {
-      const id = requireId(args.id);
+      const id = taskNumber(args.id);
       const action = args.action;
       if (action !== "pause" && action !== "resume" && action !== "cancel") {
         throw new Error("action 只能是 pause、resume 或 cancel");
@@ -323,7 +323,8 @@ function optionalString(args: Record<string, unknown>, key: string): string | un
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
-function requireId(value: unknown): number {
+/** 定时任务编号「T3」「#3」「3」里的数字，写的不是编号就报错 */
+export function taskNumber(value: unknown): number {
   const text = typeof value === "number" ? String(value) : typeof value === "string" ? value.trim() : "";
   const match = /^(?:T|#)?\s*(\d+)$/i.exec(text);
   if (!match) {
