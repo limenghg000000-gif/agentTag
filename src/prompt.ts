@@ -1,5 +1,5 @@
 import { type FeatureList, featurePromptLines } from "./features.js";
-import { type ChangeAction, changeWords } from "./schedules.js";
+import { type ChangeGrant, changeWords, describeGrants } from "./schedules.js";
 import { CONFLICT_TOOL } from "./tools/conflicts.js";
 
 const TIME_FORMAT = new Intl.DateTimeFormat("zh-CN", {
@@ -42,8 +42,8 @@ export interface PromptContext {
   ruleOnly?: boolean;
   /** 话题里在说建定时任务，这次却没给 schedule_create：为什么没给（「这句没 @ 你」） */
   scheduleLocked?: string;
-  /** 话题里没 @ 的跟聊，这句话本身说了暂停、恢复、取消哪几个定时任务：这次只能对这几个（编号）做这几样 */
-  scheduleTopicOnly?: { ids: readonly number[]; actions: readonly ChangeAction[] };
+  /** 话题里没 @ 的跟聊，这句话本身说了暂停、恢复、取消哪几个定时任务：这次只能对这几个（编号）做这句说的那样 */
+  scheduleTopicOnly?: readonly ChangeGrant[];
   /** 这个话题之前查到过的结果（listEarlierResults 的那几行），给了 topic_earlier_results 时才有 */
   earlierResults?: readonly string[];
   /** 这个话题之前查过（记着查到的结果）、这次没说要从头查：追问接着之前的结论往下查，只补查缺的 */
@@ -232,14 +232,12 @@ export function buildSystemPrompt({
         "一两句说完，任务现在是什么状态就说什么状态，不要说在等确认、等他回复。没调 schedule_create、schedule_change 拿到结果，不能说已经建好、已经暂停或取消了。",
     );
   }
-  if (scheduleTopicOnly && scheduleTopicOnly.ids.length > 0 && scheduleTopicOnly.actions.length > 0) {
-    const named = scheduleTopicOnly.ids.map((id) => `T${id}`).join("、");
-    const doing = changeWords(scheduleTopicOnly.actions);
-    const managing = scheduleTopicOnly.actions.some((action) => action !== "pause");
+  if (scheduleTopicOnly && scheduleTopicOnly.length > 0) {
+    const doing = changeWords(scheduleTopicOnly);
     lines.push(
-      `- 这句没 @ 你：定时任务这次只能${doing}他这句话里点名的 ${named}（用 schedule_change），建新的、别的改法、动别的任务都不行，要的话请他 @ 你说。` +
-        (managing ? "恢复、取消只有建任务的人和管理员能做，schedule_change 不让做时照它返回的原因告诉他。" : "") +
-        (scheduleTopicOnly.actions.includes("cancel") ? "取消了就找不回来：他这句明确要取消才取消，只是在商量、在问的不要动，回答他就行。" : "") +
+      `- 这句没 @ 你：定时任务这次只能${describeGrants(scheduleTopicOnly)}（他这句话里点名的，用 schedule_change），建新的、别的改法、动别的任务都不行，要的话请他 @ 你说。` +
+        (scheduleTopicOnly.some((grant) => grant.action !== "pause") ? "恢复、取消只有建任务的人和管理员能做，schedule_change 不让做时照它返回的原因告诉他。" : "") +
+        (scheduleTopicOnly.some((grant) => grant.action === "cancel") ? "取消了就找不回来：他这句明确要取消才取消，只是在商量、在问的不要动，回答他就行。" : "") +
         `没调 schedule_change 拿到结果，不能说已经${doing.replaceAll("、", "或")}了。`,
     );
   }

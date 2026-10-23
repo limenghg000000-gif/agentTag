@@ -35,7 +35,7 @@ import {
 } from "./progress.js";
 import { type AboutBot, buildSystemPrompt } from "./prompt.js";
 import type { RecentThreadStore } from "./recent-threads.js";
-import { type ChangeAction, changeWords } from "./schedules.js";
+import { type ChangeAction, type ChangeGrant, describeGrants } from "./schedules.js";
 import { createEarlierResultsTool, EARLIER_RESULTS_TOOL, type EarlierResult, EarlierResults, listEarlierResults } from "./topic-results.js";
 import { type CardKitApi, StreamingCard } from "./stream-card.js";
 import type { TaskRegistry } from "./tasks.js";
@@ -248,53 +248,72 @@ const SCHEDULE_TALK = new RegExp(
   "i",
 );
 const SCHEDULE_TOOLS: ReadonlySet<string> = new Set(SCHEDULE_TOOL_NAMES);
-/** 说的是不要做：「别暂停」「不用取消」「先别删」「不想恢复」 */
-const NOT_DO = String.raw`(?:别|不要|不用|甭|没|不(?:想|必|需要?|打算)?|无需|先别)\s*(?:再|先)?\s*`;
-/** 这句话本身要暂停定时任务（「暂停定时任务 T5」「T5 先暂停一下」），说「别暂停」「不用暂停」的不算 */
+/** 小句之间的标点：一小句说的事只管这一小句写的编号（「T3 恢复一下，T5 删掉」不能取消 T3） */
+const CHANGE_CLAUSE_BREAK = /[，,。；;！!？?\n]+/;
+/** 这一小句里有说不要、不能的字（「别暂停 T5」「不要把 T5 取消」「T5 不能取消」「没必要恢复」）：这一小句什么都不给，宁可请他再说一遍 */
+const NEGATED = /[不别没甭勿莫]|无需/;
+/** 在问，不是要它做：「要不要取消 T3」「T3 取消了吗」「是否暂停」 */
+const WONDERING = /要不要|是否|该不该|需不需要|用不用|了没|[吗么][\s?？。.!！~～]*$/;
 const PAUSE_ASK = /暂停/;
-const NOT_PAUSE = new RegExp(`${NOT_DO}暂停`);
 /** 「取消暂停」「把暂停解除了」是要恢复，不是取消 */
 const UNPAUSE_ASK = /(?:取消|解除|撤销)\s*(?:掉\s*)?暂停|暂停\s*(?:取消|解除|撤销)/;
-const NOT_UNPAUSE = new RegExp(`${NOT_DO}(?:取消|解除|撤销)\\s*(?:掉\\s*)?暂停`);
 const RESUME_ASK = /恢复|重新开/;
-const NOT_RESUME = new RegExp(`${NOT_DO}(?:恢复|重新开)`);
 const CANCEL_ASK = /取消|删(?:掉|了|除)/;
-const NOT_CANCEL = new RegExp(`${NOT_DO}(?:取消|删)`);
-/** 在问要不要取消、取消了没有，不是要它取消：「要不要取消 T3」「T3 取消了吗」 */
-const WONDERING = /要不要|是否|该不该|需不需要|用不用|了没|[吗么][\s?？。.!！~～]*$/;
 /** 这句话里写着的定时任务编号：T5、t12（和群记忆的 #3、经验 K3 不是一套） */
 const NAMED_TASK = /(?<![A-Za-z0-9])T(\d+)(?![A-Za-z0-9])/gi;
 
-/** 话题里没 @ 的跟聊能对定时任务做的：这句话点名的编号、说了要做的暂停、恢复、取消 */
-export interface TopicScheduleChange {
-  ids: ReadonlySet<number>;
-  actions: ReadonlySet<ChangeAction>;
+/** 一小句说了暂停、恢复、取消里的哪几样 */
+function clauseActions(clause: string): ChangeAction[] {
+  if (NEGATED.test(clause)) {
+    return [];
+  }
+  const unpause = UNPAUSE_ASK.test(clause);
+  const actions: ChangeAction[] = [];
+  if (PAUSE_ASK.test(clause) && !unpause) {
+    actions.push("pause");
+  }
+  if (RESUME_ASK.test(clause) || unpause) {
+    actions.push("resume");
+  }
+  // 取消收不回：这一小句只说了取消才算。「把暂停取消了」是恢复，「T3 恢复 T5 删掉」分不清删哪个
+  if (CANCEL_ASK.test(clause) && !PAUSE_ASK.test(clause) && actions.length === 0) {
+    actions.push("cancel");
+  }
+  return actions;
 }
 
 /**
- * 话题里没 @ 的跟聊，这句话本身要暂停、恢复、取消定时任务，写了编号：返回这句话点名的编号和要做的事，这次只能对这几个做这几样；不是这样的返回 undefined。
+ * 话题里没 @ 的跟聊，这句话本身要暂停、恢复、取消定时任务，写了编号：返回能对哪几个做哪样（一样动作一组编号），这次只能做这些；不是这样的返回 undefined。
+ * 每样动作只管同一小句里写的编号：「T3 恢复一下，T5 删掉」只能恢复 T3、取消 T5。上一小句只写了编号、没说做什么的（「T5 有问题，先暂停一下」），
+ * 暂停、恢复接着算这几个，取消只认同一小句里写的。有说不要、不能的小句不给，在问的整句不给。
  * 话题里谁都能写字，只认说话人自己这句点名的；能不能做由 schedule_change 按说话人核对：暂停谁都能，恢复、取消只有建的人和管理员。建新的照旧要 @ 机器人说。
- * 取消了找不回来：句子里也说到暂停的（「取消暂停」「把暂停取消了」是要恢复）、在问的（「要不要取消 T3」）不给取消。
  * 2026-10-23 ML 在 T5 的结果话题里没 @ 说「暂停定时任务 T5」，机器人回「没 @ 我停不了」，先放开了暂停；
  * 接着他没 @ 说「取消定时任务 T1、T3、T4、T5」又被拒，说话题里回复本来就不 @，恢复、取消也放开
  */
-export function topicScheduleChange(question: string): TopicScheduleChange | undefined {
-  const ids = new Set([...question.matchAll(NAMED_TASK)].map((match) => Number(match[1])));
-  if (ids.size === 0) {
+export function topicScheduleChange(question: string): ChangeGrant[] | undefined {
+  if (WONDERING.test(question)) {
     return undefined;
   }
-  const unpause = UNPAUSE_ASK.test(question);
-  const actions = new Set<ChangeAction>();
-  if (PAUSE_ASK.test(question) && !unpause && !NOT_PAUSE.test(question)) {
-    actions.add("pause");
+  const granted = new Map<ChangeAction, Set<number>>();
+  let carried: number[] = [];
+  for (const clause of question.split(CHANGE_CLAUSE_BREAK)) {
+    const ids = [...clause.matchAll(NAMED_TASK)].map((match) => Number(match[1]));
+    const actions = clauseActions(clause);
+    if (actions.length === 0) {
+      // 说了不要的小句里的编号不往下带（「T5 别动，先暂停」不暂停 T5）
+      carried = NEGATED.test(clause) ? [] : ids;
+      continue;
+    }
+    for (const action of actions) {
+      const targets = ids.length > 0 ? ids : action === "cancel" ? [] : carried;
+      for (const id of targets) {
+        granted.set(action, (granted.get(action) ?? new Set<number>()).add(id));
+      }
+    }
+    carried = [];
   }
-  if ((RESUME_ASK.test(question) && !NOT_RESUME.test(question)) || (unpause && !NOT_UNPAUSE.test(question))) {
-    actions.add("resume");
-  }
-  if (CANCEL_ASK.test(question) && !PAUSE_ASK.test(question) && !NOT_CANCEL.test(question) && !WONDERING.test(question)) {
-    actions.add("cancel");
-  }
-  return actions.size > 0 ? { ids, actions } : undefined;
+  const grants = [...granted].map(([action, ids]) => ({ action, ids: [...ids] }));
+  return grants.length > 0 ? grants : undefined;
 }
 
 /** 看话题里最近几条消息有没有在说定时任务（提示词里说这次建不了用）：只补了一个时间、一个链接的，前面几条多半说过。群里刚才的聊天不算 */
@@ -836,11 +855,9 @@ async function runTask(
           if (
             topicChange &&
             tool.spec.name === SCHEDULE_CHANGE_TOOL &&
-            (!topicChange.actions.has(args.action as ChangeAction) || !topicChange.ids.has(taskNumber(args.id)))
+            !topicChange.some((grant) => grant.action === args.action && grant.ids.includes(taskNumber(args.id)))
           ) {
-            throw new Error(
-              `这句没 @ 你，只能${changeWords(topicChange.actions)}他这句话里点名的定时任务（${[...topicChange.ids].map((id) => `T${id}`).join("、")}）；别的改法、别的任务，请他 @ 你说`,
-            );
+            throw new Error(`这句没 @ 你，只能${describeGrants(topicChange)}（他这句话里点名的）；别的改法、别的任务，请他 @ 你说`);
           }
           checkRestatedWrite(tool, args);
           // 定时任务到点改文档只能追加到建任务时点名的那篇的文末（没人看着，不改、不删已有内容）。
@@ -1070,7 +1087,7 @@ async function runTask(
     }
     if (topicChange && taskTools.some((tool) => tool.spec.name === SCHEDULE_CHANGE_TOOL)) {
       logger.info(
-        `没 @ 的跟聊说了${changeWords(topicChange.actions)}定时任务，这次只能对 ${[...topicChange.ids].map((id) => `T${id}`).join("、")} 做 message=${msg.messageId} sender=${msg.senderId}`,
+        `没 @ 的跟聊说了要改定时任务，这次只能${describeGrants(topicChange)} message=${msg.messageId} sender=${msg.senderId}`,
       );
     }
     if (notMemoryEditor && memory) {
@@ -1172,9 +1189,7 @@ async function runTask(
         // 不在能改群记忆名单里的人定规矩：上面那条已经叫它说没记上，不再叫它「用 memory_save 记下」
         ...(ruleOnly && !(notMemoryEditor && memory) ? { ruleOnly: true } : {}),
         ...(scheduleLocked ? { scheduleLocked } : {}),
-        ...(topicChange && toolNames.includes(SCHEDULE_CHANGE_TOOL)
-          ? { scheduleTopicOnly: { ids: [...topicChange.ids], actions: [...topicChange.actions] } }
-          : {}),
+        ...(topicChange && toolNames.includes(SCHEDULE_CHANGE_TOOL) ? { scheduleTopicOnly: topicChange } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),

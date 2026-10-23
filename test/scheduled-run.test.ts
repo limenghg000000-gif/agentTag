@@ -712,13 +712,13 @@ test("话题里没 @ 说「暂停定时任务 T5」「取消 T5」：给改的�
   const { handle } = setup({ model, taskTools: () => [tool("feishu_doc_read"), ...scheduleTools()] });
 
   const allowed: Array<[string, RegExp]> = [
-    ["暂停定时任务 T5", /只能暂停他这句话里点名的 T5（/],
-    ["T5 先暂停一下", /只能暂停他这句话里点名的 T5（/],
-    ["把t5和T6都暂停了吧", /只能暂停他这句话里点名的 T5、T6（/],
-    ["取消定时任务 T1、T3、T4、T5", /只能取消他这句话里点名的 T1、T3、T4、T5（/],
-    ["恢复 T5", /只能恢复他这句话里点名的 T5（/],
-    ["取消暂停 T5", /只能恢复他这句话里点名的 T5（/],
-    ["T3 恢复一下，T5 删掉", /只能恢复、取消他这句话里点名的 T3、T5（/],
+    ["暂停定时任务 T5", /只能暂停 T5（他这句话里点名的/],
+    ["T5 先暂停一下", /只能暂停 T5（他这句话里点名的/],
+    ["把t5和T6都暂停了吧", /只能暂停 T5、T6（他这句话里点名的/],
+    ["取消定时任务 T1、T3、T4、T5", /只能取消 T1、T3、T4、T5（他这句话里点名的/],
+    ["恢复 T5", /只能恢复 T5（他这句话里点名的/],
+    ["取消暂停 T5", /只能恢复 T5（他这句话里点名的/],
+    ["T3 恢复一下，T5 删掉", /只能恢复 T3，取消 T5（他这句话里点名的/],
   ];
   for (const [question, pattern] of allowed) {
     await handle(message(question, { messageId: `om_${question}`, rootId: "om_root" }), { unaddressed: true });
@@ -730,7 +730,7 @@ test("话题里没 @ 说「暂停定时任务 T5」「取消 T5」：给改的�
   assert.match(requests.at(-1)!.system, /取消了就找不回来/);
   assert.match(requests.at(-1)!.system, /不能说已经恢复或取消了/);
 
-  for (const question of ["别暂停 T5", "不用暂停 T5 了", "暂停一下定时任务", "先别取消 T5", "要不要取消 T5", "T5 取消了吗", "每天 9 点汇总 T5 的结果"]) {
+  for (const question of ["别暂停 T5", "不用暂停 T5 了", "暂停一下定时任务", "先别取消 T5", "不要把 T5 取消", "要不要取消 T5", "T5 取消了吗", "每天 9 点汇总 T5 的结果"]) {
     await handle(message(question, { messageId: `om_${question}`, rootId: "om_root" }), { unaddressed: true });
     assert.deepEqual(names(requests.at(-1)), ["feishu_doc_read", "schedule_list"], question);
     assert.doesNotMatch(requests.at(-1)!.system, /他这句话里点名的/, question);
@@ -773,7 +773,7 @@ test("没 @ 说暂停 T5：只能暂停 T5，取消 T5、暂停别的任务都�
   await handle(message("暂停定时任务 T5", { rootId: "om_root" }), { unaddressed: true });
   assert.deepEqual(runs, ["pause t5"]);
   const refused = JSON.stringify(requests[1]!.messages);
-  assert.equal(refused.match(/这句没 @ 你，只能暂停他这句话里点名的定时任务（T5）；别的改法、别的任务，请他 @ 你说/g)?.length, 3);
+  assert.equal(refused.match(/这句没 @ 你，只能暂停 T5（他这句话里点名的）；别的改法、别的任务，请他 @ 你说/g)?.length, 3);
   assert.deepEqual(markdowns(sent), ["已暂停定时任务 T5。"]);
 });
 
@@ -801,32 +801,70 @@ test("没 @ 说取消 T1、T3：只能取消这两个，取消别的、恢复、
   await handle(message("取消定时任务 T1、T3", { rootId: "om_root" }), { unaddressed: true });
   assert.deepEqual(runs, ["cancel T1", "cancel 3"]);
   const refused = JSON.stringify(requests[1]!.messages);
-  assert.equal(refused.match(/这句没 @ 你，只能取消他这句话里点名的定时任务（T1、T3）；别的改法、别的任务，请他 @ 你说/g)?.length, 2);
+  assert.equal(refused.match(/这句没 @ 你，只能取消 T1、T3（他这句话里点名的）；别的改法、别的任务，请他 @ 你说/g)?.length, 2);
   assert.deepEqual(markdowns(sent), ["已取消定时任务 T1、T3。"]);
 });
 
-test("没 @ 时这句话能对哪些定时任务做什么：要写编号；说别做、在问要不要取消、提到暂停的不给取消；「取消暂停」是恢复", () => {
-  const of = (question: string) => {
-    const change = topicScheduleChange(question);
-    return change && { ids: [...change.ids], actions: [...change.actions].sort() };
-  };
-  assert.deepEqual(of("暂停定时任务 T5"), { ids: [5], actions: ["pause"] });
-  assert.deepEqual(of("取消定时任务 T1、T3、T4、T5"), { ids: [1, 3, 4, 5], actions: ["cancel"] });
-  assert.deepEqual(of("把 t3 删了"), { ids: [3], actions: ["cancel"] });
-  assert.deepEqual(of("T3 重新开起来"), { ids: [3], actions: ["resume"] });
-  assert.deepEqual(of("取消暂停 T5"), { ids: [5], actions: ["resume"] });
-  assert.deepEqual(of("把 T5 的暂停取消掉"), { ids: [5], actions: ["resume"] });
-  // 同一句里又说到暂停的不给取消（分不清是不是「把暂停取消了」）
-  assert.deepEqual(of("暂停 T3，取消 T5"), { ids: [3, 5], actions: ["pause"] });
-  assert.deepEqual(of("T3 恢复一下，T5 删掉"), { ids: [3, 5], actions: ["cancel", "resume"] });
+test("没 @ 说「T3 恢复一下，T5 删掉」：只能恢复 T3、取消 T5，取消 T3 拦下", async () => {
+  const runs: string[] = [];
+  const change = tool("schedule_change", false, async (args) => {
+    runs.push(`${String(args.action)} ${String(args.id)}`);
+    return `${args.action === "cancel" ? "已取消" : "已恢复"}定时任务 ${String(args.id)}：每天 09:00（北京时间），汇总群聊`;
+  });
+  const rounds: ChatResult[] = [
+    {
+      text: "",
+      finish: "tool_calls",
+      toolCalls: [
+        { id: "c1", name: "schedule_change", arguments: JSON.stringify({ id: "T3", action: "cancel" }) },
+        { id: "c2", name: "schedule_change", arguments: JSON.stringify({ id: "T5", action: "resume" }) },
+        { id: "c3", name: "schedule_change", arguments: JSON.stringify({ id: "T3", action: "resume" }) },
+        { id: "c4", name: "schedule_change", arguments: JSON.stringify({ id: "T5", action: "cancel" }) },
+      ],
+    },
+    { text: "已恢复定时任务 T3，已取消定时任务 T5。", finish: "stop" },
+  ];
+  const { model, requests } = fakeModel(() => rounds.shift()!);
+  const { handle, sent } = setup({ model, taskTools: () => [tool("schedule_create"), tool("schedule_list"), change] });
+  await handle(message("T3 恢复一下，T5 删掉", { rootId: "om_root" }), { unaddressed: true });
+  assert.deepEqual(runs, ["resume T3", "cancel T5"]);
+  const refused = JSON.stringify(requests[1]!.messages);
+  assert.equal(refused.match(/这句没 @ 你，只能恢复 T3，取消 T5（他这句话里点名的）/g)?.length, 2);
+  assert.deepEqual(markdowns(sent), ["已恢复定时任务 T3，已取消定时任务 T5。"]);
+});
+
+test("没 @ 时这句话能对哪些定时任务做什么：每样动作只管同一小句写的编号；说不要、不能的，在问的不给", () => {
+  const of = (question: string) =>
+    topicScheduleChange(question)
+      ?.map((grant) => `${grant.action} ${grant.ids.join(",")}`)
+      .sort();
+  assert.deepEqual(of("暂停定时任务 T5"), ["pause 5"]);
+  assert.deepEqual(of("取消定时任务 T1、T3、T4、T5"), ["cancel 1,3,4,5"]);
+  assert.deepEqual(of("把 t3 删了"), ["cancel 3"]);
+  assert.deepEqual(of("T3 重新开起来"), ["resume 3"]);
+  assert.deepEqual(of("取消暂停 T5"), ["resume 5"]);
+  assert.deepEqual(of("把 T5 的暂停取消掉"), ["resume 5"]);
+  // 每样动作只管同一小句写的编号：恢复 T3 不能借后半句去取消 T3
+  assert.deepEqual(of("T3 恢复一下，T5 删掉"), ["cancel 5", "resume 3"]);
+  assert.deepEqual(of("暂停 T3，取消 T5"), ["cancel 5", "pause 3"]);
+  // 同一小句里又说了别的动作的不给取消（分不清删哪个）
+  assert.deepEqual(of("T3 恢复 T5 删掉"), ["resume 3,5"]);
+  // 上一小句只写了编号：暂停、恢复接着算，取消只认同一小句写的
+  assert.deepEqual(of("T5 有问题，先暂停一下"), ["pause 5"]);
+  assert.deepEqual(of("T5 有问题，删掉吧"), undefined);
   for (const question of [
     "取消定时任务",
     "暂停一下那个任务",
     "别取消 T5",
     "先别删 T5",
     "不想取消 T5",
+    "不要把 T5 取消",
+    "T5 不能取消",
+    "T5 先不取消了",
     "不用恢复 T5",
     "别取消暂停 T5",
+    "T5 别动，先暂停",
+    "T5 不要了，取消吧",
     "要不要取消 T5",
     "T5 是否取消",
     "T5 取消了吗",
