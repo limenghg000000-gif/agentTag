@@ -1,4 +1,5 @@
 import { type FeatureList, featurePromptLines } from "./features.js";
+import { type ChangeGrant, changeWords, describeGrants } from "./schedules.js";
 import { CONFLICT_TOOL } from "./tools/conflicts.js";
 
 const TIME_FORMAT = new Intl.DateTimeFormat("zh-CN", {
@@ -41,8 +42,8 @@ export interface PromptContext {
   ruleOnly?: boolean;
   /** 话题里在说建定时任务，这次却没给 schedule_create：为什么没给（「这句没 @ 你」） */
   scheduleLocked?: string;
-  /** 话题里没 @ 的跟聊，这句话本身说了暂停哪几个定时任务：这次只给暂停这几个（编号） */
-  schedulePauseOnly?: readonly number[];
+  /** 话题里没 @ 的跟聊，这句话本身说了暂停、恢复、取消哪几个定时任务：这次只能对这几个（编号）做这句说的那样 */
+  scheduleTopicOnly?: readonly ChangeGrant[];
   /** 这个话题之前查到过的结果（listEarlierResults 的那几行），给了 topic_earlier_results 时才有 */
   earlierResults?: readonly string[];
   /** 这个话题之前查过（记着查到的结果）、这次没说要从头查：追问接着之前的结论往下查，只补查缺的 */
@@ -127,7 +128,7 @@ export function buildSystemPrompt({
   restate,
   ruleOnly,
   scheduleLocked,
-  schedulePauseOnly,
+  scheduleTopicOnly,
   earlierResults,
   continuing,
   extra,
@@ -219,22 +220,25 @@ export function buildSystemPrompt({
         "问有哪些定时任务用 schedule_list；暂停、恢复、取消用 schedule_change，要改时间或内容的先建新的再取消旧的。定时任务的编号写成 T3，和群记忆的 #3、经验 K3 不是一套。" +
         "到点按建任务的人的权限跑：他不能改文档的，任务里也改不了；定时任务只查代码，不改代码、不开合并请求；不改已有文档，只能追加到他这句话里自己贴了链接的那篇（填 append_doc）。" +
         "他说「有异常 @ 我」的填 alert_creator。到点正常跑完不 @ 人，没跑成、被别人暂停时机器人会 @ 建的人；只能 @ 建任务的人，要 @ 别人、@ 所有人的告诉他做不到。" +
-        "暂停群里谁都能，在你回答过的话题里写上编号直接说就行、不用 @ 你；恢复、取消要 @ 你说，只有建任务的人和管理员能做。建好以后，回答最后照回执告诉他哪个不用 @、哪个要 @。" +
+        "暂停、恢复、取消在你回答过的话题里写上编号直接说就行、不用 @ 你；暂停群里谁都能，恢复、取消只有建任务的人和管理员能做；建新的要 @ 你说。建好以后，回答最后照回执告诉他怎么暂停、恢复、取消。" +
         "要追加到文档却没贴真的文档链接（只写了「链接」两个字这类）的先别建，请他 @ 你把整句话连同链接再说一遍：之后只补一个链接、或者补的那句没 @ 你，都建不了。",
     );
   }
   if (scheduleLocked) {
     lines.push(
       `- 这次不能建、改定时任务（${scheduleLocked}）${toolNames.includes("schedule_list") ? "，只能用 schedule_list 看有哪些" : ""}。` +
-        "话题里有人要建、暂停、取消定时任务的，照实说这次没建、没改，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里重新说全：这件事要他重说一遍，只补一个时间、一个链接建不了。" +
-        "没调 schedule_create、schedule_change 拿到结果，不能说已经建好、已经暂停或取消了。",
+        "话题里有人要建定时任务的，照实说这次没建，请他 @ 你，把什么时候、做什么（要追加到文档的连同文档链接）放在一句话里重新说全：这件事要他重说一遍，只补一个时间、一个链接建不了。" +
+        "要暂停、恢复、取消的，照实说这次没改，请他写上编号再说一遍（「取消定时任务 T3」，在你回答过的话题里不用 @ 你，@ 你说也行）。问有哪些、现在什么状态的，照 schedule_list 答。" +
+        "一两句说完，任务现在是什么状态就说什么状态，不要说在等确认、等他回复。没调 schedule_create、schedule_change 拿到结果，不能说已经建好、已经暂停或取消了。",
     );
   }
-  if (schedulePauseOnly && schedulePauseOnly.length > 0) {
-    const named = schedulePauseOnly.map((id) => `T${id}`).join("、");
+  if (scheduleTopicOnly && scheduleTopicOnly.length > 0) {
+    const doing = changeWords(scheduleTopicOnly);
     lines.push(
-      `- 这句没 @ 你：定时任务这次只能暂停他这句话里点名的 ${named}（他要暂停时用 schedule_change 填 pause），建新的、恢复、取消、暂停别的都不行，要的话请他 @ 你说。` +
-        "没调 schedule_change 拿到结果，不能说已经暂停了。",
+      `- 这句没 @ 你：定时任务这次只能${describeGrants(scheduleTopicOnly)}（他这句话里点名的，用 schedule_change），建新的、别的改法、动别的任务都不行，要的话请他 @ 你说。` +
+        (scheduleTopicOnly.some((grant) => grant.action !== "pause") ? "恢复、取消只有建任务的人和管理员能做，schedule_change 不让做时照它返回的原因告诉他。" : "") +
+        (scheduleTopicOnly.some((grant) => grant.action === "cancel") ? "取消了就找不回来：他这句明确要取消才取消，只是在商量、在问的不要动，回答他就行。" : "") +
+        `没调 schedule_change 拿到结果，不能说已经${doing.replaceAll("、", "或")}了。`,
     );
   }
   if (notMemoryEditor) {

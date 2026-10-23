@@ -86,6 +86,30 @@ export interface CreateInput {
 }
 
 export type ChangeAction = "pause" | "resume" | "cancel";
+/** 暂停、恢复、取消的叫法，列的时候按这个顺序 */
+const CHANGE_WORDS: Readonly<Record<ChangeAction, string>> = { pause: "暂停", resume: "恢复", cancel: "取消" };
+
+/** 这次能对哪几个定时任务做哪样：一样动作一组编号 */
+export interface ChangeGrant {
+  action: ChangeAction;
+  ids: readonly number[];
+}
+
+/** 「暂停 T5、T6，取消 T3」：按暂停、恢复、取消的顺序列 */
+export function describeGrants(grants: readonly ChangeGrant[]): string {
+  return (Object.keys(CHANGE_WORDS) as ChangeAction[])
+    .flatMap((action) => grants.filter((grant) => grant.action === action && grant.ids.length > 0))
+    .map((grant) => `${CHANGE_WORDS[grant.action]} ${grant.ids.map((id) => `T${id}`).join("、")}`)
+    .join("，");
+}
+
+/** 「暂停、取消」：这几组里有哪几样动作，按暂停、恢复、取消的顺序列 */
+export function changeWords(grants: readonly ChangeGrant[]): string {
+  return (Object.keys(CHANGE_WORDS) as ChangeAction[])
+    .filter((action) => grants.some((grant) => grant.action === action))
+    .map((action) => CHANGE_WORDS[action])
+    .join("、");
+}
 
 export interface SchedulerOptions {
   /** 定时任务记在这个文件里，重启后接着跑。不给就只记在内存里（测试用） */
