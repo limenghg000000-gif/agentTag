@@ -424,7 +424,7 @@ test("工具：建好照实说时间和怎么暂停；只能看、改本群的�
   const mine = tools("ou_ml", false);
   const created = await call(mine.get("schedule_create"), { task: "汇总上周群里的进展", cron: "0 9 * * 1" }, true);
   assert.match(created, /已建好定时任务 T1（到点去做）：每周一 09:00（北京时间），下次是 10-26（周一）09:00/);
-  assert.match(created, /暂停定时任务 T1」（群里谁都能暂停，别人暂停时会 @ 建的人）；恢复、取消只有建任务的人和管理员能操作/);
+  assert.match(created, /要暂停，在这个话题里直接说「暂停定时任务 T1」就行，不用 @ 你（群里谁都能暂停，别人暂停时会 @ 建的人）；恢复、取消要 @ 你说，只有建任务的人和管理员能做。回答最后照这句告诉他。/);
   assert.equal(scheduler.list("oc_1")[0]!.readOnly, undefined);
   assert.equal(scheduler.list("oc_1")[0]!.creator.name, "ML");
   assert.doesNotMatch(created, /只能查、不能写文档/);
