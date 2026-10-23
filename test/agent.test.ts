@@ -130,7 +130,8 @@ test("工具轮数用完后要求模型直接作答", async () => {
   const result = await runAgent({ model, system: "s", messages: user, tools: [echoTool()], signal, maxToolRounds: 2 });
 
   assert.equal(requests.length, 3);
-  assert.match(requests[2].messages.at(-1)!.content, /工具调用次数已经用完/);
+  assert.match(requests[2].messages.at(-1)!.content, /^这次任务已经调了 2 轮工具，到了一次任务的轮数上限，这一轮不能再调工具了。/);
+  assert.match(requests[2].messages.at(-1)!.content, /@ 你说「接着查」就能接着往下查/);
   assert.equal(result.toolCalls, 2);
   assert.match(result.text, /超出了单次上限/);
 });
@@ -417,7 +418,7 @@ test("轮数用完时上一条已经是用户消息（思考提醒）就把收�
     last.map((m) => m.role),
     ["tool", "user"],
   );
-  assert.match(last[1].content, /^用中文想\n\n工具调用次数已经用完/);
+  assert.match(last[1].content, /^用中文想\n\n这次任务已经调了 1 轮工具，到了一次任务的轮数上限/);
   // 调用方传进来的消息没被改
   assert.deepEqual(user, [{ role: "user", content: "帮我做事" }]);
 });
