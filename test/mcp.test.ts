@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import type { CallToolResult, Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "../src/config.js";
 import { AiopsLessons } from "../src/knowledge-aiops.js";
-import { isWriteTool, MAX_MCP_CHARS_PER_TASK, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
+import { isWriteTool, MAX_MCP_CHARS_PER_TASK, MAX_PARALLEL_MCP_CALLS, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
 import { MCP_RESULT_LIMIT } from "../src/mcp-result.js";
 import { type FakeMcp, freePort, startFakeMcp } from "./helpers/fake-mcp.js";
 
@@ -348,6 +348,41 @@ test("一次任务里调用不限次数；同样的参数不重复调；失败�
   const alerts = tools.find((t) => t.spec.name === "aiops_get_active_alerts")!;
   await alerts.run({}, { signal });
   assert.equal(server.calls.length, 31);
+});
+
+test(`一次任务里同时最多跑 ${MAX_PARALLEL_MCP_CALLS} 个调用，多的排队、都会调到；排队时停止的不再调`, async () => {
+  let running = 0;
+  let peak = 0;
+  const server = await fake({
+    call: async (_name, args) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      running--;
+      return text(JSON.stringify({ echo: args }));
+    },
+  });
+  const hub = await hubFor([config(server.url)], { logger: recorder().logger });
+  const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
+
+  // 模型一轮里并行要 12 个查询：一下子只压 4 个到服务端，12 个都查到
+  const results = await Promise.all(Array.from({ length: 12 }, (_, i) => logs.run({ logql: `q${i}` }, { signal })));
+  assert.equal(peak, MAX_PARALLEL_MCP_CALLS);
+  assert.equal(server.calls.length, 12);
+  assert.ok(results.every((result, i) => result.includes(`q${i}`)));
+
+  // 另一个任务不和这个任务抢：各自算
+  const other = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
+  const stop = new AbortController();
+  const busy = Array.from({ length: MAX_PARALLEL_MCP_CALLS }, (_, i) => other.run({ logql: `b${i}` }, { signal }));
+  const queued = other.run({ logql: "queued" }, { signal: stop.signal });
+  stop.abort(new Error("已停止"));
+  await assert.rejects(queued, /已停止/);
+  await Promise.all(busy);
+  assert.ok(!server.calls.some((call) => call.args.logql === "queued"), "排队时停止的不调");
+  // 排队的停了以后名额照常放出来，后面还能接着调
+  await other.run({ logql: "after" }, { signal });
+  assert.ok(server.calls.some((call) => call.args.logql === "after"));
 });
 
 test("一次任务里结果的总字数快用完时，后面的结果截得更短", async () => {

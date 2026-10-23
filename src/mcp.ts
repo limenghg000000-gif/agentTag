@@ -29,6 +29,11 @@ export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
 export const MAX_MCP_CHARS_PER_TASK = 300_000;
 /** 总字数快用完或用完时，单个结果至少还给这么多字 */
 const MIN_RESULT_CHARS = 6000;
+/**
+ * 一次任务里同一个服务同时最多跑几个调用，多出来的排队等前面的跑完，不拒绝。
+ * 调用次数不限以后，模型一轮里并行要十几个查询（几个时间段、几个服务）也不会一下子都压到 aiops 和 Loki 上
+ */
+export const MAX_PARALLEL_MCP_CALLS = 4;
 /** 服务端说「服务繁忙」时隔多久重试，重试几次就有几项 */
 const BUSY_RETRY_MS = [1000, 3000];
 /** 多久重新连一次、刷新工具清单和使用说明 */
@@ -140,6 +145,9 @@ interface TaskBudget {
   playbooks: Map<string, Promise<string>>;
   /** 已经交给模型的字数 */
   chars: number;
+  /** 正在跑的调用数，和排队等着跑的（见 MAX_PARALLEL_MCP_CALLS） */
+  running: number;
+  waiting: (() => void)[];
   /** 同一工具同样的参数直接复用结果；失败的不留 */
   results: Map<string, { at: number; text: Promise<string> }>;
 }
@@ -203,7 +211,7 @@ export class McpHub {
       if (allowed === undefined) {
         return [];
       }
-      const budget: TaskBudget = { playbooks: new Map(), chars: 0, results: new Map() };
+      const budget: TaskBudget = { playbooks: new Map(), chars: 0, running: 0, waiting: [], results: new Map() };
       const enabled = allowed === "*" ? server.enabled : server.enabled.filter((remote) => allowed.includes(remote.name));
       const tools = enabled.map((remote) => this.wrap(server, remote, task, budget));
       // 剧本是排查的说明：群里只开了这个服务的几个工具、其中一个都没连上时不给
@@ -528,16 +536,19 @@ export class McpHub {
         // 先按这次的上限把字数占住，同一轮并行的几个调用加起来也不会超出总字数；拿到结果后按实际字数退回多占的
         const limit = Math.min(MCP_RESULT_LIMIT, Math.max(MIN_RESULT_CHARS, MAX_MCP_CHARS_PER_TASK - budget.chars));
         budget.chars += limit;
-        const pending = this.invoke(server, remote.name, args, task, signal, timeout, limit).then(
-          (text) => {
-            budget.chars += text.length - limit;
-            return text;
-          },
-          (err: unknown) => {
-            budget.chars -= limit;
-            throw err;
-          },
-        );
+        // 同时跑的满了就排队，排上了再调
+        const pending = takeSlot(budget, signal)
+          .then((release) => this.invoke(server, remote.name, args, task, signal, timeout, limit).finally(release))
+          .then(
+            (text) => {
+              budget.chars += text.length - limit;
+              return text;
+            },
+            (err: unknown) => {
+              budget.chars -= limit;
+              throw err;
+            },
+          );
         budget.results.set(key, { at: this.now(), text: pending });
         pending.catch(() => budget.results.delete(key));
         return pending;
@@ -1032,4 +1043,36 @@ function describeError(err: unknown): string {
     return clip(detail ? `${err.message}（${detail}）` : err.message, 300);
   }
   return String(err);
+}
+
+/** 等到这个任务这个服务正在跑的调用少于 MAX_PARALLEL_MCP_CALLS 再跑，返回跑完后调的 release。排队时停止了就不跑，按停止报错 */
+function takeSlot(budget: TaskBudget, signal: AbortSignal): Promise<() => void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      budget.waiting = budget.waiting.filter((waiter) => waiter !== start);
+      reject(signal.reason);
+    };
+    const start = () => {
+      signal.removeEventListener("abort", onAbort);
+      budget.running++;
+      let released = false;
+      resolve(() => {
+        if (!released) {
+          released = true;
+          budget.running--;
+          budget.waiting.shift()?.();
+        }
+      });
+    };
+    if (budget.running < MAX_PARALLEL_MCP_CALLS) {
+      start();
+    } else {
+      budget.waiting.push(start);
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
 }
