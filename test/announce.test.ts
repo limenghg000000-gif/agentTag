@@ -262,6 +262,12 @@ test("通知卡片：有技术说明的版本下面放一个默认收起的「�
   assert.equal(panel.expanded, false);
   assert.match(panel.elements![0]!.content, /支持 &lt;at id=all&gt;&lt;\/at&gt;（#47）/);
   assert.match(JSON.stringify(card), /技术说明（0\.9\.0，给开发看）/);
+  // 写到 ![image](…) 的（0.21.2 就是这样）：飞书会当成图片、整张卡片退回，说明和技术说明里都换成全角方括号
+  const image = JSON.stringify(
+    renderAnnouncementCard([{ version: "0.21.2", notes: "- **能看懂截图了**：以前只看到「![image](…)」", tech: "**修复**\n- 以前只看到「![image](…)」（#86）" }]),
+  );
+  assert.ok(!image.includes("!["), "卡片里不能有 ![");
+  assert.equal(image.match(/!［image\]\(…\)/g)?.length, 2);
   // 没有技术说明的版本不放面板
   assert.ok(!JSON.stringify(renderAnnouncementCard([{ version: "0.9.0", notes: "- 新功能" }])).includes("collapsible_panel"));
 

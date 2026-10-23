@@ -2,7 +2,15 @@ const FENCE = /^\s*```/;
 
 /** 飞书卡片 markdown 里的尖括号会被当成标签（<at id=all></at> 会 @所有人，还有 <font> 这些）：别处来的文字转成实体再放进卡片 */
 export function escapeCardMarkdown(text: string): string {
-  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return noCardImages(text.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+}
+
+/**
+ * 飞书卡片 markdown 把 ![说明](地址) 当成图片，地址不是飞书的图片 key 时整张卡片被退回（200570 invalid image keys）。
+ * 别处来的文字里的「![」把方括号换成全角，照原样显示。0.21.2 的更新日志里写了「![image](…)」，通知卡片就这样被退回、改发了文字
+ */
+function noCardImages(text: string): string {
+  return text.replace(/!\[/g, "!［");
 }
 
 /**
