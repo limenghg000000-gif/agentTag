@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { type DocBlock, kindOf, renderBlocks, renderDocument } from "./doc-render.js";
 import { callFeishu as call, FeishuApiError, isRateLimited } from "./feishu.js";
@@ -289,7 +290,11 @@ export class FeishuDocs {
    * 改文档前请发起人确认时用：哪篇文档、要动的那段原文（替换、删除的那段；插入时插在哪一块旁边，那一块的原文）。
    * 块找不到、不能改时抛错，和真改时一样
    */
-  async preview(input: string, { action, blockId, endBlockId }: Omit<EditRequest, "markdown">): Promise<{ title: string; url?: string; original?: string }> {
+  /**
+   * 改文档前请发起人确认时用：文档标题、链接，要改的那段原文（卡片上看的），和那几块连同下面的子块的指纹。
+   * 确认以后再取一遍比指纹：原文里 @ 的人、图片、附件换了，渲染出来的字一样，指纹也不一样
+   */
+  async preview(input: string, { action, blockId, endBlockId }: Omit<EditRequest, "markdown">): Promise<{ title: string; url?: string; original?: string; fingerprint?: string }> {
     return this.explain(async () => {
       const { documentId, url } = await this.resolve(input);
       const blocks = await this.api.listBlocks(documentId);
@@ -305,7 +310,7 @@ export class FeishuDocs {
       const siblings = blocks.find((block) => block.block_id === range.parentId)?.children ?? [];
       const ids =
         action === "insert_before" ? [siblings[range.start]] : action === "insert_after" ? [siblings[range.end - 1]] : siblings.slice(range.start, range.end);
-      return { title, ...(link ? { url: link } : {}), original: renderBlocks(blocks, ids) };
+      return { title, ...(link ? { url: link } : {}), original: renderBlocks(blocks, ids), fingerprint: blocksFingerprint(blocks, ids) };
     });
   }
 
@@ -521,4 +526,19 @@ export function locate(blocks: readonly DocBlock[], documentId: string, blockId:
     end = last + 1;
   }
   return { parentId, start, end };
+}
+
+/** 几块连同下面所有子块的完整内容的指纹（块的原始 JSON，不经过渲染） */
+function blocksFingerprint(blocks: readonly DocBlock[], ids: readonly (string | undefined)[]): string {
+  const byId = new Map(blocks.map((block) => [block.block_id, block]));
+  const hash = createHash("sha256");
+  const walk = (id: string | undefined) => {
+    const block = id ? byId.get(id) : undefined;
+    hash.update(`${id ?? ""}\n${block ? JSON.stringify(block) : ""}\n`);
+    for (const child of block?.children ?? []) {
+      walk(child);
+    }
+  };
+  ids.forEach(walk);
+  return hash.digest("hex");
 }

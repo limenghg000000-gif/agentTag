@@ -130,6 +130,12 @@ test("改文档前请发起人确认：卡片上写哪篇、怎么改、要动�
 
   const removed = (await preview({ document: DOC, action: "delete", block_id: "p0" }))!;
   assert.deepEqual(removed.lines, ["文档：「长文」 https://x.feishu.cn/docx/newdoc", "删掉的原文：第一段"]);
+  assert.equal(await removed.unchanged!(), true);
+  // 确认以后有人改了那一段里渲染不出来的东西（@ 的人、图片这类换了，字面一样）：也要重新确认
+  const first = blocks.find((block) => block.block_id === "p0") as unknown as { text: { style?: unknown } };
+  first.text.style = { align: 2 };
+  assert.deepEqual((await preview({ document: DOC, action: "delete", block_id: "p0" }))!.lines, removed.lines, "卡片上看到的原文一样");
+  assert.equal(await removed.unchanged!(), false);
   const before = (await preview({ document: DOC, action: "insert_before", block_id: "p2", content: "插一句" }))!;
   assert.equal(before.lines[1], "插在这段前面：第三段");
   // 追加不碰已有的内容，不用核对原文

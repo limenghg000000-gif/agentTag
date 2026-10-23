@@ -703,6 +703,31 @@ test("开到 uat：不另拉分支、不搬改动，同一个修复分支再开�
   assert.equal(prs.length, 2);
 });
 
+test("推代码前请发起人确认：这个话题之前开到 uat 的，卡片上写跟着更新；合过了的写再开一个；合了、关了要重新确认", async () => {
+  const states: Record<number, RequestState> = {};
+  const { all } = portWorkspaces({
+    async getRequest(_repo, number) {
+      return { number, title: "", url: "", state: states[number] ?? "opened", source: "bugfix/p9", target: "", baseSha: "", headSha: "" };
+    },
+  });
+  const tools = Object.fromEntries(createCodeTools({ workspaces: all, threadKey: "om_p9", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  const ask = (args: Record<string, unknown>) => confirmOf(tools.code_open_pr)(args, { signal });
+  await tools.code_edit_file.run({ path: "a.go", old_text: "return 1", new_text: "return 2" }, { signal });
+  await tools.code_open_pr.run({ title: "改 A", body: "", branch: "bugfix/p9" }, { signal });
+  await tools.code_open_pr.run({ title: "改 A（uat）", body: "", target: "uat" }, { signal });
+  await tools.code_edit_file.run({ path: "a.go", old_text: "return 2", new_text: "return 3" }, { signal });
+  const card = (await ask({ title: "再改", body: "" }))!;
+  assert.deepEqual(card.lines.slice(1, 3), ["推到这个话题之前用的分支 bugfix/p9，!1 跟着更新", "开到 uat 的 !2 跟着更新"]);
+  assert.equal(await card.unchanged!(), true);
+  // 等确认的时候到 uat 的合了：推的时候会再开一个，和卡片上写的不一样了
+  states[2] = "merged";
+  assert.equal(await card.unchanged!(), false);
+  assert.equal((await ask({ title: "再改", body: "" }))!.lines[2], "开到 uat 的 !2 已经合过了，这次的改动再开一个合并请求到 uat");
+  // 关掉了的不动，卡片上不写
+  states[2] = "closed";
+  assert.ok(!(await ask({ title: "再改", body: "" }))!.lines.some((line) => line.includes("uat")));
+});
+
 test("还没开合并请求就说开到 uat：从 main 拉的分支直接开到 uat，测完再开到 main；有冲突、uat 上已经有了都不推", async () => {
   const { all, prs } = portWorkspaces();
   // b.txt 第 2 行在 uat 上改过：放到 uat 上有冲突，不推；还能照常开到 main

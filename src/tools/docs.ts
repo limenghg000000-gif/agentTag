@@ -155,7 +155,7 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
           ...(doc.original !== undefined ? [`${ORIGINAL_LABELS[action]}：${clip(doc.original)}`] : []),
           ...(action !== "delete" ? [`写进去的内容：${clip(content)}`] : []),
         ],
-        ...(doc.original !== undefined ? { unchanged: async () => (await docs.preview(document, where)).original === doc.original } : {}),
+        ...(doc.fingerprint !== undefined ? { unchanged: async () => (await docs.preview(document, where)).fingerprint === doc.fingerprint } : {}),
       };
     },
     async run(args) {

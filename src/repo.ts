@@ -1882,6 +1882,19 @@ export class Workspace {
     });
   }
 
+  /**
+   * 这个话题开到别的分支（uat 这类）的合并请求和它们现在的状态：推新改动时开着的跟着更新，合过了的再开一个。
+   * 开合并请求前请发起人确认时，卡片上写清这些也会动；查不到状态的照开着算（推的时候也是）
+   */
+  async targetRequests(signal?: AbortSignal): Promise<Array<{ target: string; number: number; state?: RequestState }>> {
+    const list: Array<{ target: string; number: number; state?: RequestState }> = [];
+    for (const request of this.state.requests ?? []) {
+      const state = await this.requestState(request.prNumber, signal);
+      list.push({ target: request.target, number: request.prNumber, ...(state ? { state } : {}) });
+    }
+    return list;
+  }
+
   /** 当前所有改动（含新建的文件）：先列改了哪些文件，再给完整 diff */
   diff(): Promise<ToolOutput> {
     return this.serial(() => this.stagedDiff());

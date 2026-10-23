@@ -371,10 +371,27 @@ export function createCodeTools({ workspaces, repos = workspaces.repos, threadKe
         : pending.branch
           ? `推到这个话题之前用的分支 ${pending.branch}${pr ? `，${refOf(pr.number)} 跟着更新` : `，开${requestName}到 ${pending.base}`}`
           : `新建分支 ${branch ?? "（机器人起名）"}，开${requestName}到 ${pending.base}`;
+      // 这个话题之前开到别的分支（uat 这类）的：有新改动时开着的跟着更新，合过了的再开一个，卡片上一起写
+      const fresh = pending.files.length > 0;
+      const targets = await ws.targetRequests(ctx.signal);
+      const alsoLines = targets.flatMap(({ target: other, number, state }) =>
+        state === "closed"
+          ? []
+          : state === "merged"
+            ? fresh || other === elsewhere
+              ? [`开到 ${other} 的 ${refOf(number)} 已经合过了，这次的改动再开一个${requestName}到 ${other}`]
+              : []
+            : fresh
+              ? [`开到 ${other} 的 ${refOf(number)} 跟着更新`]
+              : [],
+      );
+      const states = (list: typeof targets) => list.map(({ target: other, number, state }) => `${other}:${number}:${state ?? ""}`).join(",");
       return {
         title: elsewhere ? `开${requestName}到 ${elsewhere}` : `推代码、开${requestName}`,
-        lines: [`仓库：${ws.repo}`, route, `标题：${title}`, ...changeLines(pending.files)],
-        unchanged: async () => (await ws.pendingChanges(ctx.signal)).fingerprint === pending.fingerprint,
+        lines: [`仓库：${ws.repo}`, route, ...alsoLines, `标题：${title}`, ...changeLines(pending.files)],
+        // 改动变了，或者开到别的分支的那几个合并请求合了、关了（要动的跟着变），都要重新确认
+        unchanged: async () =>
+          (await ws.pendingChanges(ctx.signal)).fingerprint === pending.fingerprint && states(await ws.targetRequests(ctx.signal)) === states(targets),
       };
     },
     async run(args, ctx) {
