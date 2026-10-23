@@ -53,6 +53,7 @@ import {
   SCHEDULE_CREATE_TOOL,
   SCHEDULE_LIST_TOOL,
   SCHEDULE_TOOL_NAMES,
+  taskNumber,
 } from "./tools/schedules.js";
 import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
 
@@ -246,6 +247,24 @@ const SCHEDULE_TALK = new RegExp(
   "i",
 );
 const SCHEDULE_TOOLS: ReadonlySet<string> = new Set(SCHEDULE_TOOL_NAMES);
+/** 这句话本身要暂停定时任务（「暂停定时任务 T5」「T5 先暂停一下」），说「别暂停」「不用暂停」的不算 */
+const PAUSE_ASK = /暂停/;
+const NOT_PAUSE = /(?:别|不要|不用|甭|没|不)\s*暂停/;
+/** 这句话里写着的定时任务编号：T5、t12（和群记忆的 #3、经验 K3 不是一套） */
+const NAMED_TASK = /(?<![A-Za-z0-9])T(\d+)(?![A-Za-z0-9])/gi;
+
+/**
+ * 话题里没 @ 的跟聊，这句话本身要暂停定时任务、写了编号：返回这句话点名的编号，这次只能暂停这几个；不是这样的返回 undefined。
+ * 暂停群里谁都能、随时能恢复，别人暂停了会 @ 建的人；恢复、取消、建新的照旧要 @ 机器人说（话题里谁都能写字，只认说话人自己这句点名的）。
+ * 2026-10-23 ML 在 T5 的结果话题里没 @ 说「暂停定时任务 T5」，机器人回「没 @ 我停不了」
+ */
+export function pausableTasks(question: string): ReadonlySet<number> | undefined {
+  if (!PAUSE_ASK.test(question) || NOT_PAUSE.test(question)) {
+    return undefined;
+  }
+  const ids = new Set([...question.matchAll(NAMED_TASK)].map((match) => Number(match[1])));
+  return ids.size > 0 ? ids : undefined;
+}
 /** 看话题里最近几条消息有没有在说定时任务（提示词里说这次建不了用）：只补了一个时间、一个链接的，前面几条多半说过。群里刚才的聊天不算 */
 const SCHEDULE_TALK_LOOKBACK = 6;
 
@@ -666,6 +685,10 @@ async function runTask(
     };
     // 点「接着查」按钮问的：按钮上的话是模型写的，只给读的工具，群记忆也不让记、改、删（模型可以把「记住…」写成按钮），也不能切分支
     const followUp = options.readOnly === true;
+    // 话题里没 @ 的跟聊，这句话本身说了暂停哪个定时任务：给 schedule_change，只能暂停点名的这几个（见 pausableTasks）。
+    // 主动接话照规矩去做的、按钮问的、到点跑的不算
+    const pausable =
+      options.unaddressed === true && options.proactive !== true && !followUp && scheduled === undefined ? pausableTasks(question) : undefined;
     // 只是整理话题里已经有的内容（总结、讲给谁听、换个说法）：不查经验库、不给查询的工具，直接按上文写。按钮上的话是接着要查的新问题，不算
     const restate =
       !followUp &&
@@ -776,6 +799,11 @@ async function runTask(
                   : options.unaddressed
                   ? "这句没 @ 你，只能查，不能切换分支：要切请他 @ 你直接说。只看别的分支，用其他代码工具的 branch 参数"
                   : "这次带上了群里刚才的聊天，只能查，不能切换分支：要切请他 @ 你时直接说切到哪个分支。只看别的分支，用其他代码工具的 branch 参数",
+            );
+          }
+          if (pausable && tool.spec.name === SCHEDULE_CHANGE_TOOL && (args.action !== "pause" || !pausable.has(taskNumber(args.id)))) {
+            throw new Error(
+              `这句没 @ 你，只能暂停他这句话里点名的定时任务（${[...pausable].map((id) => `T${id}`).join("、")}）；恢复、取消或者停别的任务，请他 @ 你说`,
             );
           }
           checkRestatedWrite(tool, args);
@@ -945,6 +973,7 @@ async function runTask(
     // 没说要文档时不给新建文档的工具：2026-10-09 复测时，只说了「把上面的排查结果总结一下」，模型就自己建了一篇飞书文档
     const createDoc = docRequested(question, context.history);
     // 定时任务的工具：这句话本身说到了定时任务才给；主动接话、整理、定时任务自己跑的都不给，按钮问的、没 @ 的跟聊只给看的
+    // （没 @ 的跟聊这句话本身说了暂停哪个的，再给 schedule_change，只能暂停点名的）
     const scheduleTalk = SCHEDULE_TALK.test(question);
     const taskTools = allTools.filter(
       (tool) =>
@@ -960,7 +989,9 @@ async function runTask(
             options.proactive === true ||
             scheduled !== undefined ||
             restate ||
-            ((followUp || options.unaddressed === true) && tool.spec.name !== SCHEDULE_LIST_TOOL))
+            ((followUp || options.unaddressed === true) &&
+              tool.spec.name !== SCHEDULE_LIST_TOOL &&
+              !(pausable && tool.spec.name === SCHEDULE_CHANGE_TOOL)))
         ) &&
         !(followUp && (MEMORY_WRITE_TOOLS.has(tool.spec.name) || KNOWLEDGE_DRAFT_TOOLS.has(tool.spec.name))) &&
         !((memoryLocked || notMemoryEditor) && MEMORY_WRITE_TOOLS.has(tool.spec.name)) &&
@@ -975,9 +1006,11 @@ async function runTask(
     // 话题里在说建定时任务，这次却建不了：没 @ 的跟聊、按钮问的只给看的，这句话本身没说到定时（只补了一个时间、一个链接）的不给。
     // 提示词里说清楚建不了、请他 @ 着一句说全。2026-10-22 测试群：话题里没 @ 补了一句「每天 15:34，从现在开始」、
     // 只贴了文档链接，模型一个工具没调都回了「已建好定时任务」，其实没建
+    // 能暂停点名任务的（pausable）在提示词里另说一条
     const scheduleLocked =
       scheduled === undefined &&
       !restate &&
+      pausable === undefined &&
       allTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
       !taskTools.some((tool) => tool.spec.name === SCHEDULE_CREATE_TOOL) &&
       [question, ...history.filter((m) => !isChatContext(m)).slice(-SCHEDULE_TALK_LOOKBACK).map((m) => m.content)].some((text) => SCHEDULE_ASK.test(text))
@@ -998,6 +1031,9 @@ async function runTask(
     }
     if (unaddressed) {
       logger.info(`没 @ 机器人的跟聊，这次只给读的工具 message=${msg.messageId} sender=${msg.senderId}`);
+    }
+    if (pausable && taskTools.some((tool) => tool.spec.name === SCHEDULE_CHANGE_TOOL)) {
+      logger.info(`没 @ 的跟聊说了暂停定时任务，这次只能暂停 ${[...pausable].map((id) => `T${id}`).join("、")} message=${msg.messageId} sender=${msg.senderId}`);
     }
     if (notMemoryEditor && memory) {
       logger.info(`发起人不在能改群记忆的名单里，这次群记忆只能看 message=${msg.messageId} sender=${msg.senderId}`);
@@ -1029,6 +1065,7 @@ async function runTask(
             // 按配置的服务装，不看这次有没有工具：服务连不上时模型照样可能照搬话题里之前的数据
             ...(deps.mcp?.names.length ? [reviewOpsAnswer(asked, deps.mcp.names, succeeded, toolNames.includes(EARLIER_RESULTS_TOOL))] : []),
             ...(deps.mcp?.names.length && hasCodeTools ? [reviewDeflectedAnswer(deps.mcp.names, attempted)] : []),
+            reviewQuotaClaim(deps.mcp?.names ?? [], asked, () => toolTexts.join("\n")),
           ]),
       // 说建好、暂停、取消了定时任务，要这次真的调成了。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人建的）
       ...(restate || scheduled
@@ -1097,6 +1134,7 @@ async function runTask(
         // 不在能改群记忆名单里的人定规矩：上面那条已经叫它说没记上，不再叫它「用 memory_save 记下」
         ...(ruleOnly && !(notMemoryEditor && memory) ? { ruleOnly: true } : {}),
         ...(scheduleLocked ? { scheduleLocked } : {}),
+        ...(pausable && toolNames.includes(SCHEDULE_CHANGE_TOOL) ? { schedulePauseOnly: [...pausable] } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
@@ -2807,7 +2845,7 @@ export function unverifiedOpsAnswer(servers: readonly string[], earlier = false)
     (earlier
       ? `问的是这个话题里之前查到的东西（把链接、报错原文发出来这类）时，也可以用 ${EARLIER_RESULTS_TOOL} 按编号取之前查到的原文，照原文回答并说明是那时查到的。`
       : "") +
-    "先查，再只按这次查到的结果回答；调用次数每次提问都重新算，话题里之前说过额度用完、到上限的，这次照样能查。这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
+    "先查，再只按这次查到的结果回答；工具调用不限次数，话题里之前说过额度用完、到上限的，这次照样能查。这次没有这些工具或者调用失败了，就如实说明现在查不了，不要给出数据。" +
     "如果这个问题本来就不用查线上（比如解释概念、整理用户自己给的内容），照原来的意思再回答一次就行。不要提这段检查。"
   );
 }
@@ -2817,7 +2855,7 @@ export function unverifiedOpsAnswer(servers: readonly string[], earlier = false)
  * 「没有报错」这类线上数据时，让它先查再答。
  * 同一话题里接着问另一个服务时，模型容易照着之前的回答编：2026-10-08 先是照搬了别的服务的日志和 Pod，
  * 后来又照着前两次的定位结果编出了命名空间候选。只认回答的写法总会漏掉新的编法，所以提问像线上问题就要求查过。
- * succeeded 是这次成功跑完的工具：调用失败（超时、到上限、服务繁忙、工具不存在）不算查过。
+ * succeeded 是这次成功跑完的工具：调用失败（超时、服务繁忙、工具不存在）不算查过。
  * 成功调过别的工具（读代码、读文档、搜索）的不管，数据可能来自那里；只调了群记忆工具的照样打回。
  * 提问里本来就有的数字和说法不算（比如让机器人润色一段带数字的文字）
  */
@@ -2952,6 +2990,39 @@ export function reviewDeflectedAnswer(servers: readonly string[], attempted: Rea
   return (answer: string): string | undefined => {
     const investigated = [...attempted].some((name) => prefixes.some((prefix) => name.startsWith(prefix)));
     return investigated && deflects(answer) ? DEFLECTED_ANSWER : undefined;
+  };
+}
+
+export const QUOTA_CLAIM_ANSWER =
+  "（系统检查）你的回答里说机器人这边的查询工具额度用完、调用次数到上限，这次没有这回事：工具调用不限次数，这一轮也还能接着调。" +
+  "话题里之前的回答说过额度用完、到上限的，是以前的限制，不算数。该查的现在就去查，再按这次查到的结果重新给出完整的回答，不要再说额度用完。" +
+  "说的是被查的业务系统、第三方接口的额度（比如淘宝联盟接口的调用额度），照常保留。不要提这段检查。";
+
+/**
+ * 回答里说机器人自己的查询工具「额度已用完」「调用次数到上限」时打回一次，叫它接着查。
+ * 2026-10-23 转链排查：原先一次任务限调 10 次 aiops，到了模型就说「aiops 工具额度已用完」；话题里之前的回答写着这句，
+ * 后面追问「查一下 appservice 调用 page-detective 的日志」，模型又说「aiops 工具额度已用完，Loki 没查成」，一条日志都没查。
+ * 现在调用不限次数，只剩一次任务最多几轮（到了的那一轮 runAgent 不打回），这么说都不对。
+ * 只认额度、次数就是 MCP 服务名或「工具」自己的（「aiops 工具额度」「工具调用次数」「aiops 的工具已经调了 10 次，到上限了」）：
+ * 「通过 aiops 查到淘宝联盟接口额度不足」说的是查到的第三方接口额度，可能正是要查的原因，不能拦。
+ * 提问自己说到额度、上限的（「为什么上次说额度用完」）不管；这次工具结果里原样有这句话的（日志里写着「调用次数已达上限」）也不管
+ */
+export function reviewQuotaClaim(servers: readonly string[], question: string, toolOutputs: () => string) {
+  // 服务名、「工具」后面只隔着「的」「工具」「调用」「查询」
+  const own = `(?:${["工具", "mcp", ...servers.map(escapeRegExp)].join("|")})\\s*的?\\s*(?:工具|调用|查询)*\\s*的?\\s*`;
+  const used = `(?:已经?|都|也|全)*\\s*(?:用完|用尽|耗尽|用光|不够|不足|到了?上限|达到上限|超(?:过|出)了?上限)`;
+  const claim = new RegExp(
+    `${own}(?:额度|配额|次数)${used}` +
+      // 「aiops 调用已到上限」「aiops 的工具已经调了 10 次，到上限了」
+      `|${own}(?:已经?)?(?:调了\\s*\\d+\\s*次[，,]?\\s*(?:已经?)?)?(?:到了?上限|达到上限)`,
+    "i",
+  );
+  return (answer: string): string | undefined => {
+    const said = answer.match(claim)?.[0];
+    if (!said || /额度|配额|上限/.test(question) || toolOutputs().includes(said)) {
+      return undefined;
+    }
+    return QUOTA_CLAIM_ANSWER;
   };
 }
 

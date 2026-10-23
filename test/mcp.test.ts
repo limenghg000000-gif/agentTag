@@ -6,12 +6,14 @@ import { after, test } from "node:test";
 import type { CallToolResult, Tool as RemoteTool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "../src/config.js";
 import { AiopsLessons } from "../src/knowledge-aiops.js";
-import { isWriteTool, MAX_MCP_CALLS_PER_TASK, MAX_MCP_CHARS_PER_TASK, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
+import { isWriteTool, MAX_MCP_CHARS_PER_TASK, MAX_PARALLEL_MCP_CALLS, MAX_PLAYBOOKS_PER_TASK, McpHub } from "../src/mcp.js";
 import { MCP_RESULT_LIMIT } from "../src/mcp-result.js";
 import { type FakeMcp, freePort, startFakeMcp } from "./helpers/fake-mcp.js";
 
 const TOKEN = "tok_secret_123";
 const INSTRUCTIONS = "服务级问题先调 diagnose_service，再补查 1～3 次。";
+/** 字数预算的测试里一次任务调几次 */
+const CALLS = 10;
 const dir = await mkdtemp(path.join(tmpdir(), "agenttag-mcp-"));
 const promptFile = path.join(dir, "aiops.md");
 await writeFile(promptFile, "<!-- 给维护的人看的 -->\n- 群里回答要短。\n");
@@ -125,8 +127,14 @@ test("开了 aiops 工具的任务，提示词里带上服务端的使用说明�
   assert.match(prompt, /## aiops（MCP 服务）/);
   assert.match(prompt, /在你这里都带 aiops_ 前缀（aiops_diagnose_service）/);
   // 2026-10-12 测试群：上一次回答写了「已用完调用额度」，同一话题里接着问，模型两次都不调工具
-  assert.match(prompt, /每次有人 @ 你都是一次新任务，次数重新算/);
+  assert.match(prompt, /每次有人 @ 你都是一次新任务：话题里之前的回答说过「调用额度用完」「到上限了」的，这次照样可以查/);
   assert.match(prompt, new RegExp(INSTRUCTIONS));
+  // 2026-10-23 转链排查：服务端说明和剧本都写着「最多 10 次」，机器人这边不限，写在它们后面盖过去
+  assert.match(prompt, /### aiops 的调用次数\n机器人这边不限 aiops 工具的调用次数：.*在这里不用守。证据不够就接着查/);
+  assert.match(prompt, /一次任务最多 12 轮工具调用，互不依赖的查询.*放在同一轮里一起调/);
+  assert.ok(prompt.indexOf("### aiops 的调用次数") > prompt.indexOf(INSTRUCTIONS), "写在服务端使用说明后面");
+  assert.ok(prompt.indexOf("### aiops 的调用次数") < prompt.indexOf("### 在飞书群里用 aiops"));
+  assert.doesNotMatch(prompt, /最多调 10 次/);
   assert.match(prompt, /群里回答要短/);
   assert.doesNotMatch(prompt, /给维护的人看的/);
   assert.equal(hub.prompt(["web_search"]), undefined);
@@ -313,7 +321,7 @@ test("超过工具的时限就报超时，提示缩小范围", async () => {
   );
 });
 
-test(`一次任务里最多调 ${MAX_MCP_CALLS_PER_TASK} 次；同样的参数不重复调；失败的调用不复用；换个任务重新计数`, async () => {
+test("一次任务里调用不限次数；同样的参数不重复调；失败的调用不复用", async () => {
   let fail = false;
   const server = await fake({ call: (_name, args) => (fail ? text("出错了", true) : text(JSON.stringify({ echo: args }))) });
   const hub = await hubFor([config(server.url)], { logger: recorder().logger });
@@ -332,16 +340,49 @@ test(`一次任务里最多调 ${MAX_MCP_CALLS_PER_TASK} 次；同样的参数�
   await logs.run({ logql: "bad" }, { signal });
   assert.equal(server.calls.length, 3);
 
-  for (let i = 3; i < MAX_MCP_CALLS_PER_TASK; i++) {
+  // 原先一次任务限 10 次，第 11 次起报「到上限了」；现在照样调
+  for (let i = 3; i < 30; i++) {
     await logs.run({ logql: `q${i}` }, { signal });
   }
-  assert.equal(server.calls.length, MAX_MCP_CALLS_PER_TASK);
+  assert.equal(server.calls.length, 30);
   const alerts = tools.find((t) => t.spec.name === "aiops_get_active_alerts")!;
-  await assert.rejects(alerts.run({}, { signal }), /已经调了 10 次，到上限了，这次没有执行/);
-  assert.equal(server.calls.length, MAX_MCP_CALLS_PER_TASK);
+  await alerts.run({}, { signal });
+  assert.equal(server.calls.length, 31);
+});
 
-  await toolOf(hub, "aiops_get_active_alerts").run({}, { signal });
-  assert.equal(server.calls.length, MAX_MCP_CALLS_PER_TASK + 1);
+test(`一次任务里同时最多跑 ${MAX_PARALLEL_MCP_CALLS} 个调用，多的排队、都会调到；排队时停止的不再调`, async () => {
+  let running = 0;
+  let peak = 0;
+  const server = await fake({
+    call: async (_name, args) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      running--;
+      return text(JSON.stringify({ echo: args }));
+    },
+  });
+  const hub = await hubFor([config(server.url)], { logger: recorder().logger });
+  const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
+
+  // 模型一轮里并行要 12 个查询：一下子只压 4 个到服务端，12 个都查到
+  const results = await Promise.all(Array.from({ length: 12 }, (_, i) => logs.run({ logql: `q${i}` }, { signal })));
+  assert.equal(peak, MAX_PARALLEL_MCP_CALLS);
+  assert.equal(server.calls.length, 12);
+  assert.ok(results.every((result, i) => result.includes(`q${i}`)));
+
+  // 另一个任务不和这个任务抢：各自算
+  const other = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
+  const stop = new AbortController();
+  const busy = Array.from({ length: MAX_PARALLEL_MCP_CALLS }, (_, i) => other.run({ logql: `b${i}` }, { signal }));
+  const queued = other.run({ logql: "queued" }, { signal: stop.signal });
+  stop.abort(new Error("已停止"));
+  await assert.rejects(queued, /已停止/);
+  await Promise.all(busy);
+  assert.ok(!server.calls.some((call) => call.args.logql === "queued"), "排队时停止的不调");
+  // 排队的停了以后名额照常放出来，后面还能接着调
+  await other.run({ logql: "after" }, { signal });
+  assert.ok(server.calls.some((call) => call.args.logql === "after"));
 });
 
 test("一次任务里结果的总字数快用完时，后面的结果截得更短", async () => {
@@ -351,7 +392,7 @@ test("一次任务里结果的总字数快用完时，后面的结果截得更�
   const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
 
   const sizes: number[] = [];
-  for (let i = 0; i < MAX_MCP_CALLS_PER_TASK; i++) {
+  for (let i = 0; i < CALLS; i++) {
     sizes.push((await logs.run({ logql: `q${i}` }, { signal })).length);
   }
   assert.ok(sizes[0] > 15_000 && sizes[0] <= MCP_RESULT_LIMIT, `${sizes[0]}`);
@@ -367,12 +408,12 @@ test("同一轮并行调用时先占住字数，加起来也不超过一次任�
   const hub = await hubFor([config(server.url)], { logger: recorder().logger });
   const logs = hub.tools(task).find((t) => t.spec.name === "aiops_query_logs")!;
 
-  const results = await Promise.all(Array.from({ length: MAX_MCP_CALLS_PER_TASK }, (_, i) => logs.run({ logql: `q${i}` }, { signal })));
+  const results = await Promise.all(Array.from({ length: CALLS }, (_, i) => logs.run({ logql: `q${i}` }, { signal })));
   const total = results.reduce((sum, result) => sum + result.length, 0);
   // 前 5 个各占 6 万字，占满 30 万；后面 5 个每个最少还给 6000 字。不先占的话 10 个都按 6 万字截
   const full = Math.ceil(MAX_MCP_CHARS_PER_TASK / MCP_RESULT_LIMIT);
-  assert.ok(total <= MAX_MCP_CHARS_PER_TASK + (MAX_MCP_CALLS_PER_TASK - full) * 6000, `${total}`);
-  assert.equal(results.filter((result) => result.length <= 6000).length, MAX_MCP_CALLS_PER_TASK - full);
+  assert.ok(total <= MAX_MCP_CHARS_PER_TASK + (CALLS - full) * 6000, `${total}`);
+  assert.equal(results.filter((result) => result.length <= 6000).length, CALLS - full);
 });
 
 test("调用遇到 HTTP 404 时马上重连一次，不等定时刷新", async () => {
@@ -628,12 +669,12 @@ test("服务端下发了 MCP prompts：当剧本用，提示词列出剧本并�
   assert.match(log.find(/MCP 剧本 aiops\.convert_link/)!.text, /chat=oc_1 sender=ou_1 message=om_1 结果=\d+字 用时=/);
   await assert.rejects(playbook.run({ name: "nope" }, { signal }), /aiops 没有叫「nope」的剧本，可读的剧本：convert_link、troubleshoot/);
 
-  // 读剧本不算调用次数：后面照样能调满
+  // 读过剧本以后照样能查
   const logs = tools.find((tool) => tool.spec.name === "aiops_query_logs")!;
-  for (let i = 0; i < MAX_MCP_CALLS_PER_TASK; i++) {
+  for (let i = 0; i < CALLS; i++) {
     await logs.run({ logql: `q${i}` }, { signal });
   }
-  assert.equal(server.calls.length, MAX_MCP_CALLS_PER_TASK);
+  assert.equal(server.calls.length, CALLS);
 
   assert.equal(playbook.instructionsOnly, true, "读剧本的工具标成只是说明，机器人不把它算成查过");
   assert.ok(!logs.instructionsOnly);
