@@ -1,5 +1,5 @@
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { type DocBlock, kindOf, renderDocument } from "./doc-render.js";
+import { type DocBlock, kindOf, renderBlocks, renderDocument } from "./doc-render.js";
 import { callFeishu as call, FeishuApiError, isRateLimited } from "./feishu.js";
 
 /** 单次「创建嵌套块」最多插入的块数（飞书接口上限） */
@@ -283,6 +283,30 @@ export class FeishuDocs {
     ]);
     problems.push(...shareProblems.filter((p): p is string => p !== undefined));
     return { documentId, url, blocks, problems };
+  }
+
+  /**
+   * 改文档前请发起人确认时用：哪篇文档、要动的那段原文（替换、删除的那段；插入时插在哪一块旁边，那一块的原文）。
+   * 块找不到、不能改时抛错，和真改时一样
+   */
+  async preview(input: string, { action, blockId, endBlockId }: Omit<EditRequest, "markdown">): Promise<{ title: string; url?: string; original?: string }> {
+    return this.explain(async () => {
+      const { documentId, url } = await this.resolve(input);
+      const blocks = await this.api.listBlocks(documentId);
+      const { title } = renderDocument(blocks);
+      const link = url ?? (await this.urlOf(documentId));
+      if (action === "append") {
+        return { title, ...(link ? { url: link } : {}) };
+      }
+      if (!blockId) {
+        throw new DocError(`${action} 需要 block_id：先用 feishu_doc_read（with_block_ids=true）读文档拿到块 id`);
+      }
+      const range = locate(blocks, documentId, blockId, action === "insert_before" ? undefined : endBlockId);
+      const siblings = blocks.find((block) => block.block_id === range.parentId)?.children ?? [];
+      const ids =
+        action === "insert_before" ? [siblings[range.start]] : action === "insert_after" ? [siblings[range.end - 1]] : siblings.slice(range.start, range.end);
+      return { title, ...(link ? { url: link } : {}), original: renderBlocks(blocks, ids) };
+    });
   }
 
   /** 按块修改文档，返回一句做了什么 */

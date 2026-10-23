@@ -9,6 +9,7 @@ import { type ChatScope, createCardActionHandler, createMessageHandler } from ".
 import { CardAnswerStore } from "./card-answers.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { FEATURES_FILE, loadConfig, RELEASE_NOTES_FILE } from "./config.js";
+import { CONFIRM_WAIT_MS, WriteConfirms } from "./confirm.js";
 import { createDocsApi, FeishuDocs } from "./docs.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { createChatDirectory, createFeishuApi } from "./feishu.js";
@@ -189,9 +190,16 @@ const replyInThread = (msg: NormalizedMessage, markdown: string) =>
   channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: true });
 // 在群里直接 @ 时带上群里刚才的聊天（CHAT_CONTEXT）
 const context = new ThreadContextLoader(feishuApi, console, undefined, cardAnswers, config.chatContext);
+// 改东西前先确认（CONFIRM_WRITES）：推代码开合并请求、合并、改已有的飞书文档之前，在话题里发卡片请提问的人点「确认」
+const confirms = config.confirmWrites
+  ? new WriteConfirms({ send: (to, input, opts) => channel.send(to, input, opts), updateCard: (messageId, card) => channel.updateCard(messageId, card) })
+  : undefined;
+/** 等着确认的人在话题里回了「确认」「取消」：按这句定，这句不再当成提问 */
+const confirmedByText = (msg: NormalizedMessage) => confirms?.answer(msg) ?? false;
 const answerMessage = createMessageHandler({
   model,
   tools,
+  ...(confirms ? { confirms } : {}),
   // 文档和代码工具按任务创建：新建的文档要共享给当前群和发起人，代码的工作目录按话题分，只给这个群的仓库
   taskTools: ({ chatId, senderId, threadKey, askerName, messageId }) => {
     const policy = groups.of(chatId);
@@ -455,6 +463,9 @@ const catchUp = new CatchUpPoller({
   handled,
   handle: (msg) => {
     alarm.record(msg);
+    if (confirmedByText(msg)) {
+      return Promise.resolve();
+    }
     return answerMention(msg);
   },
   // 补上的消息也让主动接话知道群里有人说过话（判断完要回之前看一眼）
@@ -462,6 +473,9 @@ const catchUp = new CatchUpPoller({
   follow: {
     wants: (msg, fromApp) => listenerFor(msg, fromApp) !== undefined,
     consider: async (msg) => {
+      if (confirmedByText(msg)) {
+        return;
+      }
       const listener = listenerFor(msg);
       if (listener) {
         await considerUnaddressed(msg, listener);
@@ -475,6 +489,11 @@ channel.on("message", async (msg: NormalizedMessage) => {
   delete (msg as { raw?: unknown }).raw;
   // 主动接话判断完要回之前，看判断的这会儿群里有没有人接了话
   proactive.noteActivity(msg);
+  // 等着确认的人在话题里回了「确认」「取消」（@ 没 @ 都算）：话题里的任务正等着他，这句不排进队列
+  if (confirmedByText(msg)) {
+    handled.claim(msg.messageId);
+    return;
+  }
   if (!msg.mentionedBot) {
     // 没 @ 机器人的：只看跟聊在跟的话题里的、打开了主动接话的群主界面的，别的（包括白名单外的群）一律不管，也不记日志
     const listener = listenerFor(msg);
@@ -509,6 +528,10 @@ const followUp = createFollowUp({
 });
 const onCardAction = createCardActionHandler({ tasks, allowedChatIds: groups.allowed, followUp, ...(knowledge ? { knowledge } : {}) });
 channel.on("cardAction", async (evt) => {
+  // 确认卡片上的按钮：只认提问的人点的，点了马上放行（话题里的任务正等着）
+  if (await confirms?.handleCardAction(evt)) {
+    return;
+  }
   // 管理群设置卡片上的按钮先看（管理群不在白名单里也认）
   if (await admin?.handleCardAction(evt)) {
     return;
@@ -543,6 +566,11 @@ console.log(
   config.streamCard
     ? "卡片即回答：思考和回答边生成边写进进度卡片（要开 cardkit:card:write 权限，建不了卡片时自动退回原来的方式），STREAM_CARD=off 可以关掉"
     : "卡片即回答没开（STREAM_CARD=off）：进度卡片只显示进度，回答另外发",
+);
+console.log(
+  confirms
+    ? `改东西前先确认：推代码开合并请求、合并、改已有的飞书文档之前，在话题里发卡片请提问的人点「确认」，${CONFIRM_WAIT_MS / 60_000} 分钟没确认就不做（CONFIRM_WRITES=off 可以关掉）`
+    : "改东西前不确认（CONFIRM_WRITES=off）：有写权限的人说了要改，推代码、合并、改文档直接做",
 );
 console.log(
   follower

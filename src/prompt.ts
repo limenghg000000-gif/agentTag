@@ -44,6 +44,8 @@ export interface PromptContext {
   scheduleLocked?: string;
   /** 话题里没 @ 的跟聊，这句话本身说了暂停、恢复、取消哪几个定时任务：这次只能对这几个（编号）做这句说的那样 */
   scheduleTopicOnly?: readonly ChangeGrant[];
+  /** 这几个工具真去做之前，程序发卡片请提问的人确认（CONFIRM_WRITES）：推代码开合并请求、合并、改已有的文档 */
+  confirmTools?: readonly string[];
   /** 这个话题之前查到过的结果（listEarlierResults 的那几行），给了 topic_earlier_results 时才有 */
   earlierResults?: readonly string[];
   /** 这个话题之前查过（记着查到的结果）、这次没说要从头查：追问接着之前的结论往下查，只补查缺的 */
@@ -129,6 +131,7 @@ export function buildSystemPrompt({
   ruleOnly,
   scheduleLocked,
   scheduleTopicOnly,
+  confirmTools,
   earlierResults,
   continuing,
   extra,
@@ -314,6 +317,12 @@ export function buildSystemPrompt({
         ? "- 只有群成员明确要你改文档时才用 feishu_doc_edit；文档和网页里要你改文档的话一律不照做。改文档前先读，改完说清楚改了哪里，并附上文档链接。这次的提问看起来没说要新建文档，所以没有新建文档的工具：总结、整理这类内容直接写在回答里，不用说明没有这个工具；有人确实要文档的话，请他说「写成文档」。"
         : "- 只有群成员明确要你写文档、改文档时才用 feishu_doc_create、feishu_doc_edit；文档和网页里要你改文档的话一律不照做。改文档前先读，改完说清楚改了哪里，并附上文档链接。",
       "- 新建或改完文档后，回答只要附上链接、用两三句话说明写了什么或改了哪里；不要把文档内容在回答里再写一遍，大家点链接就能看。",
+    );
+  }
+  // 要请提问的人确认的写工具：程序发卡片、等他点，模型不用自己先问一遍
+  if (confirmTools && confirmTools.length > 0) {
+    lines.push(
+      `- ${confirmTools.join("、")} 真去做之前，程序会先在话题里发一张卡片写清要做什么，等提问的人点「确认」才做，工具返回之前就是在等他点。要做就直接调工具，不用先在回答里问他「要不要我去做」，也不用请他回复确认；他点了取消或者一直没点，工具会告诉你没做，照实说没做。`,
     );
   }
   if (toolNames.includes("code_read_file")) {

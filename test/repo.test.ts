@@ -23,7 +23,7 @@ import {
   runGit,
 } from "../src/repo.js";
 import { createCodeTools } from "../src/tools/code.js";
-import { type CodeFact, type CodeLocation, ToolOutputBuilder } from "../src/tools/tool.js";
+import { type CodeFact, type CodeLocation, type Tool, ToolOutputBuilder } from "../src/tools/tool.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const author = {
@@ -1773,6 +1773,69 @@ test("推之前编译：改到的代码编不过不推、把报错给模型；�
   // 别人后来推了新提交（对不上）的照旧拒绝；编过的记录在重新打开后还在
   sha = "d".repeat(40);
   await assert.rejects((await all.open("om_b1", "acme/demo")).mergeRequest(pr.number), /有机器人没推过的提交/);
+});
+
+/** 工具的确认（改东西之前请发起人点确认时卡片上写的） */
+function confirmOf(tool: Tool) {
+  assert.equal(typeof tool.confirm, "function");
+  return tool.confirm as Exclude<Tool["confirm"], false | undefined>;
+}
+
+test("推代码、合并前请发起人确认：卡片上列仓库、开到哪个分支、改了哪些文件、合哪个；确认以后改动变了认得出来；合不了的不发卡片直接说", async () => {
+  const checks: Record<number, MergeCheck> = {};
+  const { host } = fakeHost();
+  Object.assign(host, {
+    mergeCheck: async (_repo: string, number: number) => checks[number] ?? Promise.reject(new RepoError(`没有 !${number}`)),
+    mergeRequest: async () => ({ state: "merged", url: "https://example.com/pr/1" }),
+  });
+  const tools = Object.fromEntries(createCodeTools({ workspaces: workspaces(host), threadKey: "om_c1", botName: () => "飞书 CLI" }).map((t) => [t.spec.name, t]));
+  // 只改机器人自己的工作目录，推出去之前再确认
+  assert.equal(tools.code_edit_file.confirm, false);
+  await assert.rejects(confirmOf(tools.code_open_pr)({ title: "x", body: "" }, { signal }), /还没有任何改动，先用 code_edit_file 改代码/);
+  await tools.code_edit_file.run({ path: "src/a.ts", old_text: "= 1", new_text: "= 3" }, { signal });
+  const preview = (await confirmOf(tools.code_open_pr)({ title: "a 改成 3\n多余的行", body: "原因", branch: "bugfix/a" }, { signal }))!;
+  assert.equal(preview.title, "推代码、开合并请求");
+  assert.deepEqual(preview.lines, ["仓库：acme/demo", "新建分支 bugfix/a，开合并请求到 main", "标题：a 改成 3", "改了 1 个文件（+1 -1）：", "　src/a.ts（+1 -1）"]);
+  assert.equal(await preview.unchanged!(), true);
+  // 确认以后同一轮里又改了代码：要推的和卡片上的不一样了
+  await tools.code_edit_file.run({ path: "src/b.ts", old_text: "a, a", new_text: "a" }, { signal });
+  assert.equal(await preview.unchanged!(), false);
+  await tools.code_open_pr.run({ title: "a 改成 3", body: "原因", branch: "bugfix/a" }, { signal });
+  // 推过以后又改：推到同一个分支，合并请求跟着更新
+  await tools.code_edit_file.run({ path: "README.md", old_text: "# demo", new_text: "# demo 2" }, { signal });
+  const again = (await confirmOf(tools.code_open_pr)({ title: "改说明", body: "" }, { signal }))!;
+  assert.deepEqual(again.lines, ["仓库：acme/demo", "推到这个话题之前用的分支 bugfix/a，!1 跟着更新", "标题：改说明", "改了 1 个文件（+1 -1）：", "　README.md（+1 -1）"]);
+  const uat = (await confirmOf(tools.code_open_pr)({ title: "上 uat", body: "", target: "uat" }, { signal }))!;
+  assert.equal(uat.title, "开合并请求到 uat");
+  assert.equal(uat.lines[1], "从这个话题的分支 bugfix/a 开合并请求到 uat（这个分支是从 main 拉的，已经推过的改动一起带上）");
+
+  const sha = (await runGit(["rev-parse", "refs/heads/bugfix/a"], { cwd: remote })).stdout.trim();
+  const check: MergeCheck = {
+    number: 1,
+    title: "a 改成 3",
+    url: "https://example.com/pr/1",
+    state: "opened",
+    source: "bugfix/a",
+    target: "uat",
+    authorUsername: "agent-boot",
+    botUsername: "agent-boot",
+    sha,
+    targetProtected: false,
+  };
+  checks[1] = check;
+  const merge = (await confirmOf(tools.code_merge)({ number: "!1" }, { signal }))!;
+  assert.equal(merge.title, "合并 !1");
+  assert.deepEqual(merge.lines, ["仓库：acme/demo", "合并 !1「a 改成 3」：bugfix/a → uat", "流水线（构建）还没跑完的，设成通过后自动合并", "!1：https://example.com/pr/1"]);
+  assert.equal(await merge.unchanged!(), true);
+  // 确认以后有人往源分支上推了提交：合的时候也会拒，这里先认出来
+  checks[1] = { ...check, sha: "0".repeat(40) };
+  await assert.rejects(merge.unchanged!(), /有机器人没推过的提交/);
+  // 合不了的（受保护、只许维护者合）不发卡片，直接说原因
+  checks[1] = { ...check, target: "prod", targetProtected: true };
+  await assert.rejects(confirmOf(tools.code_merge)({ number: 1 }, { signal }), /只许维护者合并/);
+  // 已经合并过的不用确认
+  checks[1] = { ...check, state: "merged" };
+  assert.equal(await confirmOf(tools.code_merge)({ number: 1 }, { signal }), undefined);
 });
 
 test("代码工具：平台能合并时才有 code_merge，要写权限，编号认 !354", async () => {

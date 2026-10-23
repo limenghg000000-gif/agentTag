@@ -1,6 +1,7 @@
 import { posix } from "node:path";
 import type { CardActionEvent, NormalizedMessage, SendInput, SendOptions, SendResult } from "@larksuiteoapi/node-sdk";
 import { raceAbort, timeoutSignal } from "./abort.js";
+import type { ConfirmOutcome, WriteConfirms } from "./confirm.js";
 import { type AgentEvent, type AgentResult, MAX_TOOL_OUTPUT_CHARS, runAgent, safeDescribe, truncate } from "./agent.js";
 import { DuplicateAsks } from "./duplicates.js";
 import { asksForFeatures, availableFeatures, CHAT_ALONG_FEATURE, type FeatureList, renderFeaturesCard, renderFeaturesMarkdown, RICH_UI_FEATURE, VISION_FEATURE } from "./features.js";
@@ -57,7 +58,7 @@ import {
   SCHEDULE_TOOL_NAMES,
   taskNumber,
 } from "./tools/schedules.js";
-import { type CodeFact, type Tool, ToolError } from "./tools/tool.js";
+import { type CodeFact, type Tool, type ToolContext, ToolError } from "./tools/tool.js";
 
 /**
  * 每条回复的字数上限。SDK 超过 3500 字会自己切分，但切出来的后续片段会发到群主界面而不是话题里，
@@ -432,6 +433,11 @@ export interface BotDeps {
   knowledge?: Pick<KnowledgeDesk, "lookup" | "tools">;
   /** 回答前查经验库最多等多久，不填 8 秒（测试时调短） */
   knowledgeLookupMs?: number;
+  /**
+   * 改东西前先确认（CONFIRM_WRITES）：推代码开合并请求、合并、改已有的飞书文档之前，在话题里发卡片请提问的人点「确认」才做。
+   * 不传时不确认，直接做
+   */
+  confirms?: Pick<WriteConfirms, "ask">;
   /** 通过 MCP 接入的工具（如 aiops）。每个任务单独一套，调用次数按任务算 */
   mcp?: {
     /** 配置的 MCP 服务名（如 aiops），工具名以「服务名_」开头 */
@@ -836,6 +842,38 @@ async function runTask(
         }
       }
     };
+    // 这次请提问的人确认过、他取消了或者没理的写操作：同一个工具再调不再发卡片，直接拒（模型换个参数再试也一样）
+    const declined = new Map<string, ConfirmOutcome>();
+    // 改东西之前请提问的人确认：卡片上写清要做什么，他点了「确认」才做；点了确认以后要做的事变了（同一轮里又改了代码）也不做
+    const confirmWrite = async (tool: Tool, args: Record<string, unknown>, ctx: ToolContext) => {
+      const refused = declined.get(tool.spec.name);
+      if (refused) {
+        throw new Error(confirmRefusal(refused, true));
+      }
+      const preview = tool.confirm ? await tool.confirm(args, ctx) : { title: safeDescribe(tool, args), lines: [truncate(JSON.stringify(args), 300)] };
+      if (!preview) {
+        return;
+      }
+      const outcome = await deps.confirms!.ask({
+        chatId: msg.chatId,
+        threadKey: threadKeyOf(msg),
+        replyTo: msg.messageId,
+        asker: msg.senderId,
+        preview,
+        signal: ctx.signal,
+      });
+      if (outcome !== "confirmed") {
+        if (outcome === "cancelled" || outcome === "expired") {
+          declined.set(tool.spec.name, outcome);
+        }
+        throw new Error(confirmRefusal(outcome));
+      }
+      if (preview.unchanged && !(await preview.unchanged())) {
+        throw new Error(
+          "他确认以后，要做的事变了（同一轮里又改了代码、切了分支，或者文档、合并请求被人动过），这次没做。先把改动都弄好，再调用一次，会重新发卡片请他确认",
+        );
+      }
+    };
     // 定时任务建的人说了「有异常 @ 我」：查到异常时调，@ 谁由程序定（只 @ 建的人）
     const alertTools = scheduled?.alert ? [createScheduleAlertTool(scheduled.alert, scheduled.creatorName ?? context.askerName)] : [];
     const allTools = [...tools, ...(deps.taskTools?.(taskContext) ?? []), ...mcpTools, ...(memory?.tools ?? []), ...recentThreadTools, ...alertTools].map(
@@ -888,6 +926,10 @@ async function runTask(
             return tool.run(args, ctx);
           }
           attempted.add(tool.spec.name);
+          // 推代码开合并请求、合并、改已有的文档之前，请提问的人在卡片上确认。定时任务到点跑的没人看着，只能追加到建任务时点名的那篇，不用确认
+          if (deps.confirms && tool.writes && tool.confirm !== false && !scheduled) {
+            await confirmWrite(tool, args, ctx);
+          }
           const code = isCodeTool(tool.spec.name);
           let facts: CodeFact[] = [];
           let output: string;
@@ -1197,6 +1239,8 @@ async function runTask(
         ...(ruleOnly && !(notMemoryEditor && memory) ? { ruleOnly: true } : {}),
         ...(scheduleLocked ? { scheduleLocked } : {}),
         ...(topicChange && toolNames.includes(SCHEDULE_CHANGE_TOOL) ? { scheduleTopicOnly: topicChange } : {}),
+        // 要请他确认的写工具（和下面 confirmWrite 拦的一样）
+        ...(deps.confirms && !scheduled ? { confirmTools: taskTools.filter((tool) => tool.writes && tool.confirm !== false).map((tool) => tool.spec.name) } : {}),
         ...(toolNames.includes(EARLIER_RESULTS_TOOL) ? { earlierResults: listEarlierResults(earlier) } : {}),
         ...(continuing ? { continuing: true } : {}),
         extra: deps.mcp?.prompt(toolNames),
@@ -3540,6 +3584,19 @@ export function createCardActionHandler({ tasks, allowedChatIds, knowledge, foll
     const stopped = tasks.stop(value.task, evt.chatId);
     logger.info(`停止按钮 task=${value.task} operator=${evt.operator.openId} ${stopped ? "已停止" : "任务已经结束"}`);
   };
+}
+
+/** 提问的人没确认时交给模型的话：照实说没做，不要再调 */
+export function confirmRefusal(outcome: ConfirmOutcome, again = false): string {
+  const reason =
+    outcome === "cancelled"
+      ? "提问的人在确认卡片上点了「取消」（或者回了取消）"
+      : outcome === "expired"
+        ? "确认卡片一直没人点，过了时间"
+        : outcome === "unsent"
+          ? "确认卡片发不出去"
+          : "任务停了";
+  return `${again ? "这次任务里前面已经请他确认过，" : ""}${reason}，这件事没做。照实告诉他没做，不要说做了，也不要换个参数再调；要做请他再 @ 你说一次。`;
 }
 
 function toReply(text: string, finish: AgentResult["finish"]): string {

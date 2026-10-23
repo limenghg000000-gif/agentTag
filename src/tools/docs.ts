@@ -78,6 +78,8 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
 
   const create: Tool = {
     writes: true,
+    // 新建的文档碰不到已有的内容，不用确认
+    confirm: false,
     spec: {
       name: "feishu_doc_create",
       description:
@@ -140,15 +142,24 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
       },
     },
     describe: (args) => (isEditAction(args.action) ? EDIT_ACTIONS[args.action] : "修改飞书文档"),
+    // 改之前请发起人确认：卡片上写哪篇、怎么改、要动的那段原文和要写进去的内容。确认以后那段原文被人改了就不改
+    async confirm(args) {
+      const { document, action } = editArgs(args);
+      const where = { action, blockId: optionalString(args.block_id), endBlockId: optionalString(args.end_block_id) };
+      const doc = await docs.preview(document, where);
+      const content = typeof args.content === "string" ? args.content : "";
+      return {
+        title: EDIT_ACTIONS[action],
+        lines: [
+          `文档：「${oneLine(doc.title) || "无标题"}」${doc.url ? ` ${doc.url}` : ""}`,
+          ...(doc.original !== undefined ? [`${ORIGINAL_LABELS[action]}：${clip(doc.original)}`] : []),
+          ...(action !== "delete" ? [`写进去的内容：${clip(content)}`] : []),
+        ],
+        ...(doc.original !== undefined ? { unchanged: async () => (await docs.preview(document, where)).original === doc.original } : {}),
+      };
+    },
     async run(args) {
-      const document = requireString(args, "document");
-      const action = args.action;
-      if (!isEditAction(action)) {
-        throw new Error(`action 只能是 ${Object.keys(EDIT_ACTIONS).join("、")} 之一`);
-      }
-      if (action !== "delete" && (typeof args.content !== "string" || !args.content.trim())) {
-        throw new Error(`${action} 需要 content 参数`);
-      }
+      const { document, action } = editArgs(args);
       const { summary, url } = await docs.edit(document, {
         action,
         blockId: optionalString(args.block_id),
@@ -160,6 +171,41 @@ export function createDocTools({ docs, chatId, requesterOpenId }: DocToolsOption
   };
 
   return [read, create, edit];
+}
+
+/** 确认卡片上原文那一行怎么叫 */
+const ORIGINAL_LABELS: Record<EditAction, string> = {
+  append: "",
+  insert_before: "插在这段前面",
+  insert_after: "插在这段后面",
+  replace: "换掉的原文",
+  delete: "删掉的原文",
+};
+
+/** 确认卡片上一段文字最多显示多少字 */
+const CONFIRM_TEXT_CHARS = 300;
+
+/** 改文档的参数：哪篇、怎么改；除了删除都要有内容 */
+function editArgs(args: Record<string, unknown>): { document: string; action: EditAction } {
+  const document = requireString(args, "document");
+  const action = args.action;
+  if (!isEditAction(action)) {
+    throw new Error(`action 只能是 ${Object.keys(EDIT_ACTIONS).join("、")} 之一`);
+  }
+  if (action !== "delete" && (typeof args.content !== "string" || !args.content.trim())) {
+    throw new Error(`${action} 需要 content 参数`);
+  }
+  return { document, action };
+}
+
+/** 卡片上一行写完：换行换成「↵」，太长的截短 */
+function clip(text: string): string {
+  const line = text.trim().replace(/\s*\n\s*/g, " ↵ ");
+  return line.length > CONFIRM_TEXT_CHARS ? `${line.slice(0, CONFIRM_TEXT_CHARS)}…（共 ${line.length} 字）` : line;
+}
+
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function isEditAction(value: unknown): value is EditAction {

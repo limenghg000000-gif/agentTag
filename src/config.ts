@@ -92,6 +92,8 @@ export interface Config {
   followStateFile: string;
   /** 带上群里刚才的聊天（CHAT_CONTEXT，默认 on）：在群里直接 @ 时，把这之前半小时内的群聊一起给模型 */
   chatContext: boolean;
+  /** 改东西前先确认（CONFIRM_WRITES，默认 on）：推代码开合并请求、合并、改已有的飞书文档之前，发卡片请提问的人点「确认」 */
+  confirmWrites: boolean;
   /** 主动接话（PROACTIVE_CHAT_IDS，默认没有群）：这些群里没 @ 的群消息，机器人看情况接一句 */
   proactive: {
     /** 打开了主动接话的群（只算群白名单里的） */
@@ -340,6 +342,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`CHAT_CONTEXT 只能是 on 或 off，当前为 ${env.CHAT_CONTEXT}`);
   }
 
+  const confirmWrites = (env.CONFIRM_WRITES?.trim() || "on").toLowerCase();
+  if (confirmWrites !== "on" && confirmWrites !== "off") {
+    throw new Error(`CONFIRM_WRITES 只能是 on 或 off，当前为 ${env.CONFIRM_WRITES}`);
+  }
+
   const schedules = (env.SCHEDULED_TASKS?.trim() || "on").toLowerCase();
   if (schedules !== "on" && schedules !== "off") {
     throw new Error(`SCHEDULED_TASKS 只能是 on 或 off，当前为 ${env.SCHEDULED_TASKS}`);
@@ -413,6 +420,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     followThreads: followThreads === "on",
     followStateFile: path.resolve(env.DATA_DIR || DEFAULT_DATA_DIR, "follow.json"),
     chatContext: chatContext === "on",
+    confirmWrites: confirmWrites === "on",
     proactive: {
       chatIds: new Set(proactiveChatIds.filter((id) => allowedChatIds.has(id))),
       ignored: proactiveChatIds.filter((id) => !allowedChatIds.has(id)),

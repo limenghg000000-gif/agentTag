@@ -110,3 +110,35 @@ test("改文档：校验参数，结果带上文档链接", async () => {
   assert.deepEqual(edits.map((e) => e[0]), ["insert", "delete", "delete"]);
   assert.equal(edit.describe({ action: "append" }), "在文档末尾追加内容");
 });
+
+test("改文档前请发起人确认：卡片上写哪篇、怎么改、要动的那段原文和要写进去的内容；原文被人改了认得出来；新建文档不用确认", async () => {
+  const blocks = docWith(["第一段", "第二段\n有两行", "第三段"]);
+  const { byName, edits } = setup(blocks);
+  assert.equal(byName.feishu_doc_create.confirm, false);
+  const confirm = byName.feishu_doc_edit.confirm;
+  assert.equal(typeof confirm, "function");
+  const preview = (args: Record<string, unknown>) => (confirm as Exclude<typeof confirm, false | undefined>)(args, { signal });
+  const url = `https://x.feishu.cn/docx/${DOC}`;
+
+  const replace = (await preview({ document: url, action: "replace", block_id: "p1", end_block_id: "p2", content: "新的\n一段" }))!;
+  assert.equal(replace.title, "修改文档内容");
+  assert.deepEqual(replace.lines, [`文档：「长文」 ${url}`, "换掉的原文：第二段 ↵ 有两行 ↵ 第三段", "写进去的内容：新的 ↵ 一段"]);
+  assert.equal(await replace.unchanged!(), true);
+  // 确认以后有人在文档里改了那一段
+  (blocks[2] as unknown as { text: unknown }).text = { elements: [{ text_run: { content: "别人改过的第二段" } }] };
+  assert.equal(await replace.unchanged!(), false);
+
+  const removed = (await preview({ document: DOC, action: "delete", block_id: "p0" }))!;
+  assert.deepEqual(removed.lines, ["文档：「长文」 https://x.feishu.cn/docx/newdoc", "删掉的原文：第一段"]);
+  const before = (await preview({ document: DOC, action: "insert_before", block_id: "p2", content: "插一句" }))!;
+  assert.equal(before.lines[1], "插在这段前面：第三段");
+  // 追加不碰已有的内容，不用核对原文
+  const append = (await preview({ document: DOC, action: "append", content: "x".repeat(400) }))!;
+  assert.equal(append.title, "在文档末尾追加内容");
+  assert.equal(append.unchanged, undefined);
+  assert.match(append.lines[1], /^写进去的内容：x{300}…（共 400 字）$/);
+  // 参数不对、块找不到：不发卡片，直接报错
+  await assert.rejects(preview({ document: DOC, action: "replace", block_id: "p0" }), /需要 content/);
+  await assert.rejects(preview({ document: DOC, action: "delete", block_id: "nope" }), /文档里没有块 nope/);
+  assert.equal(edits.length, 0, "确认前什么都没改");
+});
