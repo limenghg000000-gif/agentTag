@@ -291,15 +291,15 @@ test("群聊太长时省略较早的，单条太长的截短", () => {
   assert.ok(!text.includes("[人0 "));
 });
 
-test("群聊里 @ 了机器人的标上「@了你」，开头说明这段没有它的回答、别凭这段说哪条做没做", () => {
+test("群聊里不标谁 @ 过机器人（这次的提问也没标，标了它会把前面那句当成这次问的）；开头说明这段看不出谁 @ 过它、做没做", () => {
   const text = renderChat([
-    item("om_1", { senderName: "赵作武", content: "每天 09:55 汇总今天群里的讨论，追加到 https://x.feishu.cn/docx/Abc123", createTime: minutesBefore(3), mentionedBot: true }),
+    item("om_1", { senderName: "赵作武", content: "这个群有哪些定时任务", createTime: minutesBefore(3) }),
     item("om_2", { senderName: "赵作武", content: "总结一下今天群里聊了什么", createTime: minutesBefore(2) }),
   ]);
-  assert.match(text, /\[赵作武 \d\d:\d\d @了你\] 每天 09:55 汇总/);
-  assert.match(text, /\[赵作武 \d\d:\d\d\] 总结一下/);
-  assert.match(CHAT_CONTEXT_HEADER, /没有你的回答/);
-  assert.match(CHAT_CONTEXT_HEADER, /别凭这段说，也别主动提/);
+  assert.match(text, /\n\[赵作武 \d\d:\d\d\] 这个群有哪些定时任务\n\[赵作武 \d\d:\d\d\] 总结一下/);
+  assert.ok(!text.includes("@了你"));
+  assert.match(CHAT_CONTEXT_HEADER, /这次 @ 你问的是这段后面单独的那一条，只回答它/);
+  assert.match(CHAT_CONTEXT_HEADER, /哪句 @ 过你、你回没回过、做没做成、建没建成，这里都看不出来，别凭这段说，也别主动提/);
 });
 
 test("卡片即回答：机器人的卡片记过回答的换成回答，没记过的（进度卡片）照样去掉", async () => {

@@ -18,8 +18,6 @@ export interface ThreadMessage {
   /** 在话题里时：话题 id（omt_ 开头）和话题第一条消息的 id */
   threadId?: string;
   rootId?: string;
-  /** 这条 @ 了本机器人（内容里的 @ 已经去掉了） */
-  mentionedBot?: boolean;
 }
 
 /** 轮询读到的一条消息，已转成和事件一样的格式，可以直接交给消息处理函数 */
@@ -165,7 +163,6 @@ export function createFeishuApi(client: Client, appId: string, getBotIdentity: (
       ...(images.length > 0 ? { images } : {}),
       ...(item.thread_id ? { threadId: item.thread_id } : {}),
       ...(item.root_id ? { rootId: item.root_id } : {}),
-      ...(normalized.mentionedBot ? { mentionedBot: true } : {}),
     };
   };
 
