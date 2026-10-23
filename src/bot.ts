@@ -2966,14 +2966,18 @@ export const QUOTA_CLAIM_ANSWER =
  * 2026-10-23 转链排查：原先一次任务限调 10 次 aiops，到了模型就说「aiops 工具额度已用完」；话题里之前的回答写着这句，
  * 后面追问「查一下 appservice 调用 page-detective 的日志」，模型又说「aiops 工具额度已用完，Loki 没查成」，一条日志都没查。
  * 现在调用不限次数，只剩一次任务最多几轮（到了的那一轮 runAgent 不打回），这么说都不对。
- * 只认说到 MCP 服务名或「工具」的：淘宝联盟这类第三方接口额度用完可能正是要查的原因，不能拦。
+ * 只认额度、次数就是 MCP 服务名或「工具」自己的（「aiops 工具额度」「工具调用次数」「aiops 的工具已经调了 10 次，到上限了」）：
+ * 「通过 aiops 查到淘宝联盟接口额度不足」说的是查到的第三方接口额度，可能正是要查的原因，不能拦。
  * 提问自己说到额度、上限的（「为什么上次说额度用完」）不管；这次工具结果里原样有这句话的（日志里写着「调用次数已达上限」）也不管
  */
 export function reviewQuotaClaim(servers: readonly string[], question: string, toolOutputs: () => string) {
-  const subject = ["工具", "mcp", ...servers.map(escapeRegExp)].join("|");
+  // 服务名、「工具」后面只隔着「的」「工具」「调用」「查询」
+  const own = `(?:工具|mcp|${servers.map(escapeRegExp).join("|")})\\s*的?\\s*(?:工具|调用|查询)*\\s*的?\\s*`;
+  const used = `(?:已经?|都|也|全)*\\s*(?:用完|用尽|耗尽|用光|不够|不足|到了?上限|达到上限|超(?:过|出)了?上限)`;
   const claim = new RegExp(
-    `(?:${subject})[^，,。；;！!？?\n]{0,12}(?:额度|配额|调用次数|次数)[^，,。；;！!？?\n]{0,6}(?:用完|用尽|耗尽|用光|不够|不足|到了?上限|达到上限|超(?:过|出)了?上限)` +
-      `|(?:${subject})[^。；;！!？?\n]{0,16}?(?:到了?上限|达到上限)`,
+    `${own}(?:额度|配额|次数)${used}` +
+      // 「aiops 调用已到上限」「aiops 的工具已经调了 10 次，到上限了」
+      `|${own}(?:已经?)?(?:调了\\s*\\d+\\s*次[，,]?\\s*(?:已经?)?)?(?:到了?上限|达到上限)`,
     "i",
   );
   return (answer: string): string | undefined => {
