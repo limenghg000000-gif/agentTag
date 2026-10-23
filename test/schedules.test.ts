@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import {
+  alertsCreator,
+  asksForAlert,
   GRACE_MS,
   MAX_FAILURES,
   MAX_PER_CHAT,
@@ -533,6 +535,44 @@ test("定时任务到点改文档：只能 append 到建任务时点名的那篇
   }
   assert.throws(() => checkScheduledDocEdit({ document: "https://x.feishu.cn/docx/OtherDoc12345", action: "append" }, bound), /只能追加到建任务时点名的那篇文档.*WeeklyReport123/);
   assert.throws(() => checkScheduledDocEdit({ action: "append" }, bound), /只能追加到建任务时点名的那篇文档/);
+});
+
+test("「有异常 @ 我」：建的人这句话、任务内容里写了，模型没填 alert_creator 也记上；说了不要、只是汇总的不算", async () => {
+  for (const text of [
+    "每隔1个小时，查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我",
+    "查完再 有异常再 @ 我，没问题，不要 @ 我",
+    "有报错叫我",
+    "出问题通知我一声",
+    "查一下订单服务，有异常就 @ 张三",
+    "ERROR 多了提醒我",
+  ]) {
+    assert.ok(asksForAlert(text), text);
+  }
+  for (const text of ["没有异常就不 @", "有异常也别 @ 我", "把昨天的问题告诉我", "每天 9 点汇总报错", "查一下报错，@ 我的时候再说", "提醒我看报错"]) {
+    assert.ok(!asksForAlert(text), text);
+  }
+
+  const { scheduler } = setup();
+  const [create, list] = createScheduleTools({ scheduler, chatId: "oc_1", senderId: "ou_ml", askerName: "ML", messageId: "om_1", canManageAll: false, now: () => bj("2026-10-21 10:00") });
+  const byId = (id: number) => scheduler.list("oc_1").find((task) => task.id === id)!;
+  // 2026-10-23 的 T6：建的人说了有异常 @ 我，模型没填 alert_creator，写好的任务内容里也没这句
+  const created = await call(create, { task: "查一下 gateway-api 最近 1 小时有没有报错", cron: "0 * * * *" }, false, "每隔1个小时，查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我");
+  assert.equal(byId(1).alertCreator, true);
+  assert.match(created, /到点查到异常才在结果下面 @ 建任务的人，没异常不 @/);
+  // 模型把这句写进了任务内容
+  await call(create, { task: "每天 9 点查订单服务昨晚的报错，有异常就 @ ML", cron: "0 9 * * *" }, false, "每天 9 点查订单服务昨晚的报错");
+  assert.equal(byId(2).alertCreator, true);
+  // 没说的不记
+  await call(create, { task: "汇总昨天的报错", cron: "0 10 * * *" }, false, "每天 10 点汇总昨天的报错");
+  assert.equal(byId(3).alertCreator, undefined);
+
+  // 以前建的、没记上但任务内容里写着的：到点照样 @，列表里也照这个写
+  const old = { prompt: "每小时查一下 gateway-api 有没有报错，有异常 @ ML", remind: undefined, alertCreator: undefined };
+  assert.ok(alertsCreator(old));
+  assert.ok(!alertsCreator({ ...old, prompt: "每小时查一下 gateway-api 的报错" }));
+  assert.ok(!alertsCreator({ ...old, remind: true }));
+  byId(3).prompt = old.prompt;
+  assert.match(await call(list, {}), /T3 · 每天 10:00 · 有异常 @ 建的人 · /);
 });
 
 test("有异常 @ 建的人的工具：模型只决定 @ 不 @，交出一句查到了什么", async () => {

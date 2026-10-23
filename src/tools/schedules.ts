@@ -1,6 +1,8 @@
 import { formatTime } from "../cron.js";
 import { parseDocRef } from "../docs.js";
 import {
+  alertsCreator,
+  asksForAlert,
   type ChangeAction,
   describeSchedule,
   label,
@@ -114,7 +116,8 @@ export function createScheduleTools(opts: ScheduleToolsOptions): Tool[] {
         ...(at ? { at } : {}),
         ...(args.remind === true ? { remind: true } : {}),
         ...(appendDoc ? { appendDoc } : {}),
-        ...(args.alert_creator === true ? { alertCreator: true } : {}),
+        // 建的人这句话、写好的任务内容里说了「有异常 @ 我」的，模型没填也记上（纯提醒本来就 @ 建的人，Scheduler 不记）
+        ...(args.alert_creator === true || asksForAlert(ctx.question ?? "") || asksForAlert(prompt) ? { alertCreator: true } : {}),
         // 这次不能改（建的人不在写权限名单里、带着群聊只给读的、建的人这句话没说要改文档）：到点也只能读，以后加进名单也不会变
         ...(ctx.writable !== true ? { readOnly: true } : {}),
       });
@@ -204,8 +207,8 @@ export function createScheduleAlertTool(onAlert: (summary: string) => void, crea
     spec: {
       name: SCHEDULE_ALERT_TOOL,
       description:
-        `这个定时任务建的时候说了「有异常 @ 我」。这次查到了他说的异常（报错、告警、失败、超过他说的线）时调一次，summary 用一句话写查到了什么；` +
-        `回答发完以后机器人在下面 @ ${who}。没查到异常、一切正常的不要调。只会 @ ${who}，不能 @ 别人。`,
+        `这个定时任务建的时候说了「有异常 @ 我」。这次查到了他说的异常（报错、告警、失败，条数不是 0 就算；他说了线的超过了才算）时调一次，summary 用一句话写查到了什么；` +
+        `回答发完以后机器人在下面 @ ${who}。一条都没有、一切正常的不要调。只会 @ ${who}，不能 @ 别人。`,
       parameters: {
         type: "object",
         properties: { summary: { type: "string", description: `查到的异常，一句话，不超过 ${MAX_ALERT_CHARS} 字` } },
@@ -245,7 +248,7 @@ export function checkScheduledDocEdit(args: Record<string, unknown>, appendDoc: 
 }
 
 /** 有异常 @ 建的人时那句话最多多少字 */
-const MAX_ALERT_CHARS = 100;
+export const MAX_ALERT_CHARS = 100;
 
 /**
  * 要追加的文档链接是建的人这句话里自己贴的：认出来是哪篇（新版文档或知识库），在他这句话里的链接里找同一篇，
@@ -292,7 +295,7 @@ function describeTask(task: ScheduledTask, now: number): string {
   const last = task.lastRunAt !== undefined ? `，上次 ${formatTime(task.lastRunAt, now)} ${task.lastResult ? RESULT_TEXT[task.lastResult] : "开始跑了，还没跑完"}` : "";
   const creator = task.creator.name ? `${shownName(task.creator.name)}建的` : "";
   const paused = task.status === "paused" && task.pausedFor === undefined && task.changedBy?.name ? `（${shownName(task.changedBy.name)}暂停的）` : "";
-  const extras = `${task.remind ? " · 纯提醒" : ""}${task.appendDoc ? ` · 追加到 ${task.appendDoc}` : ""}${task.alertCreator ? " · 有异常 @ 建的人" : ""}`;
+  const extras = `${task.remind ? " · 纯提醒" : ""}${task.appendDoc ? ` · 追加到 ${task.appendDoc}` : ""}${alertsCreator(task) ? " · 有异常 @ 建的人" : ""}`;
   return `${label(task)} · ${describeSchedule(task, now)}${extras} · ${preview(task.prompt)} · ${creator}${creator ? " · " : ""}${state}${paused}（已跑 ${task.runs} 次${last}）`;
 }
 

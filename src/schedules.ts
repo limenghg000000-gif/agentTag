@@ -111,6 +111,22 @@ export function changeWords(grants: readonly ChangeGrant[]): string {
     .join("、");
 }
 
+/**
+ * 这句话说了「有异常 @ 我」：有异常、报错、告警、出问题时 @、叫、通知、告诉谁（「有报错叫我」「出问题通知我」，模型写的任务内容「有异常就 @ 张三」也算）。
+ * 中间隔着标点，或者夹着不、别、没、无的不算（「没有异常就不 @」「有异常也别 @ 我」）；「问题」单说太宽（「把昨天的问题告诉我」是要汇总），要「出问题」「有问题」。
+ * 建任务时记不记「有异常 @ 建的人」靠模型填 alert_creator，漏填了到点就不会 @：程序照这句话再兜一层
+ */
+const ALERT_ASK = /(?:异常|报错|错误|告警|故障|失败|[出有]问题|error)[^。！!？?\n，,；;不别没无]{0,10}?(?:@|艾特|叫|通知|告诉|提醒|喊)/i;
+
+export function asksForAlert(text: string): boolean {
+  return ALERT_ASK.test(text);
+}
+
+/** 到点查到异常要不要 @ 建的人：建的时候记上了的，或者任务内容里写着「有异常 @ 我」（建的时候模型漏填了的）。纯提醒本来就 @ 他，不算 */
+export function alertsCreator(task: Pick<ScheduledTask, "alertCreator" | "remind" | "prompt">): boolean {
+  return !task.remind && (task.alertCreator === true || asksForAlert(task.prompt));
+}
+
 export interface SchedulerOptions {
   /** 定时任务记在这个文件里，重启后接着跑。不给就只记在内存里（测试用） */
   file?: string;
