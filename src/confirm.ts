@@ -166,7 +166,8 @@ export class WriteConfirms {
   }
 
   /**
-   * 提问的人在话题里回了「确认」「取消」：这个话题里等他确认的都按这句定，返回 true（这句不再当成提问）。
+   * 提问的人在话题里回了「确认」「取消」：这个话题里等他确认的按这句定，返回 true（这句不再当成提问）。
+   * 「取消」全都不做；「确认」只在只有一张等着时放行，同时有几张时一张也不放行，请他在要做的那张卡片上点。
    * 只认他本人在同一个话题里、开始请他确认以后发的、整句就是这几个字的（@ 没 @ 都算）。
    * 同一条消息只算一次：补漏轮询和事件各送来一次时，第二次照第一次的结果返回，不去定后来又等着确认的
    */
@@ -191,8 +192,19 @@ export class WriteConfirms {
         !entry.outcome &&
         !(msg.createTime > 0 && msg.createTime < entry.askedAt - CLOCK_SLACK_MS),
     );
-    for (const entry of waiting) {
-      entry.settle(result, msg.senderId);
+    if (result === "confirmed" && waiting.length > 1) {
+      // 同时有几张等他确认（模型一轮里同时要做几件事）：一句「确认」分不清是哪张，不一下全放行，每张卡片上写一句请他在那张上点。
+      // 回「取消」照样全不做：不做总是稳妥的
+      for (const entry of waiting) {
+        entry.note = `这个话题里有 ${waiting.length} 张卡片等你确认，回「确认」分不清是哪一张：要做哪件，就在那张卡片上点「确认」。`;
+        entry.rev++;
+        this.opts.updateCard(entry.cardMessageId!, this.card(entry)).catch((err: unknown) => this.logger.warn(`确认卡片：更新卡片失败 card=${entry.cardMessageId}`, err));
+      }
+      this.logger.info(`确认卡片：话题里回了「确认」，但有 ${waiting.length} 张等着确认，请他在卡片上点 message=${msg.messageId}`);
+    } else {
+      for (const entry of waiting) {
+        entry.settle(result, msg.senderId);
+      }
     }
     this.answers.set(msg.messageId, waiting.length > 0);
     trim(this.answers, KEEP_ANSWERS);

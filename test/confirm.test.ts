@@ -142,6 +142,45 @@ test("确认卡片：回「算了」就是取消", async () => {
   assert.equal(await pending, "cancelled");
 });
 
+test("确认卡片：同一个话题里同时有几张等他确认，回「确认」一张也不放行、卡片上请他点那张；点了的那张才做；回「取消」全不做", async () => {
+  const { confirms, sent, updates } = desk();
+  const outcomes: Record<string, ConfirmOutcome> = {};
+  const track = (name: string, pending: Promise<ConfirmOutcome>) => pending.then((result) => (outcomes[name] = result));
+  const first = track("first", confirms.ask(request()));
+  const second = track("second", confirms.ask(request(undefined, { preview: { title: "修改文档内容", lines: ["文档：「周报」"] } })));
+  await tick();
+  const inThread = { threadId: "omt_1", rootId: "om_root" };
+  const yes = message("确认", { ...inThread, messageId: "om_yes" });
+  assert.equal(confirms.answer(yes), true, "这句不当成提问");
+  await tick();
+  assert.deepEqual(outcomes, {}, "一张也没放行");
+  assert.deepEqual(updates.map((u) => u.messageId).sort(), ["om_card_1", "om_card_2"]);
+  for (const { card } of updates) {
+    assert.match(JSON.stringify(card), /有 2 张卡片等你确认，回「确认」分不清是哪一张/);
+    assert.equal(buttonValues(card).length, 2, "按钮还在");
+  }
+  // 同一条「确认」又送来一次：照第一次的结果，还是不放行
+  assert.equal(confirms.answer(yes), true);
+  await tick();
+  assert.deepEqual(outcomes, {});
+  // 在第二张上点确认：只做第二张
+  assert.equal(await confirms.handleCardAction(click(updates.find((u) => u.messageId === "om_card_2")!.card, "yes", "ou_asker", "om_card_2")), true);
+  await second;
+  assert.deepEqual(outcomes, { second: "confirmed" });
+  // 只剩一张了：回「好」就是这张
+  assert.equal(confirms.answer(message("好", { ...inThread, messageId: "om_ok" })), true);
+  await first;
+  assert.deepEqual(outcomes, { second: "confirmed", first: "confirmed" });
+  assert.equal(sent.length, 2);
+
+  const other = desk();
+  const a = other.confirms.ask(request());
+  const b = other.confirms.ask(request());
+  await tick();
+  assert.equal(other.confirms.answer(message("取消", { ...inThread, messageId: "om_no" })), true);
+  assert.deepEqual(await Promise.all([a, b]), ["cancelled", "cancelled"]);
+});
+
 test("确认卡片：到时间没人确认不做，卡片上写清；任务停了不做；卡片发不出去不做", async () => {
   const expiring = desk({ waitMs: 10 });
   assert.equal(await expiring.confirms.ask(request()), "expired");
