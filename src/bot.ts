@@ -2972,7 +2972,7 @@ export const QUOTA_CLAIM_ANSWER =
  */
 export function reviewQuotaClaim(servers: readonly string[], question: string, toolOutputs: () => string) {
   // 服务名、「工具」后面只隔着「的」「工具」「调用」「查询」
-  const own = `(?:工具|mcp|${servers.map(escapeRegExp).join("|")})\\s*的?\\s*(?:工具|调用|查询)*\\s*的?\\s*`;
+  const own = `(?:${["工具", "mcp", ...servers.map(escapeRegExp)].join("|")})\\s*的?\\s*(?:工具|调用|查询)*\\s*的?\\s*`;
   const used = `(?:已经?|都|也|全)*\\s*(?:用完|用尽|耗尽|用光|不够|不足|到了?上限|达到上限|超(?:过|出)了?上限)`;
   const claim = new RegExp(
     `${own}(?:额度|配额|次数)${used}` +

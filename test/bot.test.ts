@@ -2616,7 +2616,10 @@ test("回答说机器人这边的查询工具额度用完、次数到上限时�
   ];
   for (const answer of fine) {
     assert.equal(review()(answer), undefined, answer);
+    // 没配 MCP 服务、群里一个服务都不能用时也一样（Codex 在 #88 指出服务名为空时正则多出一个空分支）
+    assert.equal(reviewQuotaClaim([], "排查转链失败原因", () => "")(answer), undefined, answer);
   }
+  assert.equal(reviewQuotaClaim([], "排查转链失败原因", () => "")("工具调用次数已经用完了"), QUOTA_CLAIM_ANSWER);
   // 提问问的就是额度；工具结果里原样有这句（日志里写着）
   assert.equal(review("上次为什么说额度用完")(claims[0]), undefined);
   assert.equal(review(undefined, `{"msg":"aiops 工具额度已用完"}`)(claims[0]), undefined);
