@@ -57,7 +57,8 @@ try {
 }
 // 按群的配置：每个群用哪些仓库、谁能改、能用哪些 MCP 工具、用不用经验库、主动接话。
 // 管理群卡片上改的盖过 .env 里这个群的（GROUPS 加 GROUP_<名字>_…），都没写的项照全局
-const groups = new GroupPolicies(config, (chatId) => settings.override(chatId));
+// 现在开通的群（groups.allowed）：服务器白名单加上管理群卡片上开通的、去掉停用的。各处都拿这一份，卡片上存了以后马上生效
+const groups = new GroupPolicies(config, settings);
 
 // Channel 是飞书 SDK 在长连接之上的封装：拉取机器人身份、识别 @、按消息 id 去重、丢弃过期重推、Markdown 转富文本发送
 const channel = createLarkChannel({
@@ -145,7 +146,7 @@ const knowledge = config.knowledge
           knowledge: policy.knowledge,
         };
       },
-      allowedChatIds: config.feishu.allowedChatIds,
+      allowedChatIds: groups.allowed,
       // 群记忆和经验库说法对不上时发冲突卡片，选好以哪边为准后两边一起改
       memory,
       // 卡片按钮回调里没有点的人的名字，卡片上写「谁点了」、记确认人时去话题和通讯录里找
@@ -159,7 +160,6 @@ const admin = config.admin
       owners: config.admin.owners,
       settings,
       groups,
-      allowedChatIds: config.feishu.allowedChatIds,
       // 只能在服务器上接入了的仓库、全局开了的工具里挑
       repos: () => (workspaces ? [...workspaces.repos, ...workspaces.patterns] : []),
       mcpServers: config.mcp.map((server) => server.name),
@@ -172,7 +172,7 @@ const admin = config.admin
       send: (to, input, opts) => channel.send(to, input, opts),
       updateCard: (messageId, card) => channel.updateCard(messageId, card),
       nameOf,
-      // 写权限名单、经验库开关改了：机器人建的经验库表格按新名单调整共享
+      // 写权限名单、经验库开关、开通停用改了：机器人建的经验库表格按新名单调整共享
       onSaved: () => void knowledgeTable?.syncSharing().catch((err: unknown) => console.warn("经验库：调整多维表格的共享失败", err)),
     })
   : undefined;
@@ -216,13 +216,13 @@ const answerMessage = createMessageHandler({
         : []),
     ];
   },
-  allowedChatIds: config.feishu.allowedChatIds,
+  allowedChatIds: groups.allowed,
   // 群主界面说「别主动插话」开关主动接话，话题里说「只在 @ 我时回」停掉跟聊（下面创建，收到消息时已经有了）
   command: (msg) => proactive.toggle(msg) ?? follower?.mute(msg),
   // 仓库、写权限名单、能改群记忆的人、MCP 工具、经验库按消息所在的群取
   scope: chatScope,
   ...(images ? { images } : {}),
-  chatAlong: config.followThreads || config.chatContext || [...config.feishu.allowedChatIds].some((chatId) => groups.of(chatId).proactive),
+  chatAlong: config.followThreads || config.chatContext || [...groups.allowed].some((chatId) => groups.of(chatId).proactive),
   showThinking: config.showThinking,
   about: aboutBot(),
   ...(config.streamCard ? { cardKit: createCardKitApi(channel.rawClient) } : {}),
@@ -248,7 +248,7 @@ const handleMessage: typeof answerMessage = (msg, options) => {
 // 话题里跟聊：机器人回答过的话题里，没 @ 它的追问先判断是不是对它说的，是才回
 const follower = config.followThreads
   ? new ThreadFollower({
-      allowedChatIds: config.feishu.allowedChatIds,
+      allowedChatIds: groups.allowed,
       context,
       model,
       botName: () => channel.botIdentity?.name,
@@ -274,9 +274,9 @@ const follower = config.followThreads
 // 主动接话：PROACTIVE_CHAT_IDS 里的群，群主界面没 @ 的消息看情况接一句；接了以后那个话题交给跟聊。
 // 跟着的话题里不是对它说的话，答案在群记忆里时也接一句
 const proactive = new ProactiveReplier({
-  allowedChatIds: config.feishu.allowedChatIds,
+  allowedChatIds: groups.allowed,
   // PROACTIVE_CHAT_IDS 里的群，和管理群卡片上打开的群（每次都问，卡片上改了马上生效）
-  enabledChatIds: { has: (chatId) => config.feishu.allowedChatIds.has(chatId) && groups.of(chatId).proactive },
+  enabledChatIds: { has: (chatId) => groups.allowed.has(chatId) && groups.of(chatId).proactive },
   stateFile: config.proactive.stateFile,
   maxPerHour: config.proactive.maxPerHour,
   api: feishuApi,
@@ -312,7 +312,7 @@ await follower?.init();
 const scheduler = config.schedules
   ? new Scheduler({
       file: config.schedules.file,
-      allowedChatIds: config.feishu.allowedChatIds,
+      allowedChatIds: groups.allowed,
       run: (task, late) => runScheduledTask(task, late),
       // 要 @ 的只会是建任务的人：@ 由这里拼，模型写的字里的尖括号都换成了全角，@ 不了别人
       notify: (chatId, markdown, mention) => channel.send(chatId, { markdown }, mention ? mentionOf(mention) : undefined),
@@ -438,7 +438,7 @@ const alarm = new MissedEventAlarm({
 });
 const catchUp = new CatchUpPoller({
   api: feishuApi,
-  chatIds: config.feishu.allowedChatIds,
+  chatIds: groups.allowed,
   handled,
   handle: (msg) => {
     alarm.record(msg);
@@ -494,7 +494,7 @@ const followUp = createFollowUp({
     return follower ? follower.answerInTurn(msg, () => handleMessage(msg, options), false) : handleMessage(msg, options);
   },
 });
-const onCardAction = createCardActionHandler({ tasks, allowedChatIds: config.feishu.allowedChatIds, followUp, ...(knowledge ? { knowledge } : {}) });
+const onCardAction = createCardActionHandler({ tasks, allowedChatIds: groups.allowed, followUp, ...(knowledge ? { knowledge } : {}) });
 channel.on("cardAction", async (evt) => {
   // 管理群设置卡片上的按钮先看（管理群不在白名单里也认）
   if (await admin?.handleCardAction(evt)) {
@@ -542,7 +542,7 @@ console.log(
     : "群里直接 @ 时不带群聊（CHAT_CONTEXT=off）",
 );
 // PROACTIVE_CHAT_IDS 里的，加上管理群卡片上打开的（卡片上关掉的不算）
-const proactiveChats = [...config.feishu.allowedChatIds].filter((chatId) => groups.of(chatId).proactive);
+const proactiveChats = [...groups.allowed].filter((chatId) => groups.of(chatId).proactive);
 if (proactiveChats.length > 0) {
   const paused = proactiveChats.filter((chatId) => !proactive.active(chatId));
   const quiet = proactiveChats.filter((chatId) => proactive.active(chatId) && !proactive.listening(chatId));
@@ -560,10 +560,11 @@ if (proactiveChats.length > 0) {
 if (config.proactive.ignored.length > 0) {
   console.warn(`PROACTIVE_CHAT_IDS 里这些群不在 FEISHU_ALLOWED_CHAT_IDS 里，不生效：${config.proactive.ignored.join(", ")}`);
 }
-if (config.catchUpIntervalMs > 0 && config.feishu.allowedChatIds.size > 0) {
+// 开着管理群时现在没开通的群也可能在卡片上开通：轮询每次按 groups.allowed 现在的群查
+if (config.catchUpIntervalMs > 0 && (groups.allowed.size > 0 || config.admin)) {
   catchUp.start();
   console.log(
-    `补漏轮询已开启，每 ${config.catchUpIntervalMs / 1000} 秒检查一次白名单群里有没有漏掉的 @；` +
+    `补漏轮询已开启，每 ${config.catchUpIntervalMs / 1000} 秒检查一次开通了的群里有没有漏掉的 @；` +
       `30 分钟内补上 2 条以上会在${config.alertChatId ? `群 ${config.alertChatId}` : "漏消息的群"}里报警`,
   );
 }
@@ -604,7 +605,7 @@ if (config.admin) {
     `管理群：在群 ${config.admin.chatId} 里 @ 机器人说「配置」，回设置卡片改各群的配置，点「确认」马上生效；` +
       `所有者 ${config.admin.owners.size} 人（CONFIG_OWNERS），管理员 ${settings.admins().size} 人。` +
       `卡片上改的存在 ${settings.file}，每次改动记在 ${settings.logFile}` +
-      (config.feishu.allowedChatIds.has(config.admin.chatId) ? "" : "（管理群不在白名单里：在这个群里只回「配置」）"),
+      (groups.allowed.has(config.admin.chatId) ? "" : "（管理群不在白名单里：在这个群里只回「配置」）"),
   );
 } else if (settings.chatIds().length > 0) {
   console.log(`管理群没开（CONFIG_CHAT_ID），以前在卡片上改过的 ${settings.chatIds().length} 个群照样按 ${settings.file} 来`);
@@ -644,32 +645,50 @@ if (settingsBackup) {
   settingsBackup.start();
   console.log(`管理群改的群配置每天备份一次到 ${config.settingsBackupDir}，保留最近 ${config.memoryBackupDays} 天`);
 }
-// 部署新版本要重启：连上飞书后把 RELEASE_NOTES.md 里各群还没收到过的版本发过去，在后台做
+// 部署新版本要重启：连上飞书后把 RELEASE_NOTES.md 里各群还没收到过的版本发过去，在后台做。
+// 没配 ANNOUNCE_CHAT_IDS 时发现在开通的所有群（包括卡片上开通的）；卡片上停用了的群不发
+const announceChats = config.announce
+  ? config.announce.chatIdsFrom === "ANNOUNCE_CHAT_IDS"
+    ? config.announce.chatIds.filter((chatId) => groups.allowed.has(chatId))
+    : [...groups.allowed]
+  : [];
 const announcer =
-  config.announce && config.announce.chatIds.length > 0
+  config.announce && announceChats.length > 0
     ? new UpdateAnnouncer({
         ...config.announce,
+        chatIds: announceChats,
         send: (to, input) => channel.send(to, input),
         botName: () => channel.botIdentity?.name,
       })
     : undefined;
 if (announcer) {
   void announcer.run();
-  const { chatIds, chatIdsFrom } = config.announce!;
+  const { chatIdsFrom } = config.announce!;
+  const chatIds = announceChats;
   console.log(
     `更新通知：新版本部署后，把 RELEASE_NOTES.md 里还没发过的版本发到 ${chatIds.length} 个群 ${chatIds.join(", ")}` +
       (chatIdsFrom === "ANNOUNCE_CHAT_IDS"
         ? "（按 ANNOUNCE_CHAT_IDS）"
-        : "（没配 ANNOUNCE_CHAT_IDS，发白名单里的所有群）") +
+        : "（没配 ANNOUNCE_CHAT_IDS，发开通了的所有群）") +
       "，ANNOUNCE=off 关掉",
   );
 } else if (!config.announce) {
   console.log("更新通知：已关闭（ANNOUNCE=off）");
 }
-if (config.feishu.allowedChatIds.size === 0) {
-  console.warn("FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。");
+if (groups.allowed.size === 0) {
+  console.warn(
+    config.admin
+      ? "还没开通任何群，不会响应任何群。在管理群里 @ 机器人说「配置」开通，或者在 FEISHU_ALLOWED_CHAT_IDS 里加群。"
+      : "FEISHU_ALLOWED_CHAT_IDS 未配置，不会响应任何群。在要启用的群里 @ 机器人，日志会打出该群的 chat_id。",
+  );
 } else {
-  console.log(`已启用的群：${[...config.feishu.allowedChatIds].join(", ")}`);
+  const carded = [...groups.allowed].filter((chatId) => !groups.onServer(chatId));
+  const stopped = [...config.feishu.allowedChatIds].filter((chatId) => !groups.allowed.has(chatId));
+  console.log(
+    `已启用的群：${[...groups.allowed].join(", ")}` +
+      (carded.length > 0 ? `（其中 ${carded.join(", ")} 是在管理群的卡片上开通的）` : "") +
+      (stopped.length > 0 ? `；白名单里的 ${stopped.join(", ")} 在管理群的卡片上停用了` : ""),
+  );
 }
 
 const shutdown = async () => {
