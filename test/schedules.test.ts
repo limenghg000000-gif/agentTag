@@ -7,6 +7,7 @@ import {
   alertsCreator,
   asksForAlert,
   GRACE_MS,
+  mentionWhenDone,
   MAX_FAILURES,
   MAX_PER_CHAT,
   MAX_PER_CREATOR,
@@ -573,6 +574,16 @@ test("「有异常 @ 我」：建的人这句话、任务内容里写了，模�
   assert.ok(!alertsCreator({ ...old, remind: true }));
   byId(3).prompt = old.prompt;
   assert.match(await call(list, {}), /T3 · 每天 10:00 · 有异常 @ 建的人 · /);
+});
+
+test("到点不在开始查之前 @ 建的人：一次性的做完了 @，说了「有异常 @ 我」的只在查到异常时 @，周期任务正常做完不 @", () => {
+  const at = Date.parse("2026-10-23T09:10:00Z");
+  // 2026-10-23 ML：「今天 17:10 查一下 gateway-api 最近 1 小时有没有报错，有异常 @ 我」到点还没查就 @ 了他
+  assert.equal(mentionWhenDone({ prompt: "查一下 gateway-api 最近 1 小时有没有报错", at, alertCreator: true }), false);
+  assert.equal(mentionWhenDone({ prompt: "查一下 gateway-api 最近 1 小时有没有报错，有异常就 @ ML", at }), false);
+  assert.equal(mentionWhenDone({ prompt: "汇总今天群里的讨论", at }), true);
+  assert.equal(mentionWhenDone({ prompt: "汇总今天群里的讨论" }), false);
+  assert.equal(mentionWhenDone({ prompt: "看发版", at, remind: true }), false);
 });
 
 test("有异常 @ 建的人的工具：模型只决定 @ 不 @，交出一句查到了什么", async () => {
