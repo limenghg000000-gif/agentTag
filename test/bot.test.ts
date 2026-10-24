@@ -1626,6 +1626,23 @@ test("回答里说这次改好了文档、代码：认得出来；说以前的�
   assert.equal(asksForChange("在文档末尾加一句「改好了吗」"), true);
 });
 
+test("改群记忆里写着文档的那条、改成了：说「已更新群记忆中的文档链接」是真的，不打回", async () => {
+  const memoryUpdate: Tool = {
+    spec: { name: "memory_update", description: "memory_update", parameters: { type: "object", properties: {} } },
+    describe: () => "memory_update",
+    run: async () => "已更新 #2",
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已更新群记忆中的文档链接。", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "memory_update", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, taskTools: () => [memoryUpdate], writeAllowed: new Set(["ou_admin"]) });
+  await handle(message("把群记忆里的文档链接更新为新链接", { senderId: "ou_admin" }));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent).slice(-1), ["已更新群记忆中的文档链接。"]);
+});
+
 test("叫它切分支、切成了：说「已把当前分支改为 develop」是真的，不打回", async () => {
   const branches: Tool = {
     spec: { name: "code_branches", description: "code_branches", parameters: { type: "object", properties: { switch_to: { type: "string" } } } },

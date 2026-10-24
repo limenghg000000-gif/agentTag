@@ -1168,9 +1168,15 @@ async function runTask(
     const requestsKnown = () =>
       [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
     const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL), merged: () => mergedNow };
-    // 这次调成了改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并）或者切成了分支没有：都没有的，回答说改好了就不是真的
-    const writeTools = new Set(allTools.filter((tool) => tool.writes).map((tool) => tool.spec.name));
-    const changedNow = () => switchedBranch || [...succeeded].some((name) => writeTools.has(name));
+    // 这次改成了什么没有：改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并），切分支，记、改、删群记忆，建、改定时任务。
+    // 都没有的，回答说改好了就不是真的；改成了别的（「已更新群记忆中的文档链接」）不在这里查
+    const changeTools = new Set([
+      ...allTools.filter((tool) => tool.writes).map((tool) => tool.spec.name),
+      ...MEMORY_WRITE_TOOLS,
+      SCHEDULE_CREATE_TOOL,
+      SCHEDULE_CHANGE_TOOL,
+    ]);
+    const changedNow = () => switchedBranch || [...succeeded].some((name) => changeTools.has(name));
     const reviewChange = reviewChangeClaims(question, taskTools.some((tool) => tool.writes), changedNow);
     const reviews = [
       ...(restate
