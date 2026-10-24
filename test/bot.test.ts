@@ -8,12 +8,15 @@ import {
   askedInChinese,
   asksNow,
   asksToMerge,
+  asksForChange,
   asksToOpenRequest,
+  BLOCKED_CHANGE_ANSWER,
   BLOCKED_OPS_ANSWER,
   BLOCKED_RESTATE_ANSWER,
   blockedCodeAnswer,
   blockedRequestAnswer,
   blockUnverifiedOps,
+  changeClaim,
   type BotDeps,
   codeContent,
   codeEvidence,
@@ -1177,7 +1180,7 @@ test("MCP 工具按任务创建，拿到当前群和发起人；它的使用说�
 });
 
 test("勾了「同时发送到群」时群里多出的那份一样的提问跳过，不调用模型也不回复", async () => {
-  const { model, requests } = fakeModel(() => ({ text: "追加好了", finish: "stop" }));
+  const { model, requests } = fakeModel(() => ({ text: "答案", finish: "stop" }));
   const logs: string[] = [];
   const { sent, handle } = setup({ model, logger: { ...quiet, info: (line: string) => logs.push(line) } });
 
@@ -1185,7 +1188,7 @@ test("勾了「同时发送到群」时群里多出的那份一样的提问跳�
   await handle(message("在文档末尾追加一行", { messageId: "om_g" }));
 
   assert.equal(requests.length, 1);
-  assert.deepEqual(markdowns(sent), ["追加好了"]);
+  assert.deepEqual(markdowns(sent), ["答案"]);
   assert.ok(sent.every((s) => s.opts?.replyTo === "om_t"));
   assert.match(logs.join("\n"), /跳过重复的提问 message=om_g：和 om_t/);
 });
@@ -1242,7 +1245,7 @@ test("群里那份副本先到时，停掉它的任务，改为回答话题里�
           signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
         });
       }
-      return Promise.resolve({ text: "追加好了", finish: "stop" });
+      return Promise.resolve({ text: "答案", finish: "stop" });
     },
   };
   const { sent, updates, handle } = setup({ model });
@@ -1257,7 +1260,7 @@ test("群里那份副本先到时，停掉它的任务，改为回答话题里�
     sent.filter((s) => "markdown" in s.input).map((s) => s.opts?.replyTo),
     ["om_t"],
   );
-  assert.deepEqual(markdowns(sent), ["追加好了"]);
+  assert.deepEqual(markdowns(sent), ["答案"]);
   // 副本的进度卡片（第一张）标成已停止
   assert.ok(updates.some((u) => u.messageId === "om_reply_1" && /已停止/.test(cardText(u.card))));
 });
@@ -1572,6 +1575,194 @@ test("跟聊接过来的没 @ 的话不给改文档、改代码的工具（写�
   await handle(message("停止", { messageId: "om_3", senderId: "ou_admin", rootId: "om_root" }), { unaddressed: true });
   assert.match(logs.join("\n"), /停止指令 message=om_3/);
   assert.equal(requests.length, 2);
+});
+
+test("回答里说这次改好了文档、代码：认得出来；说以前的、说现状的、说可以帮忙改的、说定时任务和记忆的不算", () => {
+  for (const [answer, said] of [
+    ["已在文档末尾加上「第二行」：确认卡片测试", "已在文档末尾加上"],
+    ["已把第二段改成“新的说明”。", "已把第二段改成"],
+    ["已追加到周报文档末尾", "已追加"],
+    ["好的，文档已更新：确认卡片测试", "文档已更新"],
+    ["已经帮你推送到分支 agenttag/fix-1", "已经帮你推送"],
+    ["帮你在文档里加上了第二行", "帮你在文档里加上了"],
+    ["好的，加上了：确认卡片测试", "加上了"],
+    ["代码已提交到 agenttag/fix-1", "代码已提交"],
+    // 写进文档的字里带着「经验」「定时任务」「记忆」，照样是改文档
+    ["已在文档末尾加上「排障经验」。", "已在文档末尾加上"],
+    ["已在文档末尾加上排障经验和定时任务的说明。", "已在文档末尾加上"],
+    ["已把这条经验加到文档末尾。", "已把这条经验加到"],
+    ["已把第二行加到文档末尾。", "已把第二行加到"],
+    // 后面跟着问句、写进去的字里带问号，说改好了的那一小句照样算
+    ["已在文档末尾加上第二行，需要我继续吗？", "已在文档末尾加上"],
+    ["已在文档里加上「是否更新？」。", "已在文档里加上"],
+  ] as const) {
+    assert.equal(changeClaim(answer), said, answer);
+  }
+  for (const answer of [
+    "这句没 @ 我，我只能看、不能改。要改请 @ 我直接说。",
+    "文档里现在只有「第一行」，还没有加上「第二行」。",
+    "之前已经加上了「第二行」，不用再加。",
+    "已提交的代码里没有这个改动。",
+    "配置文件已更新于 10-23，当时改的是超时时间。",
+    "改好了我会告诉你。",
+    "可以帮你在文档末尾加上，请 @ 我说一声。",
+    "已取消，文档没有改。",
+    "已读取文档，里面只有一行。",
+    "文档已建好：确认卡片测试，已共享给本群可编辑。",
+    "已修改定时任务 T2 的时间。",
+    "已更新群记忆 #3。",
+    // 否定、假设、在问的不算
+    "没有证据表明文档已更新。",
+    "如果文档已更新，就不用重复添加。",
+    "文档已更新了吗？",
+    // 引号里举例的不算
+    "你确认后，我才会回复「文档已更新」。",
+    // 说确认卡片发了的不算（卡片发了是真的，文档没改）
+    "确认卡片已提交，但你没有确认，这次没有修改文档。",
+  ]) {
+    assert.equal(changeClaim(answer), undefined, answer);
+  }
+  assert.equal(asksForChange("在这篇文档末尾加一句“第二行”"), true);
+  assert.equal(asksForChange("可以把第二行加到文档里吗"), true);
+  assert.equal(asksForChange("开个 MR"), true);
+  assert.equal(asksForChange("文档改好了吗"), false);
+  assert.equal(asksForChange("有没有把第二行加到文档里"), false);
+  assert.equal(asksForChange("gateway 最近报错多吗"), false);
+  // 问改过什么的不算叫它改
+  assert.equal(asksForChange("回顾一下，你对这篇文档做了哪些修改？"), false);
+  assert.equal(asksForChange("刚才那个分支改了什么"), false);
+  // 引号里要写进去的字带着「有没有」「了吗」，照样是叫它改
+  assert.equal(asksForChange("在文档末尾加一句“有没有异常”"), true);
+  assert.equal(asksForChange("在文档末尾加一句「改好了吗」"), true);
+});
+
+test("改群记忆里写着文档的那条、改成了：说「已更新群记忆中的文档链接」是真的，不打回", async () => {
+  const memoryUpdate: Tool = {
+    spec: { name: "memory_update", description: "memory_update", parameters: { type: "object", properties: {} } },
+    describe: () => "memory_update",
+    run: async () => "已更新 #2",
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已更新群记忆中的文档链接。", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "memory_update", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, taskTools: () => [memoryUpdate], writeAllowed: new Set(["ou_admin"]) });
+  await handle(message("把群记忆里的文档链接更新为新链接", { senderId: "ou_admin" }));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent).slice(-1), ["已更新群记忆中的文档链接。"]);
+});
+
+test("叫它切分支、切成了：说「已把当前分支改为 develop」是真的，不打回", async () => {
+  const branches: Tool = {
+    spec: { name: "code_branches", description: "code_branches", parameters: { type: "object", properties: { switch_to: { type: "string" } } } },
+    describe: () => "code_branches",
+    run: async () => "已切到 develop",
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已把当前分支改为 develop。", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_branches", arguments: JSON.stringify({ switch_to: "develop" }) }] },
+  );
+  const { sent, handle } = setup({ model, taskTools: () => [branches], writeAllowed: new Set(["ou_admin"]) });
+  await handle(message("把当前分支改为 develop", { senderId: "ou_admin" }));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent).slice(-1), ["已把当前分支改为 develop。"]);
+});
+
+test("没 @ 的跟聊叫它改文档，它没改却说改好了：打回一次，还这么说就不发，换成照实说没改", async () => {
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => "文档内容：第一行",
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_edit", true)];
+  const warnings: string[] = [];
+  // 2026-10-24：话题里没 @ 说「在这篇文档末尾加一句“第二行”」，读了一遍文档就回「已在文档末尾加上」
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已在文档末尾加上「第二行」：确认卡片测试", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "feishu_doc_read", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, taskTools, writeAllowed: new Set(["ou_admin"]), logger: { ...quiet, warn: (line: string) => warnings.push(line) } });
+  await handle(message("在这篇文档末尾加一句“第二行”", { senderId: "ou_admin", rootId: "om_root" }), { unaddressed: true });
+  assert.equal(requests.length, 3);
+  const redo = JSON.stringify(requests[2].messages.at(-1));
+  assert.match(redo, /你这次没有改文档、改代码的工具，什么都没改，回答里却说已经改了（「已在文档末尾加上」）/);
+  assert.match(redo, /要改请他 @ 你/);
+  assert.deepEqual(markdowns(sent).slice(-1), [BLOCKED_CHANGE_ANSWER]);
+  assert.match(warnings.join("\n"), /回答打回重做以后还是说改好了文档、代码，可这次没改成，没有发出 message=om_1/);
+
+  // 打回以后照实说了的照常发
+  let round = 0;
+  const honest = fakeModel(() =>
+    ++round === 1 ? { text: "已在文档末尾加上「第二行」", finish: "stop" } : { text: "这句没 @ 我，我没改。要改请 @ 我直接说。", finish: "stop" },
+  );
+  const second = setup({ model: honest.model, taskTools, writeAllowed: new Set(["ou_admin"]) });
+  await second.handle(message("在这篇文档末尾加一句“第二行”", { senderId: "ou_admin", rootId: "om_root" }), { unaddressed: true });
+  assert.equal(honest.requests.length, 2);
+  assert.deepEqual(markdowns(second.sent).slice(-1), ["这句没 @ 我，我没改。要改请 @ 我直接说。"]);
+});
+
+test("@ 了叫它改文档：改的工具调成了，说改好了照常发；有改的工具却没调就说改好了，打回时只叫它照实说、不叫它去改", async () => {
+  const edits: string[] = [];
+  const tool = (name: string, writes = false): Tool => ({
+    ...(writes ? { writes: true } : {}),
+    spec: { name, description: name, parameters: { type: "object", properties: {} } },
+    describe: () => name,
+    run: async () => {
+      if (writes) {
+        edits.push(name);
+      }
+      return "好了";
+    },
+  });
+  const taskTools = () => [tool("feishu_doc_read"), tool("feishu_doc_edit", true)];
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已在文档末尾加上「第二行」", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "feishu_doc_edit", arguments: "{}" }] },
+  );
+  const { sent, handle } = setup({ model, taskTools, writeAllowed: new Set(["ou_admin"]) });
+  await handle(message("在这篇文档末尾加一句“第二行”", { senderId: "ou_admin" }));
+  assert.deepEqual(edits, ["feishu_doc_edit"]);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent).slice(-1), ["已在文档末尾加上「第二行」"]);
+
+  // 没调就说改好了：打回只叫它照实说、问他要不要现在改，不叫它这时去调改的工具（他可能只是问改过什么）
+  const lazy = fakeModel((req) =>
+    req.messages.some((m) => m.role === "user" && m.content.includes("（系统检查）"))
+      ? { text: "这次还没改，要我现在在文档末尾加上「第二行」吗？", finish: "stop" }
+      : { text: "已在文档末尾加上「第二行」", finish: "stop" },
+  );
+  const again = setup({ model: lazy.model, taskTools, writeAllowed: new Set(["ou_admin"]) });
+  await again.handle(message("在这篇文档末尾加一句“第二行”", { messageId: "om_2", senderId: "ou_admin" }));
+  const note = JSON.stringify(lazy.requests[1].messages.at(-1));
+  assert.match(note, /照实说这次没改/);
+  assert.match(note, /这次不要为了这句话再去调改的工具/);
+  assert.doesNotMatch(note, /现在就调/);
+  assert.deepEqual(edits, ["feishu_doc_edit"]);
+  assert.deepEqual(markdowns(again.sent).slice(-1), ["这次还没改，要我现在在文档末尾加上「第二行」吗？"]);
+
+  // 改的工具跑了、出错了：可能改了一半（替换先插新内容再删旧的），照实说的不打回
+  const broken = (): Tool => ({
+    writes: true,
+    spec: { name: "feishu_doc_edit", description: "feishu_doc_edit", parameters: { type: "object", properties: {} } },
+    describe: () => "feishu_doc_edit",
+    run: async () => {
+      throw new Error("删除原文失败");
+    },
+  });
+  const partial = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已写入新内容，但删除原文失败，替换未完成。", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "feishu_doc_edit", arguments: "{}" }] },
+  );
+  const third = setup({ model: partial.model, taskTools: () => [tool("feishu_doc_read"), broken()], writeAllowed: new Set(["ou_admin"]) });
+  await third.handle(message("把文档第二段改成“第二行”", { messageId: "om_3", senderId: "ou_admin" }));
+  assert.equal(partial.requests.length, 2);
+  assert.deepEqual(markdowns(third.sent).slice(-1), ["已写入新内容，但删除原文失败，替换未完成。"]);
 });
 
 test("点「接着查」按钮问的只给读的工具（写权限名单里的人也一样），提示词说明是按钮问的", async () => {

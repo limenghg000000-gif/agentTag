@@ -815,6 +815,10 @@ async function runTask(
     const restored: EarlierResult[] = [];
     // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
     let mergedNow = false;
+    // code_branches 用 switch_to 切成了分支：不是改文档、改代码的工具，可「已把当前分支改为 develop」是真的
+    let switchedBranch = false;
+    // 过了确认、真的跑起来的工具（不管成没成）：改的工具跑到一半出错，文档可能已经动了（替换是先插新内容再删旧的，删失败时新内容留着），不能说什么都没改
+    const started = new Set<string>();
     // 这次读过本群的聊天记录（chat_history）：群里谁都能写字，读过以后不能再改已有的文档和代码（新建文档可以，内容大家都看得到）；
     // 群记忆只有这句话本身让记住、忘掉时才能记。和「带上群聊时只给读的工具」一个道理
     let readChat = false;
@@ -937,6 +941,7 @@ async function runTask(
           const code = isCodeTool(tool.spec.name);
           let facts: CodeFact[] = [];
           let output: string;
+          started.add(tool.spec.name);
           try {
             // writable：这次有改文档、改代码的工具，而且发起人这句话本身说了要改。建定时任务时记下来，到点跑的时候不会比建的时候权限大。
             // 任务内容是模型写的：建的人只说「每天汇总一下」，模型写成「汇总并更新周报文档」，到点也不能改；
@@ -955,6 +960,9 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+            switchedBranch = true;
+          }
           if (tool.spec.name === SCHEDULE_CREATE_TOOL || tool.spec.name === SCHEDULE_CHANGE_TOOL) {
             const done = output.match(SCHEDULE_RECEIPT)?.[0];
             if (done) {
@@ -1163,6 +1171,17 @@ async function runTask(
     const requestsKnown = () =>
       [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
     const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL), merged: () => mergedNow };
+    // 这次改了什么没有：改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并），切分支，记、改、删群记忆，建、改定时任务。
+    // 都没跑过的（没调、没点确认），回答说改好了就不是真的；改成了别的（「已更新群记忆中的文档链接」）不在这里查；
+    // 跑了出错的也不查：可能改了一半（「已写入新内容，但删除原文失败」），改没改说不准
+    const changeTools = new Set([
+      ...allTools.filter((tool) => tool.writes).map((tool) => tool.spec.name),
+      ...MEMORY_WRITE_TOOLS,
+      SCHEDULE_CREATE_TOOL,
+      SCHEDULE_CHANGE_TOOL,
+    ]);
+    const changedNow = () => switchedBranch || [...succeeded, ...started].some((name) => changeTools.has(name));
+    const reviewChange = reviewChangeClaims(question, taskTools.some((tool) => tool.writes), changedNow);
     const reviews = [
       ...(restate
         ? [reviewRestatedAnswer(saidBefore, restateScope)]
@@ -1179,6 +1198,8 @@ async function runTask(
       ...(restate || scheduled
         ? []
         : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, scheduleRan, () => scheduleTexts.join("\n"), toolNames, () => scheduleDone))]),
+      // 叫它改文档、改代码，这次一个改的工具都没跑（没调、没点确认），却说改好了：打回一次。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人改的）
+      ...(restate || scheduled ? [] : [(answer: string) => (readChat ? undefined : reviewChange(answer))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
       ...(streaming ? [reviewUiBlocks] : []),
@@ -1410,6 +1431,20 @@ async function runTask(
       logger.warn(`回答打回重做以后还是说建好、改好了定时任务，可这次没建成、没改成，没有发出 message=${msg.messageId}`);
       answer = blockedScheduleAnswer(scheduleDone);
     }
+    // 打回重做以后还是说改好了文档、代码，可这次一个改的工具都没调成：不发出去，不然他以为改好了
+    const blockedChange =
+      !restate &&
+      !scheduled &&
+      !readChat &&
+      result.finish !== "filtered" &&
+      answer !== BLOCKED_OPS_ANSWER &&
+      !blockedCode &&
+      !blockedSchedule &&
+      reviewChange(shown) !== undefined;
+    if (blockedChange) {
+      logger.warn(`回答打回重做以后还是说改好了文档、代码，可这次没改成，没有发出 message=${msg.messageId}`);
+      answer = BLOCKED_CHANGE_ANSWER;
+    }
     // 定时任务建的人说了「有异常 @ 我」：打回以后回答里还是写着报错条数、也没说不算异常，模型还是没调 @ 人的工具，程序照回答替它记上。
     // 2026-10-23 T6 查到 180 条报错，打回那次说的是代码没查证，模型补查完代码照样没调，ML 一直没被 @
     if (scheduled?.alert && !succeeded.has(SCHEDULE_ALERT_TOOL) && result.finish !== "filtered" && answer !== BLOCKED_OPS_ANSWER && !blockedCode) {
@@ -1420,7 +1455,7 @@ async function runTask(
       }
     }
     // 回答因为没查证被拦下时，思考里多半也是这些没查证的说法，卡片上不再留着；被模型服务的内容审核拦下时也一样
-    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || blockedSchedule || result.finish === "filtered") {
+    if (answer === BLOCKED_OPS_ANSWER || answer === BLOCKED_RESTATE_ANSWER || blockedCode || blockedSchedule || blockedChange || result.finish === "filtered") {
       state.thoughts = undefined;
     }
     state.phase = "done";
@@ -1429,7 +1464,7 @@ async function runTask(
     const verified = segmentsAsText(segments);
     deps.context.remember(msg, prompt, verified, labelUserMessage(context.askerName, askedFull || "（@ 了你，没有写别的内容）"));
     // 被拦下、被审核拦下的回答里没有结论，不记
-    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && !blockedSchedule && result.finish !== "filtered") {
+    if (answer !== BLOCKED_OPS_ANSWER && answer !== BLOCKED_RESTATE_ANSWER && !blockedCode && !blockedSchedule && !blockedChange && result.finish !== "filtered") {
       await rememberThread(deps, msg, asked, verified, context.askerName);
     }
   } catch (err) {
@@ -2958,6 +2993,102 @@ export function blockedScheduleAnswer(done: readonly string[]): string {
     "\n不用再建一次；要核对可以 @ 我问「这个群有哪些定时任务」。"
   );
 }
+
+/** 说做成了的改动：加、写、改、删文档内容，推代码、提交、合并。「建好」不在里面：「已建好定时任务 T3」说的是定时任务 */
+const CHANGE_DONE = String.raw`(?:加上|加了|加好|加到|加进|加入|添加|追加|插入|放到|放进|贴到|贴进|补上|补到|写入|写进|写到|写上|写好|改成|改为|改好|改了|修改|更新|替换|删除|删掉|删了|推送|推上|推到|提交|合并|合进|合到|合好)`;
+const CLAUSE_CHARS = String.raw`[^，,。；;！!？?\n]`;
+/**
+ * 回答里说这次改了文档、代码：「已在文档末尾加上「第二行」」「已把第二段改成…」「文档已更新」「帮你在文档里加上了」「好的，加上了：…」。
+ * 「之前已经改了」说的是以前的；「已提交的代码」「已修改过的文件」说的是现状；「可以帮你加上」「改好了我告诉你」「还没加上」都不是说改好了
+ */
+const CHANGED_CLAIM = new RegExp(
+  [
+    String.raw`(?<!之前|此前|以前|上次|原来|早先|刚才|刚刚|是否|有没有)已经?\s*(?:(?:帮你|给你|为你)\s*)?(?:(?:在|把|将|往|向|给)${CLAUSE_CHARS}{0,20}?)?${CHANGE_DONE}(?![的过于])`,
+    String.raw`(?:文档|文件|代码|内容|正文|末尾|分支)${CLAUSE_CHARS}{0,6}?已经?${CHANGE_DONE}(?![的过于])`,
+    String.raw`(?:帮你|给你|为你)\s*(?:(?:在|把|将|往|向)${CLAUSE_CHARS}{0,20}?)?(?:加|写|改|删|追加|插入|更新|替换|提交|推送|合并)(?:上|好|进|入|成|掉|到)?了(?![吗么没呢?？])`,
+    String.raw`(?:^|[，,。；;！!：:\s])(?:都|全)?(?:加上|加好|改好|写好|写上|删掉|删好|追加好|更新好)了(?=[，,。；;！!：:\s]|$)`,
+  ].join("|"),
+  "gm",
+);
+/**
+ * 说的是定时任务、群记忆、经验库这些（不归改文档、改代码的工具管，有各自的检查）：「已更新群记忆 #3」「已修改定时任务 T2 的时间」；
+ * 说的是确认卡片的（「确认卡片已提交，但你没有确认」：卡片发了是真的，文档没改）
+ */
+const OTHER_CHANGE = /定时任务|(?<![A-Za-z])T\d+|记忆|经验|卡片/;
+/** 这一小句说到了文档、代码：「已把这条经验加到文档末尾」照样是改文档 */
+const DOC_OR_CODE = /文档|文件|代码|分支|合并请求|(?<![A-Za-z])(?:MR|PR)(?![A-Za-z])/i;
+/** 这一小句前面是否定、假设、拿不准的：「没有证据表明文档已更新」「如果文档已更新，就不用再加」「不确定是否已追加」 */
+const NOT_ASSERTED = /没|不|未|别|无|非|如果|假如|要是|若|万一|是否|是不是|有没有|证据|以为|好像|似乎|可能|也许/;
+/** 在问的一小句（「文档已更新了吗？」） */
+const QUESTION_SENTENCE = /(?:[?？]|[吗么呢][。！!~～]?)\s*$/;
+/** 引号里的是要写进去的内容、别人的原话（「加一句“有没有异常”」），不算这句话本身在问 */
+const QUOTED = /“[^”]*”|"[^"\n]*"|「[^」]*」|『[^』]*』|‘[^’]*’/g;
+/** 问改了没有（「文档改好了吗」「有没有加上第二行」），不是叫它改 */
+const CHANGE_STATUS_QUESTION = new RegExp(
+  String.raw`了[吗么没]|(?:有没有|是否|是不是)${CLAUSE_CHARS}{0,12}?(?:改|加|写|删|更新|追加|插入|替换|提交|推|合)|没有[?？]?\s*$|(?:做|改|加|删|动|写)[了过]${CLAUSE_CHARS}{0,6}?(?:哪|什么|啥|几处)`,
+);
+
+const CHANGED_CLAUSE_BREAK = /[，,；;：:]/;
+/**
+ * 回答里第一处说这次改好了文档、代码的话；没有返回 undefined。
+ * 说的是定时任务、群记忆、经验的那一小句不算（写进文档的字里带着这些词的照样算）；在问的一句不算；这一小句里说法前面是否定、假设、拿不准的不算
+ */
+export function changeClaim(answer: string): string | undefined {
+  // 引号里的字（写进去的内容「是否更新？」、举例的「文档已更新」）先换成占位的，不当成说法，也不当成问句、断句
+  const masked = answer.replace(QUOTED, (quote) => quote[0] + "＿".repeat(quote.length - 2) + quote.at(-1));
+  for (const sentence of masked.split(/(?<=[。！!？?\n])/)) {
+    for (const match of sentence.matchAll(CHANGED_CLAIM)) {
+      const said = match[0].replace(/^[，,。；;！!：:\s]+/, "");
+      const at = match.index + match[0].length - said.length;
+      const before = sentence.slice(0, at).split(CHANGED_CLAUSE_BREAK).at(-1) ?? "";
+      // 说法所在的这一小句：在问的（「文档已更新了吗？」）不算，「已加上第二行，需要我继续吗？」前一小句照样算；
+      // 说的是定时任务、群记忆、经验，又没说到文档、代码的，归它们自己的检查
+      const clause = before + sentence.slice(at).split(CHANGED_CLAUSE_BREAK)[0];
+      if (!NOT_ASSERTED.test(before) && !QUESTION_SENTENCE.test(clause) && !(OTHER_CHANGE.test(clause) && !DOC_OR_CODE.test(clause))) {
+        return said;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** 发起人这句话本身叫它改文档、改代码、开合并请求（和给不给改的工具用同一套判断）；问改了没有的不算，引号里要写进去的字不算 */
+export function asksForChange(question: string): boolean {
+  return (
+    (CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question) || asksToOpenRequest(question)) &&
+    !CHANGE_STATUS_QUESTION.test(question.replace(QUOTED, "“”"))
+  );
+}
+
+/**
+ * 叫它改文档、改代码，这次一个改的工具都没跑（没调、没点确认），回答却说改好了：打回一次，叫它照实说。
+ * 2026-10-24 在话题里没 @ 说「在这篇文档末尾加一句“第二行”」：没 @ 的跟聊只给读的工具，它读了一遍文档，回「已在文档末尾加上「第二行」」，其实没改。
+ * 打回只叫它照实改回答、不叫它这时去调改的工具（跟定时任务那道一样）：他可能只是问「你对这篇文档做了哪些修改」，话题里别人的话也在上下文里，借打回去改就成了替他做没叫做的事。
+ * canChange：这次有改的工具（有的话叫它问他要不要现在改，不是没 @ 改不了）；changed 在检查时再取，这次调成的才算
+ */
+export function reviewChangeClaims(question: string, canChange: boolean, changed: () => boolean) {
+  const asked = asksForChange(question);
+  return (answer: string): string | undefined => {
+    if (!asked || changed()) {
+      return undefined;
+    }
+    const said = changeClaim(answer);
+    if (said === undefined) {
+      return undefined;
+    }
+    return (
+      (canChange
+        ? `（系统检查）你这次没有改文档、改代码（没调改的工具，或者他没点确认），回答里却说已经改了（「${said}」）。` +
+          "照实说这次没改（没调还是他没点确认）；这次不要为了这句话再去调改的工具，他要改的话问他要不要现在改。"
+        : `（系统检查）你这次没有改文档、改代码的工具，什么都没改，回答里却说已经改了（「${said}」）。` +
+          "照实说这次没改；要改请他 @ 你，直接说改哪篇文档或哪段代码、改成什么。") +
+      "其余内容不用改，重新给出完整的回答，不要提这段检查。"
+    );
+  };
+}
+
+export const BLOCKED_CHANGE_ANSWER =
+  "这次没有改动文档或代码（回答里说改好了，其实没改成，为免误导没有发出来）。要改请 @ 我，说清改哪篇文档或哪段代码、改成什么；改已有的文档、推代码之前我会发卡片请你确认。";
 
 // 回答里像线上数据的写法分三类，OPS_DATA 是三类合起来。打回重做（reviewOpsAnswer）三类都认；
 // 重做后的最后一道检查（blockUnverifiedOps）：Pod 名、定位结果有就拦；时间一般也是有就拦，问的是时间本身（换算、时区、格式）时
