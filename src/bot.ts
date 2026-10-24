@@ -2985,7 +2985,7 @@ export function blockedScheduleAnswer(done: readonly string[]): string {
 }
 
 /** 说做成了的改动：加、写、改、删文档内容，推代码、提交、合并。「建好」不在里面：「已建好定时任务 T3」说的是定时任务 */
-const CHANGE_DONE = String.raw`(?:加上|加了|加好|添加|追加|插入|写入|写进|写上|写好|改成|改为|改好|改了|修改|更新|替换|删除|删掉|删了|推送|推上|推到|提交|合并|合进|合到|合好)`;
+const CHANGE_DONE = String.raw`(?:加上|加了|加好|加到|加进|加入|添加|追加|插入|放到|放进|贴到|贴进|补上|补到|写入|写进|写到|写上|写好|改成|改为|改好|改了|修改|更新|替换|删除|删掉|删了|推送|推上|推到|提交|合并|合进|合到|合好)`;
 const CLAUSE_CHARS = String.raw`[^，,。；;！!？?\n]`;
 /**
  * 回答里说这次改了文档、代码：「已在文档末尾加上「第二行」」「已把第二段改成…」「文档已更新」「帮你在文档里加上了」「好的，加上了：…」。
@@ -3002,6 +3002,8 @@ const CHANGED_CLAIM = new RegExp(
 );
 /** 说的是定时任务、群记忆、经验库这些（不归改文档、改代码的工具管，有各自的检查）：「已更新群记忆 #3」「已修改定时任务 T2 的时间」 */
 const OTHER_CHANGE = /定时任务|(?<![A-Za-z])T\d+|记忆|经验/;
+/** 这一小句说到了文档、代码：「已把这条经验加到文档末尾」照样是改文档 */
+const DOC_OR_CODE = /文档|文件|代码|分支|合并请求|(?<![A-Za-z])(?:MR|PR)(?![A-Za-z])/i;
 /** 这一小句前面是否定、假设、拿不准的：「没有证据表明文档已更新」「如果文档已更新，就不用再加」「不确定是否已追加」 */
 const NOT_ASSERTED = /没|不|未|别|无|非|如果|假如|要是|若|万一|是否|是不是|有没有|证据|以为|好像|似乎|可能|也许/;
 /** 在问的一句（「文档已更新了吗？」） */
@@ -3013,20 +3015,23 @@ const CHANGE_STATUS_QUESTION = new RegExp(
   String.raw`了[吗么没]|(?:有没有|是否|是不是)${CLAUSE_CHARS}{0,12}?(?:改|加|写|删|更新|追加|插入|替换|提交|推|合)|没有[?？]?\s*$`,
 );
 
+const CHANGED_CLAUSE_BREAK = /[，,；;：:]/;
 /**
  * 回答里第一处说这次改好了文档、代码的话；没有返回 undefined。
- * 说的是定时任务、群记忆、经验的那一句不算；在问的一句不算；这一小句里说法前面是否定、假设、拿不准的不算
+ * 说的是定时任务、群记忆、经验的那一小句不算（写进文档的字里带着这些词的照样算）；在问的一句不算；这一小句里说法前面是否定、假设、拿不准的不算
  */
 export function changeClaim(answer: string): string | undefined {
   for (const sentence of answer.split(/(?<=[。！!？?\n])/)) {
-    if (OTHER_CHANGE.test(sentence) || QUESTION_SENTENCE.test(sentence)) {
+    if (QUESTION_SENTENCE.test(sentence)) {
       continue;
     }
     for (const match of sentence.matchAll(CHANGED_CLAIM)) {
       const said = match[0].replace(/^[，,。；;！!：:\s]+/, "");
       const at = match.index + match[0].length - said.length;
-      const clause = sentence.slice(0, at).split(/[，,；;：:]/).at(-1) ?? "";
-      if (!NOT_ASSERTED.test(clause)) {
+      const before = sentence.slice(0, at).split(CHANGED_CLAUSE_BREAK).at(-1) ?? "";
+      // 说法所在的这一小句（引号里写进去的字不算）说的是定时任务、群记忆、经验，又没说到文档、代码的，归它们自己的检查
+      const clause = (before + sentence.slice(at).split(CHANGED_CLAUSE_BREAK)[0]).replace(QUOTED, "「」");
+      if (!NOT_ASSERTED.test(before) && !(OTHER_CHANGE.test(clause) && !DOC_OR_CODE.test(clause))) {
         return said;
       }
     }
