@@ -342,7 +342,22 @@ test("没改什么点下一步：说一声，不出核对", async () => {
   const card = t.sent[0]!.messageId;
   await t.click(card, "next", "ou_owner", keepAll);
   assert.match(text(t.cards.get(card)), /和现在的设置一样，没有要改的/);
+  assert.match(afterForm(t.cards.get(card)), /⚠️.*和现在的设置一样/, "写在「下一步」正下方，不写在长表单上面");
+
+  // 管理员名单也一样：选的和现在的一样
+  await t.say("配置 管理员", "ou_owner");
+  const admins = t.sent.at(-1)!.messageId;
+  await t.click(admins, "next", "ou_owner", { admins: [] });
+  assert.match(afterForm(t.cards.get(admins)), /⚠️.*和现在的名单一样，没有要改的/);
 });
+
+/** 卡片上紧跟在表单后面的那个组件 */
+function afterForm(card: Record<string, unknown> | undefined): string {
+  const elements = (card as { body: { elements: Array<{ tag?: string }> } }).body.elements;
+  const at = elements.findIndex((element) => element.tag === "form");
+  assert.ok(at >= 0, "卡片上有表单");
+  return JSON.stringify(elements[at + 1]);
+}
 
 test("没读到表单里的值（没开原始事件）：请再点一次，不改", async () => {
   const t = await setup();
