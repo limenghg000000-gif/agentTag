@@ -443,7 +443,7 @@ export class AdminDesk {
     }
     // 换个编号重画：同一个按钮还能再点（飞书 SDK 按按钮内容去重），顺带刷新各群现在的设置
     await this.render(session);
-    // 读群成员要一会儿，放到后台，回调马上返回
+    // 读群成员要一会儿，放到后台：这张卡片先换好
     void next
       .then((opened) => this.publish(opened, session.cardMessageId))
       .catch((err: unknown) => this.unsent(err, session.home, session.cardMessageId));
@@ -897,7 +897,13 @@ export class AdminDesk {
   }
 
   private async update(messageId: string, card: object): Promise<void> {
-    await this.opts.updateCard(messageId, card).catch((err: unknown) => this.logger.warn("管理群：更新设置卡片失败", err));
+    try {
+      await this.opts.updateCard(messageId, card);
+      // 改好了也记一行：点了没看到变化时，分得清是没改上还是飞书那边没刷出来
+      this.logger.info(`管理群：设置卡片改好了 card=${messageId}`);
+    } catch (err) {
+      this.logger.warn(`管理群：更新设置卡片失败 card=${messageId}`, err);
+    }
   }
 
   /** 改的那个管理群里另发一条：谁改了什么（卡片更新了群里不提醒） */

@@ -5,7 +5,7 @@ import { AdminDesk } from "./admin.js";
 import { MissedEventAlarm } from "./alarm.js";
 import { parseReleaseNotes, UpdateAnnouncer } from "./announce.js";
 import { MemoryBackup } from "./backup.js";
-import { type ChatScope, createCardActionHandler, createMessageHandler } from "./bot.js";
+import { type ChatScope, createCardActionHandler, createMessageHandler, dispatchCardAction } from "./bot.js";
 import { CardAnswerStore } from "./card-answers.js";
 import { CatchUpPoller, HandledMessages } from "./catchup.js";
 import { FEATURES_FILE, loadConfig, RELEASE_NOTES_FILE } from "./config.js";
@@ -528,17 +528,20 @@ const followUp = createFollowUp({
   },
 });
 const onCardAction = createCardActionHandler({ tasks, allowedChatIds: groups.allowed, followUp, ...(knowledge ? { knowledge } : {}) });
-channel.on("cardAction", async (evt) => {
-  // 确认卡片上的按钮：只认提问的人点的，点了马上放行（话题里的任务正等着）
-  if (await confirms?.handleCardAction(evt)) {
-    return;
-  }
-  // 管理群设置卡片上的按钮先看（管理群不在白名单里也认）
-  if (await admin?.handleCardAction(evt)) {
-    return;
-  }
-  await onCardAction(evt);
-});
+// 每次点都记一行，先回飞书再处理（见 dispatchCardAction）
+channel.on("cardAction", (evt) =>
+  dispatchCardAction(evt, async () => {
+    // 确认卡片上的按钮：只认提问的人点的，点了马上放行（话题里的任务正等着）
+    if (await confirms?.handleCardAction(evt)) {
+      return;
+    }
+    // 管理群设置卡片上的按钮先看（管理群不在白名单里也认）
+    if (await admin?.handleCardAction(evt)) {
+      return;
+    }
+    await onCardAction(evt);
+  }),
+);
 // 有人给机器人没被 @ 时说的话点了表情：算有人理（要在飞书开发者后台订阅「消息被 reaction」事件才收得到，没订阅就只看回复和 @）
 channel.on("reaction", (evt) => proactive.noteReaction(evt.messageId, evt.operator.openId, evt.emojiType, evt.action));
 channel.on("error", (err) => console.error(`[feishu] ${err.code}: ${err.message}`));

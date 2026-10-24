@@ -3557,6 +3557,34 @@ function applyEvent(state: ProgressState, event: Extract<AgentEvent, { type: "to
   }
 }
 
+/**
+ * 卡片按钮回调：每次点都记一行日志，马上回飞书，处理（改卡片、放行等着确认的任务、接着问）放到回调回完以后。
+ * 飞书要回调几秒内回应，飞书 SDK 要等处理函数跑完才回应；处理里要找点的人的名字、调接口改同一张卡片，
+ * 拖在回调里可能点了没反应。先回应、再调接口改卡片是飞书推荐的做法
+ */
+export function dispatchCardAction(
+  evt: CardActionEvent,
+  handle: (evt: CardActionEvent) => Promise<void>,
+  logger: Logger = console,
+  defer: (run: () => void) => void = (run) => void setTimeout(run, 0),
+): void {
+  logger.info(describeCardClick(evt));
+  defer(() => {
+    handle(evt).catch((err: unknown) => logger.error(`卡片按钮处理失败 card=${evt.messageId}`, err));
+  });
+}
+
+/** 日志里的一行：哪种卡片的哪个按钮、带没带表单、谁在哪张卡片上点的（按钮里的提问原文这类不打） */
+export function describeCardClick(evt: CardActionEvent): string {
+  const value = typeof evt.action.value === "object" && evt.action.value !== null ? (evt.action.value as Record<string, unknown>) : {};
+  const kind = typeof value.action === "string" ? value.action : "没有标记";
+  const op = typeof value.op === "string" ? ` op=${value.op}` : "";
+  const button = `${evt.action.tag}${evt.action.name ? `/${evt.action.name}` : ""}`;
+  const raw = evt.raw as { action?: { form_value?: unknown } } | undefined;
+  const form = raw?.action?.form_value !== undefined ? " 带表单" : "";
+  return `卡片按钮：${kind}${op}（${button}${form}） card=${evt.messageId} chat=${evt.chatId} operator=${evt.operator.openId}`;
+}
+
 export interface CardActionDeps {
   tasks: TaskRegistry;
   allowedChatIds: ReadonlySet<string>;
