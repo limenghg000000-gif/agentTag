@@ -20,6 +20,8 @@ import {
   createCardActionHandler,
   createMessageHandler,
   DEFLECTED_ANSWER,
+  describeCardClick,
+  dispatchCardAction,
   madeUpRequestAnswer,
   madeUpRequestRefs,
   mergedClaimAnswer,
@@ -440,6 +442,39 @@ test("点卡片上的停止按钮停掉对应任务", async () => {
   assert.deepEqual(markdowns(sent), []);
   assert.match(cardText(updates.at(-1)!.card), /已停止/);
   assert.equal(deps.tasks.size, 0);
+});
+
+test("点卡片按钮：先记一行、回调马上回，处理放到回调回完以后；处理出错记日志", async () => {
+  const lines: string[] = [];
+  const logger = { info: (line: string) => lines.push(`info ${line}`), warn() {}, error: (line: string) => lines.push(`error ${line}`) };
+  const later: Array<() => void> = [];
+  const handled: string[] = [];
+  const click: CardActionEvent = {
+    messageId: "om_card",
+    chatId: "oc_admin",
+    operator: { openId: "ou_1" },
+    action: { tag: "button", name: "submit", value: { action: "settings", card: "c1", op: "next", r: "0" } },
+    raw: { action: { form_value: { admins: ["ou_2"] } } },
+  };
+
+  dispatchCardAction(click, async (evt) => void handled.push(evt.messageId), logger, (run) => later.push(run));
+  assert.deepEqual(lines, ["info 卡片按钮：settings op=next（button/submit 带表单） card=om_card chat=oc_admin operator=ou_1"]);
+  assert.deepEqual(handled, [], "回调回完之前不处理");
+  later.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(handled, ["om_card"]);
+
+  dispatchCardAction(click, async () => Promise.reject(new Error("改卡片失败")), logger, (run) => later.push(run));
+  later.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lines.at(-1), "error 卡片按钮处理失败 card=om_card");
+});
+
+test("点卡片按钮的日志不打按钮里带的提问原文，没标记的按钮也记", () => {
+  const ask: CardActionEvent = { messageId: "om_a", chatId: "oc_1", operator: { openId: "ou_1" }, action: { tag: "button", value: { action: "ask", q: "gateway-api 为什么报错" } } };
+  assert.equal(describeCardClick(ask), "卡片按钮：ask（button） card=om_a chat=oc_1 operator=ou_1");
+  const bare: CardActionEvent = { messageId: "om_b", chatId: "oc_1", operator: { openId: "ou_1" }, action: { tag: "unknown", value: undefined } };
+  assert.equal(describeCardClick(bare), "卡片按钮：没有标记（unknown） card=om_b chat=oc_1 operator=ou_1");
 });
 
 test("经验库确认卡片的按钮先交给经验库处理，处理了就不再当停止按钮看", async () => {
