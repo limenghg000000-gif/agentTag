@@ -496,9 +496,8 @@ channel.on("message", async (msg: NormalizedMessage) => {
     return;
   }
   if (!msg.mentionedBot) {
-    // 管理群里整句就是「配置…」的：不 @ 也回设置卡片（别的话照下面的规矩）
-    if (await admin?.handleUnaddressed(msg)) {
-      handled.claim(msg.messageId);
+    // 管理群里整句就是「配置…」的：不 @ 也回设置卡片，回之前先占住这条，补漏轮询不会再交给模型（别的话照下面的规矩）
+    if (await admin?.handleUnaddressed(msg, (messageId) => handled.claim(messageId))) {
       return;
     }
     // 没 @ 机器人的：只看跟聊在跟的话题里的、打开了主动接话的群主界面的，别的（包括白名单外的群）一律不管，也不记日志

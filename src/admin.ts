@@ -192,9 +192,10 @@ export class AdminDesk {
 
   /**
    * 管理群里没 @ 机器人的话：整句就是「配置」「配置 管理员」，或者「配置 群名」对得上群的，和 @ 了一样回设置卡片。
-   * 别的不管、不回（管理群也是平时说话的群，「配置一下测试环境」这类不当成要卡片）
+   * 别的不管、不回（管理群也是平时说话的群，「配置一下测试环境」这类不当成要卡片），返回 false 照别的规矩走。
+   * 是「配置」时先 claim 这条：补漏轮询已经处理过的（claim 返回 false）不再回卡片，也不交给别处
    */
-  async handleUnaddressed(msg: NormalizedMessage): Promise<boolean> {
+  async handleUnaddressed(msg: NormalizedMessage, claim: (messageId: string) => boolean): Promise<boolean> {
     if (!this.opts.chatIds.has(msg.chatId) || msg.mentionedBot) {
       return false;
     }
@@ -206,7 +207,9 @@ export class AdminDesk {
     if (query && !ADMINS_QUERY.test(query) && !(await this.names(query))) {
       return false;
     }
-    await this.answer(msg, query);
+    if (claim(msg.messageId)) {
+      await this.answer(msg, query);
+    }
     return true;
   }
 

@@ -125,7 +125,7 @@ async function setup(
     },
     say: (content: string, sender = "ou_owner", chatId = ADMIN_CHAT, mentionedBot = true) => desk.handleMessage(message(content, sender, chatId, mentionedBot)),
     /** 群里没 @ 机器人说的 */
-    hear: (content: string, sender = "ou_owner", chatId = ADMIN_CHAT) => desk.handleUnaddressed(message(content, sender, chatId, false)),
+    hear: (content: string, sender = "ou_owner", chatId = ADMIN_CHAT, claim: (messageId: string) => boolean = () => true) => desk.handleUnaddressed(message(content, sender, chatId, false), claim),
     /** 点卡片上的按钮：按 op 在卡片里找按钮；在卡片发到的那个群里点 */
     click: async (messageId: string, op: string, operator: string, form?: Record<string, unknown>, extra: Record<string, string> = {}) => {
       const card = cards.get(messageId);
@@ -264,8 +264,21 @@ test("管理群里不 @ 也能说「配置」：整句是「配置」「配置 �
   assert.equal(await t.hear("设置 测试环境"), false, "对不上群的不回总览");
   assert.equal(await t.hear("帮我查下日志"), false, "别的话也不回怎么用");
   assert.equal(await t.hear("配置", "ou_owner", "oc_ops"), false, "不是管理群的不管");
-  assert.equal(await t.desk.handleUnaddressed(message("配置", "ou_owner", ADMIN_CHAT, true)), false, "@ 了的归 handleMessage");
+  assert.equal(await t.desk.handleUnaddressed(message("配置", "ou_owner", ADMIN_CHAT, true), () => true), false, "@ 了的归 handleMessage");
   assert.equal(t.sent.length, 3);
+
+  // 补漏轮询已经处理过这条：不再回卡片，也不交给别处
+  const claimed: string[] = [];
+  const taken = (messageId: string) => {
+    claimed.push(messageId);
+    return false;
+  };
+  assert.equal(await t.hear("配置", "ou_owner", ADMIN_CHAT, taken), true);
+  assert.equal(claimed.length, 1);
+  assert.equal(t.sent.length, 3);
+  // 不是「配置」的不占
+  assert.equal(await t.hear("帮我查下日志", "ou_owner", ADMIN_CHAT, taken), false);
+  assert.equal(claimed.length, 1);
 });
 
 test("「配置 群名」直接打开那个群；GROUPS 里的名字也认；对不上的回总览并说一句", async () => {
