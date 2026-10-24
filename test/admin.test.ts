@@ -11,6 +11,8 @@ import { GroupSettings } from "../src/settings.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 const ADMIN_CHAT = "oc_admin";
+/** 另一个管理群：只有所有者自己，自己试用 */
+const MINE = "oc_mine";
 
 const env = {
   FEISHU_APP_ID: "cli_x",
@@ -43,6 +45,8 @@ async function setup(
     chats?: () => Promise<string[]>;
     /** 飞书拒收卡片（比如卡片写错了） */
     rejectCards?: boolean;
+    /** 管理群，不填只有 ADMIN_CHAT */
+    adminChats?: string[];
   } = {},
 ) {
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), "agenttag-admin-")), "settings");
@@ -54,12 +58,12 @@ async function setup(
   const cards = new Map<string, Record<string, unknown>>();
   const saved: string[] = [];
   let now = 1_000_000;
-  const names: Record<string, string> = { oc_ops: "运营群", oc_test: "测试群", oc_plain: "产品群", oc_new: "新群", [ADMIN_CHAT]: "管理群" };
-  const members: Record<string, string[]> = { oc_ops: ["ou_a", "ou_b", "ou_c"], oc_new: ["ou_n1", "ou_n2"], [ADMIN_CHAT]: ["ou_owner", "ou_admin", "ou_x"] };
+  const names: Record<string, string> = { oc_ops: "运营群", oc_test: "测试群", oc_plain: "产品群", oc_new: "新群", [ADMIN_CHAT]: "管理群", [MINE]: "自测群" };
+  const members: Record<string, string[]> = { oc_ops: ["ou_a", "ou_b", "ou_c"], oc_new: ["ou_n1", "ou_n2"], [ADMIN_CHAT]: ["ou_owner", "ou_admin", "ou_x"], [MINE]: ["ou_owner"] };
   // 机器人在的群：白名单里的三个、管理群，还有一个没开通的新群
   const chats = opts.chats ?? (async () => ["oc_test", "oc_ops", "oc_plain", ADMIN_CHAT, "oc_new"]);
   const desk = new AdminDesk({
-    chatId: ADMIN_CHAT,
+    chatIds: new Set(opts.adminChats ?? [ADMIN_CHAT]),
     owners: new Set(["ou_owner"]),
     settings,
     groups,
@@ -115,13 +119,14 @@ async function setup(
       now += ms;
     },
     say: (content: string, sender = "ou_owner", chatId = ADMIN_CHAT, mentionedBot = true) => desk.handleMessage(message(content, sender, chatId, mentionedBot)),
-    /** 点卡片上的按钮：按 op 在卡片里找按钮 */
+    /** 点卡片上的按钮：按 op 在卡片里找按钮；在卡片发到的那个群里点 */
     click: async (messageId: string, op: string, operator: string, form?: Record<string, unknown>, extra: Record<string, string> = {}) => {
       const card = cards.get(messageId);
       assert.ok(card, `没有卡片 ${messageId}`);
       const value = findButton(card, op, extra);
       assert.ok(value, `卡片上没有 ${op} 按钮：${JSON.stringify(card)}`);
-      return desk.handleCardAction(cardEvent(messageId, value, operator, form));
+      const chatId = sent.find((item) => item.messageId === messageId)?.to ?? ADMIN_CHAT;
+      return desk.handleCardAction(cardEvent(messageId, value, operator, form, chatId));
     },
   };
 }
@@ -441,6 +446,45 @@ test("管理员名单：只有所有者能加减；加上的管理员能改各�
   await t.click(group, "next", "ou_admin", { ...keepAll, proactive: "on" });
   await t.click(group, "confirm", "ou_admin");
   assert.deepEqual(t.settings.override("oc_test"), { proactive: true });
+});
+
+test("管理群可以有几个：哪个里面都能改，卡片和改动通知只发在说「配置」的那个群；管理员从各个管理群的人里选；管理群都不算没开通的群", async () => {
+  const t = await setup({ adminChats: [ADMIN_CHAT, MINE], chats: async () => ["oc_test", "oc_ops", "oc_plain", ADMIN_CHAT, MINE, "oc_new"] });
+  await t.say("配置 运营群", "ou_owner", MINE);
+  const card = t.sent[0]!;
+  assert.equal(card.to, MINE);
+  await t.click(card.messageId, "next", "ou_owner", { ...keepAll, proactive: "on" });
+  await t.click(card.messageId, "confirm", "ou_owner");
+  assert.deepEqual(t.settings.override("oc_ops"), { proactive: true });
+  assert.match(text(t.sent.at(-1)!.card), /改了「运营群」的设置/);
+  assert.deepEqual(
+    t.sent.map((item) => item.to),
+    [MINE, MINE],
+    "通知只发在自测群，不吵大家用的管理群",
+  );
+  // 卡片在自测群里，拿到别的管理群里点（编号对得上也不认）：不改
+  await t.say("配置 测试群", "ou_owner", MINE);
+  const other = t.sent.at(-1)!.messageId;
+  const next = findButton(t.cards.get(other), "next", {})!;
+  await t.desk.handleCardAction(cardEvent(other, next, "ou_owner", { ...keepAll, proactive: "on" }, ADMIN_CHAT));
+  assert.match(text(t.cards.get(other)), /已经失效/);
+  assert.equal(t.settings.override("oc_test"), undefined);
+
+  // 自测群里只有所有者自己：管理员照样能从大家用的管理群的人里选
+  await t.say("配置 管理员", "ou_owner", MINE);
+  const admins = t.sent.at(-1)!.messageId;
+  await t.click(admins, "next", "ou_owner", { admins: ["ou_admin"] });
+  await t.click(admins, "confirm", "ou_owner");
+  assert.deepEqual([...t.settings.admins()], ["ou_admin"]);
+  // 两个管理群都不当成要开通的群，「配置 群编号」也打不开
+  await t.say("配置", "ou_owner", ADMIN_CHAT);
+  const overview = t.sent.at(-1)!;
+  assert.equal(overview.to, ADMIN_CHAT);
+  assert.equal(findButton(overview.card, "open", { chat: MINE }), undefined);
+  assert.equal(findButton(overview.card, "open", { chat: ADMIN_CHAT }), undefined);
+  assert.ok(findButton(overview.card, "open", { chat: "oc_new" }));
+  await t.say(`配置 ${MINE}`, "ou_owner", ADMIN_CHAT);
+  assert.doesNotMatch(text(t.sent.at(-1)!.card), /「自测群」的设置/);
 });
 
 test("管理员名单：群里有人可选时卡片照样发得出去（表单和选人框不重名）", async () => {

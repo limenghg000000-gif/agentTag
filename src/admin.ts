@@ -35,8 +35,11 @@ const HINT =
 const EXPIRED = "这张卡片已经失效（机器人重启过，或者已经处理完了）。在管理群里 @ 我说「配置」重新打开";
 
 export interface AdminDeskOptions {
-  /** 管理群的 chat_id：只在这个群里回设置卡片、认卡片上的按钮 */
-  chatId: string;
+  /**
+   * 管理群的 chat_id（可以有几个）：只在这些群里回设置卡片、认卡片上的按钮。
+   * 卡片发在说「配置」的那个群里，改好的通知也只发在那个群里（不吵别的管理群），各群都记进改动记录
+   */
+  chatIds: ReadonlySet<string>;
   /** 所有者（.env 里的 CONFIG_OWNERS）：能改各群的设置，也能加减管理员 */
   owners: ReadonlySet<string>;
   settings: GroupSettings;
@@ -69,6 +72,8 @@ interface Person {
 
 interface BaseSession {
   id: string;
+  /** 卡片发在哪个管理群：只认这个群里点的，改好的通知也发在这里 */
+  home: string;
   createdAt: number;
   /** 卡片消息；发出去以后才有 */
   cardMessageId?: string;
@@ -117,7 +122,7 @@ interface AdminsSession extends BaseSession {
   kind: "admins";
   version: number;
   draft: string[];
-  /** 能选的人：管理群的成员，加上已经是管理员的 */
+  /** 能选的人：各个管理群的成员，加上已经是管理员的 */
   people: string[];
   peopleNote?: string;
   view: "form" | "review";
@@ -170,7 +175,7 @@ export class AdminDesk {
    * 不是管理群的、没 @ 的，和管理群也在白名单里时的别的话，返回 false，照常处理
    */
   async handleMessage(msg: NormalizedMessage): Promise<boolean> {
-    if (msg.chatId !== this.opts.chatId || !msg.mentionedBot) {
+    if (!this.opts.chatIds.has(msg.chatId) || !msg.mentionedBot) {
       return false;
     }
     const match = COMMAND.exec(msg.content);
@@ -185,19 +190,19 @@ export class AdminDesk {
     const query = match[1]?.trim();
     this.logger.info(`管理群：${opener.openId} 说了「配置${query ? ` ${query}` : ""}」`);
     try {
-      await this.publish(await this.open(query, opener), msg.messageId);
+      await this.publish(await this.open(msg.chatId, query, opener), msg.messageId);
     } catch (err) {
-      await this.unsent(err, msg.messageId);
+      await this.unsent(err, msg.chatId, msg.messageId);
     }
     return true;
   }
 
   /** 设置卡片没发出去：记日志，管理群里回一句，免得点了、说了以后什么都没有 */
-  private async unsent(err: unknown, replyTo: string | undefined): Promise<void> {
+  private async unsent(err: unknown, home: string, replyTo: string | undefined): Promise<void> {
     this.logger.error("管理群：设置卡片没发出去", err);
     const reason = describe(err).replace(/\s+/g, " ").slice(0, 200);
     await this.opts
-      .send(this.opts.chatId, { markdown: `设置卡片没发出去（${reason}），设置没改。请稍后再试，还不行就把这句话发给维护机器人的人。` }, replyTo ? { replyTo } : undefined)
+      .send(home, { markdown: `设置卡片没发出去（${reason}），设置没改。请稍后再试，还不行就把这句话发给维护机器人的人。` }, replyTo ? { replyTo } : undefined)
       .catch((sendErr: unknown) => this.logger.warn("管理群：回卡片没发出去失败", sendErr));
   }
 
@@ -207,11 +212,11 @@ export class AdminDesk {
     if (value?.action !== SETTINGS_ACTION || typeof value.op !== "string") {
       return false;
     }
-    if (evt.chatId !== this.opts.chatId) {
+    if (!this.opts.chatIds.has(evt.chatId)) {
       return true;
     }
     const session = typeof value.card === "string" ? this.sessions.get(value.card) : undefined;
-    if (!session || (session.cardMessageId && session.cardMessageId !== evt.messageId)) {
+    if (!session || session.home !== evt.chatId || (session.cardMessageId && session.cardMessageId !== evt.messageId)) {
       this.logger.info(`管理群：设置卡片已失效 card=${String(value.card)} operator=${evt.operator.openId}`);
       await this.update(evt.messageId, closedCard("已失效", EXPIRED, "grey"));
       return true;
@@ -240,25 +245,25 @@ export class AdminDesk {
    * 「配置」后面跟的：没有是总览，「管理员」是管理员名单，群名（或 chat_id、GROUPS 里的名字）对上一个就直接打开那个群，
    * 还没开通的群打开就是开通
    */
-  private async open(query: string | undefined, opener: Person): Promise<Session> {
+  private async open(home: string, query: string | undefined, opener: Person): Promise<Session> {
     if (query && ADMINS_QUERY.test(query)) {
-      return this.adminsSession(opener);
+      return this.adminsSession(home, opener);
     }
     if (!query) {
-      return this.listSession(opener);
+      return this.listSession(home, opener);
     }
     // 直接写 chat_id 的，机器人列不出来的群（没开权限）也能开通
-    if (CHAT_ID.test(query) && query !== this.opts.chatId) {
-      return this.groupSession(query, opener);
+    if (CHAT_ID.test(query) && !this.opts.chatIds.has(query)) {
+      return this.groupSession(home, query, opener);
     }
     const pending = await this.pending();
     const found = await this.find(query, [...this.opts.groups.allowed, ...pending.chatIds]);
     if (found.length === 1) {
-      return this.groupSession(found[0]!, opener);
+      return this.groupSession(home, found[0]!, opener);
     }
     return found.length > 1
-      ? this.listSession(opener, `有 ${found.length} 个群对得上「${query}」，点要改的那个`, found, pending)
-      : this.listSession(opener, `没找到叫「${query}」的群，下面是机器人在的所有群`, undefined, pending);
+      ? this.listSession(home, opener, `有 ${found.length} 个群对得上「${query}」，点要改的那个`, found, pending)
+      : this.listSession(home, opener, `没找到叫「${query}」的群，下面是机器人在的所有群`, undefined, pending);
   }
 
   private async find(query: string, chatIds: readonly string[]): Promise<string[]> {
@@ -277,7 +282,7 @@ export class AdminDesk {
   }
 
   /** 总览：only 给了时只列这几个群（对得上名字的）；known 是刚列过的还没开通的群 */
-  private async listSession(opener: Person, intro?: string, only?: readonly string[], known?: { chatIds: string[]; note?: string }): Promise<ListSession> {
+  private async listSession(home: string, opener: Person, intro?: string, only?: readonly string[], known?: { chatIds: string[]; note?: string }): Promise<ListSession> {
     const pending = known ?? (await this.pending());
     const pick = (list: readonly string[]) => (only ? list.filter((chatId) => only.includes(chatId)) : [...list]);
     const chatIds = pick([...this.opts.groups.allowed]);
@@ -287,6 +292,7 @@ export class AdminDesk {
     return {
       kind: "list",
       id: randomUUID(),
+      home,
       createdAt: this.now(),
       opener,
       rev: 0,
@@ -297,7 +303,7 @@ export class AdminDesk {
     };
   }
 
-  /** 机器人在、还没开通的群（管理群自己不算）。列不出来（没开权限）时没有，附一句说明 */
+  /** 机器人在、还没开通的群（管理群不算）。列不出来（没开权限）时没有，附一句说明 */
   private async pending(): Promise<{ chatIds: string[]; note?: string }> {
     const howTo = "也可以说「配置 群的编号」开通（群的编号是 oc_ 开头的那串，有人在那个群里 @ 机器人时服务器日志里会打出来）";
     if (!this.opts.directory) {
@@ -310,7 +316,7 @@ export class AdminDesk {
           this.chatNames.set(chat.chatId, chat.name);
         }
       }
-      return { chatIds: chats.map((chat) => chat.chatId).filter((chatId) => chatId !== this.opts.chatId && !this.opts.groups.allowed.has(chatId)) };
+      return { chatIds: chats.map((chat) => chat.chatId).filter((chatId) => !this.opts.chatIds.has(chatId) && !this.opts.groups.allowed.has(chatId)) };
     } catch (err) {
       if (!this.directoryWarned) {
         this.directoryWarned = true;
@@ -320,14 +326,15 @@ export class AdminDesk {
     }
   }
 
-  private async groupSession(chatId: string, opener: Person): Promise<GroupSession> {
+  private async groupSession(home: string, chatId: string, opener: Person): Promise<GroupSession> {
     // 版本号和表单要同一时刻取：下面读群成员、群名要等，这期间别人存了的话，旧表单配上新版本号确认时就会盖掉别人的改动
     const version = this.opts.settings.version(chatId);
     const draft = this.formDraft(chatId);
-    const { people, note } = await this.members(chatId, this.listed(chatId, draft), "这个群");
+    const { people, note } = await this.members([chatId], this.listed(chatId, draft), "这个群");
     return {
       kind: "group",
       id: randomUUID(),
+      home,
       createdAt: this.now(),
       opener,
       rev: 0,
@@ -342,14 +349,15 @@ export class AdminDesk {
     };
   }
 
-  private async adminsSession(opener: Person): Promise<AdminsSession> {
+  private async adminsSession(home: string, opener: Person): Promise<AdminsSession> {
     // 同 groupSession：版本号和名单在等群成员之前一起取
     const version = this.opts.settings.version(ADMINS_TARGET);
     const draft = [...this.opts.settings.admins()];
-    const { people, note } = await this.members(this.opts.chatId, draft, "管理群");
+    const { people, note } = await this.members([...this.opts.chatIds], draft, "管理群");
     return {
       kind: "admins",
       id: randomUUID(),
+      home,
       createdAt: this.now(),
       opener,
       rev: 0,
@@ -371,20 +379,24 @@ export class AdminDesk {
     return unique([...(draft.writeAllowed ?? []), ...(draft.memoryEditors ?? []), ...(base.writeAllowed ?? []), ...(base.memoryEditors ?? [])]);
   }
 
-  /** 能选的人：群成员加上名单里已经有的。读不到群成员时只有名单里的人，附一句说明 */
-  private async members(chatId: string, listed: readonly string[], where: string): Promise<{ people: string[]; note?: string }> {
+  /** 能选的人：这几个群的成员（管理员名单是各个管理群的）加上名单里已经有的。读不到群成员时只有名单里的人，附一句说明 */
+  private async members(chatIds: readonly string[], listed: readonly string[], where: string): Promise<{ people: string[]; note?: string }> {
     let note: string | undefined;
     let members: string[] = [];
     if (!this.opts.directory) {
       note = `读不到${where}的成员，只能从名单里已经有的人里减，加不了人`;
     } else {
       try {
-        members = (await this.opts.directory.members(chatId, MAX_MEMBERS + 1)).map((member) => member.openId);
+        for (const chatId of chatIds) {
+          members.push(...(await this.opts.directory.members(chatId, MAX_MEMBERS + 1)).map((member) => member.openId));
+        }
+        members = unique(members);
         if (members.length > MAX_MEMBERS) {
           members = members.slice(0, MAX_MEMBERS);
           note = `${where}人多，只列了前 ${MAX_MEMBERS} 人`;
         }
       } catch (err) {
+        members = [];
         note = `读不到${where}的成员（要给应用开「获取群组成员」权限），只能从名单里已经有的人里减，加不了人`;
         if (!this.directoryWarned) {
           this.directoryWarned = true;
@@ -417,9 +429,9 @@ export class AdminDesk {
   private async onList(session: ListSession, value: ActionValue, operator: Person): Promise<void> {
     let next: Promise<Session> | undefined;
     if (value.op === "open" && typeof value.chat === "string" && (session.chatIds.includes(value.chat) || session.pending.includes(value.chat))) {
-      next = this.groupSession(value.chat, operator);
+      next = this.groupSession(session.home, value.chat, operator);
     } else if (value.op === "admins") {
-      next = this.adminsSession(operator);
+      next = this.adminsSession(session.home, operator);
     }
     if (!next) {
       return;
@@ -429,7 +441,7 @@ export class AdminDesk {
     // 读群成员要一会儿，放到后台，回调马上返回
     void next
       .then((opened) => this.publish(opened, session.cardMessageId))
-      .catch((err: unknown) => this.unsent(err, session.cardMessageId));
+      .catch((err: unknown) => this.unsent(err, session.home, session.cardMessageId));
   }
 
   private async onGroup(session: GroupSession, op: string, current: boolean, operator: Person, form: Record<string, unknown> | undefined): Promise<void> {
@@ -545,6 +557,7 @@ export class AdminDesk {
     const after = nowOn ? `\n\n${grey(`改完以后：${this.summary(this.opts.groups.of(session.chatId))}`)}` : "";
     await this.update(session.cardMessageId!, closedCard(title, `${personTag(operator.openId)} 点了确认，${done}：\n${changeLines(session.changes)}${after}`, "green"));
     await this.notify(
+      session.home,
       nowOn && wasOn ? `${session.name} 的设置改了` : title,
       `${personTag(operator.openId)} ${notice}，${done}：\n${changeLines(session.changes)}`,
       session.cardMessageId,
@@ -635,7 +648,7 @@ export class AdminDesk {
     this.sessions.delete(session.id);
     this.logger.info(`管理群：${operator.openId} 改了管理员名单：${session.changes.map((change) => `${change.before} → ${change.after}`).join("；")}`);
     await this.update(session.cardMessageId!, closedCard("管理员名单已保存", `${personTag(operator.openId)} 点了确认，马上生效：\n${changeLines(session.changes)}`, "green"));
-    await this.notify("管理员名单改了", `${personTag(operator.openId)} 改了管理员名单：\n${changeLines(session.changes)}`, session.cardMessageId);
+    await this.notify(session.home, "管理员名单改了", `${personTag(operator.openId)} 改了管理员名单：\n${changeLines(session.changes)}`, session.cardMessageId);
   }
 
   /**
@@ -862,7 +875,7 @@ export class AdminDesk {
     this.prune();
     this.sessions.set(session.id, session);
     try {
-      const { messageId } = await this.opts.send(this.opts.chatId, { card: this.card(session) }, replyTo ? { replyTo } : undefined);
+      const { messageId } = await this.opts.send(session.home, { card: this.card(session) }, replyTo ? { replyTo } : undefined);
       session.cardMessageId ??= messageId;
     } catch (err) {
       this.sessions.delete(session.id);
@@ -882,10 +895,10 @@ export class AdminDesk {
     await this.opts.updateCard(messageId, card).catch((err: unknown) => this.logger.warn("管理群：更新设置卡片失败", err));
   }
 
-  /** 管理群里另发一条：谁改了什么（卡片更新了群里不提醒） */
-  private async notify(title: string, body: string, replyTo: string | undefined): Promise<void> {
+  /** 改的那个管理群里另发一条：谁改了什么（卡片更新了群里不提醒） */
+  private async notify(home: string, title: string, body: string, replyTo: string | undefined): Promise<void> {
     await this.opts
-      .send(this.opts.chatId, { card: closedCard(title, body, "green") }, replyTo ? { replyTo } : undefined)
+      .send(home, { card: closedCard(title, body, "green") }, replyTo ? { replyTo } : undefined)
       .catch((err: unknown) => this.logger.warn("管理群：改动通知没发出去", err));
   }
 

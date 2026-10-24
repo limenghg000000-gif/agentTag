@@ -23,8 +23,8 @@ export interface Config {
    * 没配时为空，各群的配置只能在 .env 里改
    */
   admin?: {
-    /** 管理群的 chat_id */
-    chatId: string;
+    /** 管理群的 chat_id，可以有几个（比如一个大家用的，一个自己试的）：哪个群里都能改，改动通知发在改的那个群里 */
+    chatIds: ReadonlySet<string>;
     /** 所有者（open_id）：能改各群的设置，也能在卡片上加减管理员。只能在 .env 里改 */
     owners: ReadonlySet<string>;
   };
@@ -437,23 +437,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   };
 }
 
-/** 管理群：CONFIG_CHAT_ID 和 CONFIG_OWNERS 要一起配，只配一个的启动时报错 */
+/** 管理群：CONFIG_CHAT_ID（可以写几个，逗号分隔）和 CONFIG_OWNERS 要一起配，只配一个的启动时报错 */
 function loadAdminConfig(env: NodeJS.ProcessEnv): Config["admin"] {
-  const chatId = env.CONFIG_CHAT_ID?.trim() ?? "";
+  const chatIds = splitList(env.CONFIG_CHAT_ID ?? "");
   const owners = openIds(env.CONFIG_OWNERS ?? "", "CONFIG_OWNERS");
-  if (!chatId && owners.length === 0) {
+  if (chatIds.length === 0 && owners.length === 0) {
     return undefined;
   }
-  if (!chatId) {
+  if (chatIds.length === 0) {
     throw new Error("配了 CONFIG_OWNERS 就要配 CONFIG_CHAT_ID（管理群的 chat_id）");
   }
-  if (!/^oc_[\w-]+$/.test(chatId)) {
-    throw new Error(`CONFIG_CHAT_ID 要填群的 chat_id（oc_ 开头），当前为 ${chatId}`);
+  const bad = chatIds.find((chatId) => !/^oc_[\w-]+$/.test(chatId));
+  if (bad) {
+    throw new Error(`CONFIG_CHAT_ID 要填群的 chat_id（oc_ 开头，几个群用逗号分隔），当前有 ${bad}`);
   }
   if (owners.length === 0) {
     throw new Error("配了 CONFIG_CHAT_ID 就要配 CONFIG_OWNERS（所有者的 open_id，逗号分隔）：没有所有者就没人能加管理员");
   }
-  return { chatId, owners: new Set(owners) };
+  return { chatIds: new Set(chatIds), owners: new Set(owners) };
 }
 
 /** ANNOUNCE_LINK（产品功能说明）、DOCS_LINK（文档中心）：要是 https 地址 */

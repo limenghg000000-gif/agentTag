@@ -501,7 +501,10 @@ test("管理群：CONFIG_CHAT_ID 和 CONFIG_OWNERS 一起配才开；卡片上�
   assert.equal(plain.settingsBackupDir, path.resolve("/srv/bot", "backup", "settings"));
 
   const config = loadConfig({ ...base, CONFIG_CHAT_ID: " oc_admin ", CONFIG_OWNERS: "ou_ml, ou_b" });
-  assert.deepEqual(config.admin, { chatId: "oc_admin", owners: new Set(["ou_ml", "ou_b"]) });
+  assert.deepEqual(config.admin, { chatIds: new Set(["oc_admin"]), owners: new Set(["ou_ml", "ou_b"]) });
+  // 管理群可以有几个（比如一个大家用的，一个自己试的），逗号分隔
+  assert.deepEqual(loadConfig({ ...base, CONFIG_CHAT_ID: "oc_admin, oc_mine,", CONFIG_OWNERS: "ou_ml" }).admin?.chatIds, new Set(["oc_admin", "oc_mine"]));
+  assert.throws(() => loadConfig({ ...base, CONFIG_CHAT_ID: "oc_admin,管理群", CONFIG_OWNERS: "ou_ml" }), /CONFIG_CHAT_ID 要填群的 chat_id.*当前有 管理群/);
 
   assert.throws(() => loadConfig({ ...base, CONFIG_CHAT_ID: "oc_admin" }), /配了 CONFIG_CHAT_ID 就要配 CONFIG_OWNERS/);
   assert.throws(() => loadConfig({ ...base, CONFIG_OWNERS: "ou_ml" }), /配了 CONFIG_OWNERS 就要配 CONFIG_CHAT_ID/);
