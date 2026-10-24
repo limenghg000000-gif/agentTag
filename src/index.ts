@@ -157,7 +157,7 @@ const knowledge = config.knowledge
 // 管理群（CONFIG_CHAT_ID）：管理员 @ 机器人说「配置」，程序回设置卡片（不经过模型），点「确认」存进 settings、下一条消息起生效
 const admin = config.admin
   ? new AdminDesk({
-      chatId: config.admin.chatId,
+      chatIds: config.admin.chatIds,
       owners: config.admin.owners,
       settings,
       groups,
@@ -643,11 +643,14 @@ for (const line of groups.describe()) {
   console.log(line);
 }
 if (config.admin) {
+  const adminChats = [...config.admin.chatIds];
+  const outside = adminChats.filter((chatId) => !groups.allowed.has(chatId));
   console.log(
-    `管理群：在群 ${config.admin.chatId} 里 @ 机器人说「配置」，回设置卡片改各群的配置，点「确认」马上生效；` +
-      `所有者 ${config.admin.owners.size} 人（CONFIG_OWNERS），管理员 ${settings.admins().size} 人。` +
+    `管理群：在群 ${adminChats.join(", ")} 里 @ 机器人说「配置」，回设置卡片改各群的配置，点「确认」马上生效` +
+      (adminChats.length > 1 ? "，改动通知发在改的那个群里" : "") +
+      `；所有者 ${config.admin.owners.size} 人（CONFIG_OWNERS），管理员 ${settings.admins().size} 人。` +
       `卡片上改的存在 ${settings.file}，每次改动记在 ${settings.logFile}` +
-      (groups.allowed.has(config.admin.chatId) ? "" : "（管理群不在白名单里：在这个群里只回「配置」）"),
+      (outside.length > 0 ? `（${outside.join(", ")} 不在白名单里：在这${outside.length > 1 ? "些" : "个"}群里只回「配置」）` : ""),
   );
 } else if (settings.chatIds().length > 0) {
   console.log(`管理群没开（CONFIG_CHAT_ID），以前在卡片上改过的 ${settings.chatIds().length} 个群照样按 ${settings.file} 来`);
