@@ -47,6 +47,8 @@ async function setup(
     rejectCards?: boolean;
     /** 管理群，不填只有 ADMIN_CHAT */
     adminChats?: string[];
+    /** 读这些群的成员时出错（机器人被移出群这类） */
+    membersFail?: string[];
   } = {},
 ) {
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), "agenttag-admin-")), "settings");
@@ -78,6 +80,9 @@ async function setup(
             chatName: async (chatId: string) => names[chatId],
             members: async (chatId: string) => {
               await opts.onMembers?.();
+              if (opts.membersFail?.includes(chatId)) {
+                throw new Error("机器人不在群里");
+              }
               return (members[chatId] ?? []).map((openId) => ({ openId }));
             },
             chats: async () => (await chats()).map((chatId) => ({ chatId, ...(names[chatId] ? { name: names[chatId] } : {}) })),
@@ -485,6 +490,15 @@ test("管理群可以有几个：哪个里面都能改，卡片和改动通知�
   assert.ok(findButton(overview.card, "open", { chat: "oc_new" }));
   await t.say(`配置 ${MINE}`, "ou_owner", ADMIN_CHAT);
   assert.doesNotMatch(text(t.sent.at(-1)!.card), /「自测群」的设置/);
+
+  // 机器人被移出了自测群、读不到那个群的成员：大家用的管理群的人照样能选
+  const partial = await setup({ adminChats: [ADMIN_CHAT, MINE], membersFail: [MINE] });
+  await partial.say("配置 管理员", "ou_owner", ADMIN_CHAT);
+  const list = partial.sent[0]!.messageId;
+  assert.match(text(partial.cards.get(list)), /有 1 个管理群读不到成员/);
+  await partial.click(list, "next", "ou_owner", { admins: ["ou_admin"] });
+  await partial.click(list, "confirm", "ou_owner");
+  assert.deepEqual([...partial.settings.admins()], ["ou_admin"]);
 });
 
 test("管理员名单：群里有人可选时卡片照样发得出去（表单和选人框不重名）", async () => {

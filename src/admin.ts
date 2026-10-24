@@ -386,22 +386,27 @@ export class AdminDesk {
     if (!this.opts.directory) {
       note = `读不到${where}的成员，只能从名单里已经有的人里减，加不了人`;
     } else {
-      try {
-        for (const chatId of chatIds) {
+      // 一个群一个群读：其中一个读不到（机器人被移出了自测的管理群这类），别的群的人照样能选
+      let failed = 0;
+      for (const chatId of chatIds) {
+        try {
           members.push(...(await this.opts.directory.members(chatId, MAX_MEMBERS + 1)).map((member) => member.openId));
+        } catch (err) {
+          failed++;
+          if (!this.directoryWarned) {
+            this.directoryWarned = true;
+            this.logger.warn("管理群：读不到群成员（要 im:chat.members:read 权限，机器人要在群里），设置卡片上只能从读得到的群成员和名单里已有的人里选", err);
+          }
         }
-        members = unique(members);
-        if (members.length > MAX_MEMBERS) {
-          members = members.slice(0, MAX_MEMBERS);
-          note = `${where}人多，只列了前 ${MAX_MEMBERS} 人`;
-        }
-      } catch (err) {
-        members = [];
+      }
+      members = unique(members);
+      if (failed === chatIds.length) {
         note = `读不到${where}的成员（要给应用开「获取群组成员」权限），只能从名单里已经有的人里减，加不了人`;
-        if (!this.directoryWarned) {
-          this.directoryWarned = true;
-          this.logger.warn("管理群：读不到群成员（要 im:chat.members:read 权限，机器人要在群里），设置卡片上只能从名单里已有的人里减", err);
-        }
+      } else if (members.length > MAX_MEMBERS) {
+        members = members.slice(0, MAX_MEMBERS);
+        note = `${where}人多，只列了前 ${MAX_MEMBERS} 人`;
+      } else if (failed > 0) {
+        note = `有 ${failed} 个${where}读不到成员（机器人还在不在那个群里？），只列了读得到的`;
       }
     }
     return { people: unique([...members, ...listed]), ...(note ? { note } : {}) };
