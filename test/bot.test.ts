@@ -1603,6 +1603,10 @@ test("回答里说这次改好了文档、代码：认得出来；说以前的�
     "文档已建好：确认卡片测试，已共享给本群可编辑。",
     "已修改定时任务 T2 的时间。",
     "已更新群记忆 #3。",
+    // 否定、假设、在问的不算
+    "没有证据表明文档已更新。",
+    "如果文档已更新，就不用重复添加。",
+    "文档已更新了吗？",
   ]) {
     assert.equal(changeClaim(answer), undefined, answer);
   }
@@ -1612,6 +1616,26 @@ test("回答里说这次改好了文档、代码：认得出来；说以前的�
   assert.equal(asksForChange("文档改好了吗"), false);
   assert.equal(asksForChange("有没有把第二行加到文档里"), false);
   assert.equal(asksForChange("gateway 最近报错多吗"), false);
+  // 引号里要写进去的字带着「有没有」「了吗」，照样是叫它改
+  assert.equal(asksForChange("在文档末尾加一句“有没有异常”"), true);
+  assert.equal(asksForChange("在文档末尾加一句「改好了吗」"), true);
+});
+
+test("叫它切分支、切成了：说「已把当前分支改为 develop」是真的，不打回", async () => {
+  const branches: Tool = {
+    spec: { name: "code_branches", description: "code_branches", parameters: { type: "object", properties: { switch_to: { type: "string" } } } },
+    describe: () => "code_branches",
+    run: async () => "已切到 develop",
+  };
+  const { model, requests } = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已把当前分支改为 develop。", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "code_branches", arguments: JSON.stringify({ switch_to: "develop" }) }] },
+  );
+  const { sent, handle } = setup({ model, taskTools: () => [branches], writeAllowed: new Set(["ou_admin"]) });
+  await handle(message("把当前分支改为 develop", { senderId: "ou_admin" }));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(markdowns(sent).slice(-1), ["已把当前分支改为 develop。"]);
 });
 
 test("没 @ 的跟聊叫它改文档，它没改却说改好了：打回一次，还这么说就不发，换成照实说没改", async () => {

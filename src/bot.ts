@@ -815,6 +815,8 @@ async function runTask(
     const restored: EarlierResult[] = [];
     // code_merge 真的合进去了（不算调用失败、设成流水线通过后自动合并的）：回答里说「已合并」要有它
     let mergedNow = false;
+    // code_branches 用 switch_to 切成了分支：不是改文档、改代码的工具，可「已把当前分支改为 develop」是真的
+    let switchedBranch = false;
     // 这次读过本群的聊天记录（chat_history）：群里谁都能写字，读过以后不能再改已有的文档和代码（新建文档可以，内容大家都看得到）；
     // 群记忆只有这句话本身让记住、忘掉时才能记。和「带上群聊时只给读的工具」一个道理
     let readChat = false;
@@ -955,6 +957,9 @@ async function runTask(
             throw err;
           }
           succeeded.add(tool.spec.name);
+          if (tool.spec.name === BRANCHES_TOOL && args.switch_to) {
+            switchedBranch = true;
+          }
           if (tool.spec.name === SCHEDULE_CREATE_TOOL || tool.spec.name === SCHEDULE_CHANGE_TOOL) {
             const done = output.match(SCHEDULE_RECEIPT)?.[0];
             if (done) {
@@ -1163,9 +1168,9 @@ async function runTask(
     const requestsKnown = () =>
       [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
     const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL), merged: () => mergedNow };
-    // 这次调成了改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并）没有：都没有的，回答说改好了就不是真的
+    // 这次调成了改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并）或者切成了分支没有：都没有的，回答说改好了就不是真的
     const writeTools = new Set(allTools.filter((tool) => tool.writes).map((tool) => tool.spec.name));
-    const changedNow = () => [...succeeded].some((name) => writeTools.has(name));
+    const changedNow = () => switchedBranch || [...succeeded].some((name) => writeTools.has(name));
     const reviewChange = reviewChangeClaims(question, taskTools.some((tool) => tool.writes), changedNow);
     const reviews = [
       ...(restate
@@ -2993,27 +2998,48 @@ const CHANGED_CLAIM = new RegExp(
     String.raw`(?:帮你|给你|为你)\s*(?:(?:在|把|将|往|向)${CLAUSE_CHARS}{0,20}?)?(?:加|写|改|删|追加|插入|更新|替换|提交|推送|合并)(?:上|好|进|入|成|掉|到)?了(?![吗么没呢?？])`,
     String.raw`(?:^|[，,。；;！!：:\s])(?:都|全)?(?:加上|加好|改好|写好|写上|删掉|删好|追加好|更新好)了(?=[，,。；;！!：:\s]|$)`,
   ].join("|"),
-  "m",
+  "gm",
 );
 /** 说的是定时任务、群记忆、经验库这些（不归改文档、改代码的工具管，有各自的检查）：「已更新群记忆 #3」「已修改定时任务 T2 的时间」 */
 const OTHER_CHANGE = /定时任务|(?<![A-Za-z])T\d+|记忆|经验/;
-/** 问改了没有（「文档改好了吗」「有没有加上」），不是叫它改 */
-const CHANGE_STATUS_QUESTION = /了[吗么没]|有没有|是否|是不是|没有[?？]?\s*$/;
+/** 这一小句前面是否定、假设、拿不准的：「没有证据表明文档已更新」「如果文档已更新，就不用再加」「不确定是否已追加」 */
+const NOT_ASSERTED = /没|不|未|别|无|非|如果|假如|要是|若|万一|是否|是不是|有没有|证据|以为|好像|似乎|可能|也许/;
+/** 在问的一句（「文档已更新了吗？」） */
+const QUESTION_SENTENCE = /(?:[?？]|[吗么呢][。！!~～]?)\s*$/;
+/** 引号里的是要写进去的内容、别人的原话（「加一句“有没有异常”」），不算这句话本身在问 */
+const QUOTED = /“[^”]*”|"[^"\n]*"|「[^」]*」|『[^』]*』|‘[^’]*’/g;
+/** 问改了没有（「文档改好了吗」「有没有加上第二行」），不是叫它改 */
+const CHANGE_STATUS_QUESTION = new RegExp(
+  String.raw`了[吗么没]|(?:有没有|是否|是不是)${CLAUSE_CHARS}{0,12}?(?:改|加|写|删|更新|追加|插入|替换|提交|推|合)|没有[?？]?\s*$`,
+);
 
-/** 回答里第一处说这次改好了文档、代码的话；没有返回 undefined。说的是定时任务、群记忆、经验的那一句不算 */
+/**
+ * 回答里第一处说这次改好了文档、代码的话；没有返回 undefined。
+ * 说的是定时任务、群记忆、经验的那一句不算；在问的一句不算；这一小句里说法前面是否定、假设、拿不准的不算
+ */
 export function changeClaim(answer: string): string | undefined {
   for (const sentence of answer.split(/(?<=[。！!？?\n])/)) {
-    const said = sentence.match(CHANGED_CLAIM)?.[0];
-    if (said !== undefined && !OTHER_CHANGE.test(sentence)) {
-      return said.replace(/^[，,。；;！!：:\s]+/, "");
+    if (OTHER_CHANGE.test(sentence) || QUESTION_SENTENCE.test(sentence)) {
+      continue;
+    }
+    for (const match of sentence.matchAll(CHANGED_CLAIM)) {
+      const said = match[0].replace(/^[，,。；;！!：:\s]+/, "");
+      const at = match.index + match[0].length - said.length;
+      const clause = sentence.slice(0, at).split(/[，,；;：:]/).at(-1) ?? "";
+      if (!NOT_ASSERTED.test(clause)) {
+        return said;
+      }
     }
   }
   return undefined;
 }
 
-/** 发起人这句话本身叫它改文档、改代码、开合并请求（和给不给改的工具用同一套判断）；问改了没有的不算 */
+/** 发起人这句话本身叫它改文档、改代码、开合并请求（和给不给改的工具用同一套判断）；问改了没有的不算，引号里要写进去的字不算 */
 export function asksForChange(question: string): boolean {
-  return (CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question) || asksToOpenRequest(question)) && !CHANGE_STATUS_QUESTION.test(question);
+  return (
+    (CHANGE_REQUEST.test(question) || DOC_REQUEST.test(question) || asksToOpenRequest(question)) &&
+    !CHANGE_STATUS_QUESTION.test(question.replace(QUOTED, "“”"))
+  );
 }
 
 /**
