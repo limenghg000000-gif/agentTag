@@ -1626,6 +1626,9 @@ test("回答里说这次改好了文档、代码：认得出来；说以前的�
   assert.equal(asksForChange("文档改好了吗"), false);
   assert.equal(asksForChange("有没有把第二行加到文档里"), false);
   assert.equal(asksForChange("gateway 最近报错多吗"), false);
+  // 问改过什么的不算叫它改
+  assert.equal(asksForChange("回顾一下，你对这篇文档做了哪些修改？"), false);
+  assert.equal(asksForChange("刚才那个分支改了什么"), false);
   // 引号里要写进去的字带着「有没有」「了吗」，照样是叫它改
   assert.equal(asksForChange("在文档末尾加一句“有没有异常”"), true);
   assert.equal(asksForChange("在文档末尾加一句「改好了吗」"), true);
@@ -1700,7 +1703,7 @@ test("没 @ 的跟聊叫它改文档，它没改却说改好了：打回一次�
   assert.deepEqual(markdowns(second.sent).slice(-1), ["这句没 @ 我，我没改。要改请 @ 我直接说。"]);
 });
 
-test("@ 了叫它改文档：改的工具调成了，说改好了照常发；有改的工具却没调就说改好了，打回时叫它现在去改", async () => {
+test("@ 了叫它改文档：改的工具调成了，说改好了照常发；有改的工具却没调就说改好了，打回时只叫它照实说、不叫它去改", async () => {
   const edits: string[] = [];
   const tool = (name: string, writes = false): Tool => ({
     ...(writes ? { writes: true } : {}),
@@ -1725,19 +1728,20 @@ test("@ 了叫它改文档：改的工具调成了，说改好了照常发；有
   assert.equal(requests.length, 2);
   assert.deepEqual(markdowns(sent).slice(-1), ["已在文档末尾加上「第二行」"]);
 
-  // 没调就说改好了：打回，叫它现在去调（会先请他确认），调成了再说改好了
+  // 没调就说改好了：打回只叫它照实说、问他要不要现在改，不叫它这时去调改的工具（他可能只是问改过什么）
   const lazy = fakeModel((req) =>
-    req.messages.some((m) => m.role === "tool")
-      ? { text: "已在文档末尾加上「第二行」", finish: "stop" }
-      : req.messages.some((m) => m.role === "user" && m.content.includes("（系统检查）"))
-        ? { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "feishu_doc_edit", arguments: "{}" }] }
-        : { text: "已在文档末尾加上「第二行」", finish: "stop" },
+    req.messages.some((m) => m.role === "user" && m.content.includes("（系统检查）"))
+      ? { text: "这次还没改，要我现在在文档末尾加上「第二行」吗？", finish: "stop" }
+      : { text: "已在文档末尾加上「第二行」", finish: "stop" },
   );
   const again = setup({ model: lazy.model, taskTools, writeAllowed: new Set(["ou_admin"]) });
   await again.handle(message("在这篇文档末尾加一句“第二行”", { messageId: "om_2", senderId: "ou_admin" }));
-  assert.match(JSON.stringify(lazy.requests[1].messages.at(-1)), /他要改的话现在就调对应的工具去改/);
-  assert.deepEqual(edits, ["feishu_doc_edit", "feishu_doc_edit"]);
-  assert.deepEqual(markdowns(again.sent).slice(-1), ["已在文档末尾加上「第二行」"]);
+  const note = JSON.stringify(lazy.requests[1].messages.at(-1));
+  assert.match(note, /照实说这次没改成/);
+  assert.match(note, /这次不要为了这句话再去调改的工具/);
+  assert.doesNotMatch(note, /现在就调/);
+  assert.deepEqual(edits, ["feishu_doc_edit"]);
+  assert.deepEqual(markdowns(again.sent).slice(-1), ["这次还没改，要我现在在文档末尾加上「第二行」吗？"]);
 });
 
 test("点「接着查」按钮问的只给读的工具（写权限名单里的人也一样），提示词说明是按钮问的", async () => {
