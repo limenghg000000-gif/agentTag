@@ -3012,7 +3012,7 @@ const OTHER_CHANGE = /定时任务|(?<![A-Za-z])T\d+|记忆|经验/;
 const DOC_OR_CODE = /文档|文件|代码|分支|合并请求|(?<![A-Za-z])(?:MR|PR)(?![A-Za-z])/i;
 /** 这一小句前面是否定、假设、拿不准的：「没有证据表明文档已更新」「如果文档已更新，就不用再加」「不确定是否已追加」 */
 const NOT_ASSERTED = /没|不|未|别|无|非|如果|假如|要是|若|万一|是否|是不是|有没有|证据|以为|好像|似乎|可能|也许/;
-/** 在问的一句（「文档已更新了吗？」） */
+/** 在问的一小句（「文档已更新了吗？」） */
 const QUESTION_SENTENCE = /(?:[?？]|[吗么呢][。！!~～]?)\s*$/;
 /** 引号里的是要写进去的内容、别人的原话（「加一句“有没有异常”」），不算这句话本身在问 */
 const QUOTED = /“[^”]*”|"[^"\n]*"|「[^」]*」|『[^』]*』|‘[^’]*’/g;
@@ -3027,17 +3027,17 @@ const CHANGED_CLAUSE_BREAK = /[，,；;：:]/;
  * 说的是定时任务、群记忆、经验的那一小句不算（写进文档的字里带着这些词的照样算）；在问的一句不算；这一小句里说法前面是否定、假设、拿不准的不算
  */
 export function changeClaim(answer: string): string | undefined {
-  for (const sentence of answer.split(/(?<=[。！!？?\n])/)) {
-    if (QUESTION_SENTENCE.test(sentence)) {
-      continue;
-    }
+  // 引号里的字（写进去的内容「是否更新？」、举例的「文档已更新」）先换成占位的，不当成说法，也不当成问句、断句
+  const masked = answer.replace(QUOTED, (quote) => quote[0] + "＿".repeat(quote.length - 2) + quote.at(-1));
+  for (const sentence of masked.split(/(?<=[。！!？?\n])/)) {
     for (const match of sentence.matchAll(CHANGED_CLAIM)) {
       const said = match[0].replace(/^[，,。；;！!：:\s]+/, "");
       const at = match.index + match[0].length - said.length;
       const before = sentence.slice(0, at).split(CHANGED_CLAUSE_BREAK).at(-1) ?? "";
-      // 说法所在的这一小句（引号里写进去的字不算）说的是定时任务、群记忆、经验，又没说到文档、代码的，归它们自己的检查
-      const clause = (before + sentence.slice(at).split(CHANGED_CLAUSE_BREAK)[0]).replace(QUOTED, "「」");
-      if (!NOT_ASSERTED.test(before) && !(OTHER_CHANGE.test(clause) && !DOC_OR_CODE.test(clause))) {
+      // 说法所在的这一小句：在问的（「文档已更新了吗？」）不算，「已加上第二行，需要我继续吗？」前一小句照样算；
+      // 说的是定时任务、群记忆、经验，又没说到文档、代码的，归它们自己的检查
+      const clause = before + sentence.slice(at).split(CHANGED_CLAUSE_BREAK)[0];
+      if (!NOT_ASSERTED.test(before) && !QUESTION_SENTENCE.test(clause) && !(OTHER_CHANGE.test(clause) && !DOC_OR_CODE.test(clause))) {
         return said;
       }
     }
