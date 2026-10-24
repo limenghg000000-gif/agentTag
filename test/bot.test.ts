@@ -1739,11 +1739,30 @@ test("@ 了叫它改文档：改的工具调成了，说改好了照常发；有
   const again = setup({ model: lazy.model, taskTools, writeAllowed: new Set(["ou_admin"]) });
   await again.handle(message("在这篇文档末尾加一句“第二行”", { messageId: "om_2", senderId: "ou_admin" }));
   const note = JSON.stringify(lazy.requests[1].messages.at(-1));
-  assert.match(note, /照实说这次没改成/);
+  assert.match(note, /照实说这次没改/);
   assert.match(note, /这次不要为了这句话再去调改的工具/);
   assert.doesNotMatch(note, /现在就调/);
   assert.deepEqual(edits, ["feishu_doc_edit"]);
   assert.deepEqual(markdowns(again.sent).slice(-1), ["这次还没改，要我现在在文档末尾加上「第二行」吗？"]);
+
+  // 改的工具跑了、出错了：可能改了一半（替换先插新内容再删旧的），照实说的不打回
+  const broken = (): Tool => ({
+    writes: true,
+    spec: { name: "feishu_doc_edit", description: "feishu_doc_edit", parameters: { type: "object", properties: {} } },
+    describe: () => "feishu_doc_edit",
+    run: async () => {
+      throw new Error("删除原文失败");
+    },
+  });
+  const partial = fakeModel((req) =>
+    req.messages.some((m) => m.role === "tool")
+      ? { text: "已写入新内容，但删除原文失败，替换未完成。", finish: "stop" }
+      : { text: "", finish: "tool_calls", toolCalls: [{ id: "c1", name: "feishu_doc_edit", arguments: "{}" }] },
+  );
+  const third = setup({ model: partial.model, taskTools: () => [tool("feishu_doc_read"), broken()], writeAllowed: new Set(["ou_admin"]) });
+  await third.handle(message("把文档第二段改成“第二行”", { messageId: "om_3", senderId: "ou_admin" }));
+  assert.equal(partial.requests.length, 2);
+  assert.deepEqual(markdowns(third.sent).slice(-1), ["已写入新内容，但删除原文失败，替换未完成。"]);
 });
 
 test("点「接着查」按钮问的只给读的工具（写权限名单里的人也一样），提示词说明是按钮问的", async () => {

@@ -817,6 +817,8 @@ async function runTask(
     let mergedNow = false;
     // code_branches 用 switch_to 切成了分支：不是改文档、改代码的工具，可「已把当前分支改为 develop」是真的
     let switchedBranch = false;
+    // 过了确认、真的跑起来的工具（不管成没成）：改的工具跑到一半出错，文档可能已经动了（替换是先插新内容再删旧的，删失败时新内容留着），不能说什么都没改
+    const started = new Set<string>();
     // 这次读过本群的聊天记录（chat_history）：群里谁都能写字，读过以后不能再改已有的文档和代码（新建文档可以，内容大家都看得到）；
     // 群记忆只有这句话本身让记住、忘掉时才能记。和「带上群聊时只给读的工具」一个道理
     let readChat = false;
@@ -939,6 +941,7 @@ async function runTask(
           const code = isCodeTool(tool.spec.name);
           let facts: CodeFact[] = [];
           let output: string;
+          started.add(tool.spec.name);
           try {
             // writable：这次有改文档、改代码的工具，而且发起人这句话本身说了要改。建定时任务时记下来，到点跑的时候不会比建的时候权限大。
             // 任务内容是模型写的：建的人只说「每天汇总一下」，模型写成「汇总并更新周报文档」，到点也不能改；
@@ -1168,15 +1171,16 @@ async function runTask(
     const requestsKnown = () =>
       [asked, ...history.map((m) => m.content), memory?.prompt.text ?? "", knowledge?.text ?? "", ...toolTexts].join("\n");
     const requests = { known: requestsKnown, canOpen: toolNames.includes(OPEN_PR_TOOL), canMerge: toolNames.includes(MERGE_TOOL), merged: () => mergedNow };
-    // 这次改成了什么没有：改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并），切分支，记、改、删群记忆，建、改定时任务。
-    // 都没有的，回答说改好了就不是真的；改成了别的（「已更新群记忆中的文档链接」）不在这里查
+    // 这次改了什么没有：改文档、改代码的工具（新建文档、改文档、改代码、开合并请求、合并），切分支，记、改、删群记忆，建、改定时任务。
+    // 都没跑过的（没调、没点确认），回答说改好了就不是真的；改成了别的（「已更新群记忆中的文档链接」）不在这里查；
+    // 跑了出错的也不查：可能改了一半（「已写入新内容，但删除原文失败」），改没改说不准
     const changeTools = new Set([
       ...allTools.filter((tool) => tool.writes).map((tool) => tool.spec.name),
       ...MEMORY_WRITE_TOOLS,
       SCHEDULE_CREATE_TOOL,
       SCHEDULE_CHANGE_TOOL,
     ]);
-    const changedNow = () => switchedBranch || [...succeeded].some((name) => changeTools.has(name));
+    const changedNow = () => switchedBranch || [...succeeded, ...started].some((name) => changeTools.has(name));
     const reviewChange = reviewChangeClaims(question, taskTools.some((tool) => tool.writes), changedNow);
     const reviews = [
       ...(restate
@@ -1194,7 +1198,7 @@ async function runTask(
       ...(restate || scheduled
         ? []
         : [(answer: string) => (readChat ? undefined : reviewScheduleClaims(answer, scheduleRan, () => scheduleTexts.join("\n"), toolNames, () => scheduleDone))]),
-      // 叫它改文档、改代码，这次一个改的工具都没调成，却说改好了：打回一次。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人改的）
+      // 叫它改文档、改代码，这次一个改的工具都没跑（没调、没点确认），却说改好了：打回一次。整理之前内容、定时任务到点跑的不查；读过群聊的不查（总结群聊时说的是别人改的）
       ...(restate || scheduled ? [] : [(answer: string) => (readChat ? undefined : reviewChange(answer))]),
       reviewByteUnits(evidence),
       // 卡片上画图时才查：不画图时 ```chart 是用户要的代码示例
@@ -3057,7 +3061,7 @@ export function asksForChange(question: string): boolean {
 }
 
 /**
- * 叫它改文档、改代码，这次一个改的工具都没调成，回答却说改好了：打回一次，叫它照实说。
+ * 叫它改文档、改代码，这次一个改的工具都没跑（没调、没点确认），回答却说改好了：打回一次，叫它照实说。
  * 2026-10-24 在话题里没 @ 说「在这篇文档末尾加一句“第二行”」：没 @ 的跟聊只给读的工具，它读了一遍文档，回「已在文档末尾加上「第二行」」，其实没改。
  * 打回只叫它照实改回答、不叫它这时去调改的工具（跟定时任务那道一样）：他可能只是问「你对这篇文档做了哪些修改」，话题里别人的话也在上下文里，借打回去改就成了替他做没叫做的事。
  * canChange：这次有改的工具（有的话叫它问他要不要现在改，不是没 @ 改不了）；changed 在检查时再取，这次调成的才算
@@ -3074,8 +3078,8 @@ export function reviewChangeClaims(question: string, canChange: boolean, changed
     }
     return (
       (canChange
-        ? `（系统检查）你这次没有用改文档、改代码的工具改成（没调、调了出错，或者他没点确认），回答里却说已经改了（「${said}」）。` +
-          "照实说这次没改成（卡在哪一步就说哪一步）；这次不要为了这句话再去调改的工具，他要改的话问他要不要现在改。"
+        ? `（系统检查）你这次没有改文档、改代码（没调改的工具，或者他没点确认），回答里却说已经改了（「${said}」）。` +
+          "照实说这次没改（没调还是他没点确认）；这次不要为了这句话再去调改的工具，他要改的话问他要不要现在改。"
         : `（系统检查）你这次没有改文档、改代码的工具，什么都没改，回答里却说已经改了（「${said}」）。` +
           "照实说这次没改；要改请他 @ 你，直接说改哪篇文档或哪段代码、改成什么。") +
       "其余内容不用改，重新给出完整的回答，不要提这段检查。"
