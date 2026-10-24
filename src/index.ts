@@ -477,6 +477,10 @@ const catchUp = new CatchUpPoller({
       if (confirmedByText(msg)) {
         return;
       }
+      // 管理群里不 @ 说的「配置」：和事件那边一样回设置卡片（这条轮询已经占住了）
+      if (await admin?.handleUnaddressed(msg, () => true)) {
+        return;
+      }
       const listener = listenerFor(msg);
       if (listener) {
         await considerUnaddressed(msg, listener);
