@@ -154,7 +154,7 @@ const knowledge = config.knowledge
       nameOf,
     })
   : undefined;
-// 管理群（CONFIG_CHAT_ID）：管理员 @ 机器人说「配置」，程序回设置卡片（不经过模型），点「确认」存进 settings、下一条消息起生效
+// 管理群（CONFIG_CHAT_ID）：管理员说「配置」（@ 不 @ 都行），程序回设置卡片（不经过模型），点「确认」存进 settings、下一条消息起生效
 const admin = config.admin
   ? new AdminDesk({
       chatIds: config.admin.chatIds,
@@ -496,6 +496,11 @@ channel.on("message", async (msg: NormalizedMessage) => {
     return;
   }
   if (!msg.mentionedBot) {
+    // 管理群里整句就是「配置…」的：不 @ 也回设置卡片（别的话照下面的规矩）
+    if (await admin?.handleUnaddressed(msg)) {
+      handled.claim(msg.messageId);
+      return;
+    }
     // 没 @ 机器人的：只看跟聊在跟的话题里的、打开了主动接话的群主界面的，别的（包括白名单外的群）一律不管，也不记日志
     const listener = listenerFor(msg);
     if (!listener || !handled.claim(msg.messageId)) {
@@ -649,7 +654,7 @@ if (config.admin) {
   const adminChats = [...config.admin.chatIds];
   const outside = adminChats.filter((chatId) => !groups.allowed.has(chatId));
   console.log(
-    `管理群：在群 ${adminChats.join(", ")} 里 @ 机器人说「配置」，回设置卡片改各群的配置，点「确认」马上生效` +
+    `管理群：在群 ${adminChats.join(", ")} 里说「配置」（@ 不 @ 机器人都行），回设置卡片改各群的配置，点「确认」马上生效` +
       (adminChats.length > 1 ? "，改动通知发在改的那个群里" : "") +
       `；所有者 ${config.admin.owners.size} 人（CONFIG_OWNERS），管理员 ${settings.admins().size} 人。` +
       `卡片上改的存在 ${settings.file}，每次改动记在 ${settings.logFile}` +
