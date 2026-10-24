@@ -124,6 +124,8 @@ async function setup(
       now += ms;
     },
     say: (content: string, sender = "ou_owner", chatId = ADMIN_CHAT, mentionedBot = true) => desk.handleMessage(message(content, sender, chatId, mentionedBot)),
+    /** 群里没 @ 机器人说的 */
+    hear: (content: string, sender = "ou_owner", chatId = ADMIN_CHAT, claim: (messageId: string) => boolean = () => true) => desk.handleUnaddressed(message(content, sender, chatId, false), claim),
     /** 点卡片上的按钮：按 op 在卡片里找按钮；在卡片发到的那个群里点 */
     click: async (messageId: string, op: string, operator: string, form?: Record<string, unknown>, extra: Record<string, string> = {}) => {
       const card = cards.get(messageId);
@@ -246,6 +248,37 @@ test("管理群里 @ 机器人说「配置」：回总览卡片，列出白名�
   assert.match(overview, /测试群/);
   assert.match(overview, /写权限 谁都不能/, "运营群在 .env 里写权限是 none");
   assert.match(overview, /所有者 1 人，管理员 0 人/);
+});
+
+test("管理群里不 @ 也能说「配置」：整句是「配置」「配置 管理员」或者对得上群的才回卡片，平时聊天的话不管", async () => {
+  const t = await setup();
+  assert.equal(await t.hear("配置"), true);
+  assert.match(text(t.sent[0]!.card), /各群的设置/);
+  assert.match(t.sent[0]!.replyTo ?? "", /^om_in_/, "回在说「配置」的那条下面");
+  assert.equal(await t.hear("配置 管理员"), true);
+  assert.match(text(t.sent[1]!.card), /管理员名单/);
+  assert.equal(await t.hear("设置 运营群"), true);
+  assert.match(text(t.sent[2]!.card), /「运营群」的设置/);
+
+  assert.equal(await t.hear("配置一下测试环境"), false);
+  assert.equal(await t.hear("设置 测试环境"), false, "对不上群的不回总览");
+  assert.equal(await t.hear("帮我查下日志"), false, "别的话也不回怎么用");
+  assert.equal(await t.hear("配置", "ou_owner", "oc_ops"), false, "不是管理群的不管");
+  assert.equal(await t.desk.handleUnaddressed(message("配置", "ou_owner", ADMIN_CHAT, true), () => true), false, "@ 了的归 handleMessage");
+  assert.equal(t.sent.length, 3);
+
+  // 补漏轮询已经处理过这条：不再回卡片，也不交给别处
+  const claimed: string[] = [];
+  const taken = (messageId: string) => {
+    claimed.push(messageId);
+    return false;
+  };
+  assert.equal(await t.hear("配置", "ou_owner", ADMIN_CHAT, taken), true);
+  assert.equal(claimed.length, 1);
+  assert.equal(t.sent.length, 3);
+  // 不是「配置」的不占
+  assert.equal(await t.hear("帮我查下日志", "ou_owner", ADMIN_CHAT, taken), false);
+  assert.equal(claimed.length, 1);
 });
 
 test("「配置 群名」直接打开那个群；GROUPS 里的名字也认；对不上的回总览并说一句", async () => {

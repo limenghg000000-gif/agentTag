@@ -31,8 +31,8 @@ const OPEN_IDS = /ou_[A-Za-z0-9_-]+/g;
 const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
 
 const HINT =
-  "这里是管理群：@ 我说「配置」看各群的设置、改设置、开通新群，「配置 群名」直接打开那个群，「配置 管理员」看管理员名单。别的问题请到各群里问我。";
-const EXPIRED = "这张卡片已经失效（机器人重启过，或者已经处理完了）。在管理群里 @ 我说「配置」重新打开";
+  "这里是管理群：说「配置」（@ 不 @ 我都行）看各群的设置、改设置、开通新群，「配置 群名」直接打开那个群，「配置 管理员」看管理员名单。别的问题请到各群里问我。";
+const EXPIRED = "这张卡片已经失效（机器人重启过，或者已经处理完了）。在管理群里说「配置」重新打开";
 
 export interface AdminDeskOptions {
   /**
@@ -186,15 +186,50 @@ export class AdminDesk {
       await this.opts.send(msg.chatId, { markdown: HINT }, { replyTo: msg.messageId }).catch((err: unknown) => this.logger.warn("管理群：回怎么用失败", err));
       return true;
     }
-    const opener = person(msg.senderId, msg.senderName);
+    await this.answer(msg, match[1]?.trim());
+    return true;
+  }
+
+  /**
+   * 管理群里没 @ 机器人的话：整句就是「配置」「配置 管理员」，或者「配置 群名」对得上群的，和 @ 了一样回设置卡片。
+   * 别的不管、不回（管理群也是平时说话的群，「配置一下测试环境」这类不当成要卡片），返回 false 照别的规矩走。
+   * 是「配置」时先 claim 这条：补漏轮询已经处理过的（claim 返回 false）不再回卡片，也不交给别处
+   */
+  async handleUnaddressed(msg: NormalizedMessage, claim: (messageId: string) => boolean): Promise<boolean> {
+    if (!this.opts.chatIds.has(msg.chatId) || msg.mentionedBot) {
+      return false;
+    }
+    const match = COMMAND.exec(msg.content);
+    if (!match) {
+      return false;
+    }
     const query = match[1]?.trim();
-    this.logger.info(`管理群：${opener.openId} 说了「配置${query ? ` ${query}` : ""}」`);
+    if (query && !ADMINS_QUERY.test(query) && !(await this.names(query))) {
+      return false;
+    }
+    if (claim(msg.messageId)) {
+      await this.answer(msg, query);
+    }
+    return true;
+  }
+
+  /** 「配置」后面写的能打开群：群的编号，或者对得上至少一个群名 */
+  private async names(query: string): Promise<boolean> {
+    if (CHAT_ID.test(query) && !this.opts.chatIds.has(query)) {
+      return true;
+    }
+    const pending = await this.pending();
+    return (await this.find(query, [...this.opts.groups.allowed, ...pending.chatIds])).length > 0;
+  }
+
+  private async answer(msg: NormalizedMessage, query: string | undefined): Promise<void> {
+    const opener = person(msg.senderId, msg.senderName);
+    this.logger.info(`管理群：${opener.openId} 说了「配置${query ? ` ${query}` : ""}」${msg.mentionedBot ? "" : "（没 @）"}`);
     try {
       await this.publish(await this.open(msg.chatId, query, opener), msg.messageId);
     } catch (err) {
       await this.unsent(err, msg.chatId, msg.messageId);
     }
-    return true;
   }
 
   /** 设置卡片没发出去：记日志，管理群里回一句，免得点了、说了以后什么都没有 */
@@ -224,7 +259,7 @@ export class AdminDesk {
     session.cardMessageId ??= evt.messageId;
     if (this.now() - session.createdAt > SETTINGS_TTL_MS) {
       this.sessions.delete(session.id);
-      await this.update(evt.messageId, closedCard("已失效", "这张卡片超过 30 分钟，已经失效。在管理群里 @ 我说「配置」重新打开", "grey"));
+      await this.update(evt.messageId, closedCard("已失效", "这张卡片超过 30 分钟，已经失效。在管理群里说「配置」重新打开", "grey"));
       return true;
     }
     // 卡片上要写是谁点的：回调里一般没有名字，去找（找不到写「有人」）
