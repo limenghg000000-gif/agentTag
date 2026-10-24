@@ -1078,8 +1078,9 @@ export class AdminDesk {
       markdown(
         grey("每一项选「照服务器上的配置」就用服务器上写的（括号里是现在的）。改好点「下一步」核对改动，点「确认」才生效。只有管理员能改，卡片 30 分钟内有效"),
       ),
-      ...note,
       { tag: "form", name: "settings", elements: [...fields, submitButton(enabled ? "下一步：核对改动" : "下一步：核对后开通", value("next"))] },
+      // 点了按钮的结果写在按钮正下方：表单长，写在上面看不到，像是点了没反应
+      ...note,
       buttons([
         actionButton("全部照服务器上的配置", "default", value("reset")),
         ...(enabled ? [actionButton("停用这个群", "danger", value("disable"))] : []),
@@ -1103,7 +1104,6 @@ export class AdminDesk {
       markdown(`**所有者**（写在服务器配置里，卡片上改不了）：${[...this.opts.owners].map(personTag).join("、")}`),
       markdown(`**管理员**（能改各群的设置，不能加减管理员）：${admins.length > 0 ? admins.map(personTag).join("、") : "还没有"}`),
       markdown(grey("只有所有者能加减管理员。要加的人得先在这个管理群里" + (session.peopleNote ? `。${session.peopleNote}` : ""))),
-      ...note,
       {
         tag: "form",
         // 不能和下面的选人框（admins）重名：飞书整张卡片拒收（11310 name duplicate）
@@ -1113,6 +1113,8 @@ export class AdminDesk {
           submitButton("下一步：核对改动", value("next")),
         ],
       },
+      // 和群的设置卡片一样，写在「下一步」正下方
+      ...note,
       buttons([actionButton("取消", "default", value("cancel"))]),
     ]);
   }
